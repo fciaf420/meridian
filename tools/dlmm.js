@@ -4,7 +4,7 @@ import {
   PublicKey,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
-import { BN } from "bn.js";
+import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
@@ -514,7 +514,7 @@ export async function closePosition({ position_address }) {
       position: positionPubKey,
       fromBinId: -887272,
       toBinId: 887272,
-      bps: new (await import("bn.js")).default(10000),
+      bps: new BN(10000),
       shouldClaimAndClose: true,
     });
 
