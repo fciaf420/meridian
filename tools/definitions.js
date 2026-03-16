@@ -474,14 +474,16 @@ Returns: organic score, holder count, mcap, liquidity, audit flags (mint/freeze 
     function: {
       name: "get_token_holders",
       description: `Get holder distribution for a token by mint address.
-Use to check concentration risk — if top holders control too much supply it's a red flag.
-Returns top 20 holders with their percentage of supply.
+Fetches top 100 holders — use limit to control how many to display (default 20).
+Each holder includes: address, amount, % of supply, SOL balance, tags (Pool/AMM/etc), and funding info (who funded this wallet, amount, slot).
+is_pool=true means it's a liquidity pool address, not a real holder — filter these out when analyzing concentration.
 
 NOTE: Requires mint address. If you only have a symbol/name, call get_token_info first to resolve the mint.`,
       parameters: {
         type: "object",
         properties: {
-          mint: { type: "string", description: "Token mint address (base58). Use get_token_info first if you only have a symbol." }
+          mint: { type: "string", description: "Token mint address (base58). Use get_token_info first if you only have a symbol." },
+          limit: { type: "number", description: "How many holders to return (default 20, max 100)" }
         },
         required: ["mint"]
       }

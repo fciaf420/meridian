@@ -54,26 +54,42 @@ export async function getTokenInfo({ query }) {
 
 /**
  * Get holder distribution for a token mint.
+ * Fetches top 100 holders — caller decides how many to display.
  */
-export async function getTokenHolders({ mint }) {
-  const url = `${DATAPI_BASE}/holders/${mint}`;
+export async function getTokenHolders({ mint, limit = 20 }) {
+  const url = `${DATAPI_BASE}/holders/${mint}?limit=100`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Holders API error: ${res.status}`);
   const data = await res.json();
 
-  // Condense — return top holders + concentration stats
   const holders = Array.isArray(data) ? data : (data.holders || data.data || []);
-  const total = holders.length;
-  const top10Pct = holders.slice(0, 10).reduce((s, h) => s + (h.percentage || h.pct || 0), 0);
 
-  return {
-    mint,
-    total_in_response: total,
-    top_10_pct: top10Pct?.toFixed(2),
-    holders: holders.slice(0, 20).map((h) => ({
+  const mapped = holders.slice(0, Math.min(limit, 100)).map((h) => {
+    const tags = (h.tags || []).map((t) => t.name || t.id || t);
+    const isPool = tags.some((t) => /pool|amm|liquidity|raydium|orca|meteora/i.test(t));
+    return {
       address: h.address || h.wallet,
       amount: h.amount,
       pct: h.percentage ?? h.pct,
-    })),
+      sol_balance: h.solBalanceDisplay ?? h.solBalance,
+      tags: tags.length ? tags : undefined,
+      is_pool: isPool || undefined,
+      funding: h.fundingAddress ? {
+        address: h.fundingAddress,
+        amount: h.fundingAmount,
+        slot: h.fundingSlot,
+      } : undefined,
+    };
+  });
+
+  const realHolders = mapped.filter((h) => !h.is_pool);
+  const top10Pct = realHolders.slice(0, 10).reduce((s, h) => s + (Number(h.pct) || 0), 0);
+
+  return {
+    mint,
+    total_fetched: holders.length,
+    showing: mapped.length,
+    top_10_real_holders_pct: top10Pct.toFixed(2),
+    holders: mapped,
   };
 }
