@@ -10,9 +10,9 @@
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,
 
-  "managementModel": "openrouter/healer-alpha",
-  "screeningModel": "openrouter/hunter-alpha",
-  "generalModel": "openrouter/healer-alpha",
+  "managementModel": "deepseek-chat",
+  "screeningModel": "deepseek-reasoner",
+  "generalModel": "deepseek-chat",
 
   "minFeeActiveTvlRatio": 0.05,
   "minTvl": 10000,

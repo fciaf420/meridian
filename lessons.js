@@ -87,6 +87,24 @@ export async function recordPerformance(perf) {
 
   save(data);
 
+  // Store in holographic memory
+  try {
+    const { rememberPoolOutcome, rememberStrategy } = await import("./memory.js");
+    const outcome = pnl_pct >= 0 ? "profitable" : "unprofitable";
+    rememberPoolOutcome(
+      perf.pool_name || perf.pool,
+      `${outcome}, PnL ${pnl_pct.toFixed(1)}%, range_eff ${range_efficiency.toFixed(0)}%, strategy=${perf.strategy}, bin_step=${perf.bin_step}`
+    );
+    if (perf.strategy && perf.bin_step) {
+      rememberStrategy(
+        `${perf.strategy}_bs${perf.bin_step}`,
+        `${outcome}, PnL ${pnl_pct.toFixed(1)}%, vol=${perf.volatility}, fee_tvl=${perf.fee_tvl_ratio}`
+      );
+    }
+  } catch (e) {
+    log("memory", `Failed to store in nuggets: ${e.message}`);
+  }
+
   // Evolve thresholds every 5 closed positions
   if (data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
     const { config, reloadScreeningThresholds } = await import("./config.js");

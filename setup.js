@@ -241,8 +241,8 @@ const screeningIntervalMin = await askNum(
 console.log("\n── LLM ───────────────────────────────────────");
 
 const llmModel = await ask(
-  "LLM model (OpenRouter model ID)",
-  e("llmModel", process.env.LLM_MODEL || "nousresearch/hermes-3-llama-3.1-405b")
+  "LLM model (DeepSeek model ID)",
+  e("llmModel", process.env.LLM_MODEL || "deepseek-chat")
 );
 
 const dryRun = await ask(

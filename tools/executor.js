@@ -24,6 +24,7 @@ import { execSync, spawn } from "child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 import { log, logAction } from "../logger.js";
+import { rememberFact, recallMemory } from "../memory.js";
 import { notifyDeploy, notifyClose } from "../telegram.js";
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -80,6 +81,8 @@ const toolMap = {
     }
   },
   add_lesson: ({ rule, tags }) => { addLesson(rule, tags || []); return { saved: true, rule }; },
+  remember_fact: ({ nugget, key, value }) => rememberFact(nugget, key, value),
+  recall_memory: ({ query, nugget }) => recallMemory(query, nugget),
   clear_lessons: ({ mode, keyword }) => {
     if (mode === "all") {
       const n = clearAllLessons();
@@ -121,7 +124,11 @@ const toolMap = {
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
       minVolumeToRebalance: ["management", "minVolumeToRebalance"],
       emergencyPriceDropPct: ["management", "emergencyPriceDropPct"],
+      stopLossPct: ["management", "stopLossPct"],
       takeProfitFeePct: ["management", "takeProfitFeePct"],
+      trailingTakeProfit: ["management", "trailingTakeProfit"],
+      trailingTriggerPct: ["management", "trailingTriggerPct"],
+      trailingDropPct: ["management", "trailingDropPct"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
       // risk

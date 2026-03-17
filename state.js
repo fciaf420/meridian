@@ -77,6 +77,8 @@ export function trackPosition({
     last_claim_at: null,
     total_fees_claimed_usd: 0,
     rebalance_count: 0,
+    peak_pnl_pct: 0,
+    trailing_active: false,
     closed: false,
     closed_at: null,
     notes: [],
@@ -196,6 +198,56 @@ export function setPositionInstruction(position_address, instruction) {
   save(state);
   log("state", `Position ${position_address} instruction set: ${instruction}`);
   return true;
+}
+
+/**
+ * Update peak PnL and check trailing take profit / stop loss.
+ * Returns an action string if a threshold is hit, or null.
+ */
+export function updatePnlAndCheckExits(position_address, currentPnlPct, config) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return null;
+
+  const mgmt = config.management;
+  let action = null;
+
+  // Hard stop loss
+  if (mgmt.stopLossPct && currentPnlPct <= mgmt.stopLossPct) {
+    action = `STOP_LOSS: PnL ${currentPnlPct.toFixed(1)}% hit stop loss (${mgmt.stopLossPct}%)`;
+    pos.notes.push(action);
+    save(state);
+    return action;
+  }
+
+  // Track peak PnL
+  if (currentPnlPct > (pos.peak_pnl_pct || 0)) {
+    pos.peak_pnl_pct = currentPnlPct;
+  }
+
+  // Trailing take profit
+  if (mgmt.trailingTakeProfit) {
+    // Activate trailing once profit exceeds trigger
+    if (!pos.trailing_active && currentPnlPct >= mgmt.trailingTriggerPct) {
+      pos.trailing_active = true;
+      pos.notes.push(`Trailing TP activated at ${currentPnlPct.toFixed(1)}%`);
+      log("state", `Position ${position_address} trailing TP activated (peak: ${currentPnlPct.toFixed(1)}%)`);
+    }
+
+    // Check if profit has dropped from peak by trailingDropPct
+    if (pos.trailing_active) {
+      const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
+      if (dropFromPeak >= mgmt.trailingDropPct) {
+        action = `TRAILING_TP: PnL dropped ${dropFromPeak.toFixed(1)}% from peak ${pos.peak_pnl_pct.toFixed(1)}% (trail: ${mgmt.trailingDropPct}%)`;
+        pos.notes.push(action);
+        save(state);
+        return action;
+      }
+    }
+  }
+
+  save(state);
+  return action;
 }
 
 /**

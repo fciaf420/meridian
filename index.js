@@ -11,10 +11,15 @@ import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
+import { initMemory, recallForScreening, recallForManagement } from "./memory.js";
+import { updatePnlAndCheckExits } from "./state.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
-log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+log("startup", `Model: ${process.env.LLM_MODEL || "deepseek-chat"}`);
+
+// Initialize holographic memory at startup
+initMemory();
 
 const TP_PCT  = config.management.takeProfitFeePct;
 const DEPLOY  = config.management.deployAmountSol;
@@ -68,8 +73,38 @@ function startCronJobs() {
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
     let mgmtReport = null;
     try {
+      // Targeted recall + trailing TP / stop loss pre-check
+      let memoryHints = "";
+      let exitAlerts = "";
+      try {
+        const pos = await getMyPositions();
+        const recalls = [];
+        const exits = [];
+        for (const p of pos.positions || []) {
+          // Memory recall
+          const hits = recallForManagement(p);
+          for (const h of hits) {
+            recalls.push(`[${h.source}] ${h.key}: ${h.answer} (confidence: ${(h.confidence * 100).toFixed(0)}%)`);
+          }
+          // Trailing TP / stop loss check
+          if (p.pnl_pct != null) {
+            const exitAction = updatePnlAndCheckExits(p.position, p.pnl_pct, config);
+            if (exitAction) {
+              exits.push(`⚠ ${p.pair}: ${exitAction}`);
+              log("exit_check", `${p.pair}: ${exitAction}`);
+            }
+          }
+        }
+        if (recalls.length > 0) {
+          memoryHints = `\n\nMEMORY RECALL (from past sessions):\n${recalls.join("\n")}\n`;
+        }
+        if (exits.length > 0) {
+          exitAlerts = `\n\nEXIT ALERTS (CLOSE THESE IMMEDIATELY):\n${exits.join("\n")}\n`;
+        }
+      } catch { /* best-effort */ }
+
       const { content } = await agentLoop(`
-MANAGEMENT CYCLE
+MANAGEMENT CYCLE${memoryHints}${exitAlerts}
 
 1. get_my_positions — check all open positions.
 2. For each position:
@@ -131,8 +166,19 @@ REPORT FORMAT (Strictly follow this for each position):
     log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
     let screenReport = null;
     try {
+      // Targeted recall: recall strategy/pattern memories for screening context
+      let memoryHints = "";
+      try {
+        const strategyRecall = recallForScreening({ name: "screening" });
+        const patternRecall = recallForScreening({ name: "patterns" });
+        const recalls = [...strategyRecall, ...patternRecall];
+        if (recalls.length > 0) {
+          memoryHints = `\n\nMEMORY RECALL (from past sessions):\n${recalls.map(h => `[${h.source}] ${h.key}: ${h.answer}`).join("\n")}\n`;
+        }
+      } catch { /* memory recall is best-effort */ }
+
       const { content } = await agentLoop(`
-SCREENING CYCLE — DEPLOY ONLY
+SCREENING CYCLE — DEPLOY ONLY${memoryHints}
 
 1. get_my_positions first. Only proceed if positions < ${config.risk.maxPositions}.
 2. get_wallet_balance. Proceed if SOL >= ${config.management.minSolToOpen}.

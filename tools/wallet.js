@@ -242,7 +242,7 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   // ─── Sign and send ─────────────────────────────────────────
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
   tx.sign([wallet]);
-  const txHash = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
+  const txHash = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
   await connection.confirmTransaction(txHash, "confirmed");
 
   log("swap", `SUCCESS (fallback) tx: ${txHash}`);

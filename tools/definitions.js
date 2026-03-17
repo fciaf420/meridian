@@ -366,8 +366,12 @@ Examples:
 - { maxTvl: 50000 }              — tighter TVL cap
 - { binsBelow: 50 }              — narrower bin range
 - { maxPositions: 5 }            — allow more concurrent positions
-- { managementModel: "openrouter/healer-alpha" }  — switch management cycle model
-- { screeningModel: "openrouter/healer-alpha" }   — switch screening cycle model
+- { managementModel: "deepseek-chat" }  — switch management cycle model
+- { screeningModel: "deepseek-chat" }   — switch screening cycle model
+- { stopLossPct: -15 }                  — close position if PnL drops below -15%
+- { trailingTakeProfit: true }           — enable/disable trailing take profit
+- { trailingTriggerPct: 5 }             — activate trailing TP when PnL hits +5%
+- { trailingDropPct: 2 }                — close when PnL drops 2% from peak
 
 Always provide a reason. This is logged as a lesson and visible in future cycles.`,
       parameters: {
@@ -670,6 +674,54 @@ Examples:
           }
         },
         required: ["rule"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "remember_fact",
+      description: `Store a fact in holographic memory for cross-session learning.
+Use this to remember patterns, outcomes, or strategies that should persist across restarts.
+Nuggets: "pools" (pool outcomes), "strategies" (what strategies work), "lessons" (general rules), "patterns" (market patterns).
+Or create a new nugget name for a new category.
+
+Examples:
+- remember_fact("pools", "BONK-SOL", "high volume but unstable, close within 30min")
+- remember_fact("strategies", "bid_ask_bs100", "works well for volatile tokens, 70%+ win rate")
+- remember_fact("lessons", "evening_volatility", "volume drops after 8pm UTC, avoid new deploys")`,
+      parameters: {
+        type: "object",
+        properties: {
+          nugget: { type: "string", description: "Memory category (pools, strategies, lessons, patterns, or custom)" },
+          key: { type: "string", description: "Short descriptive key for the fact" },
+          value: { type: "string", description: "The fact content to remember" }
+        },
+        required: ["nugget", "key", "value"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "recall_memory",
+      description: `Query holographic memory for relevant facts from past sessions.
+Use this before making decisions to check if you've learned something relevant.
+Supports fuzzy matching — you don't need an exact key, just a related query.
+
+Examples:
+- recall_memory("BONK") → might recall "BONK-SOL: high volume but unstable"
+- recall_memory("bid_ask strategy") → might recall strategy effectiveness data
+- recall_memory("evening trading") → might recall timing-based lessons`,
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "What to search for in memory (fuzzy matched)" },
+          nugget: { type: "string", description: "Optional: search only in this nugget (pools, strategies, lessons, patterns)" }
+        },
+        required: ["query"]
       }
     }
   }

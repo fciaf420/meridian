@@ -186,7 +186,7 @@ export async function deployPosition({
     const txHash = await sendAndConfirmTransaction(getConnection(), tx, [
       wallet,
       newPosition,
-    ]);
+    ], { skipPreflight: true });
 
     log("deploy", `SUCCESS tx: ${txHash}`);
 
@@ -487,7 +487,7 @@ export async function claimFees({ position_address }) {
       position: new PublicKey(position_address),
     });
 
-    const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+    const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
     log("claim", `SUCCESS tx: ${txHash}`);
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address);
@@ -523,7 +523,7 @@ export async function closePosition({ position_address }) {
         owner: wallet.publicKey,
         position: positionPubKey,
       });
-      const claimHash = await sendAndConfirmTransaction(getConnection(), claimTx, [wallet]);
+      const claimHash = await sendAndConfirmTransaction(getConnection(), claimTx, [wallet], { skipPreflight: true });
       txHashes.push(claimHash);
       log("close", `Step 1 OK: ${claimHash}`);
     } catch (e) {
@@ -542,7 +542,7 @@ export async function closePosition({ position_address }) {
     });
 
     for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
       txHashes.push(txHash);
     }
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);

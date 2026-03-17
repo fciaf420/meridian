@@ -13,6 +13,7 @@
     "postinstall": "node scripts/patch-anchor.js"
   },
   "dependencies": {
+    "nuggets": "file:../nuggets",
     "@meteora-ag/dlmm": "latest",
     "@solana/spl-token": "^0.3.11",
     "@solana/web3.js": "^1.95.0",
