@@ -136,6 +136,34 @@ export function getMemoryContext() {
 }
 
 /**
+ * Store mid-position observations during management cycles.
+ * Builds up a picture of how pools behave over time.
+ */
+export function rememberPositionSnapshot(position) {
+  const s = getShelf();
+  const pair = position.pair || position.pool_name || "unknown";
+  const key = pair.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
+
+  // Pool behavior snapshot
+  const inRange = position.in_range ? "in-range" : "OOR";
+  const pnl = position.pnl_pct != null ? `${position.pnl_pct.toFixed(1)}%` : "?";
+  const fees = position.unclaimed_fees_usd != null ? `$${position.unclaimed_fees_usd}` : "?";
+  const age = position.age_minutes != null ? `${position.age_minutes}m` : "?";
+
+  const snapshot = `${inRange}, PnL ${pnl}, fees ${fees}, age ${age}`;
+  s.remember("pools", key, snapshot);
+
+  // Track pool patterns (volume/fee trends)
+  if (position.fee_tvl_ratio != null) {
+    const patternKey = `${key}_feeTvl`;
+    s.getOrCreate("patterns");
+    s.remember("patterns", patternKey, `fee/TVL=${position.fee_tvl_ratio} at ${new Date().toISOString().slice(11, 16)}`);
+  }
+
+  log("memory", `Snapshot stored: ${key} → ${snapshot}`);
+}
+
+/**
  * Let the LLM explicitly remember something.
  */
 export function rememberFact(nuggetName, key, value) {

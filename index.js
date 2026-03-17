@@ -11,7 +11,7 @@ import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { initMemory, recallForScreening, recallForManagement } from "./memory.js";
+import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot } from "./memory.js";
 import { updatePnlAndCheckExits } from "./state.js";
 
 log("startup", "DLMM LP Agent starting...");
@@ -86,6 +86,9 @@ function startCronJobs() {
           for (const h of hits) {
             recalls.push(`[${h.source}] ${h.key}: ${h.answer} (confidence: ${(h.confidence * 100).toFixed(0)}%)`);
           }
+          // Store mid-position snapshot in nuggets
+          rememberPositionSnapshot(p);
+
           // Trailing TP / stop loss check
           if (p.pnl_pct != null) {
             const exitAction = updatePnlAndCheckExits(p.position, p.pnl_pct, config);
