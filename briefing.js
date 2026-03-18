@@ -1,6 +1,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { getPerformanceSummary } from "./lessons.js";
+import { config } from "./config.js";
 
 const STATE_FILE = "./state.json";
 const LESSONS_FILE = "./lessons.json";
@@ -21,6 +22,12 @@ export async function generateBriefing() {
   const perfLast24h = (lessonsData.performance || []).filter(p => new Date(p.recorded_at) > last24h);
   const totalPnLUsd = perfLast24h.reduce((sum, p) => sum + (p.pnl_usd || 0), 0);
   const totalFeesUsd = perfLast24h.reduce((sum, p) => sum + (p.fees_earned_usd || 0), 0);
+  const unit = config.management.pnlUnit || "sol";
+  const solPrice = perfLast24h[0]?.sol_price || 0; // approximate
+  const fmt = (usd) => {
+    if (unit === "sol" && solPrice > 0) return `${(usd / solPrice).toFixed(4)} SOL`;
+    return `$${usd.toFixed(2)}`;
+  };
 
   // 3. Lessons Learned
   const lessonsLast24h = (lessonsData.lessons || []).filter(l => new Date(l.created_at) > last24h);
@@ -38,8 +45,8 @@ export async function generateBriefing() {
     `📤 Positions Closed: ${closedLast24h.length}`,
     "",
     `<b>Performance:</b>`,
-    `💰 Net PnL: ${totalPnLUsd >= 0 ? "+" : ""}$${totalPnLUsd.toFixed(2)}`,
-    `💎 Fees Earned: $${totalFeesUsd.toFixed(2)}`,
+    `💰 Net PnL: ${totalPnLUsd >= 0 ? "+" : ""}${fmt(totalPnLUsd)}`,
+    `💎 Fees Earned: ${fmt(totalFeesUsd)}`,
     perfLast24h.length > 0
       ? `📈 Win Rate (24h): ${Math.round((perfLast24h.filter(p => p.pnl_usd > 0).length / perfLast24h.length) * 100)}%`
       : "📈 Win Rate (24h): N/A",
@@ -52,7 +59,7 @@ export async function generateBriefing() {
     `<b>Current Portfolio:</b>`,
     `📂 Open Positions: ${openPositions.length}`,
     perfSummary
-      ? `📊 All-time PnL: $${perfSummary.total_pnl_usd.toFixed(2)} (${perfSummary.win_rate_pct}% win)`
+      ? `📊 All-time PnL: ${fmt(perfSummary.total_pnl_usd)} (${perfSummary.win_rate_pct}% win)`
       : "",
     "────────────────"
   ];

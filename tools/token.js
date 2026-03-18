@@ -1,6 +1,21 @@
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
 
 /**
+ * Get the narrative/story behind a token from Jupiter ChainInsight.
+ * Useful for understanding if a token has a real community/theme vs nothing.
+ */
+export async function getTokenNarrative({ mint }) {
+  const res = await fetch(`${DATAPI_BASE}/chaininsight/narrative/${mint}`);
+  if (!res.ok) throw new Error(`Narrative API error: ${res.status}`);
+  const data = await res.json();
+  return {
+    mint,
+    narrative: data.narrative || null,
+    status: data.status,
+  };
+}
+
+/**
  * Search for token data by name, symbol, or mint address.
  * Returns condensed token info useful for confidence scoring.
  */
@@ -27,6 +42,9 @@ export async function getTokenInfo({ query }) {
       organic_label: t.organicScoreLabel,
       launchpad: t.launchpad,
       graduated: !!t.graduatedPool,
+      // Global fees paid by traders (priority + jito tips) in SOL.
+      // Low value = bundled txs or scam token. Minimum threshold: ~30 SOL.
+      global_fees_sol: t.fees != null ? parseFloat(t.fees.toFixed(2)) : null,
       audit: t.audit ? {
         mint_disabled: t.audit.mintAuthorityDisabled,
         freeze_disabled: t.audit.freezeAuthorityDisabled,
@@ -207,6 +225,7 @@ export async function getTokenHolders({ mint, limit = 20 }) {
 
   return {
     mint,
+    global_fees_sol: tokenInfo?.fees != null ? parseFloat(tokenInfo.fees.toFixed(2)) : null,
     total_fetched: holders.length,
     showing: mapped.length,
     top_10_real_holders_pct: top10Pct.toFixed(2),

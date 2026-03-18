@@ -7,6 +7,7 @@ import { NuggetShelf } from "nuggets";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SAVE_DIR = path.join(__dirname, "data", "nuggets");
@@ -157,10 +158,12 @@ export function rememberPositionSnapshot(position) {
   const pair = position.pair || position.pool_name || "unknown";
   const key = pair.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
 
-  // Pool behavior snapshot
+  // Pool behavior snapshot — use configured PnL unit
   const inRange = position.in_range ? "in-range" : "OOR";
   const pnl = position.pnl_pct != null ? `${position.pnl_pct.toFixed(1)}%` : "?";
-  const fees = position.unclaimed_fees_usd != null ? `$${position.unclaimed_fees_usd}` : "?";
+  const unit = config.management.pnlUnit || "sol";
+  const useSol = unit === "sol" && position.unclaimed_fees_sol != null;
+  const fees = useSol ? `${position.unclaimed_fees_sol} SOL` : (position.unclaimed_fees_usd != null ? `$${position.unclaimed_fees_usd}` : "?");
   const age = position.age_minutes != null ? `${position.age_minutes}m` : "?";
 
   const snapshot = `${inRange}, PnL ${pnl}, fees ${fees}, age ${age}`;

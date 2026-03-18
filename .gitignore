@@ -12,9 +12,16 @@ user-config.json
 state.json
 lessons.json
 smart-wallets.json
+pool-memory.json
+token-blacklist.json
+strategy-library.json
 
 # Logs
 logs/
+
+# Web UI
+web/node_modules/
+web/dist/
 
 # OS
 .DS_Store

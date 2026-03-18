@@ -36,6 +36,7 @@ export const config = {
     maxBinStep:        u.maxBinStep        ?? 125,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
+    minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
   },
 
   // ─── Position Management ────────────────
@@ -52,6 +53,9 @@ export const config = {
     trailingDropPct:       u.trailingDropPct ?? 1.5,
     minSolToOpen:          u.minSolToOpen ?? 0.55,
     deployAmountSol:       u.deployAmountSol ?? 0.5,
+    gasReserve:            u.gasReserve        ?? 0.2,   // always keep this much SOL for gas
+    positionSizePct:       u.positionSizePct   ?? 0.35,  // % of deployable capital per position
+    pnlUnit:               u.pnlUnit           ?? "sol", // "sol" or "usd" — how PnL is displayed
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -77,6 +81,11 @@ export const config = {
     generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "deepseek-chat",
   },
 
+  // ─── Web UI ───────────────────────────
+  web: {
+    port: parseInt(u.webPort || process.env.WEB_PORT || "3737", 10),
+  },
+
   // ─── Common Token Mints ────────────────
   tokens: {
     SOL:  "So11111111111111111111111111111111111111112",
@@ -84,6 +93,21 @@ export const config = {
     USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
   },
 };
+
+/**
+ * Compute the optimal deploy amount for a given wallet balance.
+ * Scales position size with wallet growth (compounding).
+ */
+export function computeDeployAmount(walletSol) {
+  const reserve  = config.management.gasReserve      ?? 0.2;
+  const pct      = config.management.positionSizePct ?? 0.35;
+  const floor    = config.management.deployAmountSol;
+  const ceil     = config.risk.maxDeployAmount;
+  const deployable = Math.max(0, walletSol - reserve);
+  const dynamic    = deployable * pct;
+  const result     = Math.min(ceil, Math.max(floor, dynamic));
+  return parseFloat(result.toFixed(2));
+}
 
 /**
  * Reload user-config.json and apply updated screening thresholds to the

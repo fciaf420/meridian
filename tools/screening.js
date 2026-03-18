@@ -1,4 +1,6 @@
 import { config } from "../config.js";
+import { isBlacklisted } from "../token-blacklist.js";
+import { log } from "../logger.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 
@@ -46,8 +48,19 @@ export async function discoverPools({
 
   const condensed = (data.data || []).map(condensePool);
 
-  // Attach score and disqualification reason
-  const pools = condensed;
+  // Filter blacklisted base tokens
+  const pools = condensed.filter((p) => {
+    if (isBlacklisted(p.base?.mint)) {
+      log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
+      return false;
+    }
+    return true;
+  });
+
+  const filtered = condensed.length - pools.length;
+  if (filtered > 0) {
+    log("blacklist", `Filtered ${filtered} pool(s) with blacklisted tokens`);
+  }
 
   return {
     total: data.total,

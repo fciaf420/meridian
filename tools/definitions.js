@@ -126,7 +126,9 @@ Always call this before deploying a position to get the freshest price.`,
       name: "deploy_position",
       description: `Open a new DLMM liquidity position.
 
-You have autonomy to choose strategy and range based on pool metrics.
+PRIORITY ORDER for strategy and bins:
+1. User explicitly specifies → always follow exactly (user override is absolute)
+2. No user spec → use active strategy's lp_strategy and choose bins based on volatility
 
 STRATEGIES:
 - 'bid_ask': Single-sided SOL below active bin. You only deposit SOL. As price drops, your SOL buys the base token bin by bin. You are NOT holding the token upfront — safer if it dumps.
@@ -146,12 +148,14 @@ WHEN TO USE WHICH:
 
 HARD RULES:
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
-- Range: total bins (below + above + 1) cannot exceed 70.
 
-BIN RANGE GUIDELINES:
+BIN RANGE GUIDELINES (when user hasn't specified):
 - Low volatility (<3) → narrow range: 35–45 bins
 - Medium volatility (3–6) → medium range: 45–55 bins
 - High volatility (>6) → wide range: 55–69 bins
+- Wide-range strategies: up to 350 bins. Max 1400 total.
+- To convert a % price range to bins: bins = ceil(log(1 - pct) / log(1 + bin_step/10000))
+  Example: -60% range at bin_step 100 → ceil(log(0.40)/log(1.01)) = 92 bins.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -176,15 +180,15 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           strategy: {
             type: "string",
             enum: ["bid_ask", "spot"],
-            description: "DLMM strategy. bid_ask = single-sided SOL below price (volatile tokens). spot = symmetric around price (stable pairs). Default: bid_ask."
+            description: "DLMM strategy. If user specifies, use exactly what they said. Otherwise use the active strategy's lp_strategy field. Default: bid_ask."
           },
           bins_above: {
             type: "number",
-            description: "Number of bins above active bin. Only used with 'spot' strategy. For bid_ask, this is always 0."
+            description: "Number of bins above active bin. Default 0 (single-sided SOL). Set > 0 only for two-sided strategies."
           },
           bins_below: {
             type: "number",
-            description: "Number of bins below active bin. Choose 35–69 based on pool volatility. Low volatility → 35–45. High volatility → 55–69."
+            description: "Number of bins below active bin. If the user specifies a value, use it exactly. If they specify a % range, convert using: bins = ceil(log(1 - pct) / log(1 + bin_step/10000)). Otherwise choose based on volatility: 35–69 standard, 100–350 for wide-range. Max 1400 total."
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
@@ -387,9 +391,12 @@ Examples:
 - { maxTvl: 50000 }              — tighter TVL cap
 - { binsBelow: 50 }              — narrower bin range
 - { maxPositions: 5 }            — allow more concurrent positions
-- { managementModel: "deepseek-chat" }  — switch management cycle model
-- { screeningModel: "deepseek-chat" }   — switch screening cycle model
+- { managementModel: "deepseek-chat" }  — switch management cycle model (also: "claude-sonnet-4-20250514")
+- { screeningModel: "deepseek-chat" }   — switch screening cycle model (also: "claude-sonnet-4-20250514")
 - { stopLossPct: -15 }                  — close position if PnL drops below -15%
+- { minTokenFeesSol: 20 }             — lower global fees gate
+- { gasReserve: 0.3 }                 — keep more SOL for gas
+- { positionSizePct: 0.25 }           — smaller positions per deploy
 - { trailingTakeProfit: true }           — enable/disable trailing take profit
 - { trailingTriggerPct: 5 }             — activate trailing TP when PnL hits +5%
 - { trailingDropPct: 2 }                — close when PnL drops 2% from peak
@@ -515,6 +522,10 @@ Returns: organic score, holder count, mcap, liquidity, audit flags (mint/freeze 
 Fetches top 100 holders — use limit to control how many to display (default 20).
 Each holder includes: address, amount, % of supply, SOL balance, tags (Pool/AMM/etc), and funding info (who funded this wallet, amount, slot).
 is_pool=true means it's a liquidity pool address, not a real holder — filter these out when analyzing concentration.
+
+Also returns global_fees_sol — total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees).
+This is a key signal: low global_fees_sol means transactions are bundled or the token is a scam.
+HARD GATE: if global_fees_sol < config.screening.minTokenFeesSol (default 30), do NOT deploy.
 
 NOTE: Requires mint address. If you only have a symbol/name, call get_token_info first to resolve the mint.`,
       parameters: {
@@ -678,9 +689,12 @@ Use after studying top LPers or observing a pattern worth remembering.
 Lessons are injected into the system prompt on every future cycle.
 Write concrete, actionable rules — not vague observations.
 
+Use 'role' to target a specific agent type so it only appears in the right context.
+Use 'pinned: true' for critical rules that must always be present regardless of memory cap.
+
 Examples:
-- "PREFER: pools where top LPers hold < 30 min — scalping beats holding in high-volatility pairs"
-- "AVOID: entering pools where top performers show avg_hold > 4h and low win_rate — they're stuck"`,
+- rule: "PREFER: pools where top LPers hold < 30 min", tags: ["scalping"], role: "SCREENER"
+- rule: "AVOID: closing when OOR < 30min — price often recovers", tags: ["oor"], role: "MANAGER", pinned: true`,
       parameters: {
         type: "object",
         properties: {
@@ -691,7 +705,16 @@ Examples:
           tags: {
             type: "array",
             items: { type: "string" },
-            description: "Optional tags e.g. ['hold_time', 'scalping', 'pool_type']"
+            description: "Tags e.g. ['narrative', 'screening', 'oor', 'fees', 'management']"
+          },
+          role: {
+            type: "string",
+            enum: ["SCREENER", "MANAGER", "GENERAL"],
+            description: "Which agent role this lesson applies to. Omit for all roles."
+          },
+          pinned: {
+            type: "boolean",
+            description: "Pin this lesson so it's always injected regardless of memory cap. Use for critical rules."
           }
         },
         required: ["rule"]
@@ -768,6 +791,241 @@ Examples:
           nugget: { type: "string", description: "Optional: search only in this nugget (pools, strategies, lessons, patterns)" }
         },
         required: ["query"]
+      }
+    }
+  },
+
+  // ─── Strategy Library ──────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "add_strategy",
+      description: `Save a new LP strategy to the strategy library.
+Use when the user pastes a tweet or description of a strategy.
+Parse the text and extract structured criteria, then call this tool to store it.`,
+      parameters: {
+        type: "object",
+        properties: {
+          id:           { type: "string", description: "Short slug e.g. 'overnight_classic_bid_ask'" },
+          name:         { type: "string", description: "Human-readable name" },
+          author:       { type: "string", description: "Strategy author/creator" },
+          lp_strategy:  { type: "string", enum: ["bid_ask", "spot", "curve"], description: "LP strategy type" },
+          token_criteria: { type: "object", description: "Token selection criteria" },
+          entry:        { type: "object", description: "Entry conditions" },
+          range:        { type: "object", description: "Bin range configuration" },
+          exit:         { type: "object", description: "Exit rules" },
+          best_for:     { type: "string", description: "Ideal market conditions" },
+          raw:          { type: "string", description: "Original tweet/text" }
+        },
+        required: ["id", "name"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "list_strategies",
+      description: "List all saved strategies in the library with a summary of each. Shows which one is currently active.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_strategy",
+      description: "Get full details of a specific strategy including all criteria and raw text.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "string", description: "Strategy ID from list_strategies" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "set_active_strategy",
+      description: "Set which strategy to use for the next screening/deployment cycle.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "string", description: "Strategy ID to activate" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "remove_strategy",
+      description: "Remove a strategy from the library.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "string", description: "Strategy ID to remove" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  // ─── Lesson Management ─────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "list_lessons",
+      description: "Browse saved lessons with optional filters. Use to find a lesson ID before pinning/unpinning.",
+      parameters: {
+        type: "object",
+        properties: {
+          role:   { type: "string", enum: ["SCREENER", "MANAGER", "GENERAL"], description: "Filter by role" },
+          pinned: { type: "boolean", description: "Filter to only pinned (true) or unpinned (false) lessons" },
+          tag:    { type: "string", description: "Filter by a specific tag" },
+          limit:  { type: "number", description: "Max lessons to return (default 30)" }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "pin_lesson",
+      description: "Pin a lesson by ID so it's always injected into the prompt regardless of memory cap.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "number", description: "Lesson ID (from list_lessons)" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "unpin_lesson",
+      description: "Unpin a previously pinned lesson.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "number", description: "Lesson ID to unpin" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  // ─── Performance History ────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "get_performance_history",
+      description: `Retrieve closed position records filtered by time window.
+Use when the user asks about recent performance, last 24h positions, P&L history, etc.`,
+      parameters: {
+        type: "object",
+        properties: {
+          hours: { type: "number", description: "How many hours back to look (default 24). Use 168 for last 7 days." },
+          limit: { type: "number", description: "Max records to return (default 50)" }
+        }
+      }
+    }
+  },
+
+  // ─── Pool Memory ────────────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "get_pool_memory",
+      description: `Check your deploy history for a pool BEFORE deploying.
+Returns all past deploys, PnL, win rate, and any notes you've added.
+Call this tool before deploying to any pool — you may have been here before and it didn't work.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: { type: "string", description: "The pool address to look up" }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "add_pool_note",
+      description: "Annotate a pool with a freeform note that persists across sessions.",
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: { type: "string", description: "Pool address to annotate" },
+          note: { type: "string", description: "The note to save" }
+        },
+        required: ["pool_address", "note"]
+      }
+    }
+  },
+
+  // ─── Token Blacklist ────────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "add_to_blacklist",
+      description: "Permanently blacklist a base token mint so it's never deployed into again.",
+      parameters: {
+        type: "object",
+        properties: {
+          mint: { type: "string", description: "The base token mint address to blacklist" },
+          symbol: { type: "string", description: "Token symbol" },
+          reason: { type: "string", description: "Why this token is being blacklisted" }
+        },
+        required: ["mint", "reason"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "remove_from_blacklist",
+      description: "Remove a token mint from the blacklist.",
+      parameters: {
+        type: "object",
+        properties: { mint: { type: "string", description: "The mint address to remove" } },
+        required: ["mint"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "list_blacklist",
+      description: "List all blacklisted token mints with their reasons.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+
+  // ─── Token Narrative ────────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "get_token_narrative",
+      description: `Get the narrative/story behind a token from Jupiter ChainInsight.
+Returns a plain-text description of what the token is about.
+GOOD signals: specific origin story, active community, trending catalyst, named entities.
+BAD signals: empty/null, pure hype only, completely generic, copy-paste of another token.`,
+      parameters: {
+        type: "object",
+        properties: {
+          mint: { type: "string", description: "Token mint address (base58)" }
+        },
+        required: ["mint"]
       }
     }
   }

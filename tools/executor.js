@@ -11,10 +11,13 @@ import {
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
-import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword } from "../lessons.js";
+import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
+import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
+import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
-import { getTokenInfo, getTokenHolders } from "./token.js";
+import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds } from "../config.js";
 import fs from "fs";
 import path from "path";
@@ -25,7 +28,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 import { log, logAction } from "../logger.js";
 import { rememberFact, recallMemory } from "../memory.js";
-import { notifyDeploy, notifyClose } from "../telegram.js";
+import { emit } from "../notifier.js";
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
@@ -44,6 +47,7 @@ const toolMap = {
   search_pools: searchPools,
   get_token_info: getTokenInfo,
   get_token_holders: getTokenHolders,
+  get_token_narrative: getTokenNarrative,
   add_smart_wallet: addSmartWallet,
   remove_smart_wallet: removeSmartWallet,
   list_smart_wallets: listSmartWallets,
@@ -55,6 +59,20 @@ const toolMap = {
   get_top_lpers: studyTopLPers,
   study_top_lpers: studyTopLPers,
   get_pool_info: getPoolInfo,
+  get_pool_memory: getPoolMemory,
+  add_pool_note: addPoolNote,
+  add_strategy: addStrategy,
+  list_strategies: listStrategies,
+  get_strategy: getStrategy,
+  set_active_strategy: setActiveStrategy,
+  remove_strategy: removeStrategy,
+  add_to_blacklist: addToBlacklist,
+  remove_from_blacklist: removeFromBlacklist,
+  list_blacklist: listBlacklist,
+  get_performance_history: getPerformanceHistory,
+  pin_lesson: ({ id }) => pinLesson(id),
+  unpin_lesson: ({ id }) => unpinLesson(id),
+  list_lessons: ({ role, pinned, tag, limit } = {}) => listLessons({ role, pinned, tag, limit }),
   set_position_note: ({ position_address, instruction }) => {
     const ok = setPositionInstruction(position_address, instruction || null);
     if (!ok) return { error: `Position ${position_address} not found in state` };
@@ -81,7 +99,10 @@ const toolMap = {
       return { success: false, error: e.message };
     }
   },
-  add_lesson: ({ rule, tags }) => { addLesson(rule, tags || []); return { saved: true, rule }; },
+  add_lesson: ({ rule, tags, pinned, role }) => {
+    addLesson(rule, tags || [], { pinned: !!pinned, role: role || null });
+    return { saved: true, rule, pinned: !!pinned, role: role || "all" };
+  },
   remember_fact: ({ nugget, key, value }) => rememberFact(nugget, key, value),
   recall_memory: ({ query, nugget }) => recallMemory(query, nugget),
   clear_lessons: ({ mode, keyword }) => {
@@ -119,6 +140,7 @@ const toolMap = {
       maxBinStep: ["screening", "maxBinStep"],
       timeframe: ["screening", "timeframe"],
       category: ["screening", "category"],
+      minTokenFeesSol: ["screening", "minTokenFeesSol"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
@@ -132,6 +154,9 @@ const toolMap = {
       trailingDropPct: ["management", "trailingDropPct"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
+      gasReserve: ["management", "gasReserve"],
+      positionSizePct: ["management", "positionSizePct"],
+      pnlUnit: ["management", "pnlUnit"],
       // risk
       maxPositions: ["risk", "maxPositions"],
       maxDeployAmount: ["risk", "maxDeployAmount"],
@@ -183,11 +208,16 @@ const toolMap = {
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
     }
 
-    // Save as a lesson so it's visible in future prompts
-    addLesson(
-      `[SELF-TUNED] Changed ${Object.entries(applied).map(([k,v]) => `${k}=${v}`).join(", ")} — ${reason}`,
-      ["self_tune", "config_change"]
+    // Save as a lesson — but skip ephemeral per-deploy interval changes
+    // (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
+    //  the rule is already in the system prompt, storing it 75+ times is pure noise)
+    const lessonsKeys = Object.keys(applied).filter(
+      k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
     );
+    if (lessonsKeys.length > 0) {
+      const summary = lessonsKeys.map(k => `${k}=${applied[k]}`).join(", ");
+      addLesson(`[SELF-TUNED] Changed ${summary} — ${reason}`, ["self_tune", "config_change"]);
+    }
 
     log("config", `Agent self-tuned: ${JSON.stringify(applied)} — ${reason}`);
     return { success: true, applied, unknown, reason };
@@ -244,9 +274,9 @@ export async function executeTool(name, args) {
 
     if (success) {
       if (name === "deploy_position") {
-        notifyDeploy({ pair: args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.tx }).catch(() => {});
+        emit("deploy", { pair: args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.tx });
       } else if (name === "close_position") {
-        notifyClose({ pair: args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        emit("close", { pair: args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? 0 });
       }
     }
 

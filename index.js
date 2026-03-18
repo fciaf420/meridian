@@ -6,13 +6,23 @@ import { log } from "./logger.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
-import { config, reloadScreeningThresholds } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
-import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
+import { startPolling, stopPolling, sendMessage, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
+import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
+import { getActiveStrategy } from "./strategy-library.js";
 import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot } from "./memory.js";
 import { updatePnlAndCheckExits } from "./state.js";
+import { emit } from "./notifier.js";
+import {
+  sessionHistory, appendHistory, getHistory,
+  isBusy, setBusy,
+  isManagementBusy, setManagementBusy,
+  isScreeningBusy, setScreeningBusy,
+} from "./session.js";
+import { startServer } from "./server.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -55,8 +65,35 @@ function buildPrompt() {
 //  CRON DEFINITIONS
 // ═══════════════════════════════════════════
 let _cronTasks = [];
-let _managementBusy = false; // prevents overlapping management cycles
-let _screeningBusy = false;  // prevents overlapping screening cycles
+
+async function runBriefing() {
+  log("cron", "Starting morning briefing");
+  try {
+    const briefing = await generateBriefing();
+    emit("briefing", { html: briefing });
+    setLastBriefingDate();
+  } catch (error) {
+    log("cron_error", `Morning briefing failed: ${error.message}`);
+  }
+}
+
+/**
+ * If the agent restarted after the 1:00 AM UTC cron window,
+ * fire the briefing immediately on startup so it's never skipped.
+ */
+async function maybeRunMissedBriefing() {
+  const todayUtc = new Date().toISOString().slice(0, 10);
+  const lastSent = getLastBriefingDate();
+
+  if (lastSent === todayUtc) return; // already sent today
+
+  const nowUtc = new Date();
+  const briefingHourUtc = 1;
+  if (nowUtc.getUTCHours() < briefingHourUtc) return;
+
+  log("cron", `Missed briefing detected (last sent: ${lastSent || "never"}) — sending now`);
+  await runBriefing();
+}
 
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
@@ -67,8 +104,8 @@ function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
+    if (isManagementBusy()) return;
+    setManagementBusy(true);
     timers.managementLastRun = Date.now();
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
     let mgmtReport = null;
@@ -121,8 +158,8 @@ MANAGEMENT CYCLE${memoryHints}${exitAlerts}
    - No positions remaining → update_config management.managementIntervalMin = 10 (reset to default)
    - Positions still open → keep current interval (already set by deploy volatility)
 
-REPORT FORMAT (Strictly follow this for each position):
-**[PAIR]** | Age: [X]m | Fees: $[X] | PnL: [X]%
+REPORT FORMAT (Strictly follow this for each position — use ${config.management.pnlUnit?.toUpperCase() || "SOL"} values):
+**[PAIR]** | Age: [X]m | Fees: [X] ${config.management.pnlUnit?.toUpperCase() || "SOL"} | PnL: [X]%
 **Instruction:** [instruction if set, else "none"]
 **Decision:** [STAY/CLOSE]
 **Reason:** [1 short sentence]
@@ -132,21 +169,21 @@ REPORT FORMAT (Strictly follow this for each position):
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
     } finally {
-      _managementBusy = false;
-      if (telegramEnabled()) {
-        if (mgmtReport) sendMessage(`🔄 Management Cycle\n\n${mgmtReport}`).catch(() => {});
+      setManagementBusy(false);
+      if (mgmtReport) emit("cycle:management", { report: mgmtReport });
+      try {
         const pos = await getMyPositions().catch(() => null);
         for (const p of pos?.positions || []) {
           if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-            notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => {});
+            emit("out_of_range", { pair: p.pair, minutesOOR: p.minutes_out_of_range });
           }
         }
-      }
+      } catch { /* best-effort */ }
     }
   });
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, async () => {
-    if (_screeningBusy) return;
+    if (isScreeningBusy()) return;
 
     // Hard guards — don't even run the agent if preconditions aren't met
     try {
@@ -164,21 +201,38 @@ REPORT FORMAT (Strictly follow this for each position):
       return;
     }
 
-    _screeningBusy = true;
+    setScreeningBusy(true);
     timers.screeningLastRun = Date.now();
     log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
     let screenReport = null;
     try {
+      // Compute dynamic deploy amount based on current wallet (compounding)
+      const currentBalance = await getWalletBalances().catch(() => null);
+      const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
+      log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance?.sol ?? "?"} SOL)`);
+
+      // Load active strategy
+      const activeStrategy = getActiveStrategy();
+      const strategyBlock = activeStrategy ? `
+ACTIVE STRATEGY: ${activeStrategy.name} (by ${activeStrategy.author})
+Apply these criteria during token selection and deployment:
+- LP Type: ${activeStrategy.lp_strategy}
+- Token: ${JSON.stringify(activeStrategy.token_criteria)}
+- Entry: ${JSON.stringify(activeStrategy.entry)}
+- Range: ${JSON.stringify(activeStrategy.range)}
+- Exit: ${JSON.stringify(activeStrategy.exit)}
+- Best for: ${activeStrategy.best_for}
+Deviate from this strategy only if the token clearly doesn't match — explain why in your report.
+` : `No active strategy set — use default bid_ask with standard settings.`;
+
       // Targeted recall: recall strategy memories for common bin steps
       let memoryHints = "";
       try {
         const recalls = [];
-        // Recall strategies for common bin steps we use
         for (const bs of [80, 100, 125]) {
           const hits = recallForScreening({ bin_step: bs });
           for (const h of hits) recalls.push(h);
         }
-        // Recall any pool memories from recent positions
         const recentPos = await getMyPositions();
         for (const p of recentPos.positions || []) {
           const hits = recallForScreening({ name: p.pair });
@@ -193,29 +247,40 @@ REPORT FORMAT (Strictly follow this for each position):
 
       const { content } = await agentLoop(`
 SCREENING CYCLE — DEPLOY ONLY${memoryHints}
-
+${strategyBlock}
 1. get_my_positions first. Only proceed if positions < ${config.risk.maxPositions}.
 2. get_wallet_balance. Proceed if SOL >= ${config.management.minSolToOpen}.
 3. get_top_candidates, pick the best one, and call study_top_lpers.
-4. Call check_smart_wallets_on_pool for the chosen pool. Smart wallet presence = strong confidence boost. No presence = neutral, rely on fundamentals.
-5. If the pool is high-quality: get_active_bin and deploy_position.
-6. Report result and reasoning including smart wallet signal and interval set.
+4. Call get_pool_memory for the chosen pool. If it has a bad track record (losing avg_pnl_pct, low win_rate), skip and try next candidate.
+5. Call check_smart_wallets_on_pool for the chosen pool.
+   - Smart wallets present → strong confidence boost, proceed to deploy.
+   - For ALL pools (smart wallets or not): call get_token_holders (base mint) and check global_fees_sol.
+     * global_fees_sol = total priority/jito tips paid by ALL traders on this token — NOT Meteora LP fees, do not confuse them.
+     * HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL — low fees = bundled txs or scam token, no exceptions.
+   - No smart wallets → ALSO call get_token_narrative before deciding:
+     * SKIP if: top_10_real_holders_pct > 60% OR bundlers_pct_in_top_100 > 30% OR narrative is empty/null OR narrative is pure hype with no specific story
+     * CAUTION (check organic score + buy/sell pressure before deciding) if: bundlers_pct 15–30% AND top_10 > 40%
+     * DEPLOY if: global_fees_sol >= ${config.screening.minTokenFeesSol}, distribution is healthy AND narrative has a specific origin
+     * Bundlers 5–15% are normal and not a reason to skip on their own — weigh against overall token health
+     * Report global_fees_sol, holder check, and narrative outcome in your reasoning.
+6. If the pool passes all checks: get_active_bin and deploy_position with ${deployAmount} SOL.
+   COMPOUNDING: This amount is scaled from your current wallet (${currentBalance?.sol ?? "?"} SOL).
+   As profits accumulate and wallet grows, deploy amount increases automatically. Do NOT override with a smaller amount.
+7. Report result and reasoning including smart wallet signal, holder check outcome, deploy amount used, and interval set.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel);
       screenReport = content;
     } catch (error) {
       log("cron_error", `Screening cycle failed: ${error.message}`);
       screenReport = `Screening cycle failed: ${error.message}`;
     } finally {
-      _screeningBusy = false;
-      if (telegramEnabled()) {
-        if (screenReport) sendMessage(`🔍 Screening Cycle\n\n${screenReport}`).catch(() => {});
-      }
+      setScreeningBusy(false);
+      if (screenReport) emit("cycle:screening", { report: screenReport });
     }
   });
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
+    if (isManagementBusy()) return;
+    setManagementBusy(true);
     log("cron", "Starting health check");
     try {
       await agentLoop(`
@@ -226,24 +291,21 @@ Summarize the current portfolio health, total fees earned, and performance of al
     } catch (error) {
       log("cron_error", `Health check failed: ${error.message}`);
     } finally {
-      _managementBusy = false;
+      setManagementBusy(false);
     }
   });
 
   // Morning Briefing at 8:00 AM UTC+7 (1:00 AM UTC)
   const briefingTask = cron.schedule(`0 1 * * *`, async () => {
-    log("cron", "Starting morning briefing");
-    try {
-      const briefing = await generateBriefing();
-      if (telegramEnabled()) {
-        await sendHTML(briefing);
-      }
-    } catch (error) {
-      log("cron_error", `Morning briefing failed: ${error.message}`);
-    }
+    await runBriefing();
   }, { timezone: 'UTC' });
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask];
+  // Every 6h — catch up if briefing was missed (agent restart, crash, etc.)
+  const briefingWatchdog = cron.schedule(`0 */6 * * *`, async () => {
+    await maybeRunMissedBriefing();
+  }, { timezone: 'UTC' });
+
+  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
 }
 
@@ -288,18 +350,6 @@ function formatCandidates(candidates) {
 // ═══════════════════════════════════════════
 const isTTY = process.stdin.isTTY;
 let cronStarted = false;
-let busy = false;
-const sessionHistory = []; // persists conversation across REPL turns
-const MAX_HISTORY = 20;    // keep last 20 messages (10 exchanges)
-
-function appendHistory(userMsg, assistantMsg) {
-  sessionHistory.push({ role: "user", content: userMsg });
-  sessionHistory.push({ role: "assistant", content: assistantMsg });
-  // Trim to last MAX_HISTORY messages
-  if (sessionHistory.length > MAX_HISTORY) {
-    sessionHistory.splice(0, sessionHistory.length - MAX_HISTORY);
-  }
-}
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
 registerCronRestarter(() => { if (cronStarted) startCronJobs(); });
@@ -313,7 +363,7 @@ if (isTTY) {
 
   // Update prompt countdown every 10 seconds
   setInterval(() => {
-    if (!busy) {
+    if (!isBusy()) {
       rl.setPrompt(buildPrompt());
       rl.prompt(true); // true = preserve current line
     }
@@ -333,11 +383,11 @@ if (isTTY) {
   }
 
   async function runBusy(fn) {
-    if (busy) { console.log("Agent is busy, please wait..."); rl.prompt(); return; }
-    busy = true; rl.pause();
+    if (isBusy()) { console.log("Agent is busy, please wait..."); rl.prompt(); return; }
+    setBusy(true); rl.pause();
     try { await fn(); }
     catch (e) { console.error(`Error: ${e.message}`); }
-    finally { busy = false; rl.setPrompt(buildPrompt()); rl.resume(); rl.prompt(); }
+    finally { setBusy(false); rl.setPrompt(buildPrompt()); rl.resume(); rl.prompt(); }
   }
 
   // ── Startup: show wallet + top candidates ──
@@ -349,7 +399,7 @@ if (isTTY) {
 
   console.log("Fetching wallet and top pool candidates...\n");
 
-  busy = true;
+  setBusy(true);
   let startupCandidates = [];
 
   try {
@@ -365,10 +415,13 @@ if (isTTY) {
     console.log(`Positions: ${positions.total_positions} open\n`);
 
     if (positions.total_positions > 0) {
+      const unit = config.management.pnlUnit || "sol";
       console.log("Open positions:");
       for (const p of positions.positions) {
         const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
-        console.log(`  ${p.pair.padEnd(16)} ${status}  fees: $${p.unclaimed_fees_usd}`);
+        const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
+        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
+        console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
       }
       console.log();
     }
@@ -379,15 +432,22 @@ if (isTTY) {
   } catch (e) {
     console.error(`Startup fetch failed: ${e.message}`);
   } finally {
-    busy = false;
+    setBusy(false);
   }
 
   // Always start autonomous cycles on launch
   launchCron();
+  maybeRunMissedBriefing().catch(() => {});
+
+  // Web server — provides timer countdowns to the frontend
+  startServer(() => ({
+    management: formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin)),
+    screening:  formatCountdown(nextRunIn(timers.screeningLastRun,  config.schedule.screeningIntervalMin)),
+  })).catch((e) => log("server_error", `Web server failed to start: ${e.message}`));
 
   // Telegram bot
   startPolling(async (text) => {
-    if (_managementBusy || _screeningBusy || busy) {
+    if (isManagementBusy() || isScreeningBusy() || isBusy()) {
       sendMessage("Agent is busy right now — try again in a moment.").catch(() => {});
       return;
     }
@@ -395,14 +455,14 @@ if (isTTY) {
     if (text === "/briefing") {
       try {
         const briefing = await generateBriefing();
-        await sendHTML(briefing);
+        emit("briefing", { html: briefing });
       } catch (e) {
         await sendMessage(`Error: ${e.message}`).catch(() => {});
       }
       return;
     }
 
-    busy = true;
+    setBusy(true);
     try {
       log("telegram", `Incoming: ${text}`);
       const { content } = await agentLoop(text, config.llm.maxSteps, sessionHistory, "GENERAL", config.llm.generalModel);
@@ -411,7 +471,7 @@ if (isTTY) {
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});
     } finally {
-      busy = false;
+      setBusy(false);
       rl.setPrompt(buildPrompt());
       rl.prompt(true);
     }
@@ -484,11 +544,14 @@ Commands:
     if (input === "/status") {
       await runBusy(async () => {
         const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+        const unit = config.management.pnlUnit || "sol";
         console.log(`\nWallet: ${wallet.sol} SOL  ($${wallet.sol_usd})`);
         console.log(`Positions: ${positions.total_positions}`);
         for (const p of positions.positions) {
           const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
-          console.log(`  ${p.pair.padEnd(16)} ${status}  fees: $${p.unclaimed_fees_usd}`);
+          const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
+          const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
+          console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
         }
         console.log();
       });
@@ -624,6 +687,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   // Non-TTY: start immediately
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
   startCronJobs();
+  maybeRunMissedBriefing().catch(() => {});
   (async () => {
     try {
       await agentLoop(`

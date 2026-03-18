@@ -5,6 +5,7 @@
 
   "deployAmountSol": 0.5,
   "maxPositions": 3,
+  "maxDeployAmount": 50,
   "minSolToOpen": 0.07,
 
   "managementIntervalMin": 10,
@@ -17,11 +18,26 @@
   "minFeeActiveTvlRatio": 0.05,
   "minTvl": 10000,
   "maxTvl": 150000,
+  "minVolume": 500,
   "minOrganic": 65,
   "minHolders": 500,
+  "minMcap": 150000,
+  "maxMcap": 10000000,
+  "minBinStep": 80,
+  "maxBinStep": 125,
   "timeframe": "5m",
   "category": "trending",
+  "minTokenFeesSol": 30,
 
   "takeProfitFeePct": 5,
-  "outOfRangeWaitMinutes": 30
+  "stopLossPct": -20,
+  "trailingTakeProfit": true,
+  "trailingTriggerPct": 3,
+  "trailingDropPct": 1.5,
+  "outOfRangeWaitMinutes": 30,
+  "gasReserve": 0.2,
+  "positionSizePct": 0.35,
+  "pnlUnit": "sol",
+
+  "webPort": 3737
 }

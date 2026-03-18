@@ -137,7 +137,7 @@ export function recordClaim(position_address, fees_usd) {
   if (!pos) return;
   pos.last_claim_at = new Date().toISOString();
   pos.total_fees_claimed_usd = (pos.total_fees_claimed_usd || 0) + (fees_usd || 0);
-  pos.notes.push(`Claimed ~$${fees_usd?.toFixed(2) || "?"} fees at ${pos.last_claim_at}`);
+  pos.notes.push(`Claimed ~${fees_usd?.toFixed(2) || "?"} USD fees at ${pos.last_claim_at}`);
   save(state);
 }
 
@@ -296,6 +296,25 @@ export function getStateSummary() {
     last_updated: state.lastUpdated,
     recent_events: (state.recentEvents || []).slice(-10),
   };
+}
+
+// ─── Briefing Tracking ─────────────────────────────────────────
+
+/**
+ * Get the date (YYYY-MM-DD UTC) when the last briefing was sent.
+ */
+export function getLastBriefingDate() {
+  const state = load();
+  return state._lastBriefingDate || null;
+}
+
+/**
+ * Record that the briefing was sent today.
+ */
+export function setLastBriefingDate() {
+  const state = load();
+  state._lastBriefingDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+  save(state);
 }
 
 /**

@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+:root {
+  --background: 0 0% 4%;
+  --foreground: 0 0% 95%;
+  --card: 0 0% 7%;
+  --card-foreground: 0 0% 95%;
+  --primary: 142 76% 36%;
+  --primary-foreground: 0 0% 100%;
+  --muted: 0 0% 15%;
+  --muted-foreground: 0 0% 64%;
+  --border: 0 0% 15%;
+  --accent: 142 76% 36%;
+  --destructive: 0 62% 50%;
+  --ring: 142 76% 36%;
+  --radius: 0.5rem;
+}
+
+body {
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(var(--muted)); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }

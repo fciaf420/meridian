@@ -19,7 +19,7 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
-import { normalizeMint } from "./wallet.js";
+import { normalizeMint, getWalletBalances } from "./wallet.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -125,7 +125,8 @@ export async function deployPosition({
         bins_below: activeBinsBelow,
         bins_above: activeBinsAbove,
         amount_x: amount_x || 0,
-        amount_y: amount_y || amount_sol || 0
+        amount_y: amount_y || amount_sol || 0,
+        wide_range: (activeBinsBelow + activeBinsAbove) > 69,
       },
       message: "DRY RUN — no transaction sent",
     };
@@ -147,7 +148,7 @@ export async function deployPosition({
   };
 
   const strategyType = strategyMap[activeStrategy];
-  if (!strategyType) {
+  if (strategyType === undefined) {
     throw new Error(`Invalid strategy: ${activeStrategy}. Use spot, curve, or bid_ask.`);
   }
 
@@ -166,31 +167,71 @@ export async function deployPosition({
     totalXLamports = new BN(Math.floor(finalAmountX * Math.pow(10, decimals)));
   }
 
+  const totalBins = activeBinsBelow + activeBinsAbove;
+  const isWideRange = totalBins > 69;
   const newPosition = Keypair.generate();
 
   log("deploy", `Pool: ${pool_address}`);
-  log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId}`);
+  log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
   try {
-    const tx = await pool.initializePositionAndAddLiquidityByStrategy({
-      positionPubKey: newPosition.publicKey,
-      user: wallet.publicKey,
-      totalXAmount: totalXLamports,
-      totalYAmount: totalYLamports,
-      strategy: { maxBinId, minBinId, strategyType },
-      slippage: 1000, // 10% slippage in bps
-    });
+    const txHashes = [];
 
-    const txHash = await sendAndConfirmTransaction(getConnection(), tx, [
-      wallet,
-      newPosition,
-    ], { skipPreflight: true });
+    if (isWideRange) {
+      // ── Wide Range Path (>69 bins) ─────────────────────────────────
+      // Solana limits inner instruction realloc to 10240 bytes, so we can't create
+      // a large position in a single initializePosition ix.
+      // Solution: createExtendedEmptyPosition then addLiquidityByStrategyChunkable.
 
-    log("deploy", `SUCCESS tx: ${txHash}`);
+      // Phase 1: Create empty position (may be multiple txs)
+      const createTxs = await pool.createExtendedEmptyPosition(
+        minBinId,
+        maxBinId,
+        newPosition.publicKey,
+        wallet.publicKey,
+      );
+      const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
+      for (let i = 0; i < createTxArray.length; i++) {
+        const signers = i === 0 ? [wallet, newPosition] : [wallet];
+        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers, { skipPreflight: true });
+        txHashes.push(txHash);
+        log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
+      }
 
-    _positionsCacheAt = 0; // invalidate cache after deploy
+      // Phase 2: Add liquidity (may be multiple txs)
+      const addTxs = await pool.addLiquidityByStrategyChunkable({
+        positionPubKey: newPosition.publicKey,
+        user: wallet.publicKey,
+        totalXAmount: totalXLamports,
+        totalYAmount: totalYLamports,
+        strategy: { minBinId, maxBinId, strategyType },
+        slippage: 10, // 10%
+      });
+      const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
+      for (let i = 0; i < addTxArray.length; i++) {
+        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet], { skipPreflight: true });
+        txHashes.push(txHash);
+        log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+      }
+    } else {
+      // ── Standard Path (<=69 bins) ─────────────────────────────────
+      const tx = await pool.initializePositionAndAddLiquidityByStrategy({
+        positionPubKey: newPosition.publicKey,
+        user: wallet.publicKey,
+        totalXAmount: totalXLamports,
+        totalYAmount: totalYLamports,
+        strategy: { maxBinId, minBinId, strategyType },
+        slippage: 1000, // 10% in bps
+      });
+      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition], { skipPreflight: true });
+      txHashes.push(txHash);
+    }
+
+    log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
+
+    _positionsCacheAt = 0;
     trackPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
@@ -213,9 +254,10 @@ export async function deployPosition({
       pool: pool_address,
       bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
       strategy: activeStrategy,
+      wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
-      tx: txHash,
+      txs: txHashes,
     };
   } catch (error) {
     log("deploy_error", error.message);
@@ -268,12 +310,26 @@ export async function getPositionPnl({ pool_address, position_address }) {
 
     const unclaimedUsd    = parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0);
     const currentValueUsd = parseFloat(p.unrealizedPnl?.balances || 0);
+    const pnlUsdVal       = Math.round((p.pnlUsd ?? 0) * 100) / 100;
+    const allTimeFeesUsd  = Math.round(parseFloat(p.allTimeFees?.total?.usd || 0) * 100) / 100;
+
+    // SOL conversion
+    let solPrice = 0;
+    try { solPrice = (await getWalletBalances()).sol_price || 0; } catch { /* best-effort */ }
+    const toSol = (usd) => solPrice > 0 ? Math.round((usd / solPrice) * 10000) / 10000 : null;
+
     return {
-      pnl_usd:           Math.round((p.pnlUsd ?? 0) * 100) / 100,
+      pnl_usd:           pnlUsdVal,
+      pnl_sol:           toSol(pnlUsdVal),
       pnl_pct:           Math.round((p.pnlPctChange ?? 0) * 100) / 100,
       current_value_usd: Math.round(currentValueUsd * 100) / 100,
+      current_value_sol: toSol(currentValueUsd),
       unclaimed_fee_usd: Math.round(unclaimedUsd * 100) / 100,
-      all_time_fees_usd: Math.round(parseFloat(p.allTimeFees?.total?.usd || 0) * 100) / 100,
+      unclaimed_fee_sol: toSol(unclaimedUsd),
+      all_time_fees_usd: allTimeFeesUsd,
+      all_time_fees_sol: toSol(allTimeFeesUsd),
+      sol_price:   solPrice,
+      pnl_unit:    config.management.pnlUnit,
       in_range:    !p.isOutOfRange,
       lower_bin:   p.lowerBinId      ?? null,
       upper_bin:   p.upperBinId      ?? null,
@@ -337,6 +393,11 @@ export async function getMyPositions({ force = false } = {}) {
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
 
+    // SOL price for conversion (one fetch, shared across all positions)
+    let solPrice = 0;
+    try { solPrice = (await getWalletBalances()).sol_price || 0; } catch { /* best-effort */ }
+    const toSol = (usd) => solPrice > 0 ? Math.round((usd / solPrice) * 10000) / 10000 : null;
+
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
 
@@ -363,6 +424,11 @@ export async function getMyPositions({ force = false } = {}) {
         : null;
       const ageMinutes = Math.max(ageFromPnlApi ?? 0, ageFromState ?? 0) || null;
 
+      const pnlUsdRounded = Math.round(pnlUsd * 100) / 100;
+      const unclaimedRounded = Math.round(unclaimedFees * 100) / 100;
+      const totalValRounded = Math.round(totalValue * 100) / 100;
+      const collectedRounded = Math.round(collectedFees * 100) / 100;
+
       return {
         position: r.position,
         pool: r.pool,
@@ -372,11 +438,17 @@ export async function getMyPositions({ force = false } = {}) {
         upper_bin: upperBin,
         active_bin: activeBin,
         in_range: inRange,
-        unclaimed_fees_usd: Math.round(unclaimedFees * 100) / 100,
-        total_value_usd: Math.round(totalValue * 100) / 100,
-        collected_fees_usd: Math.round(collectedFees * 100) / 100,
-        pnl_usd: Math.round(pnlUsd * 100) / 100,
+        unclaimed_fees_usd: unclaimedRounded,
+        unclaimed_fees_sol: toSol(unclaimedRounded),
+        total_value_usd: totalValRounded,
+        total_value_sol: toSol(totalValRounded),
+        collected_fees_usd: collectedRounded,
+        collected_fees_sol: toSol(collectedRounded),
+        pnl_usd: pnlUsdRounded,
+        pnl_sol: toSol(pnlUsdRounded),
         pnl_pct: Math.round(pnlPct * 100) / 100,
+        sol_price: solPrice,
+        pnl_unit: config.management.pnlUnit,
         age_minutes: ageMinutes,
         minutes_out_of_range: minutesOutOfRange(r.position),
       };
