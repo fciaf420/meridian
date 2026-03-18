@@ -484,12 +484,21 @@ export async function claimFees({ position_address }) {
     poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
 
-    const tx = await pool.claimSwapFee({
+    const positionPubKey = new PublicKey(position_address);
+    const positionData = await pool.getPosition(positionPubKey);
+
+    const txs = await pool.claimSwapFee({
       owner: wallet.publicKey,
-      position: new PublicKey(position_address),
+      position: positionData,
     });
 
-    const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
+    const txArr = Array.isArray(txs) ? txs : [txs];
+    const txHashes = [];
+    for (const tx of txArr) {
+      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
+      txHashes.push(txHash);
+    }
+    const txHash = txHashes[0];
     log("claim", `SUCCESS tx: ${txHash}`);
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address);
@@ -517,19 +526,22 @@ export async function closePosition({ position_address }) {
     const pool = await getPool(poolAddress);
 
     const positionPubKey = new PublicKey(position_address);
+    const positionData = await pool.getPosition(positionPubKey);
 
     const txHashes = [];
 
     // ─── Step 1: Claim Fees (to clear account state) ───────────
     try {
       log("close", `Step 1: Claiming fees for ${position_address}`);
-      const claimTx = await pool.claimSwapFee({
+      const claimTxs = await pool.claimSwapFee({
         owner: wallet.publicKey,
-        position: positionPubKey,
+        position: positionData,
       });
-      const claimHash = await sendAndConfirmTransaction(getConnection(), claimTx, [wallet], { skipPreflight: true });
-      txHashes.push(claimHash);
-      log("close", `Step 1 OK: ${claimHash}`);
+      for (const tx of Array.isArray(claimTxs) ? claimTxs : [claimTxs]) {
+        const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
+        txHashes.push(claimHash);
+      }
+      log("close", `Step 1 OK: ${txHashes.join(", ")}`);
     } catch (e) {
       log("close_warn", `Step 1 (Claim) failed or nothing to claim: ${e.message}`);
     }
