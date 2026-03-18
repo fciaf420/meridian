@@ -169,12 +169,23 @@ REPORT FORMAT (Strictly follow this for each position):
     log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
     let screenReport = null;
     try {
-      // Targeted recall: recall strategy/pattern memories for screening context
+      // Targeted recall: recall strategy memories for common bin steps
       let memoryHints = "";
       try {
-        const strategyRecall = recallForScreening({ name: "screening" });
-        const patternRecall = recallForScreening({ name: "patterns" });
-        const recalls = [...strategyRecall, ...patternRecall];
+        const recalls = [];
+        // Recall strategies for common bin steps we use
+        for (const bs of [80, 100, 125]) {
+          const hits = recallForScreening({ bin_step: bs });
+          for (const h of hits) recalls.push(h);
+        }
+        // Recall any pool memories from recent positions
+        const recentPos = await getMyPositions();
+        for (const p of recentPos.positions || []) {
+          const hits = recallForScreening({ name: p.pair });
+          for (const h of hits) {
+            if (!recalls.some(x => x.key === h.key)) recalls.push(h);
+          }
+        }
         if (recalls.length > 0) {
           memoryHints = `\n\nMEMORY RECALL (from past sessions):\n${recalls.map(h => `[${h.source}] ${h.key}: ${h.answer}`).join("\n")}\n`;
         }

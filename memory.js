@@ -11,6 +11,9 @@ import { log } from "./logger.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SAVE_DIR = path.join(__dirname, "data", "nuggets");
 
+// Unique session ID per process — needed for nuggets hit tracking
+const SESSION_ID = `session_${Date.now()}`;
+
 let shelf = null;
 
 /**
@@ -54,10 +57,15 @@ export function rememberPoolOutcome(poolName, result) {
  */
 export function rememberStrategy(pattern, result) {
   const s = getShelf();
-  const key = pattern.slice(0, 40);
+  const key = pattern.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
   const value = typeof result === "string" ? result : JSON.stringify(result);
   s.remember("strategies", key, value.slice(0, 200));
   log("memory", `Remembered strategy: ${key}`);
+}
+
+/** Sanitize keys the same way as write paths — strip special chars */
+function sanitizeKey(str) {
+  return str.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
 }
 
 /**
@@ -68,21 +76,23 @@ export function recallForScreening(poolData) {
   const results = [];
 
   // Check if we have memory about this pool or token
-  if (poolData?.name) {
-    const r = s.recall(poolData.name, "pools");
+  const rawName = poolData?.name || poolData?.pair;
+  if (rawName) {
+    const name = sanitizeKey(rawName);
+    const r = s.recall(name, "pools", SESSION_ID);
     if (r.found) results.push({ source: "pools", ...r });
   }
 
   if (poolData?.base_token) {
-    const r = s.recall(poolData.base_token, "pools");
+    const r = s.recall(sanitizeKey(poolData.base_token), "pools", SESSION_ID);
     if (r.found && !results.some(x => x.key === r.key)) {
       results.push({ source: "pools", ...r });
     }
   }
 
-  // Check strategy patterns
+  // Check strategy patterns by bin_step
   if (poolData?.bin_step) {
-    const r = s.recall(`bin_step_${poolData.bin_step}`, "strategies");
+    const r = s.recall(`bid_ask_bs${poolData.bin_step}`, "strategies", SESSION_ID);
     if (r.found) results.push({ source: "strategies", ...r });
   }
 
@@ -96,13 +106,16 @@ export function recallForManagement(position) {
   const s = getShelf();
   const results = [];
 
-  if (position?.pool_name) {
-    const r = s.recall(position.pool_name, "pools");
+  // Position objects have `pair` (e.g. "Gany-SOL"), not `pool_name`
+  const rawKey = position?.pair || position?.pool_name;
+  if (rawKey) {
+    const poolKey = sanitizeKey(rawKey);
+    const r = s.recall(poolKey, "pools", SESSION_ID);
     if (r.found) results.push({ source: "pools", ...r });
   }
 
   // Check for learned lessons about management
-  const r = s.recall("management", "lessons");
+  const r = s.recall("management", "lessons", SESSION_ID);
   if (r.found) results.push({ source: "lessons", ...r });
 
   return results;
@@ -179,7 +192,7 @@ export function rememberFact(nuggetName, key, value) {
  */
 export function recallMemory(query, nuggetName) {
   const s = getShelf();
-  const result = s.recall(query, nuggetName || undefined);
+  const result = s.recall(query, nuggetName || undefined, SESSION_ID);
   log("memory", `LLM recall "${query}" → ${result.found ? result.answer : "not found"}`);
   return result;
 }

@@ -128,13 +128,30 @@ Always call this before deploying a position to get the freshest price.`,
 
 You have autonomy to choose strategy and range based on pool metrics.
 
-HARD RULES:
-- Strategy: 'spot' or 'bid_ask' ONLY. Never use 'curve'.
-- Bin Step: Only deploy in pools with bin_step between 80 and 125.
+STRATEGIES:
+- 'bid_ask': Single-sided SOL below active bin. You only deposit SOL. As price drops, your SOL buys the base token bin by bin. You are NOT holding the token upfront — safer if it dumps.
+- 'spot': Two-sided — deposits BOTH tokens around active bin. You ARE holding the base token. If the token dumps, you absorb more loss because you already held it. More fee capture but more risk.
+- Never use 'curve'.
 
-Guidelines:
+SINGLE-SIDED (bid_ask) vs TWO-SIDED (spot) — CRITICAL:
+- Single-sided = you do NOT hold the base token. SOL sits below price, only converts as price drops into your range. Safe default.
+- Two-sided = you ARE holding the base token in the LP. If token dumps, your position loses more because you had exposure from the start. Requires conviction the token will hold or go up.
+
+WHEN TO USE WHICH:
+- Meme tokens, new tokens, unproven tokens → ALWAYS bid_ask single-sided. Never take two-sided exposure on tokens you don't trust.
+- High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token.
+- High volatility, trending, pumping → bid_ask. You earn fees from the sell pressure without holding the bag.
+- Stable, range-bound, high volume → spot. More fee capture from both sides.
+- When unsure → ALWAYS default to bid_ask single-sided. It's the safe choice.
+
+HARD RULES:
+- Bin Step: Only deploy in pools with bin_step between 80 and 125.
 - Range: total bins (below + above + 1) cannot exceed 70.
-- Deposit: Can be single-sided (SOL only or Base only) or dual-sided.
+
+BIN RANGE GUIDELINES:
+- Low volatility (<3) → narrow range: 35–45 bins
+- Medium volatility (3–6) → medium range: 45–55 bins
+- High volatility (>6) → wide range: 55–69 bins
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -158,8 +175,12 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           strategy: {
             type: "string",
-            enum: ["bid_ask"],
-            description: "DLMM strategy type. Only bid_ask is allowed."
+            enum: ["bid_ask", "spot"],
+            description: "DLMM strategy. bid_ask = single-sided SOL below price (volatile tokens). spot = symmetric around price (stable pairs). Default: bid_ask."
+          },
+          bins_above: {
+            type: "number",
+            description: "Number of bins above active bin. Only used with 'spot' strategy. For bid_ask, this is always 0."
           },
           bins_below: {
             type: "number",

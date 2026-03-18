@@ -108,13 +108,13 @@ export async function deployPosition({
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
-  
-  if (activeStrategy !== "bid_ask") {
-    throw new Error("Only 'bid_ask' strategy is allowed.");
+
+  if (!["bid_ask", "spot"].includes(activeStrategy)) {
+    throw new Error("Only 'bid_ask' or 'spot' strategies are allowed.");
   }
 
   const activeBinsBelow = bins_below ?? config.strategy.binsBelow;
-  const activeBinsAbove = 0; // always single-sided SOL, never above active bin
+  const activeBinsAbove = bins_above ?? (activeStrategy === "spot" ? activeBinsBelow : 0);
 
   if (process.env.DRY_RUN === "true") {
     return {
