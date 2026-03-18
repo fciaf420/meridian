@@ -3,7 +3,7 @@
  * Provides cross-session learning via HRR-based memory.
  */
 
-import { NuggetShelf } from "nuggets";
+import { NuggetShelf, promoteFacts } from "nuggets";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
@@ -198,4 +198,38 @@ export function recallMemory(query, nuggetName) {
   const result = s.recall(query, nuggetName || undefined, SESSION_ID);
   log("memory", `LLM recall "${query}" → ${result.found ? result.answer : "not found"}`);
   return result;
+}
+
+/**
+ * Let the LLM forget a fact from memory.
+ */
+export function forgetFact(nuggetName, key) {
+  const s = getShelf();
+  try {
+    const nugget = s.get(nuggetName);
+    nugget.forget(key);
+    log("memory", `LLM forgot fact in ${nuggetName}: ${key}`);
+    return { forgotten: true, nugget: nuggetName, key };
+  } catch (e) {
+    log("memory", `Failed to forget ${nuggetName}/${key}: ${e.message}`);
+    return { forgotten: false, error: e.message };
+  }
+}
+
+/**
+ * Promote high-hit facts to MEMORY.md for permanent context.
+ * Call periodically (e.g. after each management cycle).
+ */
+export function maybePromote() {
+  const s = getShelf();
+  try {
+    const promoted = promoteFacts(s);
+    if (promoted > 0) {
+      log("memory", `Promoted ${promoted} facts to MEMORY.md`);
+    }
+    return promoted;
+  } catch (e) {
+    log("memory", `Promotion failed: ${e.message}`);
+    return 0;
+  }
 }

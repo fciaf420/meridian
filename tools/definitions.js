@@ -794,6 +794,27 @@ Examples:
       }
     }
   },
+  {
+    type: "function",
+    function: {
+      name: "forget_fact",
+      description: `Remove a fact from holographic memory.
+Use this to clean up stale, incorrect, or outdated facts.
+Specify the nugget name and the exact key of the fact to forget.
+
+Examples:
+- forget_fact("pools", "BONK-SOL") — remove an outdated pool outcome
+- forget_fact("strategies", "old_pattern") — remove an obsolete strategy note`,
+      parameters: {
+        type: "object",
+        properties: {
+          nugget: { type: "string", description: "Memory category the fact belongs to (pools, strategies, lessons, patterns, or custom)" },
+          key: { type: "string", description: "The exact key of the fact to remove" }
+        },
+        required: ["nugget", "key"]
+      }
+    }
+  },
 
   // ─── Strategy Library ──────────────────────────────────────────
 

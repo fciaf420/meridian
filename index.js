@@ -13,7 +13,7 @@ import { startPolling, stopPolling, sendMessage, isEnabled as telegramEnabled } 
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot } from "./memory.js";
+import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot, maybePromote } from "./memory.js";
 import { updatePnlAndCheckExits } from "./state.js";
 import { emit } from "./notifier.js";
 import {
@@ -154,7 +154,8 @@ MANAGEMENT CYCLE${memoryHints}${exitAlerts}
    - INSTRUCTION OVERRIDE: If instruction condition NOT YET MET → hold, regardless of other signals.
    - If no instruction: BIAS = STAY. Only close if yield died, pool collapsed, or extreme loss.
 3. If closing: swap base tokens to SOL.
-4. After any close — recalibrate management interval (MANDATORY):
+4. If you learn a reusable insight about position management, call remember_fact("lessons", key, value) to save it.
+5. After any close — recalibrate management interval (MANDATORY):
    - No positions remaining → update_config management.managementIntervalMin = 10 (reset to default)
    - Positions still open → keep current interval (already set by deploy volatility)
 
@@ -179,6 +180,8 @@ REPORT FORMAT (Strictly follow this for each position — use ${config.managemen
           }
         }
       } catch { /* best-effort */ }
+      // Promote high-hit nugget facts to MEMORY.md
+      maybePromote();
     }
   });
 
@@ -216,18 +219,37 @@ REPORT FORMAT (Strictly follow this for each position — use ${config.managemen
       const strategyBlock = `
 STRATEGY SELECTION — choose per token based on its profile:
 
-  Token Profile                         │ Strategy  │ Bins        │ Reasoning
+  Token Profile                         │ Strategy  │ Range       │ Reasoning
   ──────────────────────────────────────┼───────────┼─────────────┼──────────────────────────
-  New memecoin, < 24h, high volatility  │ bid_ask   │ 35–45       │ Single-sided = no bag risk
-  Pumping token, price up > 50% recent  │ bid_ask   │ 55–69 wide  │ Catch sell pressure safely
-  Proven token, organic > 80, ranging   │ spot      │ 55–69       │ Two-sided = max fee capture
-  High volume, stable, range-bound      │ spot      │ 45–60       │ Both sides earn, low IL risk
-  Unknown/uncertain                     │ bid_ask   │ 45–55       │ Safe default
+  New memecoin, < 24h, high volatility  │ bid_ask   │ 25–35%      │ Single-sided SOL only = no bag risk
+  Pumping token, price up > 50% recent  │ bid_ask   │ 35–50%      │ Catch sell pressure safely
+  Proven token, organic > 80, ranging   │ spot      │ 35–50%      │ Two-sided = max fee capture
+  High vol, stable, large bin_step      │ spot      │ 50–70%      │ Wide range, ride the trend
+  High volume, stable, range-bound      │ spot      │ 30–40%      │ Both sides earn, low IL risk
+  Cautious on decent token              │ spot      │ 25–35%      │ Single-sided spot (SOL side only)
+  Unknown/uncertain                     │ bid_ask   │ 30–40%      │ Safe default
+
+Range = % price drop from entry (active bin at deploy time).
+Convert to bins using: bins = ceil(abs(log(1 - pct) / log(1 + bin_step/10000)))
+Examples at different bin steps:
+  25% range → 37 bins at 80bps, 24 bins at 125bps
+  35% range → 55 bins at 80bps, 35 bins at 125bps
+  50% range → 87 bins at 80bps, 56 bins at 125bps
+  70% range → 152 bins at 80bps, 97 bins at 125bps
+Always compute bins from the pool's actual bin_step — never use raw bin counts from this table.
+
+Strategy types:
+- bid_ask: Always single-sided (SOL only). Safest — no token exposure.
+- spot: Can be EITHER two-sided or single-sided depending on bin placement.
+  * Two-sided spot: bins above AND below active bin → earns fees on both sides, but holds token.
+  * Single-sided spot (SOL only): all bins BELOW active bin → earns fees when price drops into range, no bag risk.
+  * Use single-sided spot when you like the pool but want safety. Use two-sided spot only for high-conviction tokens.
 
 Rules:
-- Default to bid_ask single-sided when unsure — it's always the safer choice.
-- Only use spot (two-sided) if organic score > 80, holders > 1000, and price is stable/ranging.
-- Report which strategy you chose and WHY in your reasoning.
+- Default to bid_ask or single-sided spot when unsure — always the safer choice.
+- Only use two-sided spot if organic score > 80, holders > 1000, and price is stable/ranging.
+- Wide ranges (>69 bins) are supported — the deploy tool handles multi-tx automatically.
+- Report which strategy you chose, single vs two-sided, bin count, and the % range it covers.
 ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrategy.name} — ${activeStrategy.lp_strategy}, best for: ${activeStrategy.best_for}` : ""}`;
 
       // Targeted recall: recall strategy memories for common bin steps

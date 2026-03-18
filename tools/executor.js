@@ -27,7 +27,7 @@ import { execSync, spawn } from "child_process";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 import { log, logAction } from "../logger.js";
-import { rememberFact, recallMemory } from "../memory.js";
+import { rememberFact, recallMemory, forgetFact } from "../memory.js";
 import { emit } from "../notifier.js";
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -105,6 +105,7 @@ const toolMap = {
   },
   remember_fact: ({ nugget, key, value }) => rememberFact(nugget, key, value),
   recall_memory: ({ query, nugget }) => recallMemory(query, nugget),
+  forget_fact: ({ nugget, key }) => forgetFact(nugget, key),
   clear_lessons: ({ mode, keyword }) => {
     if (mode === "all") {
       const n = clearAllLessons();
