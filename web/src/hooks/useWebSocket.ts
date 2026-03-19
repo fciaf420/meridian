@@ -25,8 +25,10 @@ export interface TimerInfo {
 }
 
 export interface PositionInfo {
+  position: string;
   pair: string;
   pool: string;
+  strategy?: "bid_ask" | "spot";
   in_range: boolean;
   active_bin: number;
   lower_bin: number;
@@ -36,8 +38,7 @@ export interface PositionInfo {
   pnl_usd?: number;
   unclaimed_fees_sol?: number;
   unclaimed_fees_usd?: number;
-  age_seconds: number;
-  position_pubkey: string;
+  age_minutes?: number;
 }
 
 export interface PositionData {

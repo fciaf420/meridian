@@ -105,6 +105,7 @@ function startCronJobs() {
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
     if (isManagementBusy()) return;
+    if (isScreeningBusy()) { log("cron", "Management deferred — screening cycle in progress"); return; }
     setManagementBusy(true);
     timers.managementLastRun = Date.now();
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
@@ -187,6 +188,7 @@ REPORT FORMAT (Strictly follow this for each position — use ${config.managemen
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, async () => {
     if (isScreeningBusy()) return;
+    if (isManagementBusy()) { log("cron", "Screening deferred — management cycle in progress"); return; }
 
     // Hard guards — don't even run the agent if preconditions aren't met
     try {

@@ -70,7 +70,7 @@ export default function DashboardTab({ positions, wallet }: DashboardTabProps) {
             positions.positions.length > 0 ? (
               <div className="space-y-2">
                 {positions.positions.map((p) => (
-                  <PositionCard key={p.position_pubkey} position={p} />
+                  <PositionCard key={p.position} position={p} />
                 ))}
               </div>
             ) : (

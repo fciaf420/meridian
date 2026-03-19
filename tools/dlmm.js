@@ -436,6 +436,7 @@ export async function getMyPositions({ force = false } = {}) {
         pool: r.pool,
         pair: r.pair,
         base_mint: r.base_mint,
+        strategy: tracked?.strategy || "bid_ask",
         lower_bin: lowerBin,
         upper_bin: upperBin,
         active_bin: activeBin,
@@ -649,7 +650,7 @@ export async function closePosition({ position_address }) {
         minutesOOR = Math.floor((Date.now() - new Date(tracked.out_of_range_since).getTime()) / 60000);
       }
 
-      // Snapshot PnL from cache BEFORE invalidating — this was the last known state before close
+      // Snapshot PnL — try cache first, then fetch fresh from API if cache miss
       let pnlUsd = 0;
       let pnlPct = 0;
       let finalValueUsd = 0;
@@ -660,6 +661,19 @@ export async function closePosition({ position_address }) {
         pnlPct        = cachedPos.pnl_pct   ?? 0;
         finalValueUsd = cachedPos.total_value_usd ?? 0;
         feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
+      } else {
+        // No cache — fetch fresh PnL from API (position may still be queryable)
+        try {
+          const freshPnl = await getPositionPnl({ pool_address: poolAddress, position_address });
+          if (freshPnl && !freshPnl.error) {
+            pnlUsd        = freshPnl.pnl_usd   ?? 0;
+            pnlPct        = freshPnl.pnl_pct   ?? 0;
+            finalValueUsd = freshPnl.current_value_usd ?? 0;
+            feesUsd       = (freshPnl.all_time_fees_usd || 0) + (freshPnl.unclaimed_fee_usd || 0);
+          }
+        } catch (e) {
+          log("close_warn", `Could not fetch PnL for performance recording: ${e.message}`);
+        }
       }
 
       _positionsCacheAt = 0; // invalidate cache after snapshotting PnL

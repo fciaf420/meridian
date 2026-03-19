@@ -1,24 +1,20 @@
 import { memo } from "react";
 import type { PositionInfo } from "../hooks/useWebSocket";
 import { Badge } from "@/components/ui/badge";
-import { Progress } from "@/components/ui/progress";
+import BinRangeChart from "./BinRangeChart";
 
-function formatAge(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  const mins = Math.floor(seconds / 60);
-  if (mins < 60) return `${mins}m`;
-  const hrs = Math.floor(mins / 60);
-  const remainMins = mins % 60;
+function formatAge(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  const hrs = Math.floor(minutes / 60);
+  const remainMins = minutes % 60;
   if (hrs < 24) return `${hrs}h ${remainMins}m`;
   const days = Math.floor(hrs / 24);
   return `${days}d ${hrs % 24}h`;
 }
 
 function PositionCardInner({ position }: { position: PositionInfo }) {
-  const { pair, in_range, pnl_pct, unclaimed_fees_sol, unclaimed_fees_usd, age_seconds, active_bin, lower_bin, upper_bin } = position;
+  const { pair, in_range, pnl_pct, unclaimed_fees_sol, unclaimed_fees_usd, age_minutes, active_bin, lower_bin, upper_bin } = position;
 
-  const binRange = upper_bin - lower_bin;
-  const binProgress = binRange > 0 ? ((active_bin - lower_bin) / binRange) * 100 : 50;
   const pnlColor = pnl_pct >= 0 ? "text-emerald-400" : "text-red-400";
   const fees = unclaimed_fees_sol != null ? `${unclaimed_fees_sol.toFixed(4)} SOL` : unclaimed_fees_usd != null ? `$${unclaimed_fees_usd.toFixed(2)}` : "--";
 
@@ -46,21 +42,24 @@ function PositionCardInner({ position }: { position: PositionInfo }) {
         </div>
         <div className="ml-auto">
           <span className="text-ash text-[10px] block">Age</span>
-          <span className="font-mono text-[11px] text-steel">{formatAge(age_seconds)}</span>
+          <span className="font-mono text-[11px] text-steel">{age_minutes != null ? formatAge(age_minutes) : "--"}</span>
         </div>
       </div>
 
-      {/* Bin range */}
-      <div>
-        <div className="flex justify-between mb-0.5">
-          <span className="font-mono text-[9px] text-ash/60">{lower_bin}</span>
-          <span className="font-mono text-[9px] text-ash/60">{upper_bin}</span>
-        </div>
-        <Progress
-          value={binProgress}
-          indicatorClassName={in_range ? "bg-emerald-400/70" : "bg-red-400/70"}
+      {/* Bin range chart */}
+      {lower_bin != null && upper_bin != null && active_bin != null ? (
+        <BinRangeChart
+          lowerBin={lower_bin}
+          upperBin={upper_bin}
+          activeBin={active_bin}
+          inRange={in_range}
+          strategy={position.strategy}
         />
-      </div>
+      ) : (
+        <div className="h-6 rounded bg-ink/40 flex items-center justify-center">
+          <span className="font-mono text-[9px] text-ash/40">bin data unavailable</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -68,7 +67,8 @@ function PositionCardInner({ position }: { position: PositionInfo }) {
 const PositionCard = memo(PositionCardInner, (prev, next) =>
   prev.position.pnl_pct === next.position.pnl_pct &&
   prev.position.in_range === next.position.in_range &&
-  prev.position.unclaimed_fees_sol === next.position.unclaimed_fees_sol
+  prev.position.unclaimed_fees_sol === next.position.unclaimed_fees_sol &&
+  prev.position.active_bin === next.position.active_bin
 );
 
 export default PositionCard;
