@@ -127,14 +127,13 @@ export default function ChatPanel({ messages, status, onSend, onOpenCommandPalet
               value={input}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
-              placeholder={isBusy ? "Agent is working..." : "Ask the agent... (type / for commands)"}
-              disabled={isBusy}
-              className="flex-1 bg-ink border border-teal/30 rounded-lg px-4 py-2.5 text-sm text-cream placeholder-ash/40 focus:outline-none focus:ring-1 focus:ring-steel focus:border-steel disabled:opacity-50"
+              placeholder={isBusy ? "Type message — will queue until agent is free..." : "Ask the agent... (type / for commands)"}
+              className="flex-1 bg-ink border border-teal/30 rounded-lg px-4 py-2.5 text-sm text-cream placeholder-ash/40 focus:outline-none focus:ring-1 focus:ring-steel focus:border-steel"
             />
             <span className="absolute right-16 top-1/2 -translate-y-1/2 text-[10px] text-ash/30 font-mono">Ctrl+K</span>
             <button
               type="submit"
-              disabled={isBusy || !input.trim()}
+              disabled={!input.trim()}
               className="bg-steel hover:bg-steel/80 disabled:opacity-40 text-ink rounded-lg px-4 py-2.5 transition-colors"
             >
               <Send size={16} />
