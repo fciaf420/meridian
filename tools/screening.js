@@ -99,19 +99,22 @@ export async function getTopCandidates({ limit = 10 } = {}) {
  * Returns the full unfiltered API object (all fields, not condensed).
  */
 export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
-  const url = `${POOL_DISCOVERY_BASE}/pools?` +
-    `page_size=1` +
-    `&filter_by=${encodeURIComponent(`pool_address=${pool_address}`)}` +
-    `&timeframe=${timeframe}`;
+  const fetchPool = async (tf) => {
+    const url = `${POOL_DISCOVERY_BASE}/pools?` +
+      `page_size=1` +
+      `&filter_by=${encodeURIComponent(`pool_address=${pool_address}`)}` +
+      `&timeframe=${tf}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
+    const data = await res.json();
+    return (data.data || [])[0] || null;
+  };
 
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json();
-  const pool = (data.data || [])[0];
+  // Always fetch both the requested timeframe AND 1h for context
+  const [pool, pool1h] = await Promise.all([
+    fetchPool(timeframe),
+    timeframe !== "1h" ? fetchPool("1h").catch(() => null) : null,
+  ]);
 
   if (!pool) {
     throw new Error(`Pool ${pool_address} not found`);
@@ -119,6 +122,19 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
 
   const condensed = condensePool(pool);
   condensed.timeframe = timeframe;
+  condensed._summary = `${timeframe} snapshot: volume $${condensed.volume_window || 0}, fee $${condensed.fee_window || 0}, fee/TVL ${condensed.fee_active_tvl_ratio || 0}%, ${condensed.swap_count || 0} swaps`;
+
+  // Attach 1h context so LLM can see the bigger picture alongside the 5m snapshot
+  if (pool1h) {
+    condensed.context_1h = {
+      volume: round(pool1h.volume),
+      fee: round(pool1h.fee),
+      fee_active_tvl_ratio: fix(pool1h.fee_active_tvl_ratio, 4),
+      swap_count: pool1h.swap_count,
+    };
+    condensed._summary += ` | 1h context: volume $${round(pool1h.volume)}, fee $${round(pool1h.fee)}, fee/TVL ${fix(pool1h.fee_active_tvl_ratio, 4)}%, ${pool1h.swap_count} swaps`;
+  }
+
   return condensed;
 }
 
