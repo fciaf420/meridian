@@ -425,10 +425,22 @@ export async function getMyPositions({ force = false } = {}) {
           const { getPoolDetail } = await import("./screening.js");
           const poolDetail = await getPoolDetail({ pool_address: r.pool, timeframe: "1h" }).catch(() => null);
 
-          // Infer strategy: if no base token was deposited (amount_x = 0), it's bid_ask
-          // regardless of where active bin is now (price may have moved into the range)
-          const depositedX = parseFloat(p.allTimeDeposits?.tokenX?.amount || 0);
-          const inferredStrategy = depositedX === 0 ? "bid_ask" : "spot";
+          // Infer strategy from on-chain bin liquidity distribution
+          let inferredStrategy = "bid_ask"; // safe default
+          try {
+            const pool = await getPool(r.pool);
+            const posData = await pool.getPosition(new PublicKey(r.position));
+            const binData = posData.positionData?.positionBinData || [];
+            const yAmounts = binData.map(b => Number(b.positionYAmount || 0)).filter(a => a > 0);
+            if (yAmounts.length > 1) {
+              const ratio = Math.max(...yAmounts) / (Math.min(...yAmounts) || 1);
+              inferredStrategy = ratio < 2 ? "spot" : "bid_ask";
+            }
+          } catch {
+            // Fallback: check deposit amounts — no base token deposited = bid_ask
+            const depositedX = parseFloat(p.allTimeDeposits?.tokenX?.amount || 0);
+            inferredStrategy = depositedX === 0 ? "bid_ask" : "spot";
+          }
 
           const depositSol = parseFloat(p.allTimeDeposits?.tokenY?.amountSol || 0);
           const depositUsd = parseFloat(p.allTimeDeposits?.total?.usd || 0);
