@@ -41,11 +41,11 @@ export const config = {
 
   // ─── Position Management ────────────────
   management: {
-    minClaimAmount:        5,
-    outOfRangeBinsToClose: 5,
+    minClaimAmount:        u.minClaimAmount        ?? 5,
+    outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 5,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
-    minVolumeToRebalance:  1000,
-    emergencyPriceDropPct: -50,
+    minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
+    emergencyPriceDropPct: u.emergencyPriceDropPct ?? -50,
     stopLossPct:           u.stopLossPct ?? -20,
     takeProfitFeePct:      u.takeProfitFeePct ?? 5,
     trailingTakeProfit:    u.trailingTakeProfit ?? true,
@@ -60,22 +60,22 @@ export const config = {
 
   // ─── Strategy Mapping ───────────────────
   strategy: {
-    strategy:   "bid_ask",
-    binsBelow:  69,  // activeBin - 69 to activeBin = 70 bins total (program max)
+    strategy:   u.strategy   ?? "bid_ask",
+    binsBelow:  u.binsBelow  ?? 69,  // activeBin - 69 to activeBin = 70 bins total (program max)
   },
 
   // ─── Scheduling ─────────────────────────
   schedule: {
     managementIntervalMin: u.managementIntervalMin ?? 10,
     screeningIntervalMin:  u.screeningIntervalMin  ?? 30,
-    healthCheckIntervalMin: 60,
+    healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
     pnlWatcherIntervalSec: u.pnlWatcherIntervalSec ?? 30,
   },
 
   // ─── LLM Settings ──────────────────────
   llm: {
-    temperature: 0.373,
-    maxTokens: 4096,
+    temperature: u.temperature ?? 0.373,
+    maxTokens:   u.maxTokens   ?? 4096,
     maxSteps: u.maxSteps ?? 20,
     managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openai/gpt-5.4-nano",
     screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openai/gpt-5.4-nano",

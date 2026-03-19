@@ -17,6 +17,9 @@ import { initMemory, recallForScreening, recallForManagement, rememberPositionSn
 import { updatePnlAndCheckExits } from "./state.js";
 import { emit } from "./notifier.js";
 import { startPnlWatcher, stopPnlWatcher } from "./pnl-watcher.js";
+import { recordPositionSnapshot as recordPoolSnapshot, recallForPool } from "./pool-memory.js";
+import { checkSmartWalletsOnPool } from "./smart-wallets.js";
+import { getTokenHolders, getTokenNarrative } from "./tools/token.js";
 import {
   sessionHistory, appendHistory, getHistory,
   isBusy, setBusy,
@@ -130,8 +133,9 @@ function startCronJobs() {
           for (const h of hits) {
             recalls.push(`[${h.source}] ${h.key}: ${h.answer} (confidence: ${(h.confidence * 100).toFixed(0)}%)`);
           }
-          // Store mid-position snapshot in nuggets
+          // Store mid-position snapshot in nuggets + pool-memory
           rememberPositionSnapshot(p);
+          if (p.pool) recordPoolSnapshot(p.pool, p);
 
           // Trailing TP / stop loss check
           if (p.pnl_pct != null) {
@@ -148,6 +152,17 @@ function startCronJobs() {
         if (exits.length > 0) {
           exitAlerts = `\n\nEXIT ALERTS (CLOSE THESE IMMEDIATELY):\n${exits.join("\n")}\n`;
         }
+        // Pool context from pool-memory (deploy history + live trend)
+        const poolContextLines = [];
+        for (const p of pos.positions || []) {
+          if (p.pool) {
+            const ctx = recallForPool(p.pool);
+            if (ctx) poolContextLines.push(ctx);
+          }
+        }
+        if (poolContextLines.length > 0) {
+          memoryHints += `\n\nPOOL CONTEXT (from memory):\n${poolContextLines.join("\n\n")}\n`;
+        }
       } catch { /* best-effort */ }
 
       // Inject recent auto-closes from PnL watcher so LLM knows what happened
@@ -163,25 +178,35 @@ function startCronJobs() {
         }
       } catch { /* best-effort */ }
 
+      const pnlUnit = config.management.pnlUnit?.toUpperCase() || "SOL";
       const { content } = await agentLoop(`
 MANAGEMENT CYCLE${memoryHints}${exitAlerts}${autoCloseInfo}
 
+HARD CLOSE RULES (check in order — close immediately on first match, no further analysis):
+1. Position instruction condition met → CLOSE immediately (highest priority)
+2. Position instruction exists but condition NOT met → HOLD (skip all other rules)
+3. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
+4. minutes_out_of_range >= ${config.management.outOfRangeWaitMinutes} → CLOSE (OOR timeout)
+5. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio}% AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
+6. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (emergency stop)
+
+These rules come from user-config. They are not suggestions. Do not override them.
+If NO rule triggers → HOLD. Do not close for any other reason.
+
+STEPS:
 1. get_my_positions — check all open positions.
 2. For each position:
    - Call get_position_pnl.
-   - Check state summary for any position instruction (e.g. "close at 5% profit").
-   - INSTRUCTION OVERRIDE: If instruction condition IS MET → close immediately, no further analysis.
-   - INSTRUCTION OVERRIDE: If instruction condition NOT YET MET → hold, regardless of other signals.
-   - If no instruction: BIAS = STAY. Only close if yield died, pool collapsed, or extreme loss.
-3. If closing: swap base tokens to SOL.
-4. If you learn a reusable insight about position management, call remember_fact("lessons", key, value) to save it.
-5. After any close — recalibrate management interval (MANDATORY):
-   - No positions remaining → update_config management.managementIntervalMin = 10 (reset to default)
-   - Positions still open → keep current interval (already set by deploy volatility)
+   - Apply HARD CLOSE RULES above in order. First match → close, stop checking.
+   - If no rule triggers: HOLD.
+3. If closing: swap base tokens to SOL immediately after.
+4. After any close — recalibrate management interval (MANDATORY):
+   - No positions remaining → update_config setting=managementIntervalMin value=10
+   - Positions still open → keep current interval
 
-REPORT FORMAT (Strictly follow this for each position — use ${config.management.pnlUnit?.toUpperCase() || "SOL"} values):
-**[PAIR]** | Age: [X]m | Fees: [X] ${config.management.pnlUnit?.toUpperCase() || "SOL"} | PnL: [X]%
-**Instruction:** [instruction if set, else "none"]
+REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values):
+**[PAIR]** | Age: [X]m | Fees: [X] ${pnlUnit} | PnL: [X]%
+**Rule triggered:** [rule number or "none"]
 **Decision:** [STAY/CLOSE]
 **Reason:** [1 short sentence]
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel);
@@ -294,29 +319,58 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
         }
       } catch { /* memory recall is best-effort */ }
 
+      // Pre-load top 3 candidates with recon data in parallel
+      let candidateBlocks = "";
+      try {
+        const result = await getTopCandidates({ limit: 3 });
+        const candidates = result?.candidates || [];
+        const blocks = await Promise.allSettled(candidates.map(async (c) => {
+          const [sw, holders, narrative, poolMem] = await Promise.allSettled([
+            checkSmartWalletsOnPool({ pool_address: c.pool }),
+            c.base_mint ? getTokenHolders({ mint: c.base_mint }) : null,
+            c.base_mint ? getTokenNarrative({ mint: c.base_mint }) : null,
+            recallForPool(c.pool),
+          ]);
+          const swResult = sw.status === "fulfilled" ? sw.value : null;
+          const holdResult = holders.status === "fulfilled" ? holders.value : null;
+          const narrResult = narrative.status === "fulfilled" ? narrative.value : null;
+          const memResult = poolMem.status === "fulfilled" ? poolMem.value : null;
+
+          let block = `[${c.name}] pool: ${c.pool} | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders}`;
+          if (swResult?.found?.length > 0) block += `\n  Smart wallets: ${swResult.found.length} found`;
+          else block += `\n  Smart wallets: none`;
+          if (holdResult?.global_fees_sol != null) block += ` | global_fees: ${holdResult.global_fees_sol} SOL`;
+          if (holdResult?.top_10_real_holders_pct != null) block += ` | top10: ${holdResult.top_10_real_holders_pct}%`;
+          if (narrResult?.narrative) block += `\n  Narrative: ${narrResult.narrative.slice(0, 150)}`;
+          if (memResult) block += `\n  Memory: ${memResult}`;
+          return block;
+        }));
+        const validBlocks = blocks.filter(b => b.status === "fulfilled").map(b => b.value);
+        if (validBlocks.length > 0) {
+          candidateBlocks = `\n\nPRE-LOADED CANDIDATES (recon already done — evaluate and deploy the best one):\n${validBlocks.join("\n\n")}\n`;
+        }
+      } catch (e) {
+        log("cron", `Pre-load failed (${e.message}), agent will fetch manually`);
+      }
+
       const { content } = await agentLoop(`
-SCREENING CYCLE — DEPLOY ONLY${memoryHints}
+SCREENING CYCLE — DEPLOY ONLY${memoryHints}${candidateBlocks}
 ${strategyBlock}
-1. get_my_positions first. Only proceed if positions < ${config.risk.maxPositions}.
-2. get_wallet_balance. Proceed if SOL >= ${config.management.minSolToOpen}.
-3. get_top_candidates, pick the best one, and call study_top_lpers.
-4. Call get_pool_memory for the chosen pool. If it has a bad track record (losing avg_pnl_pct, low win_rate), skip and try next candidate.
-5. Call check_smart_wallets_on_pool for the chosen pool.
-   - Smart wallets present → strong confidence boost, proceed to deploy.
-   - For ALL pools (smart wallets or not): call get_token_holders (base mint) and check global_fees_sol.
-     * global_fees_sol = total priority/jito tips paid by ALL traders on this token — NOT Meteora LP fees, do not confuse them.
-     * HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL — low fees = bundled txs or scam token, no exceptions.
-   - No smart wallets → ALSO call get_token_narrative before deciding:
-     * SKIP if: top_10_real_holders_pct > 60% OR bundlers_pct_in_top_100 > 30% OR narrative is empty/null OR narrative is pure hype with no specific story
-     * CAUTION (check organic score + buy/sell pressure before deciding) if: bundlers_pct 15–30% AND top_10 > 40%
-     * DEPLOY if: global_fees_sol >= ${config.screening.minTokenFeesSol}, distribution is healthy AND narrative has a specific origin
-     * Bundlers 5–15% are normal and not a reason to skip on their own — weigh against overall token health
-     * Report global_fees_sol, holder check, and narrative outcome in your reasoning.
-6. If the pool passes all checks: get_active_bin, then deploy_position with ${deployAmount} SOL.
-   - Choose strategy (bid_ask or spot) and bin range based on the token profile table above.
-   - COMPOUNDING: This amount is scaled from your current wallet (${currentBalance?.sol ?? "?"} SOL).
-     As profits accumulate and wallet grows, deploy amount increases automatically. Do NOT override with a smaller amount.
-7. Report result and reasoning including: strategy chosen + why, smart wallet signal, holder check outcome, deploy amount used, and interval set.
+${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, and memory data.
+Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
+HARD SKIP rules still apply:
+- global_fees_sol < ${config.screening.minTokenFeesSol} SOL → skip (bundled/scam)
+- top_10_real_holders_pct > 60% OR bundlers > 30% → skip
+- No smart wallets + empty/hype narrative → skip
+
+Pick the best candidate, then: get_active_bin → calculate_bins → deploy_position with ${deployAmount} SOL.` : `1. get_top_candidates, pick the best one.
+2. check_smart_wallets_on_pool, get_token_holders (check global_fees_sol >= ${config.screening.minTokenFeesSol}), get_token_narrative.
+3. HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL or holders/narrative red flags.
+4. get_active_bin → calculate_bins → deploy_position with ${deployAmount} SOL.`}
+- Choose strategy (bid_ask or spot) and bin range based on the token profile table above.
+- COMPOUNDING: Deploy amount is ${deployAmount} SOL (scaled from wallet: ${currentBalance?.sol ?? "?"} SOL). Do NOT override with a smaller amount.
+- After deploy: update_config setting=managementIntervalMin based on volatility (>=5→3, 2-5→5, <2→10).
+- Report: strategy chosen + why, smart wallet signal, holder check, deploy amount, interval set.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel);
       screenReport = content;
     } catch (error) {

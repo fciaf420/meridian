@@ -47,13 +47,10 @@ function saveState(state) {
 export async function runPnlWatcher() {
   try {
     // Guard: skip if management cycle is currently running
-    if (isManagementBusy()) {
-      log("pnl_watcher", "Skipping — management cycle in progress");
-      return;
-    }
+    if (isManagementBusy()) return;
 
-    // Fetch all open positions (force refresh, bypass cache)
-    const result = await getMyPositions({ force: true });
+    // Fetch positions (use cache if fresh, avoids spamming RPC every 30s)
+    const result = await getMyPositions();
     const positions = result?.positions || [];
 
     if (positions.length === 0) return;

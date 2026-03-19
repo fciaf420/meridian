@@ -117,6 +117,87 @@ export function getPoolMemory({ pool_address }) {
   };
 }
 
+// ─── Mid-position snapshots ─────────────────────────────────────
+
+const MAX_SNAPSHOTS = 48; // ~4 hours at 5-min intervals
+
+/**
+ * Record a live position snapshot for trend analysis.
+ * Called every management cycle for each open position.
+ */
+export function recordPositionSnapshot(poolAddress, snapshot) {
+  if (!poolAddress) return;
+  const db = load();
+  if (!db[poolAddress]) {
+    db[poolAddress] = {
+      name: snapshot.pair || poolAddress.slice(0, 8),
+      base_mint: null,
+      deploys: [],
+      total_deploys: 0,
+      avg_pnl_pct: 0,
+      win_rate: 0,
+      last_deployed_at: null,
+      last_outcome: null,
+      notes: [],
+      snapshots: [],
+    };
+  }
+  const entry = db[poolAddress];
+  if (!entry.snapshots) entry.snapshots = [];
+
+  entry.snapshots.push({
+    ts: new Date().toISOString(),
+    pnl_pct: snapshot.pnl_pct ?? null,
+    in_range: snapshot.in_range ?? null,
+    fees_sol: snapshot.unclaimed_fees_sol ?? null,
+    age_min: snapshot.age_minutes ?? null,
+    oor_min: snapshot.minutes_out_of_range ?? 0,
+  });
+
+  // Keep rolling window
+  if (entry.snapshots.length > MAX_SNAPSHOTS) {
+    entry.snapshots = entry.snapshots.slice(-MAX_SNAPSHOTS);
+  }
+  save(db);
+}
+
+/**
+ * Generate a concise 2-3 line summary for prompt injection.
+ * Includes deploy history + recent PnL trend from snapshots.
+ */
+export function recallForPool(poolAddress) {
+  if (!poolAddress) return null;
+  const db = load();
+  const entry = db[poolAddress];
+  if (!entry) return null;
+
+  const lines = [];
+
+  // Deploy history
+  if (entry.total_deploys > 0) {
+    lines.push(`${entry.name}: ${entry.total_deploys} deploys, avg PnL ${entry.avg_pnl_pct}%, win rate ${(entry.win_rate * 100).toFixed(0)}%, last: ${entry.last_outcome}`);
+  }
+
+  // Recent trend from snapshots (last 6 = ~30 min at 5-min intervals)
+  const snaps = entry.snapshots || [];
+  if (snaps.length >= 2) {
+    const recent = snaps.slice(-6);
+    const first = recent[0];
+    const last = recent[recent.length - 1];
+    const drift = ((last.pnl_pct || 0) - (first.pnl_pct || 0)).toFixed(1);
+    const oorCount = recent.filter(s => !s.in_range).length;
+    lines.push(`Trend (${recent.length} checks): PnL drift ${drift}%, OOR ${oorCount}/${recent.length}`);
+  }
+
+  // Latest note
+  if (entry.notes?.length > 0) {
+    const latest = entry.notes[entry.notes.length - 1];
+    lines.push(`Note: ${latest.note}`);
+  }
+
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
 export function addPoolNote({ pool_address, note }) {
   if (!pool_address) return { error: "pool_address required" };
   if (!note) return { error: "note required" };
