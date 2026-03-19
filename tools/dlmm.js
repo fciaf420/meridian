@@ -603,6 +603,34 @@ export async function closePosition({ position_address }) {
     const positionPubKey = new PublicKey(position_address);
     const positionData = await pool.getPosition(positionPubKey);
 
+    // ─── Snapshot PnL BEFORE closing (position is still on-chain) ───
+    let pnlUsd = 0;
+    let pnlPct = 0;
+    let finalValueUsd = 0;
+    let feesUsd = 0;
+    const trackedPre = getTrackedPosition(position_address);
+    feesUsd = trackedPre?.total_fees_claimed_usd || 0;
+    const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
+    if (cachedPos) {
+      pnlUsd        = cachedPos.pnl_usd   ?? 0;
+      pnlPct        = cachedPos.pnl_pct   ?? 0;
+      finalValueUsd = cachedPos.total_value_usd ?? 0;
+      feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
+    } else {
+      // No cache — fetch fresh from API while position is still open
+      try {
+        const freshPnl = await getPositionPnl({ pool_address: poolAddress, position_address });
+        if (freshPnl && !freshPnl.error) {
+          pnlUsd        = freshPnl.pnl_usd   ?? 0;
+          pnlPct        = freshPnl.pnl_pct   ?? 0;
+          finalValueUsd = freshPnl.current_value_usd ?? 0;
+          feesUsd       = (freshPnl.all_time_fees_usd || 0) + (freshPnl.unclaimed_fee_usd || 0);
+        }
+      } catch (e) {
+        log("close_warn", `Could not snapshot PnL before close: ${e.message}`);
+      }
+    }
+
     const txHashes = [];
 
     // ─── Step 1: Claim Fees (to clear account state) ───────────
@@ -650,33 +678,7 @@ export async function closePosition({ position_address }) {
         minutesOOR = Math.floor((Date.now() - new Date(tracked.out_of_range_since).getTime()) / 60000);
       }
 
-      // Snapshot PnL — try cache first, then fetch fresh from API if cache miss
-      let pnlUsd = 0;
-      let pnlPct = 0;
-      let finalValueUsd = 0;
-      let feesUsd = tracked.total_fees_claimed_usd || 0;
-      const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
-      if (cachedPos) {
-        pnlUsd        = cachedPos.pnl_usd   ?? 0;
-        pnlPct        = cachedPos.pnl_pct   ?? 0;
-        finalValueUsd = cachedPos.total_value_usd ?? 0;
-        feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
-      } else {
-        // No cache — fetch fresh PnL from API (position may still be queryable)
-        try {
-          const freshPnl = await getPositionPnl({ pool_address: poolAddress, position_address });
-          if (freshPnl && !freshPnl.error) {
-            pnlUsd        = freshPnl.pnl_usd   ?? 0;
-            pnlPct        = freshPnl.pnl_pct   ?? 0;
-            finalValueUsd = freshPnl.current_value_usd ?? 0;
-            feesUsd       = (freshPnl.all_time_fees_usd || 0) + (freshPnl.unclaimed_fee_usd || 0);
-          }
-        } catch (e) {
-          log("close_warn", `Could not fetch PnL for performance recording: ${e.message}`);
-        }
-      }
-
-      _positionsCacheAt = 0; // invalidate cache after snapshotting PnL
+      _positionsCacheAt = 0; // invalidate cache
       const initialUsd = tracked.initial_value_usd || 0;
 
       await recordPerformance({
@@ -693,6 +695,8 @@ export async function closePosition({ position_address }) {
         fees_earned_usd: feesUsd,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
+        actual_pnl_usd: pnlUsd,
+        actual_pnl_pct: pnlPct,
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: "agent decision",

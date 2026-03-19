@@ -99,7 +99,7 @@ INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g.
 HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_TP, close immediately):
 - STOP LOSS: Close if PnL drops below ${config.management.stopLossPct}%.
 - TRAILING TAKE PROFIT: Once PnL reaches +${config.management.trailingTriggerPct}%, trailing mode activates. If PnL then drops ${config.management.trailingDropPct}% from peak → close and lock in profit.
-- FIXED TAKE PROFIT: Close when fees earned >= ${config.management.takeProfitFeePct}% of deployed capital.
+- FIXED TAKE PROFIT: Close when total PnL >= ${config.management.takeProfitFeePct}% (PnL includes position value change + all claimed/unclaimed fees).
 
 BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
 
