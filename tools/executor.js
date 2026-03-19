@@ -76,7 +76,7 @@ const toolMap = {
     if (price_range_pct != null) {
       // Convert % range to bin count
       const pct = Math.abs(price_range_pct) / 100;
-      const bins = Math.ceil(Math.log(1 - pct) / Math.log(1 + stepPct));
+      const bins = Math.abs(Math.ceil(Math.log(1 - pct) / Math.log(1 + stepPct)));
       const actualPct = (1 - Math.pow(1 + stepPct, -bins)) * 100;
       return { bin_step, price_range_pct: Math.abs(price_range_pct), bins_needed: bins, actual_range_pct: Math.round(actualPct * 100) / 100, wide_range: bins > 69, per_bin_pct: Math.round(stepPct * 10000) / 100 };
     }

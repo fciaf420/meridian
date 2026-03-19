@@ -119,7 +119,7 @@ export async function deployPosition({
     const poolBinStep = bin_step || 100; // fallback, will be overridden by pool data below
     const stepPct = poolBinStep / 10000;
     const pct = Math.abs(price_range_pct) / 100;
-    bins_below = Math.ceil(Math.log(1 - pct) / Math.log(1 + stepPct));
+    bins_below = Math.abs(Math.ceil(Math.log(1 - pct) / Math.log(1 + stepPct)));
     log("deploy", `Auto-calculated bins_below=${bins_below} from price_range_pct=${price_range_pct}% at bin_step=${poolBinStep}`);
   }
 

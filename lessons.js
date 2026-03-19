@@ -108,6 +108,17 @@ export async function recordPerformance(perf) {
   if (perf.pool) {
     try {
       const { recordPoolDeploy } = await import("./pool-memory.js");
+      // Calculate price_range_pct from bin_range if available
+      let deployRangePct = null;
+      if (perf.bin_range && perf.bin_step) {
+        const bins = typeof perf.bin_range === "object"
+          ? (perf.bin_range.bins_below || 0) + (perf.bin_range.bins_above || 0)
+          : perf.bin_range;
+        if (bins > 0) {
+          const stepPct = perf.bin_step / 10000;
+          deployRangePct = Math.round((1 - Math.pow(1 + stepPct, -bins)) * 1000) / 10;
+        }
+      }
       recordPoolDeploy(perf.pool, {
         pool_name: perf.pool_name,
         base_mint: perf.base_mint,
@@ -120,6 +131,7 @@ export async function recordPerformance(perf) {
         close_reason: perf.close_reason,
         strategy: perf.strategy,
         volatility: perf.volatility,
+        price_range_pct: deployRangePct,
       });
     } catch (e) {
       log("pool-memory", `Failed to record pool deploy: ${e.message}`);

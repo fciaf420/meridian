@@ -60,6 +60,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
     close_reason: deployData.close_reason || null,
     strategy: deployData.strategy || null,
     volatility_at_deploy: deployData.volatility ?? null,
+    price_range_pct: deployData.price_range_pct ?? null,
   };
 
   entry.deploys.push(deploy);
@@ -173,9 +174,11 @@ export function recallForPool(poolAddress) {
 
   const lines = [];
 
-  // Deploy history
+  // Deploy history with range info
   if (entry.total_deploys > 0) {
-    lines.push(`${entry.name}: ${entry.total_deploys} deploys, avg PnL ${entry.avg_pnl_pct}%, win rate ${(entry.win_rate * 100).toFixed(0)}%, last: ${entry.last_outcome}`);
+    const ranges = entry.deploys.map(d => d.price_range_pct).filter(r => r != null);
+    const rangeInfo = ranges.length > 0 ? `, avg range ${(ranges.reduce((a, b) => a + b, 0) / ranges.length).toFixed(0)}%` : "";
+    lines.push(`${entry.name}: ${entry.total_deploys} deploys, avg PnL ${entry.avg_pnl_pct}%, win rate ${(entry.win_rate * 100).toFixed(0)}%${rangeInfo}, last: ${entry.last_outcome}`);
   }
 
   // Recent trend from snapshots (last 6 = ~30 min at 5-min intervals)
