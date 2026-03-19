@@ -163,8 +163,8 @@ WHEN TO USE WHICH:
 HARD RULES:
 - Bin Step: Screening filters apply (config minBinStep/maxBinStep). If user specifies a pool, deploy regardless of bin step.
 
-MANDATORY: Call calculate_bins ONCE before every deploy_position. Pass the returned bin count as bins_below in deploy_position. NEVER pass bins_below=0 — that creates a useless 1-bin position.
-Minimum bins_below for any deploy: 10 (covers ~10% at bin_step 100).
+MANDATORY: Call calculate_bins ONCE with your target % range (25-50%). Pass the returned bin count as bins_below in deploy_position.
+Minimum 20 bins — deploy_position REJECTS anything below 20. Default to 35% range if unsure.
 
 CHOOSING YOUR RANGE:
 1. Call study_top_lpers — see what range and hold time works for successful LPers in that pool
@@ -1087,18 +1087,18 @@ BAD signals: empty/null, pure hype only, completely generic, copy-paste of anoth
     type: "function",
     function: {
       name: "calculate_bins",
-      description: `MANDATORY — call this ONCE before every deploy_position. No exceptions.
-Returns the exact bin count for a target % range at the pool's bin_step.
+      description: `Convert a target % range to bin count for deploy_position.
 
-44 bins at bin_step 50 = only 20% range. 44 bins at bin_step 100 = 36% range. The same bin count means completely different ranges depending on bin_step. NEVER guess.
+RULES:
+1. Call ONCE — pick your target range first (25-50% typical), call once, use the result as bins_below.
+2. DO NOT call multiple times to explore. One call, one result, deploy with it.
+3. Minimum deploy range is 20 bins. deploy_position will REJECT anything below 20.
+4. Default to 35% range if unsure. For volatile tokens use 40-50%.
 
-IMPORTANT: Call this ONCE with your chosen target range. Do NOT call multiple times to "explore" — decide your target % first, then call once to get the bin count. One call is enough.
-
-Examples:
-- calculate_bins(bin_step=100, price_range_pct=50) → 69 bins
-- calculate_bins(bin_step=80, price_range_pct=50) → 86 bins
-- calculate_bins(bin_step=50, price_range_pct=40) → 102 bins
-- calculate_bins(bin_step=50, bin_count=44) → shows it's only 20% range
+Quick reference (bin_step → bins for common ranges):
+  bin_step 80:  25%→36 bins, 35%→55 bins, 50%→87 bins
+  bin_step 100: 25%→29 bins, 35%→43 bins, 50%→69 bins
+  bin_step 125: 25%→23 bins, 35%→34 bins, 50%→55 bins
 
 Also works in reverse: pass bin_count to see what % range it covers.`,
       parameters: {
