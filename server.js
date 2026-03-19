@@ -369,7 +369,7 @@ export function startServer(timersFn) {
             const name = c.name || "unknown";
             const ratio = c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? "?";
             lines.push(
-              `  [${i + 1}] ${name} — fee/aTVL: ${ratio}% | vol: $${((c.volume_window || c.volume_24h || 0) / 1000).toFixed(1)}k | organic: ${c.organic_score}`,
+              `  [${i + 1}] ${name} — fee/aTVL: ${ratio}% | vol: $${((c.volume || 0) / 1000).toFixed(1)}k | organic: ${c.organic_score}`,
             );
           }
           wsSend(ws, {

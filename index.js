@@ -350,7 +350,7 @@ function formatCandidates(candidates) {
   const lines = candidates.map((p, i) => {
     const name   = (p.name || "unknown").padEnd(20);
     const ftvl   = `${p.fee_active_tvl_ratio ?? p.fee_tvl_ratio}%`.padStart(8);
-    const rawVol = p.volume || p.volume_24h || 0;
+    const rawVol = p.volume || 0;
     const vol    = (rawVol >= 1000 ? `$${(rawVol / 1000).toFixed(1)}k` : `$${Math.round(rawVol)}`).padStart(8);
     const active = `${p.active_pct}%`.padStart(6);
     const org    = String(p.organic_score).padStart(4);
