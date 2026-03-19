@@ -219,7 +219,11 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           price_range_pct: {
             type: "number",
-            description: "PREFERRED: Target price range in % (e.g. 35 for 35% drop coverage). Bins are auto-calculated from the pool's bin_step. Use this instead of bins_below. Default 35% if unsure, 40-50% for volatile tokens. Minimum effective range is ~20%."
+            description: "PREFERRED: Target price range in % (e.g. 50 for 50% coverage). Bins are auto-calculated from the pool's bin_step. Use study_top_lpers avg_range_pct or default 35%."
+          },
+          sol_split_pct: {
+            type: "number",
+            description: "For two-sided spot only: % of range on SOL side (below active bin). E.g. 80 = 80% SOL / 20% token. Default 50 (equal split). For bid_ask or SOL-only spot, omit this."
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },

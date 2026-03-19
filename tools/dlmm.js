@@ -98,7 +98,8 @@ export async function deployPosition({
   strategy,
   bins_below,
   bins_above,
-  price_range_pct, // NEW: pass target % range and bins are calculated automatically
+  price_range_pct, // pass target % range and bins are calculated automatically
+  sol_split_pct,   // for two-sided spot: SOL side % of total range (e.g. 80 = 80% below, 20% above). Default 50.
   // optional pool metadata for learning (passed by agent when available)
   pool_name,
   bin_step,
@@ -115,7 +116,7 @@ export async function deployPosition({
   }
 
   // Auto-calculate bins from price_range_pct if provided (no need for separate calculate_bins call)
-  if (price_range_pct != null && bins_below == null) {
+  if (price_range_pct > 0 && !bins_below) {
     const poolBinStep = bin_step || 100; // fallback, will be overridden by pool data below
     const stepPct = poolBinStep / 10000;
     const pct = Math.abs(price_range_pct) / 100;
@@ -123,9 +124,18 @@ export async function deployPosition({
     log("deploy", `Auto-calculated bins_below=${bins_below} from price_range_pct=${price_range_pct}% at bin_step=${poolBinStep}`);
   }
 
-  const activeBinsBelow = bins_below ?? config.strategy.binsBelow;
-  // For spot: only mirror bins if depositing base token (amount_x > 0), otherwise SOL-only = below only
+  // For two-sided spot with price_range_pct + sol_split_pct: split total bins proportionally
   const hasBaseToken = (amount_x ?? 0) > 0;
+  if (price_range_pct > 0 && sol_split_pct != null && hasBaseToken && bins_below && !bins_above) {
+    const totalCalcBins = bins_below; // bins_below was calculated from full range
+    const solPct = Math.min(100, Math.max(0, sol_split_pct)) / 100;
+    bins_below = Math.round(totalCalcBins * solPct);
+    bins_above = totalCalcBins - bins_below;
+    log("deploy", `Split ${sol_split_pct}% SOL / ${100 - sol_split_pct}% token: bins_below=${bins_below}, bins_above=${bins_above}`);
+  }
+
+  const activeBinsBelow = bins_below ?? config.strategy.binsBelow;
+  // For spot: mirror bins if depositing base token and no explicit bins_above
   const activeBinsAbove = bins_above ?? (activeStrategy === "spot" && hasBaseToken ? activeBinsBelow : 0);
 
   // Safety: reject tiny deploys (wastes gas, barely earns fees)
