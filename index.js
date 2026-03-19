@@ -26,7 +26,7 @@ import { startServer } from "./server.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
-log("startup", `Model: ${process.env.LLM_MODEL || "deepseek-chat"}`);
+log("startup", `Model: ${config.llm.managementModel} (provider: ${process.env.LLM_PROVIDER || "openrouter"})`);
 
 // Initialize holographic memory at startup
 initMemory();
@@ -72,6 +72,7 @@ let _cronTasks = [];
 async function runBriefing() {
   log("cron", "Starting morning briefing");
   try {
+    deduplicateLessons();
     const briefing = await generateBriefing();
     emit("briefing", { html: briefing });
     setLastBriefingDate();

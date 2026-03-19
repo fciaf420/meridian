@@ -76,9 +76,9 @@ export const config = {
     temperature: 0.373,
     maxTokens: 4096,
     maxSteps: u.maxSteps ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "deepseek-chat",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "deepseek-reasoner",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "deepseek-chat",
+    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openai/gpt-5.4-nano",
+    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openai/gpt-5.4-nano",
+    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openai/gpt-5.4-nano",
   },
 
   // ─── Web UI ───────────────────────────

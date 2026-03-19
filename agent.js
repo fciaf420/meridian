@@ -11,13 +11,18 @@ import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
 import { getMemoryContext } from "./memory.js";
 import { getLpOverviewSummary } from "./tools/lp-overview.js";
 
-// DeepSeek uses the OpenAI-compatible API
+// Configurable LLM provider: "openrouter" (default) or "deepseek"
+const provider = process.env.LLM_PROVIDER || "openrouter";
 const client = new OpenAI({
-  baseURL: "https://api.deepseek.com",
-  apiKey: process.env.DEEPSEEK_API_KEY,
+  baseURL: provider === "deepseek"
+    ? "https://api.deepseek.com"
+    : "https://openrouter.ai/api/v1",
+  apiKey: provider === "deepseek"
+    ? process.env.DEEPSEEK_API_KEY
+    : process.env.OPENROUTER_API_KEY,
 });
 
-const DEFAULT_MODEL = process.env.LLM_MODEL || "deepseek-chat";
+const DEFAULT_MODEL = process.env.LLM_MODEL || "openai/gpt-5.4-nano";
 
 /**
  * Core ReAct agent loop.
@@ -53,38 +58,47 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
     try {
       const activeModel = model || DEFAULT_MODEL;
 
-      // Retry up to 3 times on transient provider errors (502, 503, 529)
-      const FALLBACK_MODEL = "deepseek-chat";
+      // Retry up to 3 times on transient errors; fallback model on 2nd failure
+      const FALLBACK_MODEL = "deepseek/deepseek-v3.2-speciale";
+      const RETRYABLE = new Set([402, 408, 429, 502, 503, 504, 529]);
       let response;
       let usedModel = activeModel;
       for (let attempt = 0; attempt < 3; attempt++) {
-        response = await client.chat.completions.create({
-          model: usedModel,
-          messages,
-          tools,
-          tool_choice: "auto",
-          temperature: config.llm.temperature,
-          max_tokens: config.llm.maxTokens,
-        });
-        if (response.choices?.length) break;
-        const errCode = response.error?.code;
-        if (errCode === 502 || errCode === 503 || errCode === 529) {
-          const wait = (attempt + 1) * 5000;
-          if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
+        try {
+          response = await client.chat.completions.create({
+            model: usedModel,
+            messages,
+            tools,
+            tool_choice: "auto",
+            temperature: config.llm.temperature,
+            max_tokens: config.llm.maxTokens,
+          });
+          if (response.choices?.length) break;
+          // Response body error (some providers return errors inline)
+          const errCode = response.error?.code || response.error?.status;
+          if (RETRYABLE.has(errCode)) {
+            throw Object.assign(new Error(response.error?.message || `Provider error ${errCode}`), { status: errCode });
+          }
+          break; // non-retryable response error
+        } catch (apiErr) {
+          const status = apiErr.status || apiErr.statusCode;
+          if (!RETRYABLE.has(status)) throw apiErr;
+          // On 2nd failure, switch to fallback model
+          if (attempt >= 1 && usedModel !== FALLBACK_MODEL) {
             usedModel = FALLBACK_MODEL;
-            log("agent", `Switching to fallback model ${FALLBACK_MODEL}`);
+            log("agent", `Primary model failed (${status}), switching to fallback ${FALLBACK_MODEL}`);
           } else {
-            log("agent", `Provider error ${errCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
+            const wait = (attempt + 1) * 5000;
+            log("agent", `Provider error ${status}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
             await new Promise((r) => setTimeout(r, wait));
           }
-        } else {
-          break;
+          response = null; // ensure we retry
         }
       }
 
-      if (!response.choices?.length) {
+      if (!response?.choices?.length) {
         log("error", `Bad API response: ${JSON.stringify(response).slice(0, 200)}`);
-        throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
+        throw new Error(`API returned no choices: ${response?.error?.message || JSON.stringify(response)}`);
       }
       const msg = response.choices[0].message;
       messages.push(msg);
@@ -180,26 +194,35 @@ export async function lightChat(goal, sessionHistory = [], model = null) {
     { role: "user", content: goal },
   ];
 
-  try {
-    const activeModel = model || DEFAULT_MODEL;
-    const response = await client.chat.completions.create({
-      model: activeModel,
-      messages,
-      temperature: config.llm.temperature,
-      max_tokens: config.llm.maxTokens,
-    });
+  const FALLBACK_MODEL = "deepseek/deepseek-v3.2-speciale";
+  const modelsToTry = [model || DEFAULT_MODEL, FALLBACK_MODEL];
 
-    const content = response.choices?.[0]?.message?.content;
-    if (!content || content.trim().includes("[NEED_TOOLS]")) {
-      log("agent", "Light chat escalating to full agent loop");
+  for (const tryModel of modelsToTry) {
+    try {
+      const response = await client.chat.completions.create({
+        model: tryModel,
+        messages,
+        temperature: config.llm.temperature,
+        max_tokens: config.llm.maxTokens,
+      });
+
+      const content = response.choices?.[0]?.message?.content;
+      if (!content || content.trim().includes("[NEED_TOOLS]")) {
+        log("agent", "Light chat escalating to full agent loop");
+        return agentLoop(goal, config.llm.maxSteps, sessionHistory, "GENERAL", model);
+      }
+
+      log("agent", `Light chat answered directly (${tryModel})`);
+      return { content, userMessage: goal };
+    } catch (e) {
+      const status = e.status || e.statusCode;
+      if (tryModel !== FALLBACK_MODEL && (status === 402 || status === 429 || status === 502 || status === 503 || status === 504 || status === 529)) {
+        log("agent", `Light chat primary failed (${status}), trying fallback ${FALLBACK_MODEL}`);
+        continue;
+      }
+      log("agent", `Light chat failed (${e.message}), falling back to full agent loop`);
       return agentLoop(goal, config.llm.maxSteps, sessionHistory, "GENERAL", model);
     }
-
-    log("agent", "Light chat answered directly");
-    return { content, userMessage: goal };
-  } catch (e) {
-    log("agent", `Light chat failed (${e.message}), falling back to full agent loop`);
-    return agentLoop(goal, config.llm.maxSteps, sessionHistory, "GENERAL", model);
   }
 }
 

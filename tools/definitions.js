@@ -418,8 +418,8 @@ Examples:
 - { maxTvl: 50000 }              — tighter TVL cap
 - { binsBelow: 50 }              — narrower bin range
 - { maxPositions: 5 }            — allow more concurrent positions
-- { managementModel: "deepseek-chat" }  — switch management cycle model (also: "claude-sonnet-4-20250514")
-- { screeningModel: "deepseek-chat" }   — switch screening cycle model (also: "claude-sonnet-4-20250514")
+- { managementModel: "openai/gpt-5.4-nano" }  — switch management cycle model (also: "deepseek/deepseek-v3.2-speciale")
+- { screeningModel: "openai/gpt-5.4-nano" }   — switch screening cycle model (also: "deepseek/deepseek-v3.2-speciale")
 - { stopLossPct: -15 }                  — close position if PnL drops below -15%
 - { minTokenFeesSol: 20 }             — lower global fees gate
 - { gasReserve: 0.3 }                 — keep more SOL for gas
