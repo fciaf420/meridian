@@ -143,7 +143,14 @@ const toolMap = {
     }
     return { error: "invalid mode" };
   },
-  update_config: ({ changes, reason }) => {
+  update_config: (args) => {
+    // Handle both { changes: {...}, reason } and flat { key: val, reason }
+    let { changes, reason } = args;
+    if (!changes || typeof changes !== "object") {
+      const { reason: r, ...rest } = args;
+      changes = rest;
+      reason = reason || r;
+    }
     // Flat key → config section mapping (covers everything in config.js)
     const CONFIG_MAP = {
       // screening
@@ -182,6 +189,7 @@ const toolMap = {
       // schedule
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
+      pnlWatcherIntervalSec: ["schedule", "pnlWatcherIntervalSec"],
       // models
       managementModel: ["llm", "managementModel"],
       screeningModel: ["llm", "screeningModel"],
@@ -221,7 +229,7 @@ const toolMap = {
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
     // Restart cron jobs if intervals changed
-    const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
+    const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null || applied.pnlWatcherIntervalSec != null;
     if (intervalChanged && _cronRestarter) {
       _cronRestarter();
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
@@ -231,7 +239,7 @@ const toolMap = {
     // (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
     //  the rule is already in the system prompt, storing it 75+ times is pure noise)
     const lessonsKeys = Object.keys(applied).filter(
-      k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
+      k => k !== "managementIntervalMin" && k !== "screeningIntervalMin" && k !== "pnlWatcherIntervalSec"
     );
     if (lessonsKeys.length > 0) {
       const summary = lessonsKeys.map(k => `${k}=${applied[k]}`).join(", ");

@@ -16,6 +16,7 @@ import { getActiveStrategy } from "./strategy-library.js";
 import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot, maybePromote, checkCapacity } from "./memory.js";
 import { updatePnlAndCheckExits } from "./state.js";
 import { emit } from "./notifier.js";
+import { startPnlWatcher, stopPnlWatcher } from "./pnl-watcher.js";
 import {
   sessionHistory, appendHistory, getHistory,
   isBusy, setBusy,
@@ -102,6 +103,7 @@ async function maybeRunMissedBriefing() {
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
   _cronTasks = [];
+  stopPnlWatcher();
 }
 
 function startCronJobs() {
@@ -148,8 +150,21 @@ function startCronJobs() {
         }
       } catch { /* best-effort */ }
 
+      // Inject recent auto-closes from PnL watcher so LLM knows what happened
+      let autoCloseInfo = "";
+      try {
+        const stateRaw = (await import("fs")).readFileSync("./state.json", "utf8");
+        const stateData = JSON.parse(stateRaw);
+        const recent = (stateData.recentAutoCloses || []).filter(
+          ac => Date.now() - new Date(ac.ts).getTime() < 60 * 60 * 1000 // last hour
+        );
+        if (recent.length > 0) {
+          autoCloseInfo = `\n\nPNL WATCHER AUTO-CLOSES (last hour):\n${recent.map(ac => `• ${ac.pair}: ${ac.reason} (PnL: ${ac.pnl_pct?.toFixed(1)}% at ${ac.ts})`).join("\n")}\n`;
+        }
+      } catch { /* best-effort */ }
+
       const { content } = await agentLoop(`
-MANAGEMENT CYCLE${memoryHints}${exitAlerts}
+MANAGEMENT CYCLE${memoryHints}${exitAlerts}${autoCloseInfo}
 
 1. get_my_positions — check all open positions.
 2. For each position:
@@ -324,7 +339,11 @@ ${strategyBlock}
   }, { timezone: 'UTC' });
 
   _cronTasks = [mgmtTask, screenTask, briefingTask, briefingWatchdog];
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+
+  // Start lightweight PnL watcher (sub-minute interval, no LLM)
+  startPnlWatcher(config.schedule.pnlWatcherIntervalSec);
+
+  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m, pnl watcher every ${config.schedule.pnlWatcherIntervalSec}s`);
 }
 
 // ═══════════════════════════════════════════
@@ -332,6 +351,7 @@ ${strategyBlock}
 // ═══════════════════════════════════════════
 async function shutdown(signal) {
   log("shutdown", `Received ${signal}. Shutting down...`);
+  stopPnlWatcher();
   stopPolling();
   const positions = await getMyPositions();
   log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);

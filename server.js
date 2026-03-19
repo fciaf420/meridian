@@ -286,7 +286,6 @@ export function startServer(timersFn) {
         ts: new Date().toISOString(),
       };
 
-      wsSend(ws, response);
       emit("chat:response", response);
     } catch (err) {
       log("server_error", `Chat handler failed: ${err.message}`);
@@ -420,7 +419,7 @@ export function startServer(timersFn) {
               `Study top LPers across these ${candidates.length} pools by calling study_top_lpers for each:\n\n${poolList}\n\nFor each pool, call study_top_lpers then move to the next. After studying all pools:\n1. Identify patterns across multiple pools.\n2. Derive 4-8 concrete lessons using add_lesson.\n3. Summarize what you learned.`,
               config.llm.maxSteps, [], "GENERAL",
             );
-            wsSend(ws, { type: "chat:response", text: content, ts: new Date().toISOString() });
+            emit("chat:response", { text: content, ts: new Date().toISOString() });
           } finally {
             setBusy(false);
           }
@@ -464,7 +463,6 @@ export function startServer(timersFn) {
               config.llm.maxSteps, [], "SCREENER",
             );
             appendHistory("auto", content);
-            wsSend(ws, { type: "chat:response", text: content, ts: new Date().toISOString() });
             emit("chat:response", { text: content, ts: new Date().toISOString() });
           } finally {
             setBusy(false);
@@ -495,7 +493,6 @@ export function startServer(timersFn) {
                 config.llm.maxSteps, [], "SCREENER",
               );
               appendHistory(`deploy #${pick} ${pool.name}`, content);
-              wsSend(ws, { type: "chat:response", text: content, ts: new Date().toISOString() });
               emit("chat:response", { text: content, ts: new Date().toISOString() });
             } finally {
               setBusy(false);

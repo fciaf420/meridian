@@ -69,6 +69,7 @@ export const config = {
     managementIntervalMin: u.managementIntervalMin ?? 10,
     screeningIntervalMin:  u.screeningIntervalMin  ?? 30,
     healthCheckIntervalMin: 60,
+    pnlWatcherIntervalSec: u.pnlWatcherIntervalSec ?? 30,
   },
 
   // ─── LLM Settings ──────────────────────

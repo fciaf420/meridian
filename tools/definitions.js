@@ -1084,10 +1084,12 @@ BAD signals: empty/null, pure hype only, completely generic, copy-paste of anoth
     type: "function",
     function: {
       name: "calculate_bins",
-      description: `MANDATORY — call this BEFORE every deploy_position. No exceptions.
+      description: `MANDATORY — call this ONCE before every deploy_position. No exceptions.
 Returns the exact bin count for a target % range at the pool's bin_step.
 
 44 bins at bin_step 50 = only 20% range. 44 bins at bin_step 100 = 36% range. The same bin count means completely different ranges depending on bin_step. NEVER guess.
+
+IMPORTANT: Call this ONCE with your chosen target range. Do NOT call multiple times to "explore" — decide your target % first, then call once to get the bin count. One call is enough.
 
 Examples:
 - calculate_bins(bin_step=100, price_range_pct=50) → 69 bins
