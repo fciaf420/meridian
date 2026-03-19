@@ -70,6 +70,24 @@ const toolMap = {
   remove_from_blacklist: removeFromBlacklist,
   list_blacklist: listBlacklist,
   get_performance_history: getPerformanceHistory,
+  calculate_bins: ({ bin_step, price_range_pct, bin_count }) => {
+    if (!bin_step || bin_step <= 0) return { error: "bin_step is required and must be > 0" };
+    const stepPct = bin_step / 10000; // e.g. 100 → 0.01 (1%)
+    if (price_range_pct != null) {
+      // Convert % range to bin count
+      const pct = Math.abs(price_range_pct) / 100;
+      const bins = Math.ceil(Math.log(1 - pct) / Math.log(1 + stepPct));
+      const actualPct = (1 - Math.pow(1 + stepPct, -bins)) * 100;
+      return { bin_step, price_range_pct: Math.abs(price_range_pct), bins_needed: bins, actual_range_pct: Math.round(actualPct * 100) / 100, wide_range: bins > 69, per_bin_pct: Math.round(stepPct * 10000) / 100 };
+    }
+    if (bin_count != null) {
+      // Convert bin count to % range
+      const pct = (1 - Math.pow(1 + stepPct, -bin_count)) * 100;
+      return { bin_step, bin_count, range_pct: Math.round(pct * 100) / 100, wide_range: bin_count > 69, per_bin_pct: Math.round(stepPct * 10000) / 100 };
+    }
+    // Just show per-bin info
+    return { bin_step, per_bin_pct: Math.round(stepPct * 10000) / 100, example_50pct_bins: Math.ceil(Math.log(0.5) / Math.log(1 + stepPct)) };
+  },
   pin_lesson: ({ id }) => pinLesson(id),
   unpin_lesson: ({ id }) => unpinLesson(id),
   list_lessons: ({ role, pinned, tag, limit } = {}) => listLessons({ role, pinned, tag, limit }),

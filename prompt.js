@@ -78,9 +78,9 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital.
      * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
 5. DEPLOY: get_active_bin then deploy_position.
    - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
-   - HARD RULE: Bin steps must be [80-125].
    - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
    - Focus on one high-conviction deployment per cycle.
+   - BIN STEP SCALING: Lower bin_step pools need MORE bins for the same % range. bin_step 20 needs 5x more bins than bin_step 100. Always calculate: bins = ceil(log(1 - pct) / log(1 + bin_step/10000)). Wide ranges (>69 bins) are handled automatically via multi-tx.
 
 SPOT STRATEGY BIN DIRECTION — CRITICAL:
    - SOL (Y / quote) fills bins BELOW the active bin only

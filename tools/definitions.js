@@ -161,15 +161,23 @@ WHEN TO USE WHICH:
 - When unsure → ALWAYS default to bid_ask single-sided. It's the safe choice.
 
 HARD RULES:
-- Bin Step: Only deploy in pools with bin_step between 80 and 125.
+- Bin Step: Screening filters apply (config minBinStep/maxBinStep). If user specifies a pool, deploy regardless of bin step.
 
-BIN RANGE GUIDELINES (when user hasn't specified):
-- Low volatility (<3) → narrow range: 35–45 bins
-- Medium volatility (3–6) → medium range: 45–55 bins
-- High volatility (>6) → wide range: 55–69 bins
-- Wide-range strategies: up to 350 bins. Max 1400 total.
-- To convert a % price range to bins: bins = ceil(log(1 - pct) / log(1 + bin_step/10000))
-  Example: -60% range at bin_step 100 → ceil(log(0.40)/log(1.01)) = 92 bins.
+BIN COUNT vs BIN STEP — CRITICAL MATH:
+Each bin covers (bin_step / 10000) % of price. Lower bin_step = smaller per-bin range = MORE bins needed for the same % coverage.
+- bin_step 100: 1 bin = 1.0% → 50% range ≈ 69 bins
+- bin_step 80:  1 bin = 0.8% → 50% range ≈ 86 bins
+- bin_step 20:  1 bin = 0.2% → 50% range ≈ 347 bins
+
+DO NOT use the same bin count across different bin steps. Always scale bins to match the intended % range.
+Formula: bins = ceil(log(1 - pct) / log(1 + bin_step/10000))
+
+BIN RANGE GUIDELINES (when user hasn't specified — assumes bin_step 100):
+- Low volatility (<3) → 35–45 bins (~30-36% range at bs100)
+- Medium volatility (3–6) → 45–55 bins (~36-42% range at bs100)
+- High volatility (>6) → 55–69 bins (~42-50% range at bs100)
+- For other bin steps: scale proportionally. E.g. bs80 needs 1.25x more bins, bs20 needs 5x more bins.
+- Wide-range strategies: up to 350 bins (auto multi-tx). Max 1400 total.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -1061,6 +1069,42 @@ BAD signals: empty/null, pure hype only, completely generic, copy-paste of anoth
           mint: { type: "string", description: "Token mint address (base58)" }
         },
         required: ["mint"]
+      }
+    }
+  },
+
+  // ─── Bin Calculator ────────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "calculate_bins",
+      description: `Calculate the exact number of bins needed for a given price range % and bin step.
+ALWAYS call this before deploying when you need to convert a % range to bins, especially on low bin_step pools where the math matters most.
+
+Examples:
+- 50% range at bin_step 100 → 69 bins
+- 50% range at bin_step 20  → 347 bins
+- 30% range at bin_step 80  → 45 bins
+
+Also returns the reverse: given a bin count, shows the % range it covers.`,
+      parameters: {
+        type: "object",
+        properties: {
+          bin_step: {
+            type: "number",
+            description: "Pool bin step (e.g. 20, 80, 100, 125)"
+          },
+          price_range_pct: {
+            type: "number",
+            description: "Desired price range in % (e.g. 50 for 50% drop). Provide this OR bin_count."
+          },
+          bin_count: {
+            type: "number",
+            description: "Number of bins. If provided instead of price_range_pct, returns the % range covered."
+          }
+        },
+        required: ["bin_step"]
       }
     }
   }
