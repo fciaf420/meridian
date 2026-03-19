@@ -179,7 +179,6 @@ export async function deployPosition({
     totalXLamports = new BN(Math.floor(finalAmountX * Math.pow(10, decimals)));
   }
 
-  const totalBins = activeBinsBelow + activeBinsAbove;
   const isWideRange = totalBins > 69;
   const newPosition = Keypair.generate();
 
