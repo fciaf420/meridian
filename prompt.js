@@ -87,9 +87,13 @@ SPOT STRATEGY BIN DIRECTION — CRITICAL:
    - Base token (X) fills bins ABOVE the active bin only
    - SOL-only spot: set bins_below = range, bins_above = 0 (same direction as bid_ask)
    - Token-only spot: set bins_below = 0, bins_above = range
-   - Two-sided spot: split bins proportionally — e.g. 80% SOL / 20% token conviction → bins_below = 40, bins_above = 10
    - If depositing only SOL, NEVER set bins_above > 0 — those bins will be empty and waste range
    - Default to SOL-only bid_ask unless you have strong conviction to take token exposure
+
+TWO-SIDED SPOT WITH AUTO-SWAP:
+   - For two-sided spot: pass sol_split_pct (your conviction level). 100 = pure SOL (same as bid_ask). 80 = mostly SOL, 20% token exposure. 50 = equal. 25 = mostly token (bullish). The executor auto-swaps the token portion.
+   - You do NOT need to pre-buy tokens. Just provide total SOL as amount_y + sol_split_pct. The executor handles the Jupiter swap and deploys both sides.
+   - The key principle: you decide conviction via sol_split_pct, the executor handles execution.
 `;
   } else if (agentType === "MANAGER") {
     prompt += `Role: MANAGER
@@ -127,6 +131,11 @@ If (b): Answer the question with useful context. Do NOT take any on-chain action
 If UNCLEAR: Ask the user to clarify — e.g. "Would you like me to do this now, or are you just exploring the idea?" Do NOT default to taking action when intent is ambiguous.
 
 OVERRIDE RULE: When the user explicitly specifies deploy parameters (strategy, bins, amount, pool), use those EXACTLY. Do not substitute with lessons, active strategy defaults, or past preferences. Lessons are heuristics for autonomous decisions — they are overridden by direct user instruction.
+
+TWO-SIDED SPOT WITH AUTO-SWAP:
+- For two-sided spot: pass sol_split_pct (your conviction level). 100 = pure SOL (same as bid_ask). 80 = mostly SOL, 20% token exposure. 50 = equal. 25 = mostly token (bullish). The executor auto-swaps the token portion.
+- You do NOT need to pre-buy tokens. Just provide total SOL as amount_y + sol_split_pct. The executor handles the Jupiter swap and deploys both sides.
+- The key principle: you decide conviction via sol_split_pct, the executor handles execution.
 `;
   }
 
