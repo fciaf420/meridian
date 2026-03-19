@@ -96,17 +96,34 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
           fee_pct_of_capital: (lper.fee_percent * 100).toFixed(2) + "%",
           total_pnl_usd: Math.round(lper.total_pnl),
         },
-        positions: positions.map((p) => ({
-          pool: p.pool,
-          pair: p.pairName || `${p.tokenName0}-${p.tokenName1}`,
-          hold_hours: p.ageHour != null ? Number(p.ageHour?.toFixed(2)) : null,
-          pnl_usd: Math.round(p.pnl?.value || 0),
-          pnl_pct: ((p.pnl?.percent || 0) * 100).toFixed(1) + "%",
-          fee_usd: Math.round(p.collectedFee || 0),
-          in_range_pct: p.inRangePct != null ? Math.round(p.inRangePct * 100) + "%" : null,
-          strategy: p.strategy || null,
-          closed_reason: p.closeReason || null,
-        })),
+        positions: positions.map((p) => {
+          // Calculate price range % from bin data if available
+          const lower = p.tickLower ?? p.lowerBinId;
+          const upper = p.tickUpper ?? p.upperBinId;
+          const bs = p.poolInfo?.tickSpacing ?? p.binStep;
+          let range_pct = null;
+          let range_bins = null;
+          if (lower != null && upper != null) {
+            range_bins = upper - lower;
+            if (bs && range_bins > 0) {
+              const stepPct = bs / 10000;
+              range_pct = Math.round((1 - Math.pow(1 + stepPct, -range_bins)) * 1000) / 10;
+            }
+          }
+          return {
+            pool: p.pool,
+            pair: p.pairName || `${p.tokenName0}-${p.tokenName1}`,
+            hold_hours: p.ageHour != null ? Number(p.ageHour?.toFixed(2)) : null,
+            pnl_usd: Math.round(p.pnl?.value || 0),
+            pnl_pct: ((p.pnl?.percent || 0) * 100).toFixed(1) + "%",
+            fee_usd: Math.round(p.collectedFee || 0),
+            in_range_pct: p.inRangePct != null ? Math.round(p.inRangePct * 100) + "%" : null,
+            range_pct,
+            range_bins,
+            strategy: p.strategy || null,
+            closed_reason: p.closeReason || null,
+          };
+        }),
       });
     } catch {
       // skip failed fetches
@@ -125,6 +142,18 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
     scalper_count: top.filter((l) => l.avg_age_hour < 1).length,
     holder_count: top.filter((l) => l.avg_age_hour >= 4).length,
   };
+
+  // Aggregate range % from all historical positions
+  const allRanges = historicalSamples
+    .flatMap(s => s.positions)
+    .map(p => p.range_pct)
+    .filter(isNum);
+  if (allRanges.length > 0) {
+    patterns.avg_range_pct = Math.round(avg(allRanges) * 10) / 10;
+    patterns.min_range_pct = Math.min(...allRanges);
+    patterns.max_range_pct = Math.max(...allRanges);
+    patterns.recommended_range_pct = `Use price_range_pct=${Math.round(patterns.avg_range_pct)} in deploy_position`;
+  }
 
   return {
     pool: pool_address,
