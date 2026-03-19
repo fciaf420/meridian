@@ -110,10 +110,11 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
     return (data.data || [])[0] || null;
   };
 
-  // Always fetch both the requested timeframe AND 1h for context
-  const [pool, pool1h] = await Promise.all([
+  // Fetch requested timeframe, 1h context, AND OHLCV candles in parallel
+  const [pool, pool1h, ohlcvData] = await Promise.all([
     fetchPool(timeframe),
     timeframe !== "1h" ? fetchPool("1h").catch(() => null) : null,
+    fetchOhlcvSummary(pool_address).catch(() => null),
   ]);
 
   if (!pool) {
@@ -122,7 +123,7 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
 
   const condensed = condensePool(pool);
   condensed.timeframe = timeframe;
-  condensed._summary = `${timeframe} snapshot: volume $${condensed.volume_window || 0}, fee $${condensed.fee_window || 0}, fee/TVL ${condensed.fee_active_tvl_ratio || 0}%, ${condensed.swap_count || 0} swaps`;
+  condensed._summary = `${timeframe}: fee/TVL ${condensed.fee_active_tvl_ratio || 0}%, ${condensed.swap_count || 0} swaps, volatility ${condensed.volatility}`;
 
   // Attach 1h context so LLM can see the bigger picture alongside the 5m snapshot
   if (pool1h) {
@@ -135,7 +136,72 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
     condensed._summary += ` | 1h context: volume $${round(pool1h.volume)}, fee $${round(pool1h.fee)}, fee/TVL ${fix(pool1h.fee_active_tvl_ratio, 4)}%, ${pool1h.swap_count} swaps`;
   }
 
+  // Attach OHLCV summary — definitive "is this pool alive?" signal
+  if (ohlcvData) {
+    condensed.ohlcv_summary = ohlcvData;
+    condensed._summary += ` | OHLCV (${ohlcvData.period}): last 3 vols $${ohlcvData.latest_3_volumes?.join(', $')}, ${ohlcvData.zero_volume_candles}/${ohlcvData.candles} empty, trend ${ohlcvData.volume_trend}, price ${ohlcvData.price_direction}`;
+  }
+
   return condensed;
+}
+
+/**
+ * Fetch OHLCV candles and summarize into actionable signals.
+ * Returns a compact summary the LLM can act on without parsing raw candles.
+ */
+const OHLCV_BASE = "https://dlmm.datapi.meteora.ag/pools";
+
+async function fetchOhlcvSummary(poolAddress, timeframe = "5m") {
+  const res = await fetch(`${OHLCV_BASE}/${poolAddress}/ohlcv?timeframe=${timeframe}`);
+  if (!res.ok) return null;
+
+  const json = await res.json();
+  const candles = json.data || [];
+  if (candles.length === 0) return null;
+
+  const volumes = candles.map(c => c.volume || 0);
+  const closes = candles.map(c => c.close || 0);
+  const zeroCount = volumes.filter(v => v === 0).length;
+  const volAvg = volumes.length > 0 ? Math.round(volumes.reduce((s, v) => s + v, 0) / volumes.length) : 0;
+  const volMin = Math.round(Math.min(...volumes));
+  const volMax = Math.round(Math.max(...volumes));
+
+  // Volume trend: compare first half avg vs second half avg
+  const mid = Math.floor(volumes.length / 2);
+  const firstHalf = volumes.slice(0, mid);
+  const secondHalf = volumes.slice(mid);
+  const firstAvg = firstHalf.reduce((s, v) => s + v, 0) / (firstHalf.length || 1);
+  const secondAvg = secondHalf.reduce((s, v) => s + v, 0) / (secondHalf.length || 1);
+  const volTrend = secondAvg > firstAvg * 1.2 ? "increasing" : secondAvg < firstAvg * 0.8 ? "decreasing" : "stable";
+
+  // Price direction: compare first vs last close
+  const firstClose = closes[0] || 0;
+  const lastClose = closes[closes.length - 1] || 0;
+  const priceChangePct = firstClose > 0 ? ((lastClose - firstClose) / firstClose) * 100 : 0;
+  const priceDir = priceChangePct > 2 ? "up" : priceChangePct < -2 ? "down" : "ranging";
+
+  // Latest candle age
+  const latestCandle = candles[candles.length - 1];
+  const latestTs = latestCandle.timestamp ? latestCandle.timestamp * 1000 : Date.parse(latestCandle.timestamp_str);
+  const ageMs = Date.now() - latestTs;
+  const ageMins = Math.floor(ageMs / 60000);
+  const ageLabel = ageMins <= 0 ? "just now" : `${ageMins} min ago`;
+
+  // Last 3 candle volumes — the LLM sees the actual recent trajectory
+  const latest3 = volumes.slice(-3).map(v => Math.round(v));
+
+  return {
+    timeframe,
+    candles: candles.length,
+    period: `last ${candles.length * (timeframe === "5m" ? 5 : timeframe === "30m" ? 30 : 60)} min`,
+    latest_3_volumes: latest3,
+    zero_volume_candles: zeroCount,
+    volume_trend: volTrend,
+    price_direction: priceDir,
+    price_change_pct: fix(priceChangePct, 2),
+    latest_candle_volume: Math.round(latestCandle.volume || 0),
+    latest_candle_age: ageLabel,
+  };
 }
 
 /**
@@ -160,16 +226,13 @@ function condensePool(p) {
     bin_step: p.dlmm_params?.bin_step || null,
     fee_pct: p.fee_pct,
 
-    // Core metrics (the numbers that matter)
+    // Core metrics
     active_tvl: round(p.active_tvl),
-    fee_window: round(p.fee),
-    volume_window: round(p.volume),
-    // API sometimes returns 0 for fee_active_tvl_ratio on short timeframes — compute from raw values as fallback
     fee_active_tvl_ratio: p.fee_active_tvl_ratio > 0
       ? fix(p.fee_active_tvl_ratio, 4)
       : (p.active_tvl > 0 ? fix((p.fee / p.active_tvl) * 100, 4) : 0),
+    swap_count: p.swap_count,
     volatility: fix(p.volatility, 2),
-
 
     // Token health
     holders: p.base_token_holders,
@@ -188,10 +251,7 @@ function condensePool(p) {
     min_price: p.min_price,
     max_price: p.max_price,
 
-    // Activity trends
-    volume_change_pct: fix(p.volume_change_pct, 1),
-    fee_change_pct: fix(p.fee_change_pct, 1),
-    swap_count: p.swap_count,
+    // Activity
     unique_traders: p.unique_traders,
   };
 }
