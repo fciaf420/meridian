@@ -69,22 +69,97 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
   }
 
   // ── 2. Historical positions for each top LPer ───────────────
+  // Fetch from LP Agent (hold times, PnL, strategy) + Meteora PnL API (bin ranges)
   const historicalSamples = [];
 
   for (const lper of top) {
     try {
       // Small buffer to avoid race conditions on the 5-req limit
-      await sleep(1000); 
+      await sleep(1000);
 
+      // LP Agent: historical positions (strategy, hold time, PnL, fees)
       const histRes = await fetch(
         `${LPAGENT_API}/lp-positions/historical?owner=${lper.owner}&page=1&limit=50`,
         { headers: { "x-api-key": nextKey() } }
       );
+      const lpAgentPositions = histRes.ok ? (await histRes.json()).data || [] : [];
 
-      if (!histRes.ok) continue;
+      // Meteora PnL API: bin range data for this LPer in this pool
+      let meteoraBinMap = {};
+      try {
+        const meteoraRes = await fetch(
+          `https://dlmm.datapi.meteora.ag/positions/${pool_address}/pnl?user=${lper.owner}&status=all&pageSize=50&page=1`
+        );
+        if (meteoraRes.ok) {
+          const meteoraData = await meteoraRes.json();
+          for (const mp of meteoraData.positions || []) {
+            const addr = mp.positionAddress || mp.address;
+            if (addr) meteoraBinMap[addr] = mp;
+          }
+        }
+      } catch { /* best-effort */ }
 
-      const histData = await histRes.json();
-      const positions = histData.data || [];
+      // Merge: LP Agent positions enriched with Meteora bin data
+      // If LP Agent returned nothing, build positions from Meteora data directly
+      const positions = lpAgentPositions.length > 0 ? lpAgentPositions : [];
+      const meteoraOnly = Object.values(meteoraBinMap);
+
+      const mappedPositions = positions.map((p) => {
+        const lower = p.tickLower ?? p.lowerBinId;
+        const upper = p.tickUpper ?? p.upperBinId;
+        const bs = p.poolInfo?.tickSpacing ?? p.binStep;
+        let range_pct = null;
+        let range_bins = null;
+        if (lower != null && upper != null) {
+          range_bins = upper - lower;
+          if (bs && range_bins > 0) {
+            const stepPct = bs / 10000;
+            range_pct = Math.round((1 - Math.pow(1 + stepPct, -range_bins)) * 1000) / 10;
+          }
+        }
+        return {
+          pool: p.pool,
+          pair: p.pairName || `${p.tokenName0}-${p.tokenName1}`,
+          hold_hours: p.ageHour != null ? Number(p.ageHour?.toFixed(2)) : null,
+          pnl_usd: Math.round(p.pnl?.value || 0),
+          pnl_pct: ((p.pnl?.percent || 0) * 100).toFixed(1) + "%",
+          fee_usd: Math.round(p.collectedFee || 0),
+          in_range_pct: p.inRangePct != null ? Math.round(p.inRangePct * 100) + "%" : null,
+          range_pct,
+          range_bins,
+          strategy: p.strategy || null,
+          closed_reason: p.closeReason || null,
+        };
+      });
+
+      // If LP Agent had no positions, use Meteora data to build range-focused entries
+      if (mappedPositions.length === 0 && meteoraOnly.length > 0) {
+        for (const mp of meteoraOnly) {
+          const range_bins = (mp.upperBinId || 0) - (mp.lowerBinId || 0);
+          let range_pct = null;
+          // Pool bin_step from the top-lpers response isn't directly available,
+          // but we can infer from the Meteora response price data or use a default
+          // For now, try to get it from pool metadata if available
+          if (range_bins > 0) {
+            // Approximate: use the price ratio to estimate bin_step
+            // Or just report raw bins and let the model see the pattern
+            range_pct = range_bins; // Will be replaced below if we can calculate
+          }
+          mappedPositions.push({
+            pool: pool_address,
+            pair: null,
+            hold_hours: mp.closedAt && mp.createdAt ? Math.round((mp.closedAt - mp.createdAt) / 3600 * 100) / 100 : null,
+            pnl_usd: mp.pnlUsd ? Math.round(parseFloat(mp.pnlUsd)) : null,
+            pnl_pct: mp.pnlPctChange ? parseFloat(mp.pnlPctChange).toFixed(1) + "%" : null,
+            fee_usd: mp.allTimeFees?.total?.usd ? Math.round(parseFloat(mp.allTimeFees.total.usd)) : null,
+            in_range_pct: null,
+            range_bins,
+            range_pct: null, // need bin_step to calculate — set below
+            strategy: null,
+            closed_reason: mp.isClosed ? "closed" : "open",
+          });
+        }
+      }
 
       historicalSamples.push({
         owner: lper.owner.slice(0, 8) + "...",
@@ -96,39 +171,30 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
           fee_pct_of_capital: (lper.fee_percent * 100).toFixed(2) + "%",
           total_pnl_usd: Math.round(lper.total_pnl),
         },
-        positions: positions.map((p) => {
-          // Calculate price range % from bin data if available
-          const lower = p.tickLower ?? p.lowerBinId;
-          const upper = p.tickUpper ?? p.upperBinId;
-          const bs = p.poolInfo?.tickSpacing ?? p.binStep;
-          let range_pct = null;
-          let range_bins = null;
-          if (lower != null && upper != null) {
-            range_bins = upper - lower;
-            if (bs && range_bins > 0) {
-              const stepPct = bs / 10000;
-              range_pct = Math.round((1 - Math.pow(1 + stepPct, -range_bins)) * 1000) / 10;
-            }
-          }
-          return {
-            pool: p.pool,
-            pair: p.pairName || `${p.tokenName0}-${p.tokenName1}`,
-            hold_hours: p.ageHour != null ? Number(p.ageHour?.toFixed(2)) : null,
-            pnl_usd: Math.round(p.pnl?.value || 0),
-            pnl_pct: ((p.pnl?.percent || 0) * 100).toFixed(1) + "%",
-            fee_usd: Math.round(p.collectedFee || 0),
-            in_range_pct: p.inRangePct != null ? Math.round(p.inRangePct * 100) + "%" : null,
-            range_pct,
-            range_bins,
-            strategy: p.strategy || null,
-            closed_reason: p.closeReason || null,
-          };
-        }),
+        positions: mappedPositions,
       });
     } catch {
       // skip failed fetches
     }
   }
+
+  // ── 2b. Calculate range_pct for Meteora-sourced positions using pool bin_step ──
+  // We need the pool's bin_step — fetch once from the pool detail
+  try {
+    const { getPoolDetail } = await import("./screening.js");
+    const poolDetail = await getPoolDetail({ pool_address, timeframe: "1h" }).catch(() => null);
+    const poolBinStep = poolDetail?.bin_step;
+    if (poolBinStep) {
+      const stepPct = poolBinStep / 10000;
+      for (const sample of historicalSamples) {
+        for (const pos of sample.positions) {
+          if (pos.range_bins > 0 && pos.range_pct == null) {
+            pos.range_pct = Math.round((1 - Math.pow(1 + stepPct, -pos.range_bins)) * 1000) / 10;
+          }
+        }
+      }
+    }
+  } catch { /* best-effort */ }
 
   // ── 3. Aggregate patterns ────────────────────────────────────
   const patterns = {

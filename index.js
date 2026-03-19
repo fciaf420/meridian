@@ -363,14 +363,17 @@ HARD SKIP rules still apply:
 - top_10_real_holders_pct > 60% OR bundlers > 30% → skip
 - No smart wallets + empty/hype narrative → skip
 
-Pick the best candidate, then: get_active_bin → calculate_bins → deploy_position with ${deployAmount} SOL.` : `1. get_top_candidates, pick the best one.
+Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL.
+Use study_top_lpers patterns.recommended_range_pct or patterns.avg_range_pct as your price_range_pct in deploy_position.
+If no range data available, default to price_range_pct=35.` : `1. get_top_candidates, pick the best one.
 2. check_smart_wallets_on_pool, get_token_holders (check global_fees_sol >= ${config.screening.minTokenFeesSol}), get_token_narrative.
 3. HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL or holders/narrative red flags.
-4. get_active_bin → calculate_bins → deploy_position with ${deployAmount} SOL.`}
-- Choose strategy (bid_ask or spot) and bin range based on the token profile table above.
+4. study_top_lpers → use patterns.avg_range_pct as price_range_pct in deploy_position. Default 35% if no data.
+5. deploy_position with ${deployAmount} SOL and price_range_pct from study.`}
+- RANGE: Use the avg_range_pct from study_top_lpers as your price_range_pct. This is what profitable LPers use in that pool. If unavailable, default to 35%.
 - COMPOUNDING: Deploy amount is ${deployAmount} SOL (scaled from wallet: ${currentBalance?.sol ?? "?"} SOL). Do NOT override with a smaller amount.
 - After deploy: update_config setting=managementIntervalMin based on volatility (>=5→3, 2-5→5, <2→10).
-- Report: strategy chosen + why, smart wallet signal, holder check, deploy amount, interval set.
+- Report: strategy chosen + why, price_range_pct used + source (study data or default), deploy amount, interval set.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel);
       screenReport = content;
     } catch (error) {
