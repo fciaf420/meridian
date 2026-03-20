@@ -106,6 +106,12 @@ export interface LpOverviewData {
   total_pools: number;
 }
 
+export interface QuickActionResult {
+  action: string;
+  data: unknown;
+  error?: string;
+}
+
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -118,6 +124,7 @@ export function useWebSocket() {
   const [wallet, setWallet] = useState<WalletData | null>(null);
   const [candidates, setCandidates] = useState<CandidateData | null>(null);
   const [lpOverview, setLpOverview] = useState<LpOverviewData | null>(null);
+  const [quickActionResult, setQuickActionResult] = useState<QuickActionResult | null>(null);
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -176,6 +183,12 @@ export function useWebSocket() {
           case "candidates":
             if (isCandidateData(msg.data)) setCandidates(msg.data);
             break;
+          case "quick-action:result":
+            setQuickActionResult({ action: msg.action, data: msg.data });
+            break;
+          case "quick-action:error":
+            setQuickActionResult({ action: msg.action, data: null, error: msg.error || "Unknown error" });
+            break;
           case "error":
             setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${msg.text}`, ts: new Date().toISOString() }]);
             break;
@@ -205,5 +218,15 @@ export function useWebSocket() {
     }
   }, []);
 
-  return { connected, messages, notifications, status, timers, positions, wallet, candidates, lpOverview, sendMessage };
+  const sendQuickAction = useCallback((action: string) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    setQuickActionResult(null);
+    wsRef.current.send(JSON.stringify({ type: "quick-action", action }));
+  }, []);
+
+  const clearQuickActionResult = useCallback(() => {
+    setQuickActionResult(null);
+  }, []);
+
+  return { connected, messages, notifications, status, timers, positions, wallet, candidates, lpOverview, sendMessage, sendQuickAction, quickActionResult, clearQuickActionResult };
 }

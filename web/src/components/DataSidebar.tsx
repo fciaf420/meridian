@@ -1,4 +1,4 @@
-import type { PositionData, WalletData, CandidateData, Notification, StatusInfo, LpOverviewData } from "../hooks/useWebSocket";
+import type { PositionData, WalletData, CandidateData, Notification, StatusInfo, LpOverviewData, QuickActionResult } from "../hooks/useWebSocket";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import DashboardTab from "./DashboardTab";
@@ -13,9 +13,12 @@ interface DataSidebarProps {
   status: StatusInfo;
   lpOverview: LpOverviewData | null;
   onCommand: (text: string) => void;
+  sendQuickAction: (action: string) => void;
+  quickActionResult: QuickActionResult | null;
+  clearQuickActionResult: () => void;
 }
 
-export default function DataSidebar({ positions, wallet, candidates, notifications, lpOverview, onCommand }: DataSidebarProps) {
+export default function DataSidebar({ positions, wallet, candidates, notifications, lpOverview, onCommand, sendQuickAction, quickActionResult, clearQuickActionResult }: DataSidebarProps) {
   const activeAlerts = positions?.positions.filter((position) => !position.in_range).length ?? 0;
   const openPositions = positions?.total_positions ?? 0;
 
@@ -48,7 +51,7 @@ export default function DataSidebar({ positions, wallet, candidates, notificatio
       </TabsList>
 
       <TabsContent value="dashboard" className="flex-1">
-        <DashboardTab positions={positions} wallet={wallet} lpOverview={lpOverview} />
+        <DashboardTab positions={positions} wallet={wallet} lpOverview={lpOverview} sendQuickAction={sendQuickAction} quickActionResult={quickActionResult} clearQuickActionResult={clearQuickActionResult} />
       </TabsContent>
 
       <TabsContent value="candidates" className="flex-1">

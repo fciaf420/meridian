@@ -25,7 +25,8 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { getLpOverview } from "./tools/lp-overview.js";
 import { generateBriefing } from "./briefing.js";
-import { getPerformanceSummary, evolveThresholds } from "./lessons.js";
+import { getPerformanceSummary, getPerformanceHistory, listLessons, evolveThresholds } from "./lessons.js";
+import { getMemoryContext } from "./memory.js";
 import { log } from "./logger.js";
 import { getScreeningThresholdSummary, normalizeCandidatesPayload } from "./runtime-helpers.js";
 
@@ -237,7 +238,9 @@ export function startServer(timersFn) {
         return;
       }
 
-      if (msg.type === "chat") {
+      if (msg.type === "quick-action") {
+        await handleQuickAction(ws, msg.action);
+      } else if (msg.type === "chat") {
         await handleChat(ws, wss, msg.text);
       } else if (msg.type === "command") {
         await handleCommand(ws, msg.command);
@@ -502,6 +505,61 @@ export function startServer(timersFn) {
     } catch (err) {
       log("server_error", `Command "${command}" failed: ${err.message}`);
       wsSend(ws, { type: "error", text: `Error: ${err.message}` });
+    }
+  }
+
+  // ═══════════════════════════════════════════
+  //  QUICK-ACTION HANDLER
+  // ═══════════════════════════════════════════
+
+  async function handleQuickAction(ws, action) {
+    if (!action || typeof action !== "string") {
+      wsSend(ws, { type: "quick-action:error", action: action ?? "unknown", error: "Invalid action" });
+      return;
+    }
+
+    try {
+      let data;
+      switch (action) {
+        case "top-pools": {
+          const result = await getTopCandidates({ limit: 10 });
+          data = result.candidates ?? result;
+          break;
+        }
+        case "recent-closes": {
+          const result = getPerformanceHistory({ hours: 24, limit: 10 });
+          data = result;
+          break;
+        }
+        case "lessons": {
+          data = listLessons({ limit: 20 });
+          break;
+        }
+        case "memory": {
+          data = getMemoryContext();
+          break;
+        }
+        case "settings": {
+          const raw = fs.readFileSync(path.join(__dirname, "user-config.json"), "utf8");
+          data = JSON.parse(raw);
+          break;
+        }
+        case "briefing": {
+          data = await generateBriefing();
+          break;
+        }
+        case "performance": {
+          data = getPerformanceSummary();
+          break;
+        }
+        default:
+          wsSend(ws, { type: "quick-action:error", action, error: `Unknown action: ${action}` });
+          return;
+      }
+      wsSend(ws, { type: "quick-action:result", action, data });
+    } catch (err) {
+      log("server_error", `Quick-action "${action}" failed: ${err.message}`);
+      wsSend(ws, { type: "quick-action:error", action, error: err.message });
     }
   }
 
