@@ -28,6 +28,7 @@ export interface PositionInfo {
   position: string;
   pair: string;
   pool: string;
+  base_mint?: string | null;
   strategy?: "bid_ask" | "spot";
   in_range: boolean;
   active_bin: number;

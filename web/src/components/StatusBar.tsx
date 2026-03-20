@@ -33,17 +33,17 @@ export default function StatusBar({ connected, status, timers, wallet }: StatusB
 
   return (
     <TooltipProvider delayDuration={300}>
-      <div className="flex items-center gap-4 px-4 py-2.5 border-b border-teal/30 bg-teal/60 backdrop-blur-sm text-xs">
+      <div className="flex items-center gap-4 border-b border-white/8 bg-[linear-gradient(180deg,rgba(18,69,89,0.82),rgba(9,43,56,0.82))] px-4 py-2.5 text-xs shadow-[0_10px_28px_rgba(0,0,0,0.18)] backdrop-blur-sm">
         {/* Connection */}
         <Tooltip>
           <TooltipTrigger asChild>
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5 font-medium">
               {connected ? (
-                <Wifi size={14} className="text-steel" />
+                <Wifi size={14} className="text-emerald-300" />
               ) : (
-                <WifiOff size={14} className="text-cream/50" />
+                <WifiOff size={14} className="text-ash/58" />
               )}
-              <span className={connected ? "text-steel" : "text-cream/50"}>
+              <span className={connected ? "text-cream" : "text-ash/70"}>
                 {connected ? "Connected" : "Disconnected"}
               </span>
             </div>
@@ -57,7 +57,7 @@ export default function StatusBar({ connected, status, timers, wallet }: StatusB
         <div className="flex items-center gap-3 text-ash">
           <Tooltip>
             <TooltipTrigger asChild>
-              <span className="font-mono text-[11px] uppercase">
+              <span className="font-mono text-[11px] uppercase tracking-[0.14em]">
                 MGT:{" "}
                 {timers.management === "--" ? (
                   <Skeleton className="h-3 w-8 inline-block" />
@@ -71,7 +71,7 @@ export default function StatusBar({ connected, status, timers, wallet }: StatusB
 
           <Tooltip>
             <TooltipTrigger asChild>
-              <span className="font-mono text-[11px] uppercase">
+              <span className="font-mono text-[11px] uppercase tracking-[0.14em]">
                 SCR:{" "}
                 {timers.screening === "--" ? (
                   <Skeleton className="h-3 w-8 inline-block" />
@@ -89,12 +89,12 @@ export default function StatusBar({ connected, status, timers, wallet }: StatusB
         {/* Wallet */}
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="font-mono text-[11px] text-ash">
+            <span className="font-mono text-[11px] text-ash tracking-[0.14em]">
               SOL:{" "}
               {wallet ? (
                 <>
                   <span className="text-cream">{wallet.sol.toFixed(3)}</span>
-                  <span className="text-ash/60 ml-1">(${wallet.sol_usd.toFixed(0)})</span>
+                  <span className="ml-1 text-ash/72">(${wallet.sol_usd.toFixed(0)})</span>
                 </>
               ) : (
                 <Skeleton className="h-3 w-14 inline-block" />
@@ -110,9 +110,9 @@ export default function StatusBar({ connected, status, timers, wallet }: StatusB
         {(status.busy || status.managementBusy || status.screeningBusy) && (
           <Tooltip>
             <TooltipTrigger asChild>
-              <div className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-steel animate-subtle-glow" />
-                <span className="font-mono text-[11px] text-steel">{busyLabel}</span>
+              <div className="flex items-center gap-1.5 rounded-full border border-emerald-300/15 bg-emerald-300/8 px-2.5 py-1">
+                <span className="h-2 w-2 rounded-full bg-emerald-300 animate-subtle-glow" />
+                <span className="font-mono text-[11px] text-emerald-200">{busyLabel}</span>
               </div>
             </TooltipTrigger>
             <TooltipContent>{busyTooltip}</TooltipContent>

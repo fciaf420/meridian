@@ -29,22 +29,25 @@ export default function App() {
   }, [sendMessage]);
 
   return (
-    <div className="h-screen flex flex-col">
+    <div className="flex min-h-screen flex-col bg-transparent">
       <StatusBar connected={connected} status={status} timers={timers} wallet={wallet} />
 
-      <div className="flex flex-1 overflow-hidden">
+      <div className="relative flex flex-1 flex-col overflow-hidden lg:flex-row">
         {/* Chat panel */}
-        <div className="flex-[55] border-r border-teal/30 flex flex-col">
+        <div className="flex min-h-[45vh] flex-col border-b border-white/8 bg-[linear-gradient(180deg,rgba(2,24,33,0.72),rgba(0,15,20,0.82))] lg:min-h-0 lg:flex-[1.08] lg:border-b-0 lg:border-r">
           <ChatPanel
             messages={messages}
             status={status}
+            timers={timers}
+            positions={positions}
+            candidates={candidates}
             onSend={sendMessage}
             onOpenCommandPalette={() => setCmdOpen(true)}
           />
         </div>
 
         {/* Data Sidebar */}
-        <div className="flex-[45] flex flex-col overflow-hidden">
+        <div className="flex flex-col overflow-hidden bg-[linear-gradient(180deg,rgba(8,31,40,0.54),rgba(0,15,20,0.72))] lg:flex-[0.92]">
           <DataSidebar
             positions={positions}
             wallet={wallet}
@@ -52,6 +55,7 @@ export default function App() {
             notifications={notifications}
             status={status}
             lpOverview={lpOverview}
+            onCommand={sendMessage}
           />
         </div>
       </div>

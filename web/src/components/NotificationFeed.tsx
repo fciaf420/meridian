@@ -8,17 +8,19 @@ type BadgeVariant = "default" | "secondary" | "destructive" | "outline";
 
 const EVENT_STYLES: Record<
   string,
-  { label: string; badge: BadgeVariant; card: string }
+  { label: string; badge: BadgeVariant; card: string; sweep?: string }
 > = {
   deploy: {
     label: "Deployed",
     badge: "default",
     card: "bg-steel/10 border-steel/20",
+    sweep: "notif-sweep notif-sweep--amber",
   },
   close: {
     label: "Closed",
     badge: "secondary",
     card: "bg-teal/20 border-steel/15",
+    sweep: "notif-sweep notif-sweep--emerald",
   },
   out_of_range: {
     label: "Out of Range",
@@ -77,6 +79,7 @@ export default function NotificationFeed({ notifications }: NotificationFeedProp
             label: n.event,
             badge: "outline" as BadgeVariant,
             card: "bg-steel/10 border-steel/20",
+            sweep: "",
           };
           const time = new Date(n.ts).toLocaleTimeString();
           const fullText = getFullText(n);
@@ -87,7 +90,7 @@ export default function NotificationFeed({ notifications }: NotificationFeedProp
           return (
             <div
               key={n.id}
-              className={`rounded-lg border p-3 text-xs ${style.card} animate-slide-in-right hover:shadow-[0_2px_8px_rgba(89,131,146,0.15)] transition-all`}
+              className={`relative overflow-hidden rounded-[20px] border p-3 text-xs ${style.card} ${style.sweep ?? ""} animate-slide-in-right transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_24px_rgba(89,131,146,0.18)]`}
             >
               <div className="flex items-center justify-between mb-1">
                 <Badge variant={style.badge}>{style.label}</Badge>
