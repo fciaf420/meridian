@@ -27,6 +27,7 @@ import { getLpOverview } from "./tools/lp-overview.js";
 import { generateBriefing } from "./briefing.js";
 import { getPerformanceSummary, evolveThresholds } from "./lessons.js";
 import { log } from "./logger.js";
+import { getScreeningThresholdSummary, normalizeCandidatesPayload } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distPath = path.join(__dirname, "web", "dist");
@@ -104,7 +105,7 @@ export function startServer(timersFn) {
   app.get("/api/candidates", async (_req, res) => {
     try {
       const result = await getTopCandidates({ limit: 5 });
-      res.json(result);
+      res.json(normalizeCandidatesPayload(result));
     } catch (err) {
       log("server_error", `GET /api/candidates failed: ${err.message}`);
       res.status(500).json({ error: err.message });
@@ -149,7 +150,7 @@ export function startServer(timersFn) {
   on("cycle:screening", async (data) => {
     broadcast(wss, { type: "notification", event: "cycle:screening", data });
     const cands = await getTopCandidates({ limit: 5 }).catch(() => null);
-    if (cands) broadcast(wss, { type: "candidates", data: cands });
+    if (cands) broadcast(wss, { type: "candidates", data: normalizeCandidatesPayload(cands) });
   });
 
   // Also broadcast fresh data after deploy/close events
@@ -222,7 +223,7 @@ export function startServer(timersFn) {
       },
       positions: positions.status === "fulfilled" ? positions.value : null,
       wallet: wallet.status === "fulfilled" ? wallet.value : null,
-      candidates: candidateResult.status === "fulfilled" ? candidateResult.value : null,
+      candidates: candidateResult.status === "fulfilled" ? normalizeCandidatesPayload(candidateResult.value) : null,
       lpOverview: lpOverviewResult.status === "fulfilled" ? lpOverviewResult.value : null,
     });
 
@@ -380,17 +381,10 @@ export function startServer(timersFn) {
         }
 
         case "/thresholds": {
-          const s = config.screening;
-          const lines = [
-            "Current screening thresholds:",
-            `  maxVolatility:     ${s.maxVolatility ?? "n/a"}`,
-            `  minFeeTvlRatio:    ${s.minFeeActiveTvlRatio}`,
-            `  minOrganic:        ${s.minOrganic}`,
-            `  minHolders:        ${s.minHolders}`,
-            `  maxPriceChangePct: ${s.maxPriceChangePct ?? "n/a"}`,
-            `  timeframe:         ${s.timeframe}`,
-            `  minTokenFeesSol:   ${s.minTokenFeesSol}`,
-          ];
+          const lines = ["Current screening thresholds:"];
+          for (const [label, value] of getScreeningThresholdSummary(config.screening)) {
+            lines.push(`  ${label}: ${value ?? "n/a"}`);
+          }
           const perf = getPerformanceSummary();
           if (perf) {
             lines.push("", `  Based on ${perf.total_positions_closed} closed positions`);

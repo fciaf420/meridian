@@ -9,6 +9,7 @@ import readline from "readline";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -159,7 +160,10 @@ const maxPositions = await askNum(
 
 const minSolToOpen = await askNum(
   "Min SOL balance to open a new position",
-  e("minSolToOpen", parseFloat((deployAmountSol + 0.05).toFixed(3))),
+  e("minSolToOpen", getEffectiveMinSolToOpen({
+    deployAmountSol,
+    gasReserve: e("gasReserve", 0.2),
+  })),
   { min: 0.05 }
 );
 

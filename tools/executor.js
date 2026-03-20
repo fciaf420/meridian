@@ -23,6 +23,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { execSync, spawn } from "child_process";
+import { CONFIG_KEY_MAP, getRequiredSolBalance } from "../runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
@@ -162,59 +163,11 @@ const toolMap = {
       changes = rest;
       reason = r;
     }
-    // Flat key → config section mapping (covers everything in config.js)
-    const CONFIG_MAP = {
-      // screening
-      minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
-      minTvl: ["screening", "minTvl"],
-      maxTvl: ["screening", "maxTvl"],
-      minVolume: ["screening", "minVolume"],
-      minOrganic: ["screening", "minOrganic"],
-      minHolders: ["screening", "minHolders"],
-      minMcap: ["screening", "minMcap"],
-      maxMcap: ["screening", "maxMcap"],
-      minBinStep: ["screening", "minBinStep"],
-      maxBinStep: ["screening", "maxBinStep"],
-      timeframe: ["screening", "timeframe"],
-      category: ["screening", "category"],
-      minTokenFeesSol: ["screening", "minTokenFeesSol"],
-      // management
-      minClaimAmount: ["management", "minClaimAmount"],
-      outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
-      outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
-      minVolumeToRebalance: ["management", "minVolumeToRebalance"],
-      emergencyPriceDropPct: ["management", "emergencyPriceDropPct"],
-      stopLossPct: ["management", "stopLossPct"],
-      takeProfitFeePct: ["management", "takeProfitFeePct"],
-      trailingTakeProfit: ["management", "trailingTakeProfit"],
-      trailingTriggerPct: ["management", "trailingTriggerPct"],
-      trailingDropPct: ["management", "trailingDropPct"],
-      minSolToOpen: ["management", "minSolToOpen"],
-      deployAmountSol: ["management", "deployAmountSol"],
-      gasReserve: ["management", "gasReserve"],
-      positionSizePct: ["management", "positionSizePct"],
-      pnlUnit: ["management", "pnlUnit"],
-      // risk
-      maxPositions: ["risk", "maxPositions"],
-      maxDeployAmount: ["risk", "maxDeployAmount"],
-      // schedule
-      managementIntervalMin: ["schedule", "managementIntervalMin"],
-      screeningIntervalMin: ["schedule", "screeningIntervalMin"],
-      pnlWatcherIntervalSec: ["schedule", "pnlWatcherIntervalSec"],
-      // models
-      managementModel: ["llm", "managementModel"],
-      screeningModel: ["llm", "screeningModel"],
-      generalModel: ["llm", "generalModel"],
-      // strategy
-      minBinStep: ["strategy", "minBinStep"],
-      binsBelow: ["strategy", "binsBelow"],
-    };
-
     const applied = {};
     const unknown = [];
 
     for (const [key, val] of Object.entries(changes)) {
-      if (!CONFIG_MAP[key]) { unknown.push(key); continue; }
+      if (!CONFIG_KEY_MAP[key]) { unknown.push(key); continue; }
       applied[key] = val;
     }
 
@@ -224,7 +177,7 @@ const toolMap = {
 
     // Apply to live config immediately
     for (const [key, val] of Object.entries(applied)) {
-      const [section, field] = CONFIG_MAP[key];
+      const [section, field] = CONFIG_KEY_MAP[key];
       const before = config[section][field];
       config[section][field] = val;
       log("config", `update_config: config.${section}.${field} ${before} → ${val} (verify: ${config[section][field]})`);
@@ -344,13 +297,24 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      let effectiveBinStep = args.bin_step;
+      if (effectiveBinStep == null && args.pool_address) {
+        try {
+          const { getPoolDetail } = await import("./screening.js");
+          const poolDetail = await getPoolDetail({ pool_address: args.pool_address });
+          effectiveBinStep = poolDetail?.bin_step ?? null;
+        } catch {
+          effectiveBinStep = null;
+        }
+      }
+
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
-      if (args.bin_step != null && (args.bin_step < minStep || args.bin_step > maxStep)) {
+      if (effectiveBinStep != null && (effectiveBinStep < minStep || effectiveBinStep > maxStep)) {
         return {
           pass: false,
-          reason: `bin_step ${args.bin_step} is outside the allowed range of [${minStep}-${maxStep}].`,
+          reason: `bin_step ${effectiveBinStep} is outside the allowed range of [${minStep}-${maxStep}].`,
         };
       }
 
@@ -412,7 +376,7 @@ async function runSafetyChecks(name, args) {
       // Check SOL balance — must have enough to deploy + gas reserve
       const balance = await getWalletBalances();
       const gasReserve = config.management.gasReserve ?? 0.05;
-      const minRequired = amountY + gasReserve;
+      const minRequired = getRequiredSolBalance({ deployAmountSol: amountY, gasReserve });
       if (balance.sol < minRequired) {
         return {
           pass: false,

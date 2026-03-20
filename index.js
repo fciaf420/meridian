@@ -27,6 +27,7 @@ import {
   isScreeningBusy, setScreeningBusy,
 } from "./session.js";
 import { startServer } from "./server.js";
+import { getScreeningThresholdSummary, getStartupMode } from "./runtime-helpers.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -453,12 +454,37 @@ function formatCandidates(candidates) {
 //  INTERACTIVE REPL
 // ═══════════════════════════════════════════
 const isTTY = process.stdin.isTTY;
+const runtimeMode = getStartupMode({ isTTY });
 let cronStarted = false;
+let serverStarted = false;
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
 registerCronRestarter(() => { if (cronStarted) startCronJobs(); });
 
-if (isTTY) {
+function ensureServerStarted() {
+  if (serverStarted || !runtimeMode.startServer) return;
+  serverStarted = true;
+  startServer(() => ({
+    management: formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin)),
+    screening:  formatCountdown(nextRunIn(timers.screeningLastRun,  config.schedule.screeningIntervalMin)),
+  })).catch((e) => log("server_error", `Web server failed to start: ${e.message}`));
+}
+
+function launchCron(options = {}) {
+  if (!cronStarted && runtimeMode.startCron) {
+    cronStarted = true;
+    timers.managementLastRun = Date.now();
+    timers.screeningLastRun = Date.now();
+    startCronJobs();
+    if (options.announce) {
+      console.log("Autonomous cycles are now running.\n");
+    }
+  }
+}
+
+ensureServerStarted();
+
+if (runtimeMode.interactive) {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -472,19 +498,6 @@ if (isTTY) {
       rl.prompt(true); // true = preserve current line
     }
   }, 10_000);
-
-  function launchCron() {
-    if (!cronStarted) {
-      cronStarted = true;
-      // Seed timers so countdown starts from now
-      timers.managementLastRun = Date.now();
-      timers.screeningLastRun  = Date.now();
-      startCronJobs();
-      console.log("Autonomous cycles are now running.\n");
-      rl.setPrompt(buildPrompt());
-      rl.prompt(true);
-    }
-  }
 
   async function runBusy(fn) {
     if (isBusy()) { console.log("Agent is busy, please wait..."); rl.prompt(); return; }
@@ -543,14 +556,8 @@ if (isTTY) {
   }
 
   // Always start autonomous cycles on launch
-  launchCron();
+  launchCron({ announce: true });
   maybeRunMissedBriefing().catch(() => {});
-
-  // Web server — provides timer countdowns to the frontend
-  startServer(() => ({
-    management: formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin)),
-    screening:  formatCountdown(nextRunIn(timers.screeningLastRun,  config.schedule.screeningIntervalMin)),
-  })).catch((e) => log("server_error", `Web server failed to start: ${e.message}`));
 
   // Telegram bot
   startPolling(async (text) => {
@@ -617,7 +624,7 @@ Commands:
           "SCREENER"
         );
         console.log(`\n${reply}\n`);
-        launchCron();
+        launchCron({ announce: true });
       });
       return;
     }
@@ -633,14 +640,14 @@ Commands:
           "SCREENER"
         );
         console.log(`\n${reply}\n`);
-        launchCron();
+        launchCron({ announce: true });
       });
       return;
     }
 
     // ── go: start cron without deploying ────
     if (input.toLowerCase() === "go") {
-      launchCron();
+      launchCron({ announce: true });
       rl.prompt();
       return;
     }
@@ -686,14 +693,10 @@ Commands:
     }
 
     if (input === "/thresholds") {
-      const s = config.screening;
       console.log("\nCurrent screening thresholds:");
-      console.log(`  maxVolatility:    ${s.maxVolatility}`);
-      console.log(`  minFeeTvlRatio:   ${s.minFeeTvlRatio}`);
-      console.log(`  minOrganic:       ${s.minOrganic}`);
-      console.log(`  minHolders:       ${s.minHolders}`);
-      console.log(`  maxPriceChangePct: ${s.maxPriceChangePct}`);
-      console.log(`  timeframe:        ${s.timeframe}`);
+      for (const [label, value] of getScreeningThresholdSummary(config.screening)) {
+        console.log(`  ${label}: ${value}`);
+      }
       const perf = getPerformanceSummary();
       if (perf) {
         console.log(`\n  Based on ${perf.total_positions_closed} closed positions`);
@@ -797,9 +800,9 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 } else {
   // Non-TTY: start immediately
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
-  startCronJobs();
+  launchCron();
   maybeRunMissedBriefing().catch(() => {});
-  (async () => {
+  if (runtimeMode.runStartupCheck) (async () => {
     try {
       await agentLoop(`
 STARTUP CHECK

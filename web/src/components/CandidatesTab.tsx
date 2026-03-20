@@ -53,7 +53,8 @@ export default function CandidatesTab({ candidates }: CandidatesTabProps) {
             <TableBody>
               {candidates.candidates.map((c, i) => {
                 const ratio = c.fee_active_tvl_ratio ?? c.fee_tvl_ratio;
-                const vol = c.volume_window ?? c.volume_24h;
+                const vol = c.volume ?? c.volume_window ?? c.volume_24h;
+                const activePct = c.active_pct ?? c.active_bin_pct;
                 return (
                   <TableRow key={c.pool}>
                     <TableCell className="text-ash/60">{i + 1}</TableCell>
@@ -70,7 +71,7 @@ export default function CandidatesTab({ candidates }: CandidatesTabProps) {
                       {c.organic_score != null ? c.organic_score.toFixed(1) : "--"}
                     </TableCell>
                     <TableCell className="text-right">
-                      {c.active_bin_pct != null ? `${c.active_bin_pct.toFixed(0)}%` : "--"}
+                      {activePct != null ? `${activePct.toFixed(0)}%` : "--"}
                     </TableCell>
                   </TableRow>
                 );

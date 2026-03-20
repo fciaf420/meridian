@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -34,6 +35,8 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
+    maxVolatility:     u.maxVolatility     ?? 8,
+    maxPriceChangePct: u.maxPriceChangePct ?? 300,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
@@ -51,7 +54,11 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit ?? true,
     trailingTriggerPct:    u.trailingTriggerPct ?? 3,
     trailingDropPct:       u.trailingDropPct ?? 1.5,
-    minSolToOpen:          u.minSolToOpen ?? 0.55,
+    minSolToOpen:          getEffectiveMinSolToOpen({
+      minSolToOpen: u.minSolToOpen ?? 0.55,
+      deployAmountSol: u.deployAmountSol ?? 0.5,
+      gasReserve: u.gasReserve ?? 0.2,
+    }),
     deployAmountSol:       u.deployAmountSol ?? 0.5,
     gasReserve:            u.gasReserve        ?? 0.2,   // always keep this much SOL for gas
     positionSizePct:       u.positionSizePct   ?? 0.35,  // % of deployable capital per position
@@ -130,8 +137,9 @@ export function reloadScreeningThresholds() {
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
+    if (fresh.maxVolatility  != null) s.maxVolatility  = fresh.maxVolatility;
+    if (fresh.maxPriceChangePct != null) s.maxPriceChangePct = fresh.maxPriceChangePct;
     if (fresh.timeframe      != null) s.timeframe      = fresh.timeframe;
     if (fresh.category       != null) s.category       = fresh.category;
   } catch { /* ignore */ }
 }
-

@@ -6,7 +6,7 @@
   "deployAmountSol": 0.5,
   "maxPositions": 3,
   "maxDeployAmount": 50,
-  "minSolToOpen": 0.07,
+  "minSolToOpen": 0.7,
 
   "managementIntervalMin": 10,
   "screeningIntervalMin": 30,

@@ -58,9 +58,11 @@ export interface CandidateInfo {
   pool: string;
   fee_tvl_ratio?: number;
   fee_active_tvl_ratio?: number;
+  volume?: number;
   volume_24h?: number;
   volume_window?: number;
   organic_score?: number;
+  active_pct?: number;
   active_bin_pct?: number;
 }
 
@@ -68,6 +70,21 @@ export interface CandidateData {
   candidates: CandidateInfo[];
   total_eligible: number;
   total_screened: number;
+}
+
+function isCandidateInfo(value: unknown): value is CandidateInfo {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.pool === "string";
+}
+
+function isCandidateData(value: unknown): value is CandidateData {
+  if (!value || typeof value !== "object") return false;
+  const payload = value as Record<string, unknown>;
+  return Array.isArray(payload.candidates)
+    && payload.candidates.every(isCandidateInfo)
+    && typeof payload.total_eligible === "number"
+    && typeof payload.total_screened === "number";
 }
 
 export interface LpOverviewData {
@@ -131,7 +148,7 @@ export function useWebSocket() {
             if (msg.timers) setTimers(msg.timers);
             if (msg.positions) setPositions(msg.positions);
             if (msg.wallet) setWallet(msg.wallet);
-            if (msg.candidates) setCandidates(msg.candidates);
+            if (isCandidateData(msg.candidates)) setCandidates(msg.candidates);
             if (msg.lpOverview) setLpOverview(msg.lpOverview);
             break;
           case "chat:response":
@@ -156,7 +173,7 @@ export function useWebSocket() {
             if (msg.data) setWallet(msg.data);
             break;
           case "candidates":
-            if (msg.data) setCandidates(msg.data);
+            if (isCandidateData(msg.data)) setCandidates(msg.data);
             break;
           case "error":
             setMessages((prev) => [...prev, { role: "assistant", content: `Error: ${msg.text}`, ts: new Date().toISOString() }]);

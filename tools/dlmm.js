@@ -20,6 +20,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
+import { calculateBinsForPriceRange, splitRangeBins } from "../runtime-helpers.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -110,18 +111,27 @@ export async function deployPosition({
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
+  let resolvedBinStep = bin_step;
+  const totalSolAmount = amount_y ?? amount_sol ?? 0;
 
   if (!["bid_ask", "spot"].includes(activeStrategy)) {
     throw new Error("Only 'bid_ask' or 'spot' strategies are allowed.");
   }
 
+  if (price_range_pct > 0 && !resolvedBinStep) {
+    try {
+      const { getPoolDetail } = await import("./screening.js");
+      const poolDetail = await getPoolDetail({ pool_address });
+      resolvedBinStep = poolDetail?.bin_step || null;
+    } catch (error) {
+      log("deploy", `Unable to resolve bin_step before range calculation: ${error.message}`);
+    }
+  }
+
   // Auto-calculate bins from price_range_pct if provided (no need for separate calculate_bins call)
-  if (price_range_pct > 0 && !bins_below) {
-    const poolBinStep = bin_step || 100; // fallback, will be overridden by pool data below
-    const stepPct = poolBinStep / 10000;
-    const pct = Math.abs(price_range_pct) / 100;
-    bins_below = Math.abs(Math.ceil(Math.log(1 - pct) / Math.log(1 + stepPct)));
-    log("deploy", `Auto-calculated bins_below=${bins_below} from price_range_pct=${price_range_pct}% at bin_step=${poolBinStep}`);
+  if (price_range_pct > 0 && !bins_below && resolvedBinStep) {
+    bins_below = calculateBinsForPriceRange(resolvedBinStep, price_range_pct);
+    log("deploy", `Auto-calculated bins_below=${bins_below} from price_range_pct=${price_range_pct}% at bin_step=${resolvedBinStep}`);
   }
 
   // ─── Detect auto-swap need ────────────────────────────────────
@@ -132,19 +142,36 @@ export async function deployPosition({
     && activeStrategy === "spot"
     && !((amount_x ?? 0) > 0);
 
-  // For two-sided spot with price_range_pct + sol_split_pct: split total bins proportionally
   let hasBaseToken = (amount_x ?? 0) > 0;
-  if (price_range_pct > 0 && sol_split_pct != null && (hasBaseToken || needsAutoSwap) && bins_below && !bins_above) {
-    const totalCalcBins = bins_below; // bins_below was calculated from full range
-    const solPct = Math.min(100, Math.max(0, sol_split_pct)) / 100;
-    bins_below = Math.round(totalCalcBins * solPct);
-    bins_above = totalCalcBins - bins_below;
-    log("deploy", `Split ${sol_split_pct}% SOL / ${100 - sol_split_pct}% token: bins_below=${bins_below}, bins_above=${bins_above}`);
+  const hasSolSide = totalSolAmount > 0;
+  const totalRangeBins = bins_below ?? null;
+
+  if (activeStrategy === "spot" && bins_above == null) {
+    if (price_range_pct > 0 && totalRangeBins != null) {
+      if (needsAutoSwap || (hasBaseToken && hasSolSide)) {
+        const split = splitRangeBins(totalRangeBins, sol_split_pct ?? 50);
+        bins_below = split.binsBelow;
+        bins_above = split.binsAbove;
+        log("deploy", `Split ${sol_split_pct ?? 50}% SOL / ${100 - (sol_split_pct ?? 50)}% token: bins_below=${bins_below}, bins_above=${bins_above}`);
+      } else if (hasBaseToken && !hasSolSide) {
+        bins_below = 0;
+        bins_above = totalRangeBins;
+      } else {
+        bins_below = totalRangeBins;
+        bins_above = 0;
+      }
+    } else if (hasBaseToken && !hasSolSide) {
+      bins_above = bins_below ?? config.strategy.binsBelow;
+      bins_below = 0;
+    } else if (hasBaseToken || needsAutoSwap) {
+      bins_above = bins_below ?? config.strategy.binsBelow;
+    } else {
+      bins_above = 0;
+    }
   }
 
   let activeBinsBelow = bins_below ?? config.strategy.binsBelow;
-  // For spot: mirror bins if depositing base token and no explicit bins_above
-  let activeBinsAbove = bins_above ?? (activeStrategy === "spot" && (hasBaseToken || needsAutoSwap) ? activeBinsBelow : 0);
+  let activeBinsAbove = bins_above ?? 0;
 
   // Safety: reject tiny deploys (wastes gas, barely earns fees)
   const MIN_BINS = 20;
@@ -152,12 +179,11 @@ export async function deployPosition({
   if (totalBins < MIN_BINS) {
     return {
       success: false,
-      error: `Rejected: total bins = ${totalBins}, minimum is ${MIN_BINS}. At bin_step ${bin_step || "?"}, ${MIN_BINS} bins ≈ ${bin_step ? (MIN_BINS * (bin_step / 10000) * 100).toFixed(0) : "?"}% range. Use calculate_bins with a target range of 25-50% and pass that bin count to bins_below.`,
+      error: `Rejected: total bins = ${totalBins}, minimum is ${MIN_BINS}. At bin_step ${resolvedBinStep || "?"}, ${MIN_BINS} bins ≈ ${resolvedBinStep ? (MIN_BINS * (resolvedBinStep / 10000) * 100).toFixed(0) : "?"}% range. Use calculate_bins with a target range of 25-50% and pass that bin count to bins_below.`,
     };
   }
 
   if (process.env.DRY_RUN === "true") {
-    const totalSol = amount_y ?? amount_sol ?? 0;
     const dryRunResult = {
       dry_run: true,
       would_deploy: {
@@ -166,17 +192,17 @@ export async function deployPosition({
         bins_below: activeBinsBelow,
         bins_above: activeBinsAbove,
         amount_x: amount_x || 0,
-        amount_y: totalSol,
+        amount_y: totalSolAmount,
         wide_range: (activeBinsBelow + activeBinsAbove) > 69,
       },
       message: "DRY RUN — no transaction sent",
     };
     if (needsAutoSwap) {
-      const tokenSolAmount = totalSol * (1 - sol_split_pct / 100);
+      const tokenSolAmount = totalSolAmount * (1 - sol_split_pct / 100);
       dryRunResult.would_deploy.auto_swap = {
         swap_sol_amount: Math.round(tokenSolAmount * 1e6) / 1e6,
-        remaining_sol: Math.round((totalSol - tokenSolAmount) * 1e6) / 1e6,
-        description: `Would auto-swap ${tokenSolAmount.toFixed(4)} SOL → base token, then deploy ${(totalSol - tokenSolAmount).toFixed(4)} SOL + received tokens`,
+        remaining_sol: Math.round((totalSolAmount - tokenSolAmount) * 1e6) / 1e6,
+        description: `Would auto-swap ${tokenSolAmount.toFixed(4)} SOL → base token, then deploy ${(totalSolAmount - tokenSolAmount).toFixed(4)} SOL + received tokens`,
       };
     }
     return dryRunResult;
@@ -186,11 +212,23 @@ export async function deployPosition({
   const wallet = getWallet();
   const pool = await getPool(pool_address);
   const activeBin = await pool.getActiveBin();
+  resolvedBinStep ||= pool.lbPair?.binStep ?? pool.lbPair?.bin_step ?? null;
+
+  if (price_range_pct > 0 && !bins_below && resolvedBinStep) {
+    bins_below = calculateBinsForPriceRange(resolvedBinStep, price_range_pct);
+    if (sol_split_pct != null && (hasBaseToken || needsAutoSwap) && !bins_above) {
+      const split = splitRangeBins(bins_below, sol_split_pct);
+      bins_below = split.binsBelow;
+      bins_above = split.binsAbove;
+    }
+    activeBinsBelow = bins_below ?? config.strategy.binsBelow;
+    activeBinsAbove = bins_above ?? (activeStrategy === "spot" && (hasBaseToken || needsAutoSwap) ? activeBinsBelow : 0);
+    totalBins = activeBinsBelow + activeBinsAbove;
+  }
 
   // ─── Auto-swap SOL → base token for two-sided spot ────────────
   if (needsAutoSwap) {
-    const totalSol = amount_y ?? amount_sol ?? 0;
-    const tokenSolAmount = totalSol * (1 - sol_split_pct / 100);
+    const tokenSolAmount = totalSolAmount * (1 - sol_split_pct / 100);
     const baseMint = pool.lbPair.tokenXMint.toBase58();
 
     log("deploy", `Auto-swap: swapping ${tokenSolAmount.toFixed(4)} SOL → ${baseMint.slice(0, 8)}... for two-sided spot`);
@@ -209,23 +247,35 @@ export async function deployPosition({
         const receivedTokens = Number(swapResult.amount_out) / Math.pow(10, decimals);
 
         amount_x = receivedTokens;
-        amount_y = totalSol - tokenSolAmount;
+        amount_y = totalSolAmount - tokenSolAmount;
         hasBaseToken = true;
 
         log("deploy", `Auto-swapped ${tokenSolAmount.toFixed(4)} SOL → ${receivedTokens} tokens (${decimals} decimals). Deploying ${amount_y.toFixed(4)} SOL + ${receivedTokens} X`);
       } else {
         log("deploy", `WARNING: Auto-swap failed (${swapResult.error}), falling back to SOL-only deployment`);
-        // Fall back: keep original amounts, revert to SOL-only bins
+        // Fall back: keep original amounts, revert to the full SOL-only range.
         activeBinsAbove = 0;
-        activeBinsBelow = bins_below ?? config.strategy.binsBelow;
+        activeBinsBelow = totalRangeBins ?? bins_below ?? config.strategy.binsBelow;
         totalBins = activeBinsBelow + activeBinsAbove;
+        if (totalBins < MIN_BINS) {
+          return {
+            success: false,
+            error: `Rejected after swap fallback: total bins = ${totalBins}, minimum is ${MIN_BINS}.`,
+          };
+        }
       }
     } catch (swapErr) {
       log("deploy", `WARNING: Auto-swap error (${swapErr.message}), falling back to SOL-only deployment`);
-      // Fall back: keep original amounts, revert to SOL-only bins
+      // Fall back: keep original amounts, revert to the full SOL-only range.
       activeBinsAbove = 0;
-      activeBinsBelow = bins_below ?? config.strategy.binsBelow;
+      activeBinsBelow = totalRangeBins ?? bins_below ?? config.strategy.binsBelow;
       totalBins = activeBinsBelow + activeBinsAbove;
+      if (totalBins < MIN_BINS) {
+        return {
+          success: false,
+          error: `Rejected after swap fallback: total bins = ${totalBins}, minimum is ${MIN_BINS}.`,
+        };
+      }
     }
   }
 
@@ -329,7 +379,7 @@ export async function deployPosition({
       pool_name,
       strategy: activeStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
-      bin_step,
+      bin_step: resolvedBinStep,
       volatility,
       fee_tvl_ratio,
       organic_score,

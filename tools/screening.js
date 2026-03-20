@@ -49,9 +49,16 @@ export async function discoverPools({
   const condensed = (data.data || []).map(condensePool);
 
   // Filter blacklisted base tokens
-  const pools = condensed.filter((p) => {
+  const pools = condensed.filter((candidate) => {
+    const p = normalizeCandidateForUi(candidate);
     if (isBlacklisted(p.base?.mint)) {
       log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
+      return false;
+    }
+    if (p.volatility != null && p.volatility > s.maxVolatility) {
+      return false;
+    }
+    if (p.price_change_pct != null && Math.abs(p.price_change_pct) > s.maxPriceChangePct) {
       return false;
     }
     return true;
@@ -87,9 +94,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     .slice(0, limit);
 
   return {
-    candidates: eligible,
+    candidates: eligible.map(normalizeCandidateForUi),
     total_eligible: eligible.length,
     total_screened: pools.length,
+  };
+}
+
+export function normalizeCandidateForUi(candidate) {
+  return {
+    ...candidate,
+    volume: candidate.volume ?? candidate.volume_window ?? candidate.volume_24h ?? null,
+    active_pct: candidate.active_pct ?? candidate.active_bin_pct ?? null,
   };
 }
 
