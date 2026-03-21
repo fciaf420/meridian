@@ -116,6 +116,17 @@ function startCronJobs() {
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
     if (isManagementBusy()) return;
     if (isScreeningBusy()) { log("cron", "Management deferred — screening cycle in progress"); return; }
+
+    // Skip management entirely if no open positions — saves LLM tokens
+    try {
+      const preCheck = await getMyPositions();
+      if (!preCheck?.positions?.length) {
+        log("cron", "Management skipped — no open positions");
+        timers.managementLastRun = Date.now();
+        return;
+      }
+    } catch { /* proceed if check fails */ }
+
     setManagementBusy(true);
     timers.managementLastRun = Date.now();
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
