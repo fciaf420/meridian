@@ -404,7 +404,7 @@ Meridian includes an **opt-in** collective intelligence system. When enabled, yo
 **1. Register your agent**
 
 ```bash
-node -e "import('./hive-mind.js').then(m => m.register('https://meridian-hive-api-production.up.railway.app'))"
+node -e "import('./hive-mind.js').then(m => m.register('https://meridian-hive-api-production.up.railway.app', 'REGISTRATION_TOKEN_HERE'))"
 ```
 
 This automatically saves two fields to your `user-config.json`:

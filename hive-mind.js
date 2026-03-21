@@ -62,22 +62,27 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = GET_TIMEOUT_MS) {
 /**
  * One-time registration with a Hive Mind server.
  * Stores hiveMindUrl and hiveMindApiKey in user-config.json.
- * @param {string} url - Base URL of the hive-mind server (e.g. "https://hive.example.com")
- * @returns {Promise<string>} The raw API key for display
+ * @param {string} url - Base URL of the hive server (e.g. "https://hive.example.com")
+ * @param {string} registrationToken - Token provided by the hive operator
+ * @returns {Promise<string>} The raw API key (shown once, save it!)
  */
-export async function register(url) {
+export async function register(url, registrationToken) {
+  if (!registrationToken) {
+    throw new Error("Registration token required. Get it from the hive operator.");
+  }
+
   const baseUrl = url.replace(/\/+$/, "");
   const cfg = readConfig();
   const displayName = cfg.displayName || `agent-${Date.now().toString(36)}`;
 
-  console.log("[hive]", `registering with ${baseUrl} as "${displayName}"...`);
+  console.log("[hive]", `Registering with ${baseUrl} as "${displayName}"...`);
 
   const res = await fetchWithTimeout(
     `${baseUrl}/api/register`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ display_name: displayName }),
+      body: JSON.stringify({ display_name: displayName, registration_token: registrationToken }),
     },
     POST_TIMEOUT_MS,
   );
@@ -90,7 +95,9 @@ export async function register(url) {
   const { agent_id, api_key } = await res.json();
 
   writeConfig({ hiveMindUrl: baseUrl, hiveMindApiKey: api_key, hiveMindAgentId: agent_id });
-  console.log("[hive]", `registered — agent_id=${agent_id}`);
+  console.log("[hive]", `Registered! agent_id=${agent_id}`);
+  console.log("[hive]", `API key: ${api_key}`);
+  console.log("[hive]", `Save this key — it will NOT be shown again.`);
 
   return api_key;
 }
