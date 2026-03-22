@@ -234,7 +234,11 @@ HARD CLOSE RULES (check in order — close immediately on first match, no furthe
 1. Position instruction condition met → CLOSE immediately (highest priority)
 2. Position instruction exists but condition NOT met → HOLD (skip all other rules)
 3. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-4. minutes_out_of_range >= ${config.management.outOfRangeWaitMinutes} → CLOSE (OOR timeout)
+4. minutes_out_of_range >= ${config.management.outOfRangeWaitMinutes} → CLOSE (OOR timeout). Check oor_direction + PnL together:
+   - Upside OOR + positive PnL → HOLD. SOL idle, no IL, fees earned. Price may return.
+   - Upside OOR + negative PnL → HOLD. Still safe, SOL idle.
+   - Downside OOR + positive PnL → CAUTION. Fees outpaced IL but risk growing. Monitor.
+   - Downside OOR + negative PnL → CLOSE. Token dropping, loss growing.
 5. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio}% AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
 6. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (emergency stop)
 
@@ -253,7 +257,7 @@ STEPS:
    - Positions still open → keep current interval
 
 REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values):
-**[PAIR]** | Age: [X]m | Fees: [X] ${pnlUnit} | PnL: [X]%
+**[PAIR]** | Age: [X]m | Fees: [X] ${pnlUnit} | PnL: [X]% | OOR: [direction or "in-range"]
 **Rule triggered:** [rule number or "none"]
 **Decision:** [STAY/CLOSE]
 **Reason:** [1 short sentence]
@@ -445,13 +449,17 @@ HARD SKIP rules still apply:
 - No smart wallets + empty/hype narrative → skip
 
 Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL.
-Use study_top_lpers patterns.recommended_range_pct or patterns.avg_range_pct as your price_range_pct in deploy_position.
-If no range data available, default to price_range_pct=35.` : `1. get_top_candidates, pick the best one.
+Use study_top_lpers patterns.avg_range_pct as a STARTING POINT for your price_range_pct. Then adjust:
+- Check your MEMORY RECALL and LESSONS above: if past sessions show repeated OOR at the study range for this pool or similar pools, WIDEN by 10-20%.
+- Downside OOR lessons → widen more aggressively (higher risk).
+- Upside OOR lessons → study range may be fine (upside OOR = missed fees, no loss).
+- Higher current volatility than study LPers' conditions → widen range.
+Your own experience overrides historical averages. Default to 35% if no study data.` : `1. get_top_candidates, pick the best one.
 2. check_smart_wallets_on_pool, get_token_holders (check global_fees_sol >= ${config.screening.minTokenFeesSol}), get_token_narrative.
 3. HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL or holders/narrative red flags.
-4. study_top_lpers → use patterns.avg_range_pct as price_range_pct in deploy_position. Default 35% if no data.
-5. deploy_position with ${deployAmount} SOL and price_range_pct from study.`}
-- RANGE: Use the avg_range_pct from study_top_lpers as your price_range_pct. This is what profitable LPers use in that pool. If unavailable, default to 35%.
+4. study_top_lpers → use patterns.avg_range_pct as STARTING POINT for price_range_pct. Adjust based on your LESSONS/MEMORY (especially OOR patterns). Default 35% if no data.
+5. deploy_position with ${deployAmount} SOL and price_range_pct from study (adjusted by lessons).`}
+- RANGE: Start with avg_range_pct from study_top_lpers, then adjust using your MEMORY and LESSONS. If you've been burned by OOR at the study range before, go wider. Your own experience overrides historical averages. Default to 35% if no study data.
 - COMPOUNDING: Deploy amount is ${deployAmount} SOL (scaled from wallet: ${currentBalance?.sol ?? "?"} SOL). Do NOT override with a smaller amount.
 - After deploy: update_config setting=managementIntervalMin based on volatility (>=5→3, 2-5→5, <2→10).
 - Report: strategy chosen + why, price_range_pct used + source (study data or default), deploy amount, interval set.

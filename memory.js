@@ -183,7 +183,7 @@ export function rememberPositionSnapshot(position) {
   const key = pair.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
 
   // Pool behavior snapshot — use configured PnL unit
-  const inRange = position.in_range ? "in-range" : "OOR";
+  const inRange = position.in_range ? "in-range" : `OOR-${position.oor_direction || "unknown"}`;
   const pnl = position.pnl_pct != null ? `${position.pnl_pct.toFixed(1)}%` : "?";
   const unit = config.management.pnlUnit || "sol";
   const useSol = unit === "sol" && position.unclaimed_fees_sol != null;

@@ -142,9 +142,11 @@ export async function recordPerformance(perf) {
   try {
     const { rememberPoolOutcome, rememberStrategy } = await import("./memory.js");
     const outcome = pnl_pct >= 0 ? "profitable" : "unprofitable";
+    const oorInfo = perf.close_reason?.match(/OOR (upside|downside)/)?.[1];
+    const oorTag = oorInfo ? `, OOR_direction=${oorInfo}` : "";
     rememberPoolOutcome(
       perf.pool_name || perf.pool,
-      `${outcome}, PnL ${pnl_pct.toFixed(1)}%, range_eff ${range_efficiency.toFixed(0)}%, strategy=${perf.strategy}, bin_step=${perf.bin_step}`
+      `${outcome}, PnL ${pnl_pct.toFixed(1)}%, range_eff ${range_efficiency.toFixed(0)}%, strategy=${perf.strategy}, bin_step=${perf.bin_step}${oorTag}, vol=${perf.volatility}`
     );
     if (perf.strategy && perf.bin_step) {
       rememberStrategy(
@@ -185,6 +187,9 @@ function derivLesson(perf) {
 
   if (outcome === "neutral") return null; // nothing interesting to learn
 
+  // Parse OOR direction from close_reason (e.g. "agent decision (OOR upside)")
+  const oorDir = perf.close_reason?.match(/OOR (upside|downside)/)?.[1] || null;
+
   // Build context description
   const context = [
     `${perf.pool_name}`,
@@ -200,8 +205,13 @@ function derivLesson(perf) {
 
   if (outcome === "good" || outcome === "bad") {
     if (perf.range_efficiency < 30 && outcome === "bad") {
-      rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
-      tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
+      const dirHint = oorDir === "downside"
+        ? " Price dropped below range (downside OOR) — SOL converted to token, realized loss."
+        : oorDir === "upside"
+        ? " Price rose above range (upside OOR) — SOL sat idle, missed fees but no IL."
+        : "";
+      rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time.${dirHint}`;
+      tags.push("oor", oorDir || "unknown", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
       rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
       tags.push("efficient", perf.strategy);

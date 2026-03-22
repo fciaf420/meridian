@@ -101,14 +101,15 @@ export function trackPosition({
 /**
  * Mark a position as out of range (sets timestamp on first detection).
  */
-export function markOutOfRange(position_address) {
+export function markOutOfRange(position_address, direction = null) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos) return;
   if (!pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
+    pos.oor_direction = direction || null;
     save(state);
-    log("state", `Position ${position_address} marked out of range`);
+    log("state", `Position ${position_address} marked out of range (${direction || "unknown"})`);
   }
 }
 
@@ -121,6 +122,7 @@ export function markInRange(position_address) {
   if (!pos) return;
   if (pos.out_of_range_since) {
     pos.out_of_range_since = null;
+    pos.oor_direction = null;
     save(state);
     log("state", `Position ${position_address} back in range`);
   }
@@ -297,6 +299,7 @@ export function getStateSummary() {
       strategy: p.strategy,
       deployed_at: p.deployed_at,
       out_of_range_since: p.out_of_range_since,
+      oor_direction: p.oor_direction || null,
       minutes_out_of_range: minutesOutOfRange(p.position),
       total_fees_claimed_usd: p.total_fees_claimed_usd,
       initial_fee_tvl_24h: p.initial_fee_tvl_24h,

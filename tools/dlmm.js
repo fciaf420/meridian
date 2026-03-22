@@ -532,13 +532,18 @@ export async function getMyPositions({ force = false } = {}) {
     const positions = await Promise.all(raw.map(async (r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
 
-      const inRange = p ? !p.isOutOfRange : true;
-      if (inRange) markInRange(r.position);
-      else markOutOfRange(r.position);
-
       const lowerBin  = p?.lowerBinId      ?? r.lower_bin;
       const upperBin  = p?.upperBinId      ?? r.upper_bin;
       const activeBin = p?.poolActiveBinId ?? null;
+
+      const inRange = p ? !p.isOutOfRange : true;
+      // Compute OOR direction: upside = price pumped above range, downside = price dropped below
+      let oorDirection = null;
+      if (!inRange && activeBin != null && upperBin != null && lowerBin != null) {
+        oorDirection = activeBin > upperBin ? "upside" : "downside";
+      }
+      if (inRange) markInRange(r.position);
+      else markOutOfRange(r.position, oorDirection);
 
       const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
       const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
@@ -633,6 +638,7 @@ export async function getMyPositions({ force = false } = {}) {
         upper_bin: upperBin,
         active_bin: activeBin,
         in_range: inRange,
+        oor_direction: oorDirection,
         unclaimed_fees_usd: unclaimedRounded,
         unclaimed_fees_sol: toSol(unclaimedRounded),
         total_value_usd: totalValRounded,
@@ -858,10 +864,12 @@ export async function closePosition({ position_address }) {
       txHashes.push(txHash);
     }
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
-    recordClose(position_address, "agent decision");
 
     // Record performance for learning
     const tracked = getTrackedPosition(position_address);
+    const oorDir = tracked?.oor_direction || null;
+    const closeReason = oorDir ? `agent decision (OOR ${oorDir})` : "agent decision";
+    recordClose(position_address, closeReason);
     if (tracked) {
       const deployedAt = new Date(tracked.deployed_at).getTime();
       const minutesHeld = Math.floor((Date.now() - deployedAt) / 60000);
@@ -872,7 +880,13 @@ export async function closePosition({ position_address }) {
       }
 
       _positionsCacheAt = 0; // invalidate cache
-      const initialUsd = tracked.initial_value_usd || 0;
+      // Use tracked initial value; if missing (legacy positions), estimate from
+      // final value so pnl_pct isn't forced to 0
+      let initialUsd = tracked.initial_value_usd || 0;
+      if (!initialUsd && tracked.amount_sol > 0 && finalValueUsd > 0) {
+        initialUsd = finalValueUsd;
+        log("close", `initial_value_usd missing for ${position_address}, using finalValueUsd ($${finalValueUsd}) as fallback`);
+      }
 
       await recordPerformance({
         position: position_address,
@@ -892,7 +906,7 @@ export async function closePosition({ position_address }) {
         actual_pnl_pct: pnlPct,
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
-        close_reason: "agent decision",
+        close_reason: closeReason,
         deployed_at: tracked.deployed_at,
       });
 

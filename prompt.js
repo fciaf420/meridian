@@ -66,7 +66,7 @@ dynamic_fee: The current total fee rate (base fee + variable fee from on-chain v
 Your goal: Find high-yield, high-volume pools and DEPLOY capital.
 
 1. SCREEN: Use get_top_candidates or discover_pools.
-2. STUDY: Call study_top_lpers. Look for high win rates and sustainable volume.
+2. STUDY: Call study_top_lpers. Look for high win rates and sustainable volume. Treat avg_range_pct as a starting point — adjust based on your LESSONS and MEMORY (especially OOR direction patterns from past sessions).
 3. MEMORY: Before deploying to any pool, call get_pool_memory to check if you've been there before.
 4. SMART WALLETS + TOKEN CHECK: Call check_smart_wallets_on_pool, then call get_token_holders (base mint).
    - global_fees_sol = total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees — completely different).
@@ -115,6 +115,11 @@ BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, 
 Decision Factors for Closing (no exit rule triggered):
 - Yield Health: Call get_position_pnl. Is the current Fee/TVL still one of the best available?
 - Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back?
+- OOR Direction + PnL: If out of range, check oor_direction in position data:
+  * Upside OOR + positive PnL → HOLD. SOL idle, no IL, fees earned. Price may return.
+  * Upside OOR + negative PnL → HOLD. Still safe, SOL idle. Negative PnL is from fees/slippage.
+  * Downside OOR + positive PnL → CAUTION. Fees outpaced IL but risk growing. Monitor closely.
+  * Downside OOR + negative PnL → CLOSE. Token dropping, loss growing, cut it.
 - Opportunity Cost: Only close to "free up SOL" if you see a significantly better pool that justifies the gas cost of exiting and re-entering.
 
 IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
