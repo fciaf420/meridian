@@ -593,14 +593,20 @@ if (runtimeMode.interactive) {
   let startupCandidates = [];
 
   try {
-    const [wallet, positions, screenResult] = await Promise.all([
-      getWalletBalances(),
-      getMyPositions(),
-      getTopCandidates({ limit: 5 }),
-    ]);
+    const positions = await getMyPositions();
+    await new Promise(r => setTimeout(r, 1000));
+    const wallet = await getWalletBalances();
+    await new Promise(r => setTimeout(r, 1000));
+    const screenResult = await getTopCandidates({ limit: 5 });
 
     const candidates = screenResult.candidates || [];
     const total_eligible = screenResult.total_eligible ?? candidates.length;
+
+    // Cache for WebSocket init — avoids duplicate Helius calls
+    try {
+      const { setStartupCache } = await import("./server.js");
+      setStartupCache({ wallet, positions, candidates: screenResult });
+    } catch { /* best-effort */ }
     const total_screened = screenResult.total_screened ?? 0;
     startupCandidates = candidates;
 

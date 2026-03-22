@@ -25,8 +25,15 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { getLpOverview } from "./tools/lp-overview.js";
 import { generateBriefing } from "./briefing.js";
+
+// Cached startup data — avoids duplicate Helius calls when WebSocket connects
+let _startupCache = { wallet: null, positions: null, candidates: null, lpOverview: null, ts: 0 };
+export function setStartupCache({ wallet, positions, candidates, lpOverview }) {
+  _startupCache = { wallet, positions, candidates, lpOverview, ts: Date.now() };
+}
 import { getPerformanceSummary, getPerformanceHistory, listLessons, evolveThresholds } from "./lessons.js";
 import { getMemoryContext } from "./memory.js";
+import { buildKnowledgeGraph } from "./tools/knowledge-graph.js";
 import { log } from "./logger.js";
 import { getScreeningThresholdSummary, normalizeCandidatesPayload } from "./runtime-helpers.js";
 
@@ -202,13 +209,21 @@ export function startServer(timersFn) {
     // Send init payload with status, history, timers, and data
     const timerInfo = typeof timersFn === "function" ? timersFn() : {};
 
-    // Fetch live data for initial payload (non-blocking — send basic init first, then data)
-    const [wallet, positions, candidateResult, lpOverviewResult] = await Promise.allSettled([
-      getWalletBalances(),
-      getMyPositions(),
-      getTopCandidates({ limit: 5 }),
-      getLpOverview(),
-    ]);
+    // Use cached startup data if fresh (< 30s), otherwise fetch live
+    const useCached = _startupCache.ts && (Date.now() - _startupCache.ts < 30000);
+    const [wallet, positions, candidateResult, lpOverviewResult] = useCached
+      ? [
+          { status: "fulfilled", value: _startupCache.wallet },
+          { status: "fulfilled", value: _startupCache.positions },
+          { status: "fulfilled", value: _startupCache.candidates },
+          { status: "fulfilled", value: _startupCache.lpOverview },
+        ]
+      : await Promise.allSettled([
+          getWalletBalances(),
+          getMyPositions(),
+          getTopCandidates({ limit: 5 }),
+          getLpOverview(),
+        ]);
 
     wsSend(ws, {
       type: "init",
@@ -550,6 +565,10 @@ export function startServer(timersFn) {
         }
         case "performance": {
           data = getPerformanceSummary();
+          break;
+        }
+        case "knowledge-graph": {
+          data = await buildKnowledgeGraph();
           break;
         }
         default:
