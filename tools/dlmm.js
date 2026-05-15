@@ -873,9 +873,9 @@ export async function deployPosition({
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
-  try {
-    const txHashes = [];
+  const txHashes = [];
 
+  try {
     if (isWideRange) {
       // ── Wide Range Path (>69 bins) ─────────────────────────────────
       // Solana limits inner instruction realloc to 10240 bytes, so we can't create
@@ -992,6 +992,84 @@ export async function deployPosition({
     };
   } catch (error) {
     log("deploy_error", error.message);
+    if (txHashes.length > 0) {
+      try {
+        _positionsCacheAt = 0;
+        const refreshed = await getMyPositions({ force: true, silent: true });
+        const matching = refreshed?.positions?.find((position) => position.position === newPosition.publicKey.toString());
+        if (matching) {
+          log(
+            "deploy_warn",
+            `Deploy reported an error after ${txHashes.length} confirmed tx(s), but position exists on-chain: ${newPosition.publicKey.toString()}`,
+          );
+
+          trackPosition({
+            position: newPosition.publicKey.toString(),
+            pool: pool_address,
+            pool_name,
+            strategy: activeStrategy,
+            bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
+            bin_step,
+            volatility: normalizedVolatility,
+            fee_tvl_ratio,
+            organic_score,
+            amount_sol: finalAmountY,
+            amount_x: finalAmountX,
+            active_bin: activeBin.binId,
+            initial_value_usd,
+          });
+
+          appendDecision({
+            type: "deploy",
+            actor: "SCREENER",
+            pool: pool_address,
+            pool_name,
+            position: newPosition.publicKey.toString(),
+            summary: `Deploy partially confirmed ${finalAmountY} SOL with ${activeStrategy}`,
+            reason: `Position was found on-chain after transaction error: ${error.message}`,
+            risks: [
+              "transaction confirmation error after partial success",
+              normalizedVolatility != null ? `volatility ${normalizedVolatility}` : null,
+              fee_tvl_ratio != null ? `fee/TVL ${fee_tvl_ratio}%` : null,
+            ].filter(Boolean),
+            metrics: {
+              amount_sol: finalAmountY,
+              strategy: activeStrategy,
+              active_bin: activeBin.binId,
+              min_bin: minBinId,
+              max_bin: maxBinId,
+              confirmed_txs: txHashes.length,
+            },
+          });
+
+          return {
+            success: true,
+            partial_confirmation: true,
+            warning: error.message,
+            position: newPosition.publicKey.toString(),
+            pool: pool_address,
+            pool_name,
+            bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
+            price_range: { min: minPrice, max: maxPrice },
+            range_coverage: {
+              downside_pct: downsideCoveragePct,
+              upside_pct: upsideCoveragePct,
+              width_pct: totalWidthPct,
+              active_price: activePrice,
+            },
+            bin_step: actualBinStep,
+            base_fee: actualBaseFee,
+            strategy: activeStrategy,
+            wide_range: isWideRange,
+            amount_x: finalAmountX,
+            amount_y: finalAmountY,
+            txs: txHashes,
+          };
+        }
+      } catch (verifyError) {
+        log("deploy_warn", `Post-error position verification failed: ${verifyError.message}`);
+      }
+    }
     return { success: false, error: error.message };
   }
 }

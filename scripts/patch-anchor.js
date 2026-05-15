@@ -21,31 +21,31 @@ const anchorPkgPath = path.join(root, "node_modules/@coral-xyz/anchor/package.js
 const anchorPkg = JSON.parse(fs.readFileSync(anchorPkgPath, "utf8"));
 const anchorUtils = path.join(root, "node_modules/@coral-xyz/anchor/dist/cjs/utils");
 
-if (!anchorPkg.exports) {
-  const dirs = fs.readdirSync(anchorUtils, { withFileTypes: true })
-    .filter(d => d.isDirectory())
-    .map(d => d.name);
+const dirs = fs.readdirSync(anchorUtils, { withFileTypes: true })
+  .filter(d => d.isDirectory())
+  .map(d => d.name);
 
-  anchorPkg.exports = {
-    // Always serve CJS — anchor's ESM dist has its own bare directory import bugs
-    ".": {
-      default: "./dist/cjs/index.js",
-    },
-    // Map each util directory to its explicit CJS index.js
-    ...Object.fromEntries(
-      dirs.map(dir => [
-        `./dist/cjs/utils/${dir}`,
-        `./dist/cjs/utils/${dir}/index.js`,
-      ])
-    ),
-    // Allow any other direct file path through
-    "./*": "./*",
-  };
+const nextExports = {
+  ...(anchorPkg.exports || {}),
+  // Always serve CJS. Anchor's ESM dist has its own bare directory import bugs.
+  ".": anchorPkg.exports?.["."] || {
+    default: "./dist/cjs/index.js",
+  },
+  // Allow any other direct file path through.
+  "./*": anchorPkg.exports?.["./*"] || "./*",
+};
 
+for (const dir of dirs) {
+  nextExports[`./dist/cjs/utils/${dir}`] = `./dist/cjs/utils/${dir}/index.js`;
+  nextExports[`./dist/cjs/utils/${dir}/index.js`] = `./dist/cjs/utils/${dir}/index.js`;
+}
+
+if (JSON.stringify(anchorPkg.exports) !== JSON.stringify(nextExports)) {
+  anchorPkg.exports = nextExports;
   fs.writeFileSync(anchorPkgPath, JSON.stringify(anchorPkg, null, 2));
   console.log("Patched: @coral-xyz/anchor/package.json exports");
 } else {
-  console.log("Skip: @coral-xyz/anchor exports already set");
+  console.log("Skip: @coral-xyz/anchor exports already patched");
 }
 
 // ─── Fix 2: Patch DLMM index.mjs bare directory imports ──────────────────────
@@ -55,10 +55,14 @@ if (fs.existsSync(dlmmMjs)) {
   let src = fs.readFileSync(dlmmMjs, "utf8");
   const original = src;
 
-  // Replace all bare directory imports of anchor utils with explicit .js paths
+  // Replace all bare directory imports of anchor utils with explicit .js paths.
+  // This catches both `from ".../utils/bytes"` and direct string occurrences.
   src = src.replace(
-    /from ["'](@coral-xyz\/anchor\/dist\/cjs\/utils\/\w+)["']/g,
-    (_, p) => `from "${p}/index.js"`
+    /(["'])@coral-xyz\/anchor\/dist\/cjs\/utils\/([A-Za-z0-9_-]+)\1/g,
+    (match, quote, dir) => {
+      if (match.includes("/index.js")) return match;
+      return `${quote}@coral-xyz/anchor/dist/cjs/utils/${dir}/index.js${quote}`;
+    }
   );
 
   // Fix 3: ESM cannot find named export 'BN' from CommonJS anchor

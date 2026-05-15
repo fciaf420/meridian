@@ -191,7 +191,7 @@ async function maybeRunMissedBriefing() {
   await runBriefing();
 }
 
-function stopCronJobs() {
+export function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
   if (_cronTasks._pnlPollInterval) clearInterval(_cronTasks._pnlPollInterval);
   _cronTasks = [];
