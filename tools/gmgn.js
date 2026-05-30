@@ -120,7 +120,7 @@ function looksRateLimited(text) {
  * success and exits non-zero (error on stderr) on failure. Returns null on
  * spawn/timeout/non-zero/parse/rate-limit.
  */
-function spawnGmgn(args) {
+export function spawnGmgn(args) {
   return queueGmgnRequest(
     () =>
       new Promise((resolve) => {

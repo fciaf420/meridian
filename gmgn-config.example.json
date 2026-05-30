@@ -1,0 +1,52 @@
+{
+  "_comment": "GMGN screening filters. Active only when user-config.json screeningSource = \"gmgn\". Copy to gmgn-config.json and fill in. apiKey is optional here if GMGN_API_KEY is in .env. (You can also set any of these in user-config.json with a gmgn* prefix, e.g. gmgnMinMcap.)",
+  "apiKey": "",
+
+  "interval": "5m",
+  "orderBy": "volume",
+  "direction": "desc",
+  "limit": 100,
+  "enrichLimit": 20,
+  "filters": ["renounced", "frozen", "not_wash_trading"],
+  "platforms": ["Pump.fun", "meteora_virtual_curve", "pool_meteora"],
+
+  "minMcap": 150000,
+  "maxMcap": 10000000,
+  "minVolume": 1000,
+  "minTvl": 10000,
+  "minTokenAgeHours": 2,
+  "maxTokenAgeHours": 168,
+  "maxBundlerRate": 0.5,
+
+  "minHolders": 1000,
+  "minTotalFeeSol": 30,
+  "maxTop10HolderRate": 0.5,
+  "maxDevTeamHoldRate": 0.02,
+  "maxBotDegenRate": 0.4,
+  "maxFreshWalletRate": 0.2,
+  "maxRatTraderRate": 0.2,
+  "athFilterPct": null,
+
+  "minSmartDegenCount": 1,
+  "requireKol": true,
+  "minKolCount": 1,
+  "maxRugRatio": 0.3,
+  "maxSniperCount": 20,
+
+  "holdersLimit": 100,
+  "maxSniperHoldRate": 0.3,
+  "preferredKolNames": [],
+  "preferredKolMinHoldPct": 1,
+  "dumpKolNames": [],
+  "dumpKolMinHoldPct": 0.5,
+
+  "indicatorFilter": true,
+  "indicatorRules": {
+    "requireBullishSupertrend": true,
+    "rejectAlreadyAtBottom": true,
+    "requireAboveSupertrend": false,
+    "minRsi": null,
+    "maxRsi": null,
+    "requireBbPosition": null
+  }
+}

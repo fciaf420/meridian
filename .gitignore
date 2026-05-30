@@ -38,3 +38,9 @@ CLAUDE.local.md
 
 # Chorus iOS CLI binary (installed locally, not source)
 build-ios-apps/
+
+# GMGN screening config (may hold apiKey) — example is tracked
+gmgn-config.json
+
+# runtime state (regenerated)
+signal-weights.json

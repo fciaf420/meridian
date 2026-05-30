@@ -82,7 +82,28 @@ export async function discoverPools({
  */
 export async function getTopCandidates({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
-  const { pools } = await discoverPools({ page_size: 50 });
+
+  // Route to the opt-in GMGN screening source. Defaults to Meteora when
+  // screening.source is unset, so the existing path is untouched.
+  let pools;
+  if (config.screening.source === "gmgn") {
+    // Dynamic import keeps gmgn-screen.js (and its gmgn-cli dependency) off the
+    // hot path for the default Meteora flow.
+    const { discoverGmgnPools } = await import("./gmgn-screen.js");
+    ({ pools } = await discoverGmgnPools({ limit: Math.max(limit, 10) }));
+
+    // Parity with the Meteora path (which filters blacklisted base tokens
+    // inside discoverPools): drop blacklisted base mints here.
+    pools = (pools || []).filter((p) => {
+      if (isBlacklisted(p.base?.mint)) {
+        log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
+        return false;
+      }
+      return true;
+    });
+  } else {
+    ({ pools } = await discoverPools({ page_size: 50 }));
+  }
 
   // Exclude pools where the wallet already has an open position
   const { getMyPositions } = await import("./dlmm.js");

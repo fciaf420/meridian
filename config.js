@@ -6,10 +6,16 @@ import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+const GMGN_CONFIG_PATH = path.join(__dirname, "gmgn-config.json");
 
-const u = fs.existsSync(USER_CONFIG_PATH)
-  ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
-  : {};
+function readJsonIfExists(filePath) {
+  return fs.existsSync(filePath)
+    ? JSON.parse(fs.readFileSync(filePath, "utf8"))
+    : {};
+}
+
+const u = readJsonIfExists(USER_CONFIG_PATH);
+const gmgnUserConfig = readJsonIfExists(GMGN_CONFIG_PATH);
 
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
@@ -18,6 +24,28 @@ if (u.llmProvider) process.env.LLM_PROVIDER     ||= u.llmProvider;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
 if (u.usdcMode !== undefined) process.env.USDC_MODE ||= String(u.usdcMode);
+if (gmgnUserConfig.apiKey || u.gmgnApiKey) {
+  process.env.GMGN_API_KEY ||= gmgnUserConfig.apiKey || u.gmgnApiKey;
+}
+
+function nonEmptyString(...values) {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
+}
+
+function gmgnValue(key, legacyKey, fallback) {
+  return gmgnUserConfig[key] ?? u[legacyKey] ?? fallback;
+}
+
+function gmgnArray(key, legacyKey, fallback) {
+  if (Array.isArray(gmgnUserConfig[key])) return gmgnUserConfig[key];
+  if (Array.isArray(u[legacyKey])) return u[legacyKey];
+  return fallback;
+}
 
 const DEFAULT_MODEL = getDefaultModelForProvider(getLlmProvider());
 
@@ -30,6 +58,7 @@ export const config = {
 
   // ─── Pool Screening Thresholds ───────────
   screening: {
+    source:            u.screeningSource    ?? "meteora", // "meteora" | "gmgn"
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl            ?? 150_000,
@@ -48,6 +77,64 @@ export const config = {
     athTopThresholdPct: u.athTopThresholdPct ?? 90,
     minTokenAgeHours:  u.minTokenAgeHours  ?? null, // null = no minimum (token age from GMGN creation_timestamp)
     maxTokenAgeHours:  u.maxTokenAgeHours  ?? null, // null = no maximum
+  },
+
+  // ─── GMGN Screening (opt-in via screening.source = "gmgn") ───────────
+  // Sourced from gmgn-config.json (preferred), then legacy user-config.json
+  // keys (gmgn*), then defaults. See gmgn-config.example.json for the schema.
+  gmgn: {
+    apiKey: nonEmptyString(gmgnUserConfig.apiKey, u.gmgnApiKey, process.env.GMGN_API_KEY),
+    // Stage-1 (trending rank) controls
+    interval:    gmgnValue("interval",    "gmgnInterval",    "5m"),
+    orderBy:     gmgnValue("orderBy",     "gmgnOrderBy",     "volume"),
+    direction:   gmgnValue("direction",   "gmgnDirection",   "desc"),
+    limit:       gmgnValue("limit",       "gmgnLimit",       100),
+    enrichLimit: gmgnValue("enrichLimit", "gmgnEnrichLimit", 20),
+    filters:     gmgnArray("filters",   "gmgnFilters",   ["renounced", "frozen", "not_wash_trading"]),
+    platforms:   gmgnArray("platforms", "gmgnPlatforms", ["Pump.fun", "meteora_virtual_curve", "pool_meteora"]),
+    // Stage-1 basic filters (trending row)
+    minMcap:          gmgnValue("minMcap",          "gmgnMinMcap",          150_000),
+    maxMcap:          gmgnValue("maxMcap",          "gmgnMaxMcap",          10_000_000),
+    maxBundlerRate:   gmgnValue("maxBundlerRate",   "gmgnMaxBundlerRate",   0.5),
+    minTokenAgeHours: gmgnValue("minTokenAgeHours", "gmgnMinTokenAgeHours", 2),
+    maxTokenAgeHours: gmgnValue("maxTokenAgeHours", "gmgnMaxTokenAgeHours", 24 * 7),
+    minVolume:        gmgnValue("minVolume",        "gmgnMinVolume",        1000),
+    minTvl:           gmgnValue("minTvl",           "gmgnMinTvl",           u.minTvl ?? 10_000),
+    // Stage-2 token-info filters
+    minHolders:          gmgnValue("minHolders",          "gmgnMinHolders",          1000),
+    minTotalFeeSol:      gmgnValue("minTotalFeeSol",      "gmgnMinTotalFeeSol",      30),
+    maxTop10HolderRate:  gmgnValue("maxTop10HolderRate",  "gmgnMaxTop10HolderRate",  0.5),
+    maxDevTeamHoldRate:  gmgnValue("maxDevTeamHoldRate",  "gmgnMaxDevTeamHoldRate",  0.02),
+    maxBotDegenRate:     gmgnValue("maxBotDegenRate",     "gmgnMaxBotDegenRate",     0.4),
+    maxFreshWalletRate:  gmgnValue("maxFreshWalletRate",  "gmgnMaxFreshWalletRate",  0.2),
+    maxRatTraderRate:    gmgnValue("maxRatTraderRate",    "gmgnMaxRatTraderRate",    0.2),
+    athFilterPct:        gmgnValue("athFilterPct",        "gmgnAthFilterPct",        null),
+    // Optional Stage-1/2 gates (read from trending row where available)
+    minSmartDegenCount:  gmgnValue("minSmartDegenCount",  "gmgnMinSmartDegenCount",  1),
+    requireKol:          gmgnValue("requireKol",          "gmgnRequireKol",          true),
+    minKolCount:         gmgnValue("minKolCount",         "gmgnMinKolCount",         1),
+    maxRugRatio:         gmgnValue("maxRugRatio",         "gmgnMaxRugRatio",         0.3),
+    maxSniperCount:      gmgnValue("maxSniperCount",      "gmgnMaxSniperCount",      20),
+    // Stage-3 holders/traders enrichment + KOL config
+    holdersLimit:           gmgnValue("holdersLimit",           "gmgnHoldersLimit",           100),
+    maxSniperHoldRate:      gmgnValue("maxSniperHoldRate",      "gmgnMaxSniperHoldRate",      0.3),
+    preferredKolNames:      gmgnArray("preferredKolNames",      "gmgnPreferredKolNames",      []),
+    preferredKolMinHoldPct: gmgnValue("preferredKolMinHoldPct", "gmgnPreferredKolMinHoldPct", 1),
+    dumpKolNames:           gmgnArray("dumpKolNames",           "gmgnDumpKolNames",           []),
+    dumpKolMinHoldPct:      gmgnValue("dumpKolMinHoldPct",      "gmgnDumpKolMinHoldPct",      0.5),
+    // Stage-4 indicator filter (reuses local fetchGmgnPriceInfo().candles)
+    indicatorFilter: gmgnValue("indicatorFilter", "gmgnIndicatorFilter", true),
+    indicatorRules: (() => {
+      const r = gmgnUserConfig.indicatorRules || {};
+      return {
+        requireBullishSupertrend: r.requireBullishSupertrend ?? true,
+        rejectAlreadyAtBottom:    r.rejectAlreadyAtBottom    ?? true,
+        requireAboveSupertrend:   r.requireAboveSupertrend   ?? false,
+        minRsi:                   r.minRsi                   ?? null,
+        maxRsi:                   r.maxRsi                   ?? null,
+        requireBbPosition:        r.requireBbPosition        ?? null,
+      };
+    })(),
   },
 
   // ─── Position Management ────────────────
@@ -196,6 +283,7 @@ export function computeDeployAmount(walletSol) {
 // Keys that map into each config section
 const SECTION_MAP = {
   screening: new Set(Object.keys(config.screening)),
+  gmgn: new Set(Object.keys(config.gmgn)),
   management: new Set(Object.keys(config.management)),
   risk: new Set(Object.keys(config.risk)),
   schedule: new Set(Object.keys(config.schedule)),
@@ -306,10 +394,10 @@ export function applyConfigChanges({ changes = {}, source = "manual", reason = "
  * agent cycle uses the evolved values without a restart.
  */
 export function reloadScreeningThresholds() {
-  if (!fs.existsSync(USER_CONFIG_PATH)) return;
   try {
-    const fresh = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
+    const fresh = readJsonIfExists(USER_CONFIG_PATH);
     const s = config.screening;
+    if (fresh.screeningSource != null) s.source = fresh.screeningSource;
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
     if (fresh.minOrganic     != null) s.minOrganic     = fresh.minOrganic;
     if (fresh.minHolders     != null) s.minHolders     = fresh.minHolders;
@@ -332,5 +420,14 @@ export function reloadScreeningThresholds() {
     if (fresh.stopLossPct           != null) m.stopLossPct           = fresh.stopLossPct;
     if (fresh.takeProfitFeePct      != null) m.takeProfitFeePct      = fresh.takeProfitFeePct;
     if (fresh.outOfRangeWaitMinutes != null) m.outOfRangeWaitMinutes = fresh.outOfRangeWaitMinutes;
+  } catch { /* ignore */ }
+  // Refresh GMGN screening keys from gmgn-config.json (mirrors the gmgn block above)
+  try {
+    const freshGmgn = readJsonIfExists(GMGN_CONFIG_PATH);
+    const g = config.gmgn;
+    for (const [key, value] of Object.entries(freshGmgn)) {
+      if (key in g && key !== "apiKey") g[key] = value;
+    }
+    if (freshGmgn.apiKey) g.apiKey = freshGmgn.apiKey;
   } catch { /* ignore */ }
 }
