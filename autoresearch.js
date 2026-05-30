@@ -38,6 +38,72 @@ const DEFAULTS = {
   kept_overrides: {},    // section → text for permanently kept experiment overrides
 };
 
+function readUserConfigSnapshot() {
+  const userConfigPath = path.join(__dirname, "user-config.json");
+  try {
+    if (!fs.existsSync(userConfigPath)) return {};
+    return JSON.parse(fs.readFileSync(userConfigPath, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function getEnvironmentSnapshot() {
+  const userConfig = readUserConfigSnapshot();
+  let weightsMeta = {};
+  try {
+    const weights = loadWeights();
+    weightsMeta = {
+      last_recalc: weights.last_recalc ?? null,
+      recalc_count: weights.recalc_count ?? 0,
+    };
+  } catch {
+    weightsMeta = {
+      last_recalc: null,
+      recalc_count: 0,
+    };
+  }
+
+  return {
+    thresholds_last_evolved: userConfig._lastEvolved ?? null,
+    thresholds_positions_at_evolution: userConfig._positionsAtEvolution ?? 0,
+    darwin_last_recalc: weightsMeta.last_recalc,
+    darwin_recalc_count: weightsMeta.recalc_count,
+  };
+}
+
+function environmentChangedSince(snapshot = {}) {
+  const current = getEnvironmentSnapshot();
+  // Only invalidate on threshold evolution (changes hard screening filters).
+  // Darwin weight recalcs only affect prompt summary text, not hard filters —
+  // they shouldn't invalidate experiments since the actual screening behavior
+  // doesn't change. This was causing 50%+ of experiments to be invalidated
+  // before completing the 7-close minimum.
+  return (
+    current.thresholds_last_evolved !== (snapshot.thresholds_last_evolved ?? null) ||
+    current.thresholds_positions_at_evolution !== (snapshot.thresholds_positions_at_evolution ?? 0)
+  );
+}
+
+function getTrialPositionsForExperiment(experiment, perfData) {
+  if (!experiment) return [];
+
+  if (experiment.section === "manager_logic") {
+    return perfData.filter((p) => {
+      const closedAt = p.recorded_at || p.closed_at;
+      return closedAt ? closedAt >= experiment.started_at : false;
+    });
+  }
+
+  return perfData.slice(experiment.started_at_position)
+    .filter((p) => {
+      const deployedAt = p.deployed_at;
+      if (deployedAt) return deployedAt >= experiment.started_at;
+      const closedAt = p.recorded_at || p.closed_at;
+      return closedAt ? closedAt >= experiment.started_at : true;
+    });
+}
+
 export function loadAutoresearch() {
   if (!fs.existsSync(AUTORESEARCH_FILE)) {
     saveAutoresearch(DEFAULTS);
@@ -148,22 +214,38 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
     }
   }
 
-  // 2. Pick the worst section
-  let worstSection = "screener_criteria";
-  let worstCount = 0;
-  for (const [section, losses] of Object.entries(sectionLosses)) {
-    if (losses.length > worstCount) {
-      worstCount = losses.length;
-      worstSection = section;
-    }
-  }
-
-  if (worstCount === 0) {
+  // 2. Pick the worst section — with rotation to avoid optimizing the same section repeatedly
+  const sections = Object.entries(sectionLosses).filter(([, losses]) => losses.length > 0);
+  if (sections.length === 0) {
     log("autoresearch", "No losses in recent closes — nothing to optimize");
     return;
   }
 
+  // Check last N experiments — if the same section was targeted 3+ times in a row, rotate
+  const MAX_CONSECUTIVE = 3;
+  const recentSections = (state.experiments || []).slice(-MAX_CONSECUTIVE).map(e => e.section);
+  const lastSection = recentSections[0];
+  const allSame = recentSections.length >= MAX_CONSECUTIVE && recentSections.every(s => s === lastSection);
+
+  // Sort by loss count descending
+  sections.sort((a, b) => b[1].length - a[1].length);
+
+  let worstSection, worstCount;
+  if (allSame && sections.length > 1) {
+    // Force rotation to the second-worst section
+    [worstSection, { length: worstCount }] = [sections[1][0], { length: sections[1][1].length }];
+    log("autoresearch", `Rotating away from ${lastSection} (${MAX_CONSECUTIVE}x consecutive) → trying ${worstSection}`);
+  } else {
+    [worstSection, { length: worstCount }] = [sections[0][0], { length: sections[0][1].length }];
+  }
+
   log("autoresearch", `Worst section: ${worstSection} (${worstCount} attributed losses)`);
+
+  const minAttributedLosses = cfg.autoresearch?.minAttributedLosses ?? 3;
+  if (worstCount < minAttributedLosses) {
+    log("autoresearch", `Only ${worstCount} attributed losses for ${worstSection} (need ${minAttributedLosses}) — skipping`);
+    return;
+  }
 
   // 3. Read current prompt text for that section
   const currentText = getPromptSectionText(worstSection);
@@ -172,17 +254,51 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
     return;
   }
 
-  // 4. Generate modification via cheap LLM
+  // 4. Generate modification via LLM with KB context
   const failures = sectionLosses[worstSection];
   const failureDesc = failures
-    .map(f => `- ${f.pool_name || "unknown"}: PnL ${f.pnl_pct}%, reason: ${f.close_reason || "unknown"}`)
+    .map(f => `- ${f.pool_name || "unknown"}: PnL ${f.pnl_pct}%, reason: ${f.close_reason || "unknown"}, strategy: ${f.strategy || "?"}, volatility: ${f.volatility || "?"}`)
     .join("\n");
+
+  // Search KB for patterns related to the failing pools/strategies
+  let kbContext = "";
+  try {
+    const { searchArticles, readArticle } = await import("./knowledge-base.js");
+    const kbQueries = new Set();
+    for (const f of failures) {
+      if (f.pool_name) kbQueries.add(f.pool_name.replace(/-SOL$/, ""));
+      if (f.strategy) kbQueries.add(f.strategy);
+      if (f.close_reason?.includes("OOR")) kbQueries.add("oor");
+    }
+    kbQueries.add(worstSection.replace("_", " "));
+
+    const seen = new Set();
+    const kbSnippets = [];
+    for (const q of kbQueries) {
+      const results = searchArticles(q);
+      for (const r of (results.results || []).slice(0, 3)) {
+        if (seen.has(r.path)) continue;
+        seen.add(r.path);
+        const article = readArticle(r.path);
+        if (article?.content) {
+          kbSnippets.push(`--- ${r.path} ---\n${article.content.slice(0, 500)}`);
+        }
+        if (kbSnippets.length >= 8) break;
+      }
+      if (kbSnippets.length >= 8) break;
+    }
+    if (kbSnippets.length > 0) {
+      kbContext = `\n\nKNOWLEDGE BASE CONTEXT (relevant articles from prior experience):\n${kbSnippets.join("\n\n")}`;
+    }
+  } catch (e) {
+    log("autoresearch", `KB lookup failed (non-fatal): ${e.message}`);
+  }
 
   const llmModel = cfg.autoresearch?.llmModel ?? getDefaultModelForProvider(getLlmProvider());
   let hypothesis, modifiedText;
 
   try {
-    const result = await callLLM(llmModel, worstSection, worstCount, currentText, failureDesc);
+    const result = await callLLM(llmModel, worstSection, worstCount, currentText, failureDesc + kbContext);
     hypothesis = result.hypothesis;
     modifiedText = result.modifiedText;
   } catch (e) {
@@ -225,6 +341,7 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
       positions: 0,
     },
     status: "active",
+    environment_snapshot: getEnvironmentSnapshot(),
   };
 
   // Snapshot current Darwin signal weights for audit trail.
@@ -255,21 +372,23 @@ async function evaluateExperiment(perfData, cfg, state) {
   if (!experiment) return;
 
   const minCloses = cfg.autoresearch?.minClosesPerTrial ?? 7;
+  const minEvidenceCloses = cfg.autoresearch?.minEvidenceCloses ?? Math.max(10, minCloses + 2);
+  const minAbsoluteWinRateDeltaPct = cfg.autoresearch?.minAbsoluteWinRateDeltaPct ?? 10;
+  const minAbsolutePnlDeltaPct = cfg.autoresearch?.minAbsolutePnlDeltaPct ?? 0.5;
   const improvementPct = cfg.autoresearch?.improvementPct ?? 15;
   const declinePct = cfg.autoresearch?.declinePct ?? 15;
   const cooldownCloses = cfg.autoresearch?.cooldownCloses ?? 5;
 
-  // Positions closed since experiment started, filtered to only include those
-  // actually DEPLOYED after the experiment began. Positions deployed before the
-  // experiment but closed after it started would contaminate trial results since
-  // the prompt change couldn't have influenced their deployment decision.
-  const trialPositions = perfData.slice(experiment.started_at_position)
-    .filter(p => {
-      // Only count positions actually deployed AFTER the experiment started
-      const deployedAt = p.deployed_at;
-      if (!deployedAt) return true; // no deploy timestamp, include by default
-      return deployedAt >= experiment.started_at;
-    });
+  if (environmentChangedSince(experiment.environment_snapshot)) {
+    log("autoresearch", `Environment changed during ${experiment.id} — invalidating trial to avoid confounded results`);
+    finishExperiment(state, "invalidated_environment_change", 0);
+    return;
+  }
+
+  // Screener/range changes should only be judged on positions deployed after the
+  // experiment started. Manager changes should be judged on any positions CLOSED
+  // after the experiment started, including positions that were already open.
+  const trialPositions = getTrialPositionsForExperiment(experiment, perfData);
   const trialCount = trialPositions.length;
 
   experiment.trial.positions = trialCount;
@@ -292,6 +411,14 @@ async function evaluateExperiment(perfData, cfg, state) {
     return;
   }
 
+  // Require a slightly larger evidence window before making a keep/revert call.
+  // This reduces noisy decisions when the default minCloses is just barely met.
+  if (trialCount < minEvidenceCloses) {
+    saveAutoresearch(state);
+    log("autoresearch", `Experiment ${experiment.id}: ${trialCount}/${minEvidenceCloses} evidence closes (waiting for a less noisy verdict)`);
+    return;
+  }
+
   // Compute trial metrics
   const trialWins = trialPositions.filter(p => (p.pnl_usd ?? 0) > 0).length;
   const trialWR = (trialWins / trialCount) * 100;
@@ -303,13 +430,33 @@ async function evaluateExperiment(perfData, cfg, state) {
   // Compare to baseline using composite score: 60% win rate + 40% avg PnL
   const baselineWR = experiment.baseline.win_rate;
   const wrImprovement = ((trialWR - baselineWR) / Math.max(baselineWR, 1)) * 100;
+  const absoluteWinRateDelta = trialWR - baselineWR;
 
   const baselinePnl = experiment.baseline.avg_pnl_pct;
   const pnlImprovement = baselinePnl !== 0
     ? ((trialAvgPnl - baselinePnl) / Math.max(Math.abs(baselinePnl), 0.1)) * 100
     : (trialAvgPnl > 0 ? 100 : trialAvgPnl < 0 ? -100 : 0);
+  const absolutePnlDelta = trialAvgPnl - baselinePnl;
 
   const compositeImprovement = (wrImprovement * 0.6) + (pnlImprovement * 0.4);
+
+  const trialLosses = trialCount - trialWins;
+  const isImbalancedTinySample = trialCount < 2 * minEvidenceCloses && (trialWins === 0 || trialLosses === 0);
+  if (isImbalancedTinySample) {
+    log("autoresearch", `Experiment ${experiment.id}: ${trialWins}/${trialCount} wins/losses too one-sided for a confident verdict — waiting for more closes`);
+    saveAutoresearch(state);
+    return;
+  }
+
+  const hasMeaningfulAbsoluteDelta =
+    Math.abs(absoluteWinRateDelta) >= minAbsoluteWinRateDeltaPct ||
+    Math.abs(absolutePnlDelta) >= minAbsolutePnlDeltaPct;
+
+  if (!hasMeaningfulAbsoluteDelta) {
+    log("autoresearch", `Experiment ${experiment.id}: absolute deltas too small for a confident verdict (WR Δ ${absoluteWinRateDelta.toFixed(1)} pts, PnL Δ ${absolutePnlDelta.toFixed(2)} pts)`);
+    finishExperiment(state, "inconclusive", cooldownCloses);
+    return;
+  }
 
   log("autoresearch", `Experiment ${experiment.id}: trial WR ${trialWR.toFixed(1)}% vs baseline ${baselineWR.toFixed(1)}% (WR improvement: ${wrImprovement.toFixed(1)}%, PnL improvement: ${pnlImprovement.toFixed(1)}%, composite: ${compositeImprovement.toFixed(1)}%)`);
 
@@ -376,8 +523,8 @@ function logExperimentLesson(experiment, outcome, improvementPct) {
 
 async function callLLM(model, sectionName, lossCount, currentText, failureDesc) {
   const provider = getLlmProvider();
-  if (provider === "codex") {
-    const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your goal is to make small, surgical edits that reduce losses.
+
+  const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your goal is to make small, surgical edits that reduce losses.
 
 KEY DOMAIN KNOWLEDGE for your modifications:
 - STRATEGIES: The agent can deploy "bid_ask" (single-sided SOL below price — earns fees on sell pressure, safe but goes idle if price pumps UP) or "spot" with sol_split_pct (two-sided, e.g. 80% SOL / 20% token — captures fees in both directions, better for pumping tokens but riskier if token dumps).
@@ -388,7 +535,7 @@ KEY DOMAIN KNOWLEDGE for your modifications:
 - HARD RULE: NEVER propose widening price_range_pct to fix OOR upside on bid_ask or SOL-only spot strategies. These strategies place bins BELOW the active bin only — wider range adds more bins below, which CANNOT reach a price that pumped ABOVE. This is a physical impossibility, not a tuning problem. If OOR upside is the issue, the fix is strategy selection or screener criteria, never range width.
 - The agent has signal weights showing which screening signals predict wins (organic_score, fee_tvl_ratio, mcap are strong; holder_count, volume are weak).`;
 
-    const userMsg = `Section "${sectionName}" has caused ${lossCount} recent losses.
+  const userMsg = `Section "${sectionName}" has caused ${lossCount} recent losses.
 
 Current text:
 ---
@@ -405,6 +552,7 @@ HYPOTHESIS: [one sentence explaining what you're changing and why]
 MODIFIED_TEXT:
 [full section text with your single change applied]`;
 
+  if (provider === "codex") {
     const content = await runCodexExec(model, `${systemMsg}\n\n${userMsg}`, {
       cwd: process.cwd(),
       sandbox: "read-only",
@@ -448,33 +596,19 @@ MODIFIED_TEXT:
   const apiKey = getProviderApiKey();
   if (!apiKey) throw new Error("LLM API key/token not available for autoresearch");
 
-  const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your goal is to make small, surgical edits that reduce losses.
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: systemMsg },
+      { role: "user", content: userMsg },
+    ],
+    temperature: 0.4,
+    max_tokens: 4096,
+  };
 
-KEY DOMAIN KNOWLEDGE for your modifications:
-- STRATEGIES: The agent can deploy "bid_ask" (single-sided SOL below price — earns fees on sell pressure, safe but goes idle if price pumps UP) or "spot" with sol_split_pct (two-sided, e.g. 80% SOL / 20% token — captures fees in both directions, better for pumping tokens but riskier if token dumps).
-- OOR UPSIDE: Price pumped above the position range. For bid_ask, SOL sits idle earning nothing. Spot two-sided would have captured fees on the way up.
-- OOR DOWNSIDE: Price dropped below the position range. SOL converted to token, real loss. Wider range helps stay in range longer.
-- If failures show repeated "OOR upside" with bid_ask, consider switching to spot with high sol_split_pct (80-90) for those pool types, or improving screener criteria to avoid deploying into tokens that are mid-pump.
-- If failures show "OOR downside", consider widening price_range_pct or tightening screening thresholds.
-- HARD RULE: NEVER propose widening price_range_pct to fix OOR upside on bid_ask or SOL-only spot strategies. These strategies place bins BELOW the active bin only — wider range adds more bins below, which CANNOT reach a price that pumped ABOVE. This is a physical impossibility, not a tuning problem. If OOR upside is the issue, the fix is strategy selection or screener criteria, never range width.
-- The agent has signal weights showing which screening signals predict wins (organic_score, fee_tvl_ratio, mcap are strong; holder_count, volume are weak).`;
-
-  const userMsg = `Section "${sectionName}" has caused ${lossCount} recent losses.
-
-Current text:
----
-${currentText}
----
-
-Recent failures:
-${failureDesc}
-
-Generate exactly ONE small, targeted modification. Change only one instruction or threshold. Do not rewrite the whole section.
-
-Reply with:
-HYPOTHESIS: [one sentence explaining what you're changing and why]
-MODIFIED_TEXT:
-[full section text with your single change applied]`;
+  if (provider === "minimax") {
+    body.reasoning_split = true;
+  }
 
   const response = await fetch(baseURL, {
     method: "POST",
@@ -482,15 +616,7 @@ MODIFIED_TEXT:
       "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: systemMsg },
-        { role: "user", content: userMsg },
-      ],
-      temperature: 0.4,
-      max_tokens: 4096,
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -499,7 +625,8 @@ MODIFIED_TEXT:
   }
 
   const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
+  const message = data.choices?.[0]?.message;
+  const content = message?.content;
   if (!content) throw new Error("Empty response from LLM");
 
   // Parse response

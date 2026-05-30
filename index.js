@@ -7,7 +7,7 @@ import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./age
 import { log } from "./logger.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates } from "./tools/screening.js";
+import { getTopCandidates, rankCandidatesByDarwin } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
@@ -198,6 +198,20 @@ function startCronJobs() {
             const yourHours = p.age_minutes != null ? Math.round(p.age_minutes / 6) / 10 : null;
             const hint = `${p.pair}: Top LPer avg hold: ${p.study_avg_hold_hours}h (from study at deploy)`;
             holdTimeHints.push(yourHours != null ? `${hint} — your age: ${yourHours}h` : hint);
+          }
+
+          if (p.strategy_profile === "evil_panda" && p.base_mint) {
+            try {
+              const gmgn = await fetchGmgnPriceInfo(p.base_mint);
+              const c = gmgn?.candles;
+              if (c) {
+                const pnlPositive = (p.pnl_pct ?? 0) > 0;
+                const exitOk = pnlPositive && c.evil_panda_exit_signal;
+                const line = `${p.pair}: Evil Panda exit check - pnl=${p.pnl_pct ?? "?"}% (${pnlPositive ? "positive" : "not positive"}), RSI(2)=${c.rsi_2 ?? "?"}, close>BB_upper=${!!c.close_above_bb_upper}, MACD_first_green=${!!c.macd_first_green_histogram}, exit=${exitOk ? "YES" : "NO"}${c.evil_panda_exit_reason ? ` (${c.evil_panda_exit_reason})` : ""}`;
+                if (exitOk) exits.push(line);
+                else holdTimeHints.push(line);
+              }
+            } catch { /* GMGN exit context is best-effort */ }
           }
         }
         if (recalls.length > 0) {
@@ -465,7 +479,14 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
           const smartWalletCount = swResult?.in_pool?.length || 0;
           c._smartWalletCount = smartWalletCount;
 
-          let block = `[${c.name}] pool: ${c.pool} | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
+          let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
+
+          if (Array.isArray(c.darwin_top_signals) && c.darwin_top_signals.length > 0) {
+            const topSignals = c.darwin_top_signals
+              .map((s) => `${s.signal}=${s.value} (${s.direction})`)
+              .join(", ");
+            block += `\n  Darwin context: higher score = better fit to learned winning signals. Top drivers: ${topSignals}`;
+          }
 
           if (dynFeeResult) block += ` | base_fee: ${c.fee_pct}% | dynamic_fee: ${dynFeeResult.dynamic_fee_pct}%`;
           if (tokenData) {
@@ -481,6 +502,14 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
           if (gmgnResult) {
             block += ` | ath: ${gmgnResult.ath_proximity_pct ?? "?"}%`;
             block += ` | momentum: 5m=${gmgnResult.change_5m ?? "?"}% 1h=${gmgnResult.change_1h ?? "?"}%`;
+            block += ` | token24hVol: $${Math.round(gmgnResult.volume_24h ?? 0)} | tokenMcap: $${Math.round(gmgnResult.market_cap ?? 0)}`;
+            if (gmgnResult.candles) {
+              const epPass = gmgnResult.volume_24h >= (config.strategy.evilPanda?.minTokenVolume24h ?? 750000)
+                && gmgnResult.market_cap >= (config.strategy.evilPanda?.minMcap ?? 200000)
+                && gmgnResult.candles.evil_panda_entry_ok;
+              block += `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, mcap>=${config.strategy.evilPanda?.minMcap ?? 200000}, 5m Supertrend green/price above`;
+              block += ` | supertrend=${gmgnResult.candles.supertrend_direction ?? "?"}/${gmgnResult.candles.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${gmgnResult.candles.rsi_2 ?? "?"}`;
+            }
             if (gmgnResult.ath_proximity_pct != null && gmgnResult.ath_proximity_pct >= config.screening.athTopThresholdPct) {
               block += `\n  ATH WARNING: ${gmgnResult.ath_proximity_pct}% of ATH (>=${config.screening.athTopThresholdPct}%) — override bid_ask range to 65-80%`;
             }
@@ -491,14 +520,23 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
           if (gmgnSignalResult) {
             block += `\n  GMGN signal: ${gmgnSignalResult.summary}`;
           }
-          return block;
+          return { pool: c.pool, block };
         }));
-        const validBlocks = blocks.filter(b => b.status === "fulfilled").map(b => b.value);
+        const rankedCandidates = rankCandidatesByDarwin(candidates);
+        loadedCandidates = rankedCandidates;
+        const blockMap = new Map(
+          blocks
+            .filter((b) => b.status === "fulfilled")
+            .map((b) => [b.value.pool, b.value.block])
+        );
+        const validBlocks = rankedCandidates
+          .map((c) => blockMap.get(c.pool))
+          .filter(Boolean);
         if (validBlocks.length > 0) {
-          candidateBlocks = `\n\nPRE-LOADED CANDIDATES (recon already done — evaluate and deploy the best one):\n${validBlocks.join("\n\n")}\n`;
+          candidateBlocks = `\n\nPRE-LOADED CANDIDATES (recon already done — evaluate and deploy the best one):\nDarwin score is a learned 0-100 ranking over the current shortlist. Higher = stronger fit to historically winning signal patterns. Use it as a ranking aid, not a hard deploy rule.\n${validBlocks.join("\n\n")}\n`;
         }
         // Stage signals for each candidate so deploy can snapshot them
-        for (const c of candidates) {
+        for (const c of rankedCandidates) {
           try {
             stageSignals(c.pool, {
               organic_score: c.organic_score ?? null,
@@ -511,6 +549,16 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
               narrative_quality: null, // filled by tool signal capture in executor
               study_win_rate: null,    // filled by tool signal capture in executor
               ath_proximity: c._gmgnResult?.ath_proximity_pct ?? null,
+              // New Darwinian signals
+              volume_trend: c._gmgnResult?.candles?.volume_trend ?? null,
+              gmgn_signal_present: (c._gmgnSignal?.signal_count_30m || 0) > 0,
+              change_1h: c._gmgnResult?.change_1h ?? null,
+              candle_price_range: c._gmgnResult?.candles?.price_range_pct ?? null,
+              token_volume_24h: c._gmgnResult?.volume_24h ?? null,
+              token_market_cap: c._gmgnResult?.market_cap ?? null,
+              supertrend_green: c._gmgnResult?.candles?.supertrend_green ?? null,
+              rsi_2: c._gmgnResult?.candles?.rsi_2 ?? null,
+              // Extra GMGN signal metadata (not weighted but stored for analysis)
               gmgn_signal_count_30m: c._gmgnSignal?.signal_count_30m ?? null,
               gmgn_signal_count_2h: c._gmgnSignal?.signal_count_2h ?? null,
               gmgn_signal_amount_30m: c._gmgnSignal?.signal_amount_usd_30m ?? null,
@@ -541,7 +589,7 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
       } catch { /* best-effort */ }
 
       const gmgnSignalGuide = candidateBlocks
-        ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n`
+        ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n- Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n`
         : "";
 
       const { content } = await screenerLoop(`
@@ -597,8 +645,17 @@ ${getRangeSelectionText(deployAmount, currentBalance?.sol)}
 
     log("cron", "Starting KB health check");
     try {
+      // Fast deterministic lint first — no LLM needed
+      const { lintKnowledgeBase } = await import("./knowledge-base.js");
+      const lintResult = lintKnowledgeBase();
+      if (lintResult) {
+        log("cron", `KB lint: ${lintResult.total_articles} articles, ${lintResult.issues.length} issues (${lintResult.orphan_count} orphans, ${lintResult.stale_count} stale, ${lintResult.empty_count} empty)`);
+      }
+      // Only call LLM for deeper review if lint found issues
+      const issueCount = lintResult?.issues?.length || 0;
+      const lintContext = issueCount > 0 ? `\n\nLINT RESULTS (${issueCount} issues):\n${lintResult.issues.join("\n")}` : "";
       const { content } = await agentLoop(
-        `KNOWLEDGE BASE HEALTH CHECK: Read kb_read("INDEX.md") to see all articles. Then review 3-5 articles that seem most likely to have issues (oldest, most cross-referenced, or covering active pools). Look for: contradictions between articles, stale data that no longer matches recent performance, missing cross-references ([[concept]] links), and articles that could be merged or split. Fix any issues found using kb_write. Report what you checked and any changes made.`,
+        `KNOWLEDGE BASE HEALTH CHECK:${lintContext}\nRead kb_read("INDEX.md") to see all articles. Review 3-5 articles that seem most likely to have issues. Look for: contradictions, stale data, missing cross-references, and articles that could be merged. Fix any issues using kb_write. Report what you checked and any changes made.`,
         10, [], "GENERAL", config.llm.generalModel
       );
       emit("cycle:kb_health", { report: content });

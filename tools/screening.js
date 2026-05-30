@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
+import { scoreSignalSnapshot } from "../signal-weights.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 
@@ -89,12 +90,12 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
-  const eligible = pools
-    .filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
-    .slice(0, limit);
+  const eligible = rankCandidatesByDarwin(
+    pools.filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
+  );
 
   return {
-    candidates: eligible.map(normalizeCandidateForUi),
+    candidates: eligible.slice(0, limit).map(normalizeCandidateForUi),
     total_eligible: eligible.length,
     total_screened: pools.length,
   };
@@ -106,6 +107,49 @@ export function normalizeCandidateForUi(candidate) {
     volume: candidate.volume ?? candidate.volume_window ?? candidate.volume_24h ?? null,
     active_pct: candidate.active_pct ?? candidate.active_bin_pct ?? null,
   };
+}
+
+export function getCandidateSignalSnapshot(candidate) {
+  const c = normalizeCandidateForUi(candidate);
+  return {
+    organic_score: c.organic_score ?? c.base?.organic ?? null,
+    fee_tvl_ratio: c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? null,
+    volume: c.volume ?? null,
+    mcap: c.mcap ?? null,
+    holder_count: c.holders ?? null,
+    smart_wallets_present: c._smartWalletCount != null ? c._smartWalletCount > 0 : c.smart_wallets_present ?? null,
+    narrative_quality: c.narrative_quality ?? null,
+    study_win_rate: c.study_win_rate ?? null,
+    volatility: c.volatility ?? null,
+    ath_proximity: c._gmgnResult?.ath_proximity_pct ?? c.ath_proximity ?? null,
+    volume_trend: c._gmgnResult?.candles?.volume_trend ?? c.volume_trend ?? null,
+    gmgn_signal_present: c._gmgnSignal ? ((c._gmgnSignal.signal_count_30m || 0) > 0) : c.gmgn_signal_present ?? null,
+    change_1h: c._gmgnResult?.change_1h ?? c.change_1h ?? null,
+    candle_price_range: c._gmgnResult?.candles?.price_range_pct ?? c.candle_price_range ?? null,
+  };
+}
+
+export function rankCandidatesByDarwin(candidates = []) {
+  return candidates
+    .map((candidate, index) => {
+      const normalized = normalizeCandidateForUi(candidate);
+      const darwin = scoreSignalSnapshot(getCandidateSignalSnapshot(normalized), { topN: 3 });
+      return {
+        ...normalized,
+        darwin_score: darwin.score_pct,
+        darwin_weight_coverage: darwin.coverage,
+        darwin_top_signals: darwin.topSignals,
+        _darwin_sort_index: index,
+      };
+    })
+    .sort((a, b) =>
+      (b.darwin_score ?? 0) - (a.darwin_score ?? 0) ||
+      (b.fee_active_tvl_ratio ?? 0) - (a.fee_active_tvl_ratio ?? 0) ||
+      (b.volume ?? 0) - (a.volume ?? 0) ||
+      (b.organic_score ?? 0) - (a.organic_score ?? 0) ||
+      (a._darwin_sort_index ?? 0) - (b._darwin_sort_index ?? 0)
+    )
+    .map(({ _darwin_sort_index, ...candidate }) => candidate);
 }
 
 /**

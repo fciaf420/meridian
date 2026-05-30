@@ -73,8 +73,14 @@ export const config = {
 
   // ─── Strategy Mapping ───────────────────
   strategy: {
-    strategy:   u.strategy   ?? "bid_ask",
+    activeStrategy: u.activeStrategy ?? "evil_panda",
+    strategy:   u.strategy   ?? "spot",
     binsBelow:  u.binsBelow  ?? 69,  // activeBin - 69 to activeBin = 70 bins total (program max)
+    evilPanda: {
+      minTokenVolume24h: u.evilPandaMinTokenVolume24h ?? 750_000,
+      minMcap: u.evilPandaMinMcap ?? 200_000,
+      priceRangePct: u.evilPandaPriceRangePct ?? 80,
+    },
   },
 
   // ─── Scheduling ─────────────────────────
@@ -116,12 +122,21 @@ export const config = {
     weightFloor: u.darwinianWeightFloor ?? 0.3,
     weightCeiling: u.darwinianWeightCeiling ?? 2.5,
     minSamples: u.darwinianMinSamples ?? 10,
+    perSignalMinSamples: u.darwinianPerSignalMinSamples ?? 12,
+    minAbsLiftToAdjust: u.darwinianMinAbsLiftToAdjust ?? 0.05,
+    strongLiftThreshold: u.darwinianStrongLiftThreshold ?? 0.2,
+    calibrationMinSamples: u.darwinianCalibrationMinSamples ?? 20,
+    meanReversionRate: u.darwinianMeanReversionRate ?? 0.02,
   },
 
   // ─── Autoresearch (ATLAS-inspired prompt optimization) ─────
   autoresearch: {
     enabled: u.autoresearch ?? false,
     minClosesPerTrial: u.autoresearchMinCloses ?? 7,
+    minEvidenceCloses: u.autoresearchMinEvidenceCloses ?? Math.max(10, (u.autoresearchMinCloses ?? 7) + 2),
+    minAttributedLosses: u.autoresearchMinAttributedLosses ?? 3,
+    minAbsoluteWinRateDeltaPct: u.autoresearchMinAbsoluteWinRateDeltaPct ?? 10,
+    minAbsolutePnlDeltaPct: u.autoresearchMinAbsolutePnlDeltaPct ?? 0.5,
     improvementPct: u.autoresearchImprovementPct ?? 15,
     declinePct: u.autoresearchDeclinePct ?? 15,
     cooldownCloses: u.autoresearchCooldownCloses ?? 5,

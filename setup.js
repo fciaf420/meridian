@@ -105,6 +105,14 @@ const existing = fs.existsSync(CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
   : {};
 
+const DEFAULT_MODELS_BY_PROVIDER = {
+  claude: "sonnet",
+  codex: "gpt-4o",
+  deepseek: "deepseek-chat",
+  minimax: "MiniMax-M2.7",
+  openrouter: "openai/gpt-5.4-nano",
+};
+
 const e = (key, fallback) => existing[key] ?? fallback;
 
 console.log(`
@@ -254,15 +262,33 @@ console.log("\n── LLM ──────────────────
 
 const defaultLlmProvider = e("llmProvider", process.env.LLM_PROVIDER || "codex");
 const llmProviderChoice = await askChoice("LLM provider:", [
+  { label: `Claude OAuth${defaultLlmProvider === "claude" ? " (default)" : ""}`, key: "claude" },
   { label: `Codex OAuth${defaultLlmProvider === "codex" ? " (default)" : ""}`, key: "codex" },
   { label: `OpenRouter${defaultLlmProvider === "openrouter" ? " (default)" : ""}`, key: "openrouter" },
   { label: `DeepSeek${defaultLlmProvider === "deepseek" ? " (default)" : ""}`, key: "deepseek" },
+  { label: `MiniMax Token Plan${defaultLlmProvider === "minimax" ? " (default)" : ""}`, key: "minimax" },
 ]);
 const llmProvider = llmProviderChoice.key || defaultLlmProvider;
-
-const llmModel = await ask(
-  "LLM model ID",
-  e("llmModel", process.env.LLM_MODEL || "gpt-4o")
+const providerDefaultModel = DEFAULT_MODELS_BY_PROVIDER[llmProvider] || "gpt-4o";
+const globalDefaultLlmModel = e(
+  "llmModel",
+  process.env.LLM_MODEL || providerDefaultModel
+);
+const managementModel = await ask(
+  "Manager model ID",
+  e("managementModel", globalDefaultLlmModel)
+);
+const screeningModel = await ask(
+  "Screener model ID",
+  e("screeningModel", globalDefaultLlmModel)
+);
+const generalModel = await ask(
+  "General/chat model ID",
+  e("generalModel", globalDefaultLlmModel)
+);
+const autoresearchModel = await ask(
+  "Autoresearch model ID",
+  e("autoresearchModel", globalDefaultLlmModel)
 );
 
 const dryRun = await ask(
@@ -292,7 +318,11 @@ const userConfig = {
   managementIntervalMin,
   screeningIntervalMin,
   llmProvider,
-  llmModel,
+  llmModel: globalDefaultLlmModel,
+  managementModel,
+  screeningModel,
+  generalModel,
+  autoresearchModel,
   dryRun: dryRun === "true",
 };
 
@@ -319,7 +349,10 @@ Timeframe:    ${timeframe}
   Mgmt:        every ${managementIntervalMin} min
   Screening:   every ${screeningIntervalMin} min
   Provider:    ${llmProvider}
-  Model:       ${llmModel}
+  Manager:     ${managementModel}
+  Screener:    ${screeningModel}
+  General:     ${generalModel}
+  Research:    ${autoresearchModel}
   Dry run:     ${dryRun}
 
 Run "npm start" to launch the agent.

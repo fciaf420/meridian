@@ -13,6 +13,7 @@
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "test:runtime": "node --test test/test-runtime-fixes.js",
+    "lint": "eslint .",
     "postinstall": "node scripts/patch-anchor.js"
   },
   "dependencies": {
@@ -30,5 +31,10 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.2.0",
+    "globals": "^17.4.0"
   }
 }

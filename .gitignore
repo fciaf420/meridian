@@ -32,3 +32,6 @@ web/dist/
 
 # Dev context
 context.md
+
+# Personal Claude Code config
+CLAUDE.local.md

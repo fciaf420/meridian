@@ -567,17 +567,21 @@ export function evolveThresholds(perfData, config, { userConfig, lessonsData } =
     }
   }
 
-  if (Object.keys(changes).length === 0) return { changes: {}, rationale: {} };
-
   // ── Persist changes to user-config.json ───────────────────────
   // Use shared userConfig if provided by caller (avoids redundant read/write
   // when evolveThresholds + evolveFromLessons run back-to-back).
   if (!userConfig) userConfig = readUserConfig();
 
-  Object.assign(userConfig, changes);
+  // Always update the counter so we don't re-check the same data every close
   userConfig._lastEvolved = new Date().toISOString();
   userConfig._positionsAtEvolution = perfData.length;
 
+  if (Object.keys(changes).length === 0) {
+    writeUserConfig(userConfig);
+    return { changes: {}, rationale: {}, userConfig };
+  }
+
+  Object.assign(userConfig, changes);
   writeUserConfig(userConfig);
 
   // Apply to live config object immediately
@@ -970,14 +974,15 @@ const ROLE_TAGS = {
  *   2. Role-matched  — lessons tagged for this agentType, up to ROLE_CAP
  *   3. Recent        — fill remaining slots up to RECENT_CAP
  */
-export function getLessonsForPrompt(opts = {}) {
-  // Support legacy call signature: getLessonsForPrompt(20)
+export function getLessonRecordsForPrompt(opts = {}) {
+  // Support legacy call signature: getLessonRecordsForPrompt(20)
   if (typeof opts === "number") opts = { maxLessons: opts };
 
   const { agentType = "GENERAL", maxLessons = 35 } = opts;
-
   const data = load();
-  if (data.lessons.length === 0) return null;
+  if (data.lessons.length === 0) {
+    return { pinned: [], roleMatched: [], recent: [], selected: [] };
+  }
 
   const PINNED_CAP = 10;
   const ROLE_CAP   = 15;
@@ -1017,7 +1022,16 @@ export function getLessonsForPrompt(opts = {}) {
         .slice(0, remainingBudget)
     : [];
 
-  const selected = [...pinned, ...roleMatched, ...recent];
+  return {
+    pinned,
+    roleMatched,
+    recent,
+    selected: [...pinned, ...roleMatched, ...recent],
+  };
+}
+
+export function getLessonsForPrompt(opts = {}) {
+  const { pinned, roleMatched, recent, selected } = getLessonRecordsForPrompt(opts);
   if (selected.length === 0) return null;
 
   const sections = [];

@@ -130,7 +130,7 @@ For two-sided spot: just pass your total SOL as amount_y + sol_split_pct. The ex
 
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
-2. No user spec → use active strategy's lp_strategy and choose bins based on volatility
+2. No user spec → use active strategy. Current default is Evil Panda: single-sided SOL spot, price_range_pct=80, token-level GMGN volume24H >= $750k, marketCap >= $200k, and 5m Supertrend green/price above.
 
 STRATEGIES:
 - 'bid_ask': Single-sided SOL below active bin. You only deposit SOL. bins_below = your range, bins_above = 0. As price drops, your SOL buys the base token bin by bin. You are NOT holding the token upfront — safer if it dumps.
@@ -159,7 +159,7 @@ WHEN TO USE WHICH:
 - High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token. Set sol_split_pct based on conviction level.
 - High volatility, trending, pumping → bid_ask. You earn fees from the sell pressure without holding the bag.
 - Stable, range-bound, high volume → spot two-sided. More fee capture from both sides.
-- When unsure → ALWAYS default to bid_ask single-sided. It's the safe choice.
+- When unsure → for autonomous runs use the active strategy. If active strategy is Evil Panda, use single-sided SOL spot only when its entry checks pass; otherwise skip.
 
 HARD RULES:
 - Bin Step: Screening filters apply (config minBinStep/maxBinStep). If user specifies a pool, deploy regardless of bin step.
@@ -220,7 +220,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           price_range_pct: {
             type: "number",
-            description: "PREFERRED: Target price range in % (e.g. 50 for 50% coverage). Bins are auto-calculated from the pool's bin_step. Use study_top_lpers avg_range_pct or default 35%."
+            description: "PREFERRED: Target price range in % (e.g. 80 for Evil Panda's 80% downside range). Bins are auto-calculated from the pool's bin_step."
           },
           sol_split_pct: {
             type: "number",

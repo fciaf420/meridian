@@ -1,3 +1,4 @@
+import OpenAI from "openai";
 import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
@@ -10,6 +11,7 @@ import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
 import { getMemoryContext } from "./memory.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { getLpOverviewSummary } from "./tools/lp-overview.js";
+import { buildUnifiedMemoryBrief } from "./unified-memory.js";
 import {
   createLlmClient,
   getDefaultModelForProvider,
@@ -136,6 +138,27 @@ function buildCodexTranscript(messages) {
   }).join("\n\n");
 }
 
+// Static system prompt — cached by claude -p via --system-prompt (KV cache friendly)
+const _systemPromptCache = {};
+function getClaudeSystemPrompt(agentType) {
+  if (_systemPromptCache[agentType]) return _systemPromptCache[agentType];
+  _systemPromptCache[agentType] = [
+    `You are the ${agentType} reasoning engine for a JavaScript trading agent runner.`,
+    "Return raw JSON only. Do not wrap it in markdown fences or add any extra commentary.",
+    "Choose one of two actions only:",
+    '1. "respond" when you can fully answer the user with the information already available.',
+    '2. "tool_calls" when you need one or more listed tools to continue.',
+    "If you choose tool_calls, keep response null and provide exact JSON arguments for each tool call.",
+    "Never invent tool outputs, transaction results, or on-chain state.",
+    "Only use tool names from the available tools list.",
+    "Be conservative with write tools. Only call them when you intentionally want the runner to perform the real action.",
+    'Return exactly this shape: {"action":"respond","response":"...","tool_calls":[]} or {"action":"tool_calls","response":null,"tool_calls":[{"name":"tool_name","arguments":{}}]}',
+    `AVAILABLE TOOLS:\n${TOOL_SUMMARIES_TEXT}`,
+  ].join("\n\n");
+  return _systemPromptCache[agentType];
+}
+
+// Full prompt for Codex/OpenRouter (everything in one blob)
 function buildCodexAgentPrompt(messages, agentType) {
   const transcript = buildCodexTranscript(messages);
 
@@ -237,9 +260,12 @@ const CLAUDE_EFFORT_BY_ROLE = {
 };
 
 async function createClaudeMessage(messages, model, agentType, step) {
-  const prompt = buildCodexAgentPrompt(messages, agentType); // same JSON contract
+  // Split: static system prompt goes via --system-prompt (KV cached by claude -p)
+  // Dynamic transcript goes via stdin (changes every call, not cached)
+  const transcript = buildCodexTranscript(messages);
+  const systemPrompt = getClaudeSystemPrompt(agentType);
   const effort = CLAUDE_EFFORT_BY_ROLE[agentType] || "medium";
-  const content = await runClaudeCli(model, prompt, { effort });
+  const content = await runClaudeCli(model, `CONVERSATION TRANSCRIPT:\n${transcript}`, { effort, systemPrompt });
 
   if (!content) {
     throw new Error("Empty response from Claude CLI");
@@ -278,14 +304,20 @@ async function createProviderMessage(messages, model, agentType, step) {
     return createClaudeMessage(messages, model, agentType, step);
   }
 
-  const response = await client.chat.completions.create({
+  const completionOptions = {
     model,
     messages,
     tools,
     tool_choice: "auto",
     temperature: config.llm.temperature,
     max_tokens: config.llm.maxTokens,
-  });
+  };
+
+  if (PROVIDER === "minimax" && agentType === "SCREENER") {
+    completionOptions.extra_body = { reasoning_split: true };
+  }
+
+  const response = await client.chat.completions.create(completionOptions);
 
   if (!response?.choices?.length) {
     const errCode = response?.error?.code || response?.error?.status;
@@ -348,14 +380,10 @@ async function requestLightChatContent(messages, model) {
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null) {
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
-  const rawLessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();
-  const memoryContext = getMemoryContext();
-  const lessons = agentType === "SCREENER" && config.memory.nuggetsFirst && memoryContext
-    ? null
-    : rawLessons;
   const signalWeights = agentType === "SCREENER" ? (getWeightsSummary() || null) : null;
-  let systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, memoryContext, signalWeights);
+  const unifiedMemory = buildUnifiedMemoryBrief(agentType);
+  let systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, unifiedMemory, perfSummary, signalWeights);
 
   const lpSummary = await getLpOverviewSummary().catch(() => null);
   if (lpSummary) {
@@ -383,8 +411,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           msg = await createProviderMessage(messages, usedModel, agentType, step);
           break;
         } catch (apiErr) {
+          const errMsg = apiErr.message || "";
+          // Claude rate limit — skip retries, go straight to DeepSeek
+          if (errMsg.includes("rate limited") || errMsg.includes("hit your limit") || errMsg.includes("resets")) {
+            log("agent", `Claude rate limited — skipping retries, falling back to DeepSeek`);
+            msg = null;
+            break;
+          }
+
           const status = apiErr.status || apiErr.statusCode;
-          const retryable = PROVIDER === "codex" || RETRYABLE.has(status);
+          const retryable = PROVIDER === "codex" || PROVIDER === "claude" || RETRYABLE.has(status);
           if (!retryable) throw apiErr;
 
           if (attempt >= 1 && fallbackModel && usedModel !== fallbackModel) {
@@ -396,6 +432,42 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             await sleep(wait);
           }
           msg = null;
+        }
+      }
+
+      // If primary provider exhausted all retries, fall back to DeepSeek
+      if (!msg) {
+        const DEEPSEEK_FALLBACK_MODELS = {
+          SCREENER: "deepseek-reasoner",
+          MANAGER: "deepseek-chat",
+          GENERAL: "deepseek-chat",
+          AUTORESEARCH: "deepseek-reasoner",
+        };
+        const dsModel = DEEPSEEK_FALLBACK_MODELS[agentType] || "deepseek-chat";
+
+        const fallbackKey = process.env.DEEPSEEK_API_KEY;
+        if (fallbackKey) {
+          try {
+            log("agent", `All ${PROVIDER} retries exhausted — falling back to ${dsModel} via DeepSeek API`);
+            const fallbackClient = new OpenAI({
+              baseURL: "https://api.deepseek.com/v1",
+              apiKey: fallbackKey,
+            });
+            const dsResponse = await fallbackClient.chat.completions.create({
+              model: dsModel,
+              messages,
+              tools,
+              tool_choice: "auto",
+              temperature: config.llm.temperature,
+              max_tokens: config.llm.maxTokens,
+            });
+            if (dsResponse?.choices?.length) {
+              msg = dsResponse.choices[0].message;
+              log("agent", `DeepSeek fallback succeeded (model: ${dsModel})`);
+            }
+          } catch (dsErr) {
+            log("agent", `DeepSeek fallback also failed: ${dsErr.message}`);
+          }
         }
       }
 

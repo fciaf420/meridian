@@ -173,6 +173,58 @@ export function getMemoryContext() {
   return lines.length > 0 ? lines.join("\n") : null;
 }
 
+const ROLE_NUGGET_PRIORITY = {
+  SCREENER: ["strategies", "pools", "patterns", "lessons"],
+  MANAGER: ["pools", "patterns", "strategies", "lessons"],
+  GENERAL: ["pools", "strategies", "patterns", "lessons"],
+};
+
+export function getMemoryFactsForPrompt(agentType = "GENERAL", maxFacts = 12) {
+  const s = getShelf();
+  const order = ROLE_NUGGET_PRIORITY[agentType] || ROLE_NUGGET_PRIORITY.GENERAL;
+  const available = new Map();
+
+  for (const info of s.list()) {
+    try {
+      available.set(info.name, s.get(info.name));
+    } catch { /* ignore missing nugget */ }
+  }
+
+  const facts = [];
+  const seen = new Set();
+
+  for (const nuggetName of order) {
+    const nugget = available.get(nuggetName);
+    if (!nugget) continue;
+
+    const topFacts = nugget.facts()
+      .filter((fact) => (fact.hits ?? 0) > 0)
+      .sort((a, b) => {
+        const hitDiff = (b.hits ?? 0) - (a.hits ?? 0);
+        if (hitDiff !== 0) return hitDiff;
+        return String(a.key).localeCompare(String(b.key));
+      })
+      .slice(0, 4);
+
+    for (const fact of topFacts) {
+      const dedupeKey = `${nuggetName}:${fact.key}:${fact.value}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      facts.push({
+        nugget: nuggetName,
+        key: fact.key,
+        value: fact.value,
+        hits: fact.hits ?? 0,
+      });
+      if (facts.length >= maxFacts) {
+        return facts;
+      }
+    }
+  }
+
+  return facts;
+}
+
 /**
  * Structured memory snapshot for the web UI and API consumers.
  */

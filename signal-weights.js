@@ -13,6 +13,10 @@ import fs from "fs";
 import { log } from "./logger.js";
 
 const WEIGHTS_FILE = "./signal-weights.json";
+const LESSONS_FILE = "./lessons.json";
+const CALIBRATION_WINDOW_DAYS = 90;
+const MIN_CALIBRATION_SAMPLES = 20;
+let _signalCalibrationCache = { mtimeMs: null, calibration: null };
 
 // ─── Signal Definitions ─────────────────────────────────────────
 
@@ -27,6 +31,11 @@ const SIGNAL_NAMES = [
   "study_win_rate",
   "volatility",
   "ath_proximity",
+  // New signals from GMGN candle + signal feed
+  "volume_trend",       // increasing/decreasing/stable — from 5m candles
+  "gmgn_signal_present", // smart money/KOL/whale activity on token
+  "change_1h",          // 1-hour price change from GMGN
+  "candle_price_range",  // real-time volatility from 5m candle spread
 ];
 
 const DEFAULT_WEIGHTS = Object.fromEntries(SIGNAL_NAMES.map((s) => [s, 1.0]));
@@ -41,10 +50,10 @@ const HIGHER_IS_BETTER = new Set([
 ]);
 
 // Boolean signals — compared by win rate when present vs absent
-const BOOLEAN_SIGNALS = new Set(["smart_wallets_present"]);
+const BOOLEAN_SIGNALS = new Set(["smart_wallets_present", "gmgn_signal_present"]);
 
 // Categorical signals — compared by win rate across categories
-const CATEGORICAL_SIGNALS = new Set(["narrative_quality"]);
+const CATEGORICAL_SIGNALS = new Set(["narrative_quality", "volume_trend"]);
 
 // ─── Persistence ─────────────────────────────────────────────────
 
@@ -61,6 +70,7 @@ export function loadWeights() {
     const initial = {
       weights: { ...DEFAULT_WEIGHTS },
       directions: { ...DEFAULT_DIRECTIONS },
+      calibration: {},
       last_recalc: null,
       recalc_count: 0,
       history: [],
@@ -84,12 +94,16 @@ export function loadWeights() {
         }
       }
     }
+    if (!data.calibration || typeof data.calibration !== "object") {
+      data.calibration = {};
+    }
     return data;
   } catch (err) {
     log("signal_weights_error", `Failed to read signal-weights.json: ${err.message}`);
     return {
       weights: { ...DEFAULT_WEIGHTS },
       directions: { ...DEFAULT_DIRECTIONS },
+      calibration: {},
       last_recalc: null,
       recalc_count: 0,
       history: [],
@@ -118,10 +132,17 @@ export function recalculateWeights(perfData, cfg = {}) {
   const darwin = cfg.darwin || {};
   const windowDays   = darwin.windowDays   ?? 60;
   const minSamples   = darwin.minSamples   ?? 10;
+  const perSignalMinSamples = darwin.perSignalMinSamples ?? 12;
+  const minAbsLiftToAdjust = darwin.minAbsLiftToAdjust ?? 0.05;
+  const strongLiftThreshold = darwin.strongLiftThreshold ?? 0.2;
   const boostFactor  = darwin.boostFactor  ?? 1.05;
   const decayFactor  = darwin.decayFactor  ?? 0.95;
   const weightFloor  = darwin.weightFloor  ?? 0.3;
   const weightCeiling = darwin.weightCeiling ?? 2.5;
+  const calibrationMinSamples = darwin.calibrationMinSamples ?? 20;
+  const meanReversionRate = darwin.meanReversionRate ?? 0.02;
+  const minAbsLift = minAbsLiftToAdjust;
+  const strongLift = strongLiftThreshold;
 
   const data = loadWeights();
   const weights = data.weights || { ...DEFAULT_WEIGHTS };
@@ -155,18 +176,27 @@ export function recalculateWeights(perfData, cfg = {}) {
     return { changes: [], weights };
   }
 
+  data.calibration = buildCalibrationStats(recent, calibrationMinSamples);
+
   // Compute predictive lift for each signal
   const lifts = {};
+  const sampleCounts = {};
 
   for (const signal of SIGNAL_NAMES) {
-    const lift = computeLift(signal, wins, losses, minSamples);
+    sampleCounts[signal] = countSignalSamples(signal, recent);
+    const lift = computeLift(signal, wins, losses, perSignalMinSamples);
     if (lift !== null) {
       lifts[signal] = lift;
     }
   }
 
   // Rank by absolute lift — high-predictive signals regardless of direction get boosted
-  const ranked = Object.entries(lifts).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  const ranked = Object.entries(lifts)
+    .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  const adjustable = ranked.filter(([signal, lift]) =>
+    (sampleCounts[signal] ?? 0) >= perSignalMinSamples &&
+    Math.abs(lift) >= minAbsLiftToAdjust
+  );
 
   if (ranked.length === 0) {
     log("signal_weights", "No signals had enough samples for lift calculation");
@@ -177,6 +207,8 @@ export function recalculateWeights(perfData, cfg = {}) {
   const directions = data.directions || { ...DEFAULT_DIRECTIONS };
 
   for (const [signal, lift] of ranked) {
+    if ((sampleCounts[signal] ?? 0) < perSignalMinSamples) continue;
+    if (Math.abs(lift) < minAbsLiftToAdjust) continue;
     // HIGHER_IS_BETTER signals always have direction "higher" — don't overwrite
     if (HIGHER_IS_BETTER.has(signal)) {
       directions[signal] = "higher";
@@ -191,25 +223,25 @@ export function recalculateWeights(perfData, cfg = {}) {
 
   data.directions = directions;
 
-  // Split into quartiles
-  const q1End = Math.ceil(ranked.length * 0.25);
-  const q3Start = Math.floor(ranked.length * 0.75);
+  // Split into quartiles using only signals with enough evidence to adjust.
+  const q1End = Math.ceil(adjustable.length * 0.25);
+  const q3Start = Math.floor(adjustable.length * 0.75);
 
-  const topQuartile = new Set(ranked.slice(0, q1End).map(([name]) => name));
-  const bottomQuartile = new Set(ranked.slice(q3Start).map(([name]) => name));
+  const topQuartile = new Set(adjustable.slice(0, q1End).map(([name]) => name));
+  const bottomQuartile = new Set(adjustable.slice(q3Start).map(([name]) => name));
 
   // Apply boosts and decays with mean reversion
-  const meanReversionRate = darwin.meanReversionRate ?? 0.02; // 2% pull toward 1.0
   const changes = [];
 
   for (const [signal, lift] of ranked) {
     const prev = weights[signal];
     let next = prev;
+    const confidence = clamp01(Math.abs(lift) / Math.max(strongLiftThreshold, 0.001));
 
     if (topQuartile.has(signal)) {
-      next = prev * boostFactor;
+      next = prev * (1 + ((boostFactor - 1) * confidence));
     } else if (bottomQuartile.has(signal)) {
-      next = prev * decayFactor;
+      next = prev * (1 - ((1 - decayFactor) * confidence));
     }
 
     // Mean reversion: gently pull toward neutral (1.0) to prevent runaway drift
@@ -229,9 +261,11 @@ export function recalculateWeights(perfData, cfg = {}) {
         lift: Math.round(lift * 1000) / 1000,
         direction: directions[signal],
         action: dir,
+        samples: sampleCounts[signal] ?? 0,
+        confidence: Math.round(confidence * 1000) / 1000,
       });
       weights[signal] = next;
-      log("signal_weights", `${signal}: ${prev} -> ${next} (${dir}, lift=${lift.toFixed(3)}, direction=${directions[signal]})`);
+      log("signal_weights", `${signal}: ${prev} -> ${next} (${dir}, lift=${lift.toFixed(3)}, confidence=${confidence.toFixed(3)}, samples=${sampleCounts[signal] ?? 0}, direction=${directions[signal]})`);
     }
   }
 
@@ -397,9 +431,215 @@ function extractNumeric(signal, entries) {
   return vals;
 }
 
+function countSignalSamples(signal, entries) {
+  let count = 0;
+  for (const entry of entries) {
+    const snap = entry.signal_snapshot;
+    if (!snap) continue;
+    const v = snap[signal];
+    if (v !== undefined && v !== null && v !== "") count++;
+  }
+  return count;
+}
+
 function mean(arr) {
   if (arr.length === 0) return 0;
   return arr.reduce((s, v) => s + v, 0) / arr.length;
+}
+
+function buildCalibrationStats(entries, minSamples) {
+  const calibration = {};
+  for (const signal of SIGNAL_NAMES) {
+    if (BOOLEAN_SIGNALS.has(signal) || CATEGORICAL_SIGNALS.has(signal)) continue;
+    const values = extractNumeric(signal, entries).sort((a, b) => a - b);
+    if (values.length < minSamples) continue;
+    const low = percentile(values, 0.1);
+    const high = percentile(values, 0.9);
+    if (low == null || high == null || high <= low) continue;
+    calibration[signal] = { low, high };
+  }
+  return calibration;
+}
+
+function percentile(sorted, pct) {
+  if (!sorted.length) return null;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * pct)));
+  return sorted[idx];
+}
+
+function loadSignalCalibration(windowDays = CALIBRATION_WINDOW_DAYS) {
+  try {
+    if (!fs.existsSync(LESSONS_FILE)) return {};
+    const stat = fs.statSync(LESSONS_FILE);
+    if (_signalCalibrationCache.mtimeMs === stat.mtimeMs && _signalCalibrationCache.calibration) {
+      return _signalCalibrationCache.calibration;
+    }
+
+    const raw = JSON.parse(fs.readFileSync(LESSONS_FILE, "utf8"));
+    const perfData = raw.performance || [];
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - windowDays);
+    const cutoffISO = cutoff.toISOString();
+    const recent = perfData.filter((p) => {
+      const ts = p.recorded_at || p.closed_at || p.deployed_at;
+      return ts && ts >= cutoffISO;
+    });
+
+    const calibration = {};
+    for (const signal of SIGNAL_NAMES) {
+      if (BOOLEAN_SIGNALS.has(signal) || CATEGORICAL_SIGNALS.has(signal)) continue;
+      const values = extractNumeric(signal, recent).sort((a, b) => a - b);
+      if (values.length < MIN_CALIBRATION_SAMPLES) continue;
+      const low = percentile(values, 0.1);
+      const high = percentile(values, 0.9);
+      if (low == null || high == null || high <= low) continue;
+      calibration[signal] = { low, high };
+    }
+
+    _signalCalibrationCache = { mtimeMs: stat.mtimeMs, calibration };
+    return calibration;
+  } catch {
+    return {};
+  }
+}
+
+function clamp01(v) {
+  if (!Number.isFinite(v)) return 0.5;
+  return Math.max(0, Math.min(1, v));
+}
+
+function normalizeLinear(value, min, max) {
+  if (value == null || !Number.isFinite(value)) return null;
+  if (max <= min) return 0.5;
+  return clamp01((value - min) / (max - min));
+}
+
+function normalizeLog(value, min, max) {
+  if (value == null || !Number.isFinite(value) || value <= 0) return null;
+  if (max <= min) return 0.5;
+  const num = Math.log10(Math.max(value, min));
+  const den = Math.log10(max) - Math.log10(min);
+  if (den <= 0) return 0.5;
+  return clamp01((num - Math.log10(min)) / den);
+}
+
+function normalizeCategorical(signal, value) {
+  if (value == null) return null;
+  const normalized = String(value).toLowerCase();
+
+  if (signal === "volume_trend") {
+    if (normalized === "increasing") return 1;
+    if (normalized === "stable") return 0.5;
+    if (normalized === "decreasing") return 0;
+  }
+
+  if (signal === "narrative_quality") {
+    if (["strong", "excellent"].includes(normalized)) return 1;
+    if (["good", "specific", "real"].includes(normalized)) return 0.8;
+    if (["neutral", "mixed"].includes(normalized)) return 0.5;
+    if (["weak", "hype"].includes(normalized)) return 0.2;
+    if (["bad", "empty", "none", "null"].includes(normalized)) return 0;
+  }
+
+  return null;
+}
+
+function getBaseSignalScore(signal, value, calibration = {}) {
+  if (value == null) return null;
+
+  if (typeof value === "boolean") return value ? 1 : 0;
+
+  if (BOOLEAN_SIGNALS.has(signal)) {
+    return value ? 1 : 0;
+  }
+
+  if (CATEGORICAL_SIGNALS.has(signal) || typeof value === "string") {
+    return normalizeCategorical(signal, value);
+  }
+
+  if (!Number.isFinite(value)) return null;
+
+  const bounds = calibration?.[signal] || null;
+
+  switch (signal) {
+    case "organic_score":
+    case "study_win_rate":
+      return bounds ? normalizeLinear(value, bounds.low, bounds.high) : normalizeLinear(value, 0, 100);
+    case "fee_tvl_ratio":
+      return bounds ? normalizeLinear(value, bounds.low, bounds.high) : normalizeLinear(value, 0, 5);
+    case "volume":
+      return bounds ? normalizeLog(value, Math.max(bounds.low, 1), Math.max(bounds.high, bounds.low * 1.01)) : normalizeLog(value, 100, 1_000_000);
+    case "mcap":
+      return bounds ? normalizeLog(value, Math.max(bounds.low, 1), Math.max(bounds.high, bounds.low * 1.01)) : normalizeLog(value, 100_000, 100_000_000);
+    case "holder_count":
+      return bounds ? normalizeLog(value, Math.max(bounds.low, 1), Math.max(bounds.high, bounds.low * 1.01)) : normalizeLog(value, 100, 50_000);
+    case "volatility":
+      return bounds ? normalizeLinear(value, bounds.low, bounds.high) : normalizeLinear(value, 0, 15);
+    case "ath_proximity":
+      return bounds ? normalizeLinear(value, bounds.low, bounds.high) : normalizeLinear(value, 0, 100);
+    case "change_1h":
+      return bounds ? normalizeLinear(value, bounds.low, bounds.high) : normalizeLinear(value, -50, 50);
+    case "candle_price_range":
+      return bounds ? normalizeLinear(value, bounds.low, bounds.high) : normalizeLinear(value, 0, 25);
+    default:
+      return bounds ? normalizeLinear(value, bounds.low, bounds.high) : normalizeLinear(value, 0, 1);
+  }
+}
+
+function applyDirection(baseScore, direction) {
+  if (baseScore == null) return null;
+  if (direction === "lower" || direction === "absent=better") {
+    return 1 - baseScore;
+  }
+  return baseScore;
+}
+
+export function scoreSignalSnapshot(snapshot = {}, opts = {}) {
+  const data = opts.weightData || loadWeights();
+  const calibration = opts.calibration || loadSignalCalibration(opts.windowDays ?? CALIBRATION_WINDOW_DAYS);
+  const weights = data.weights || {};
+  const directions = data.directions || {};
+  const contributions = [];
+
+  let weightedSum = 0;
+  let totalWeight = 0;
+
+  for (const signal of SIGNAL_NAMES) {
+    const value = snapshot?.[signal];
+    const baseScore = getBaseSignalScore(signal, value, calibration);
+    if (baseScore == null) continue;
+
+    const weight = weights[signal] ?? 1.0;
+    const direction = directions[signal] || "unknown";
+    const score = applyDirection(baseScore, direction);
+    const contribution = score * weight;
+
+    contributions.push({
+      signal,
+      value,
+      weight,
+      direction,
+      score: Math.round(score * 1000) / 1000,
+      contribution: Math.round(contribution * 1000) / 1000,
+    });
+
+    weightedSum += contribution;
+    totalWeight += weight;
+  }
+
+  contributions.sort((a, b) => b.contribution - a.contribution);
+
+  const normalizedScore = totalWeight > 0 ? weightedSum / totalWeight : 0.5;
+  const topN = opts.topN ?? 4;
+
+  return {
+    score: normalizedScore,
+    score_pct: Math.round(normalizedScore * 1000) / 10,
+    totalWeight: Math.round(totalWeight * 1000) / 1000,
+    coverage: contributions.length,
+    topSignals: contributions.slice(0, topN),
+    contributions,
+  };
 }
 
 // ─── Summary for LLM Prompt Injection ────────────────────────────

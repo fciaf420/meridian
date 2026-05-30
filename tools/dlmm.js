@@ -23,6 +23,7 @@ import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { calculateBinsForPriceRange, splitRangeBins } from "../runtime-helpers.js";
+import { fetchGmgnPriceInfo } from "./gmgn.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -223,7 +224,7 @@ export async function deployPosition({
   study_avg_hold_hours,
 }) {
   pool_address = normalizeMint(pool_address);
-  const activeStrategy = strategy || config.strategy.strategy;
+  let activeStrategy = strategy || config.strategy.strategy;
   let resolvedBinStep = bin_step;
   let totalSolAmount = amount_y ?? amount_sol ?? 0;
 
@@ -239,12 +240,75 @@ export async function deployPosition({
       if (totalSolAmount < computed * 0.5) {
         log("deploy", `Amount ${totalSolAmount} SOL overridden to ${computed} SOL (model passed too little, computed from ${bal.sol} SOL wallet)`);
         totalSolAmount = computed;
+        if (amount_y != null) amount_y = computed;
+        else if (amount_sol != null) amount_sol = computed;
       }
     }
   } catch { /* best-effort — use what the model passed */ }
 
   if (!["bid_ask", "spot"].includes(activeStrategy)) {
     throw new Error("Only 'bid_ask' or 'spot' strategies are allowed.");
+  }
+
+  // Evil Panda is a named policy mapped onto the executor's supported
+  // single-sided SOL spot primitive. Enforce its entry criteria here so the
+  // model cannot accidentally bypass the strategy with a weaker prompt-only check.
+  if (config.strategy.activeStrategy === "evil_panda") {
+    const ep = config.strategy.evilPanda || {};
+    activeStrategy = "spot";
+    price_range_pct = Math.max(price_range_pct || 0, ep.priceRangePct || 80);
+    bins_above = 0;
+
+    if ((amount_x ?? 0) > 0) {
+      return { success: false, error: "Evil Panda requires single-sided SOL spot: do not pass amount_x." };
+    }
+    if (sol_split_pct != null && sol_split_pct < 100) {
+      return { success: false, error: "Evil Panda requires single-sided SOL spot: omit sol_split_pct or use 100." };
+    }
+
+    let resolvedMint = base_mint;
+    if (!resolvedMint) {
+      try {
+        const pool = await getPool(pool_address);
+        resolvedMint = pool.lbPair.tokenXMint.toBase58();
+      } catch {
+        resolvedMint = null;
+      }
+    }
+    if (!resolvedMint) {
+      return { success: false, error: "Evil Panda entry blocked: base_mint is required to verify token-level GMGN data." };
+    }
+
+    const gmgn = await fetchGmgnPriceInfo(resolvedMint);
+    const tokenVolume24h = gmgn?.volume_24h ?? 0;
+    const tokenMcap = gmgn?.market_cap ?? 0;
+    const indicators = gmgn?.candles || null;
+    const supertrendOk = !!indicators?.evil_panda_entry_ok;
+
+    const failures = [];
+    if (tokenVolume24h < (ep.minTokenVolume24h ?? 750_000)) {
+      failures.push(`token volume24H $${Math.round(tokenVolume24h)} < $${ep.minTokenVolume24h ?? 750_000}`);
+    }
+    if (tokenMcap < (ep.minMcap ?? 200_000)) {
+      failures.push(`token mcap $${Math.round(tokenMcap)} < $${ep.minMcap ?? 200_000}`);
+    }
+    if (!supertrendOk) {
+      failures.push(`5m Supertrend not green/above price (direction=${indicators?.supertrend_direction ?? "unknown"})`);
+    }
+
+    if (failures.length > 0) {
+      return {
+        success: false,
+        error: `Evil Panda entry blocked: ${failures.join("; ")}.`,
+        gmgn: {
+          token_volume_24h: tokenVolume24h,
+          token_mcap: tokenMcap,
+          supertrend: indicators?.supertrend || null,
+          rsi_2: indicators?.rsi_2 ?? null,
+        },
+      };
+    }
+    log("deploy", `Evil Panda entry approved: spot single-sided, range=${price_range_pct}%, volume24H=$${Math.round(tokenVolume24h)}, mcap=$${Math.round(tokenMcap)}, supertrend=${indicators.supertrend_direction}`);
   }
 
   // ─── Hard guard: two-sided spot requires ALL 4 conditions ──────
@@ -360,17 +424,28 @@ export async function deployPosition({
     log("deploy", `Auto-calculated bins_below=${bins_below} from price_range_pct=${price_range_pct}% at bin_step=${resolvedBinStep}`);
   }
 
-  // ─── Hard guard: validate actual range % when bins passed directly ───
-  // Models sometimes pass raw bin counts from a different bin_step pool.
-  // At bin_step 25, 96 bins = 21% range (model probably thought bin_step 80 = 53%).
-  // Recalculate from the volatility table minimum (40% for moderate).
-  if (bins_below > 0 && !price_range_pct && resolvedBinStep) {
+  // ─── Hard guard: validate actual range % — always check, even when price_range_pct is set ───
+  // Models sometimes pass bins_below AND price_range_pct but the bins don't match the %.
+  // Always verify the actual range and correct if too narrow.
+  if (bins_below > 0 && resolvedBinStep) {
     const stepPct = resolvedBinStep / 10000;
     const actualRangePct = (1 - Math.pow(1 + stepPct, -bins_below)) * 100;
     const MIN_RANGE_PCT = 35; // absolute floor — no position should be narrower
-    if (actualRangePct < MIN_RANGE_PCT) {
+
+    // If price_range_pct was also provided, use the larger of the two
+    if (price_range_pct > 0) {
+      const binsFromPct = calculateBinsForPriceRange(resolvedBinStep, price_range_pct);
+      if (binsFromPct > bins_below) {
+        log("deploy", `bins_below=${bins_below} (${actualRangePct.toFixed(1)}%) doesn't match price_range_pct=${price_range_pct}%. Using ${binsFromPct} bins instead`);
+        bins_below = binsFromPct;
+      }
+    }
+
+    // Enforce absolute minimum
+    const finalRangePct = (1 - Math.pow(1 + stepPct, -bins_below)) * 100;
+    if (finalRangePct < MIN_RANGE_PCT) {
       const correctedBins = calculateBinsForPriceRange(resolvedBinStep, MIN_RANGE_PCT);
-      log("deploy", `Range too narrow: ${bins_below} bins at bs${resolvedBinStep} = ${actualRangePct.toFixed(1)}% (min ${MIN_RANGE_PCT}%). Correcting to ${correctedBins} bins`);
+      log("deploy", `Range too narrow: ${bins_below} bins at bs${resolvedBinStep} = ${finalRangePct.toFixed(1)}% (min ${MIN_RANGE_PCT}%). Correcting to ${correctedBins} bins`);
       bins_below = correctedBins;
     }
   }
@@ -595,7 +670,8 @@ export async function deployPosition({
         pool_name,
         base_mint: pool.lbPair.tokenXMint.toBase58(),
         strategy: activeStrategy,
-        strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct === 100 ? "SpotOneSide" : "SpotTwoSide"),
+        strategy_profile: config.strategy.activeStrategy || null,
+        strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
         sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
         bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
         bin_step: resolvedBinStep,
@@ -662,7 +738,8 @@ export async function deployPosition({
       pool_name,
       base_mint: pool.lbPair.tokenXMint.toBase58(),
       strategy: activeStrategy,
-      strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct === 100 ? "SpotOneSide" : "SpotTwoSide"),
+      strategy_profile: config.strategy.activeStrategy || null,
+      strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
       sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step: resolvedBinStep,
@@ -1173,8 +1250,9 @@ export async function getMyPositions({ force = false } = {}) {
         position: r.position,
         pool: r.pool,
         pair: r.pair,
-        base_mint: r.base_mint,
+        base_mint: trackedFinal?.base_mint || r.base_mint,
         strategy: trackedFinal?.strategy || p?._lpa_strategy || "bid_ask",
+        strategy_profile: trackedFinal?.strategy_profile || null,
         strategy_type: p?._lpa_strategy || trackedFinal?.strategy_type || null,
         sol_split_pct: trackedFinal?.sol_split_pct ?? composition?.sol_pct ?? null,
         bin_step: trackedFinal?.bin_step || null,
@@ -1498,32 +1576,93 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
       } catch { /* best-effort */ }
 
       // ─── Hard rule: always swap base token back to SOL after close ───
-      try {
-        const baseMint = tracked.base_mint;
-        const SOL = "So11111111111111111111111111111111111111112";
-        if (baseMint && baseMint !== SOL) {
-          const walletBals = await getWalletBalances();
-          const baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
-          if (baseToken && baseToken.balance > 0 && (baseToken.usd ?? 0) >= 0.10) {
-            log("close", `Auto-swapping ${baseToken.balance} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (worth $${baseToken.usd})`);
-            const swapResult = await swapToken({
+      // Retries up to MAX_ATTEMPTS with backoff; re-fetches wallet balance
+      // between attempts so a silently-landed first tx doesn't cause a
+      // false insufficient-funds failure on retry.
+      const SOL = "So11111111111111111111111111111111111111112";
+      const baseMint = tracked.base_mint;
+      let swapOutcome = null; // { success, mint, attempts, error? } when a swap was attempted
+
+      if (baseMint && baseMint !== SOL) {
+        const MAX_ATTEMPTS = 3;
+        const BACKOFF_MS = [0, 1500, 3000]; // delay BEFORE attempt N
+        let lastError = null;
+        let attempts = 0;
+        let succeeded = false;
+
+        for (let i = 0; i < MAX_ATTEMPTS; i++) {
+          if (BACKOFF_MS[i]) await new Promise((r) => setTimeout(r, BACKOFF_MS[i]));
+
+          let baseToken;
+          try {
+            const walletBals = await getWalletBalances();
+            baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
+          } catch (balErr) {
+            lastError = `balance fetch failed: ${balErr.message}`;
+            log("close_warn", `Post-close swap attempt ${i + 1}: ${lastError}`);
+            attempts = i + 1;
+            continue;
+          }
+
+          // Nothing to swap — either fully swapped by a prior attempt, or dust
+          if (!baseToken || baseToken.balance <= 0 || (baseToken.usd ?? 0) < 0.10) {
+            if (attempts > 0) succeeded = true; // prior attempt effectively cleared it
+            break;
+          }
+
+          attempts = i + 1;
+          log("close", `Auto-swapping ${baseToken.balance} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (worth $${baseToken.usd}) [attempt ${attempts}/${MAX_ATTEMPTS}]`);
+
+          let swapResult;
+          try {
+            swapResult = await swapToken({
               input_mint: baseMint,
               output_mint: SOL,
               amount: baseToken.balance,
             });
-            if (swapResult?.success) {
-              log("close", `Post-close swap OK: tx ${swapResult.tx}`);
-              txHashes.push(swapResult.tx);
-            } else {
-              log("close_warn", `Post-close swap failed: ${swapResult?.error || "unknown"}`);
-            }
+          } catch (swapErr) {
+            lastError = swapErr.message;
+            log("close_warn", `Post-close swap attempt ${attempts} threw: ${lastError}`);
+            continue;
+          }
+
+          if (swapResult?.success) {
+            log("close", `Post-close swap OK on attempt ${attempts}: tx ${swapResult.tx}`);
+            txHashes.push(swapResult.tx);
+            succeeded = true;
+            break;
+          }
+
+          lastError = swapResult?.error || "unknown";
+          log("close_warn", `Post-close swap attempt ${attempts} failed: ${lastError}`);
+
+          // Terminal errors — no point retrying
+          const terminal = /no route|route not found|unsupported|invalid mint|mint not found/i.test(lastError);
+          if (terminal) {
+            log("close_warn", `Post-close swap terminal error, not retrying: ${lastError}`);
+            break;
           }
         }
-      } catch (swapErr) {
-        log("close_warn", `Post-close swap error: ${swapErr.message}`);
+
+        if (attempts > 0) {
+          swapOutcome = succeeded
+            ? { success: true, mint: baseMint, attempts }
+            : { success: false, mint: baseMint, attempts, error: lastError };
+          if (!succeeded) {
+            log("close_warn", `Post-close swap failed after ${attempts} attempt(s); base token remains in wallet: ${baseMint}`);
+          }
+        }
       }
 
-      return { success: true, position: position_address, pool: poolAddress, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct };
+      return {
+        success: true,
+        position: position_address,
+        pool: poolAddress,
+        txs: txHashes,
+        pnl_usd: pnlUsd,
+        pnl_pct: pnlPct,
+        ...(swapOutcome && { swap: swapOutcome }),
+      };
     }
 
     return { success: true, position: position_address, pool: poolAddress, txs: txHashes };

@@ -13,6 +13,8 @@ export function getLlmProvider() {
 export function getDefaultModelForProvider(provider = getLlmProvider()) {
   if (provider === "codex") return "gpt-4o";
   if (provider === "claude") return "sonnet";
+  if (provider === "deepseek") return "deepseek-chat";
+  if (provider === "minimax") return "MiniMax-M2.7";
   return "openai/gpt-5.4-nano";
 }
 
@@ -45,7 +47,9 @@ export function getProviderApiKey(provider = getLlmProvider()) {
     throw new Error("Claude provider uses the Claude CLI (OAuth), not direct API key access.");
   }
   if (provider === "deepseek") return process.env.DEEPSEEK_API_KEY;
-  return process.env.OPENROUTER_API_KEY;
+  if (provider === "minimax") return process.env.MINIMAX_API_KEY;
+  if (provider === "openrouter") return process.env.OPENROUTER_API_KEY;
+  throw new Error(`Unknown LLM provider: ${provider}`);
 }
 
 export function getProviderClientConfig(provider = getLlmProvider()) {
@@ -63,6 +67,17 @@ export function getProviderClientConfig(provider = getLlmProvider()) {
     };
   }
 
+  if (provider === "minimax") {
+    return {
+      baseURL: "https://api.minimax.io/v1",
+      apiKey: getProviderApiKey(provider),
+    };
+  }
+
+  if (provider !== "openrouter") {
+    throw new Error(`Unknown LLM provider: ${provider}`);
+  }
+
   return {
     baseURL: "https://openrouter.ai/api/v1",
     apiKey: getProviderApiKey(provider),
@@ -77,6 +92,10 @@ export function getChatCompletionsEndpoint(provider = getLlmProvider()) {
     throw new Error("Claude provider uses the Claude CLI (OAuth), not direct chat completions.");
   }
   if (provider === "deepseek") return "https://api.deepseek.com/chat/completions";
+  if (provider === "minimax") return "https://api.minimax.io/v1/chat/completions";
+  if (provider !== "openrouter") {
+    throw new Error(`Unknown LLM provider: ${provider}`);
+  }
   return "https://openrouter.ai/api/v1/chat/completions";
 }
 
@@ -297,11 +316,40 @@ function resolveClaudeLaunch() {
   return { command: "claude", viaCmd: false };
 }
 
+// Rate limit tracking — skip Claude and go straight to DeepSeek until reset
+let _claudeRateLimitedUntil = 0;
+
+export function isClaudeRateLimited() {
+  return Date.now() < _claudeRateLimitedUntil;
+}
+
+function parseRateLimitReset(msg) {
+  // "You've hit your limit · resets 10pm (America/New_York)"
+  // "You've hit your limit · resets 12pm (America/New_York)"
+  const match = msg?.match(/resets?\s+(\d{1,2})(am|pm)/i);
+  if (!match) return Date.now() + 3600_000; // default 1 hour
+  let hour = parseInt(match[1]);
+  if (match[2].toLowerCase() === "pm" && hour < 12) hour += 12;
+  if (match[2].toLowerCase() === "am" && hour === 12) hour = 0;
+
+  // Build target time in ET (approximate — use local offset)
+  const now = new Date();
+  const target = new Date(now);
+  target.setHours(hour + 4, 0, 0, 0); // ET is roughly UTC-4/5
+  if (target <= now) target.setDate(target.getDate() + 1);
+  return target.getTime();
+}
+
 export function runClaudeCli(model, prompt, {
   timeoutMs = 180000,
   systemPrompt = null,
   effort = null,
 } = {}) {
+  // Skip if rate limited — caller should fall back to DeepSeek
+  if (isClaudeRateLimited()) {
+    const mins = Math.ceil((_claudeRateLimitedUntil - Date.now()) / 60000);
+    return Promise.reject(new Error(`Claude rate limited — resets in ~${mins}m. Use DeepSeek fallback.`));
+  }
   return new Promise((resolve, reject) => {
     const stdoutChunks = [];
     const stderrChunks = [];
@@ -317,9 +365,9 @@ export function runClaudeCli(model, prompt, {
       args.push("--effort", effort);
     }
 
-    if (systemPrompt) {
-      args.push("--system-prompt", systemPrompt);
-    }
+    // Note: --system-prompt can't be used for large prompts (ENAMETOOLONG).
+    // Instead, prepend system prompt to stdin content for KV cache benefits.
+    // claude -p still caches the prefix of stdin within its TTL window.
 
     const spawnCommand = viaCmd ? (process.env.ComSpec || "cmd.exe") : command;
     const spawnArgs = viaCmd ? ["/d", "/c", command, ...args] : args;
@@ -328,7 +376,10 @@ export function runClaudeCli(model, prompt, {
       windowsHide: true,
     });
 
-    child.stdin.end(prompt, "utf8");
+    // Prepend system prompt to stdin for KV cache — claude -p caches the
+    // prefix of stdin within its TTL. Stable system prompt = cache hits.
+    const fullPrompt = systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
+    child.stdin.end(fullPrompt, "utf8");
 
     let killed = false;
     const killTimer = setTimeout(() => {
@@ -354,7 +405,14 @@ export function runClaudeCli(model, prompt, {
       try {
         const parsed = JSON.parse(output.trim());
         if (parsed.is_error) {
-          reject(new Error(parsed.result || "Claude CLI returned an error"));
+          const msg = parsed.result || "";
+          // Detect rate limit and set cooldown
+          if (msg.includes("hit your limit") || msg.includes("resets")) {
+            _claudeRateLimitedUntil = parseRateLimitReset(msg);
+            const mins = Math.ceil((_claudeRateLimitedUntil - Date.now()) / 60000);
+            log("claude", `Rate limited — cooldown set for ~${mins} minutes`);
+          }
+          reject(new Error(msg || "Claude CLI returned an error"));
         } else if (parsed.type === "result") {
           resolve(typeof parsed.result === "string" ? parsed.result.trim() : "");
         } else {

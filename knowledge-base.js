@@ -623,6 +623,45 @@ ${truncated}`;
   return result;
 }
 
+const KB_CATEGORY_PRIORITY = {
+  SCREENER: ["strategies", "patterns", "screening", "lessons", "pools"],
+  MANAGER: ["performance", "lessons", "patterns", "strategies", "pools"],
+  GENERAL: ["patterns", "lessons", "performance", "strategies", "pools"],
+};
+
+export function getKbArticlesForPrompt(agentType = "GENERAL", maxArticles = 4) {
+  if (!config.knowledgeBase?.enabled) return [];
+
+  const categories = KB_CATEGORY_PRIORITY[agentType] || KB_CATEGORY_PRIORITY.GENERAL;
+  const seenPaths = new Set();
+  const selected = [];
+
+  for (const category of categories) {
+    const articles = listArticles(category);
+    for (const article of articles) {
+      const summary = (article.summary || "").trim();
+      if (!summary || /^\*\*Address:/i.test(summary) || /^\*Auto-created/i.test(summary)) {
+        continue;
+      }
+      if (seenPaths.has(article.path)) continue;
+      seenPaths.add(article.path);
+      selected.push({
+        category,
+        path: article.path,
+        title: article.title,
+        summary,
+        updated: article.updated,
+        words: article.words,
+      });
+      if (selected.length >= maxArticles) {
+        return selected;
+      }
+    }
+  }
+
+  return selected;
+}
+
 // ─── Pre-loading for Cycles ────────────────────────────────────
 
 /**
@@ -818,9 +857,212 @@ export function filePositionClose(perf) {
     }
 
     log("kb", `Filed position close: ${name} (${outcome}, ${pnl.toFixed(1)}%)`);
+
+    // ─── Richer ingest: update concept articles touched by this close ───
+    try {
+      _updateConceptArticles(perf, outcome, pnl, name, strategy, reason, vol, rangeEff, held);
+    } catch (e) {
+      log("kb", `Concept article update failed (non-fatal): ${e.message}`);
+    }
+
+    // ─── Log the change ───
+    try {
+      _appendLog(`CLOSE ${outcome}: ${name} PnL ${pnl.toFixed(1)}%, strategy=${strategy}, held=${held}min, reason=${reason}`);
+    } catch { /* best-effort */ }
+
   } catch (e) {
     log("kb", `Failed to file position close: ${e.message}`);
   }
+}
+
+// ─── Richer Ingest: concept article updates ──────────────────────
+function _updateConceptArticles(perf, outcome, pnl, name, strategy, reason, vol, rangeEff, held) {
+  const kbDir = getKbDir();
+  const now = new Date().toISOString().slice(0, 16);
+  const line = `- ${now} ${name}: ${outcome} ${pnl.toFixed(1)}%, held ${held}min, vol=${vol}, range_eff=${rangeEff}%`;
+
+  // 1. Strategy pattern article (e.g. lessons/bid-ask-patterns.md)
+  const stratSlug = (strategy || "unknown").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+  const stratPath = `lessons/${stratSlug}-patterns.md`;
+  const stratFull = path.join(kbDir, stratPath);
+  if (fs.existsSync(stratFull)) {
+    let content = fs.readFileSync(stratFull, "utf8");
+    const marker = "## Recent Results";
+    if (content.includes(marker)) {
+      const idx = content.indexOf(marker);
+      const after = content.indexOf("\n", idx) + 1;
+      content = content.slice(0, after) + "\n" + line + "\n" + content.slice(after);
+    } else {
+      content += `\n\n${marker}\n\n${line}\n`;
+    }
+    // Add cross-reference to pool article
+    const poolRef = `pools/${name.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase()}.md`;
+    if (!content.includes(poolRef)) {
+      content += `\n\nSee also: [${name}](../${poolRef})\n`;
+    }
+    writeArticle(stratPath, content);
+  } else {
+    let content = `# Strategy: ${strategy}\n\nPerformance patterns for the **${strategy}** strategy.\n\n## Recent Results\n\n${line}\n`;
+    writeArticle(stratPath, content);
+  }
+
+  // 2. OOR pattern article if close was OOR
+  const oorMatch = reason?.match(/OOR (upside|downside)/i);
+  if (oorMatch) {
+    const oorDir = oorMatch[1].toLowerCase();
+    const oorPath = `lessons/oor-${oorDir}-patterns.md`;
+    const oorFull = path.join(kbDir, oorPath);
+    if (fs.existsSync(oorFull)) {
+      let content = fs.readFileSync(oorFull, "utf8");
+      const marker = "## Recent Cases";
+      if (content.includes(marker)) {
+        const idx = content.indexOf(marker);
+        const after = content.indexOf("\n", idx) + 1;
+        content = content.slice(0, after) + "\n" + line + "\n" + content.slice(after);
+      } else {
+        content += `\n\n${marker}\n\n${line}\n`;
+      }
+      writeArticle(oorPath, content);
+    } else {
+      let content = `# OOR ${oorDir.charAt(0).toUpperCase() + oorDir.slice(1)} Patterns\n\n`;
+      content += `Positions that went out-of-range ${oorDir}.\n\n## Recent Cases\n\n${line}\n`;
+      writeArticle(oorPath, content);
+    }
+  }
+
+  // 3. Bin step performance article
+  const binStep = perf.bin_step;
+  if (binStep) {
+    const bsPath = `lessons/bin-step-${binStep}-performance.md`;
+    const bsFull = path.join(kbDir, bsPath);
+    if (fs.existsSync(bsFull)) {
+      let content = fs.readFileSync(bsFull, "utf8");
+      const marker = "## Recent Results";
+      if (content.includes(marker)) {
+        const idx = content.indexOf(marker);
+        const after = content.indexOf("\n", idx) + 1;
+        content = content.slice(0, after) + "\n" + line + "\n" + content.slice(after);
+      } else {
+        content += `\n\n${marker}\n\n${line}\n`;
+      }
+      writeArticle(bsPath, content);
+    } else {
+      let content = `# Bin Step ${binStep} Performance\n\nResults for pools with bin_step=${binStep}.\n\n## Recent Results\n\n${line}\n`;
+      writeArticle(bsPath, content);
+    }
+  }
+}
+
+// ─── Log: chronological record of KB changes ────────────────────
+function _appendLog(entry) {
+  const kbDir = getKbDir();
+  const logPath = path.join(kbDir, "LOG.md");
+  const now = new Date().toISOString().slice(0, 19);
+  const logLine = `- ${now} ${entry}\n`;
+
+  if (fs.existsSync(logPath)) {
+    // Append to top (after header)
+    let content = fs.readFileSync(logPath, "utf8");
+    const headerEnd = content.indexOf("\n\n");
+    if (headerEnd >= 0) {
+      content = content.slice(0, headerEnd + 2) + logLine + content.slice(headerEnd + 2);
+    } else {
+      content += "\n" + logLine;
+    }
+    // Keep max 200 entries
+    const lines = content.split("\n");
+    const entryLines = lines.filter(l => l.startsWith("- "));
+    if (entryLines.length > 200) {
+      const keep = new Set(entryLines.slice(0, 200));
+      const filtered = lines.filter(l => !l.startsWith("- ") || keep.has(l));
+      content = filtered.join("\n");
+    }
+    fs.writeFileSync(logPath, content);
+  } else {
+    ensureDir(kbDir);
+    fs.writeFileSync(logPath, `# Knowledge Base Log\n\nChronological record of KB changes.\n\n${logLine}`);
+  }
+}
+
+// ─── Lint: periodic KB health check ──────────────────────────────
+export function lintKnowledgeBase() {
+  if (!config.knowledgeBase?.enabled) return null;
+  const kbDir = getKbDir();
+  if (!fs.existsSync(kbDir)) return null;
+
+  const issues = [];
+  const allArticles = listArticles();
+
+  // 1. Find orphan articles (no cross-references from any other article)
+  const referenced = new Set();
+  for (const a of allArticles) {
+    try {
+      const content = fs.readFileSync(path.join(kbDir, a.path), "utf8");
+      const links = content.match(/\[.*?\]\((.*?\.md)\)/g) || [];
+      for (const link of links) {
+        const match = link.match(/\((.*?\.md)\)/);
+        if (match) referenced.add(match[1].replace(/^\.\.\//, ""));
+      }
+    } catch { /* skip */ }
+  }
+  const orphans = allArticles.filter(a =>
+    !referenced.has(a.path) &&
+    !a.path.includes("INDEX") &&
+    !a.path.includes("CONCEPTS") &&
+    !a.path.includes("LOG")
+  );
+  if (orphans.length > 10) {
+    issues.push(`${orphans.length} orphan articles (no incoming links)`);
+  }
+
+  // 2. Find stale articles (not updated in 7+ days)
+  const staleThreshold = Date.now() - 7 * 86400_000;
+  const stale = allArticles.filter(a => {
+    try {
+      return fs.statSync(path.join(kbDir, a.path)).mtimeMs < staleThreshold;
+    } catch { return false; }
+  });
+  if (stale.length > 0) {
+    issues.push(`${stale.length} stale articles (not updated in 7+ days)`);
+  }
+
+  // 3. Find empty articles (< 50 chars of content)
+  const empty = allArticles.filter(a => {
+    try {
+      const content = fs.readFileSync(path.join(kbDir, a.path), "utf8");
+      return content.replace(/^#.*\n+/g, "").trim().length < 50;
+    } catch { return false; }
+  });
+  if (empty.length > 0) {
+    issues.push(`${empty.length} near-empty articles`);
+  }
+
+  // 4. Check for duplicate pool articles (same pool, different slugs)
+  const poolArticles = allArticles.filter(a => a.path.startsWith("pools/"));
+  const poolNames = new Map();
+  for (const a of poolArticles) {
+    try {
+      const content = fs.readFileSync(path.join(kbDir, a.path), "utf8");
+      const nameMatch = content.match(/^# Pool: (.+)/m);
+      if (nameMatch) {
+        const n = nameMatch[1].trim().toLowerCase();
+        if (poolNames.has(n)) {
+          issues.push(`Duplicate pool articles for "${nameMatch[1]}": ${poolNames.get(n)} and ${a.path}`);
+        }
+        poolNames.set(n, a.path);
+      }
+    } catch { /* skip */ }
+  }
+
+  _appendLog(`LINT: ${issues.length} issues found`);
+
+  return {
+    total_articles: allArticles.length,
+    issues,
+    orphan_count: orphans.length,
+    stale_count: stale.length,
+    empty_count: empty.length,
+  };
 }
 
 /**

@@ -1,213 +1,108 @@
 /**
  * Study top LPers for a pool and extract behavioural patterns.
- * Used by the /learn command — not called on every cycle.
+ * Used by the /learn command - not called on every cycle.
  */
 
 import { getKey, fetchWithRetry } from "../lpagent-keys.js";
 
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
+const MERIDIAN_API = "https://api.agentmeridian.xyz/api";
+const MERIDIAN_PUBLIC_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
 
 /**
- * Fetch top LPers for a pool, filter to credible performers,
- * and return condensed behaviour patterns for LLM consumption.
+ * Fetch interpreted LP study data from Meridian and normalize it for the agent.
  */
 export async function studyTopLPers({ pool_address, limit = 4 }) {
-  const apiKey = await getKey();
-  if (!apiKey) {
-    return { pool: pool_address, message: "LPAGENT_API_KEY not set in .env — study_top_lpers is disabled.", patterns: [], lpers: [] };
-  }
-
-  // ── 1. Top LPers for this pool ──────────────────────────────
-  const topRes = await fetchWithRetry(
-    `${LPAGENT_API}/pools/${pool_address}/top-lpers?sort_order=desc&page=1&limit=20`,
-    { headers: { "x-api-key": apiKey } }
+  const res = await fetch(
+    `${MERIDIAN_API}/study-top-lp/${pool_address}`,
+    { headers: { "x-api-key": MERIDIAN_PUBLIC_KEY } }
   );
 
-  if (!topRes.ok) {
-    throw new Error(`top-lpers API error: ${topRes.status}`);
+  if (!res.ok) {
+    throw new Error(`study-top-lp API error: ${res.status}`);
   }
 
-  const topData = await topRes.json();
-  const all = topData.data || [];
+  const data = await res.json();
+  const winnersByPct = Array.isArray(data.topWinnersByPct) ? data.topWinnersByPct : [];
+  const winnersByUsd = Array.isArray(data.topWinnersByUsd) ? data.topWinnersByUsd : [];
+  const losersByPct = Array.isArray(data.topLosersByPct) ? data.topLosersByPct : [];
+  const historicalOwners = Array.isArray(data.topHistoricalOwners) ? data.topHistoricalOwners : [];
+  const ownerCount = Number(data.ownerCount || historicalOwners.length || winnersByPct.length || 0);
 
-  // Filter to LPers with enough data to be meaningful
-  const credible = all.filter(
-    (l) => l.total_lp >= 3 && l.win_rate >= 0.6 && l.total_inflow > 1000
-  );
+  const uniqueRows = new Map();
+  for (const row of [...winnersByPct, ...winnersByUsd, ...losersByPct]) {
+    if (row?.owner && !uniqueRows.has(row.owner)) {
+      uniqueRows.set(row.owner, row);
+    }
+  }
 
-  // Sort by ROI descending, take top N
-  const top = credible
-    .sort((a, b) => b.roi - a.roi)
-    .slice(0, limit);
+  const lpers = historicalOwners.slice(0, limit).map((owner) => ({
+    owner: owner.owner ? `${owner.owner.slice(0, 8)}...` : "unknown",
+    summary: {
+      preferred_strategy: owner.preferredStrategy || data.suggestedStyle?.strategy || "unknown",
+      preferred_range_style: owner.preferredRangeStyle || data.suggestedStyle?.rangeStyle || "unknown",
+      avg_hold_hours: isNum(owner.avgHoldHours) ? Number(owner.avgHoldHours.toFixed(2)) : null,
+      avg_pnl_pct: isNum(owner.avgPnlPct) ? `${owner.avgPnlPct.toFixed(1)}%` : null,
+      fee_pct_of_capital: isNum(owner.avgFeePercent) ? `${owner.avgFeePercent.toFixed(1)}%` : null,
+      avg_width_bins: isNum(owner.avgWidthBins) ? owner.avgWidthBins : null,
+    },
+    positions: Array.isArray(owner.topPositions)
+      ? owner.topPositions.map((position) => ({
+          pool: position.pool || pool_address,
+          pair: position.pairName || null,
+          hold_hours: isNum(position.ageHours) ? Number(position.ageHours.toFixed(2)) : null,
+          pnl_usd: isNum(position.pnlUsd) ? Math.round(position.pnlUsd) : null,
+          pnl_pct: isNum(position.pnlPct) ? `${position.pnlPct.toFixed(1)}%` : null,
+          fee_usd: isNum(position.feeUsd) ? Math.round(position.feeUsd) : null,
+          in_range_pct: position.inRange == null ? null : (position.inRange ? "100%" : "0%"),
+          range_pct: null,
+          range_bins: isNum(position.widthBins) ? position.widthBins : null,
+          strategy: position.strategy || owner.preferredStrategy || data.suggestedStyle?.strategy || null,
+          closed_reason: position.closedAt ? "closed" : "open",
+        }))
+      : [],
+  }));
 
-  if (top.length === 0) {
+  if (lpers.length === 0 && uniqueRows.size === 0) {
     return {
       pool: pool_address,
-      message: "No credible LPers found (need ≥3 positions, ≥60% win rate, ≥$1k inflow).",
+      message: "No interpreted LP study data returned from Meridian.",
       patterns: [],
-      historical_samples: [],
+      lpers: [],
     };
   }
 
-  // ── 2. Historical positions for each top LPer ───────────────
-  // Fetch from LP Agent (hold times, PnL, strategy) + Meteora PnL API (bin ranges)
-  const historicalSamples = [];
-
-  for (const lper of top) {
-    try {
-      // LP Agent: historical positions (strategy, hold time, PnL, fees)
-      const histKey = await getKey();
-      const histRes = await fetchWithRetry(
-        `${LPAGENT_API}/lp-positions/historical?owner=${lper.owner}&page=1&limit=50`,
-        { headers: { "x-api-key": histKey } }
-      );
-      const lpAgentPositions = histRes.ok ? (await histRes.json()).data || [] : [];
-
-      // Meteora PnL API: bin range data for this LPer in this pool
-      let meteoraBinMap = {};
-      try {
-        const meteoraRes = await fetch(
-          `https://dlmm.datapi.meteora.ag/positions/${pool_address}/pnl?user=${lper.owner}&status=all&pageSize=50&page=1`
-        );
-        if (meteoraRes.ok) {
-          const meteoraData = await meteoraRes.json();
-          for (const mp of meteoraData.positions || []) {
-            const addr = mp.positionAddress || mp.address;
-            if (addr) meteoraBinMap[addr] = mp;
-          }
-        }
-      } catch { /* best-effort */ }
-
-      // Merge: LP Agent positions enriched with Meteora bin data
-      // If LP Agent returned nothing, build positions from Meteora data directly
-      const positions = lpAgentPositions.length > 0 ? lpAgentPositions : [];
-      const meteoraOnly = Object.values(meteoraBinMap);
-
-      const mappedPositions = positions.map((p) => {
-        const lower = p.tickLower ?? p.lowerBinId;
-        const upper = p.tickUpper ?? p.upperBinId;
-        const bs = p.poolInfo?.tickSpacing ?? p.binStep;
-        let range_pct = null;
-        let range_bins = null;
-        if (lower != null && upper != null) {
-          range_bins = upper - lower;
-          if (bs && range_bins > 0) {
-            const stepPct = bs / 10000;
-            range_pct = Math.round((1 - Math.pow(1 + stepPct, -range_bins)) * 1000) / 10;
-          }
-        }
-        return {
-          pool: p.pool,
-          pair: p.pairName || `${p.tokenName0}-${p.tokenName1}`,
-          hold_hours: p.ageHour != null ? Number(p.ageHour?.toFixed(2)) : null,
-          pnl_usd: Math.round(p.pnl?.value || 0),
-          pnl_pct: ((p.pnl?.percent || 0) * 100).toFixed(1) + "%",
-          fee_usd: Math.round(p.collectedFee || 0),
-          in_range_pct: p.inRangePct != null ? Math.round(p.inRangePct * 100) + "%" : null,
-          range_pct,
-          range_bins,
-          strategy: p.strategy || null,
-          closed_reason: p.closeReason || null,
-        };
-      });
-
-      // If LP Agent had no positions, use Meteora data to build range-focused entries
-      if (mappedPositions.length === 0 && meteoraOnly.length > 0) {
-        for (const mp of meteoraOnly) {
-          const range_bins = (mp.upperBinId || 0) - (mp.lowerBinId || 0);
-          let range_pct = null;
-          // Pool bin_step from the top-lpers response isn't directly available,
-          // but we can infer from the Meteora response price data or use a default
-          // For now, try to get it from pool metadata if available
-          if (range_bins > 0) {
-            // Approximate: use the price ratio to estimate bin_step
-            // Or just report raw bins and let the model see the pattern
-            range_pct = range_bins; // Will be replaced below if we can calculate
-          }
-          mappedPositions.push({
-            pool: pool_address,
-            pair: null,
-            hold_hours: mp.closedAt && mp.createdAt ? Math.round((mp.closedAt - mp.createdAt) / 3600 * 100) / 100 : null,
-            pnl_usd: mp.pnlUsd ? Math.round(parseFloat(mp.pnlUsd)) : null,
-            pnl_pct: mp.pnlPctChange ? parseFloat(mp.pnlPctChange).toFixed(1) + "%" : null,
-            fee_usd: mp.allTimeFees?.total?.usd ? Math.round(parseFloat(mp.allTimeFees.total.usd)) : null,
-            in_range_pct: null,
-            range_bins,
-            range_pct: null, // need bin_step to calculate — set below
-            strategy: null,
-            closed_reason: mp.isClosed ? "closed" : "open",
-          });
-        }
-      }
-
-      historicalSamples.push({
-        owner: lper.owner.slice(0, 8) + "...",
-        summary: {
-          total_positions: lper.total_lp,
-          win_rate: Math.round(lper.win_rate * 100) + "%",
-          avg_hold_hours: Number(lper.avg_age_hour?.toFixed(2)),
-          roi: (lper.roi * 100).toFixed(2) + "%",
-          fee_pct_of_capital: (lper.fee_percent * 100).toFixed(2) + "%",
-          total_pnl_usd: Math.round(lper.total_pnl),
-        },
-        positions: mappedPositions,
-      });
-    } catch {
-      // skip failed fetches
-    }
-  }
-
-  // ── 2b. Calculate range_pct for Meteora-sourced positions using pool bin_step ──
-  // We need the pool's bin_step — fetch once from the pool detail
-  try {
-    const { getPoolDetail } = await import("./screening.js");
-    const poolDetail = await getPoolDetail({ pool_address, timeframe: "1h" }).catch(() => null);
-    const poolBinStep = poolDetail?.bin_step;
-    if (poolBinStep) {
-      const stepPct = poolBinStep / 10000;
-      for (const sample of historicalSamples) {
-        for (const pos of sample.positions) {
-          if (pos.range_bins > 0 && pos.range_pct == null) {
-            pos.range_pct = Math.round((1 - Math.pow(1 + stepPct, -pos.range_bins)) * 1000) / 10;
-          }
-        }
-      }
-    }
-  } catch { /* best-effort */ }
-
-  // ── 3. Aggregate patterns ────────────────────────────────────
+  const numericRows = [...uniqueRows.values()];
   const patterns = {
-    top_lper_count: top.length,
-    avg_hold_hours: avg(top.map((l) => l.avg_age_hour).filter(isNum)),
-    avg_win_rate: avg(top.map((l) => l.win_rate).filter(isNum)),
-    avg_roi_pct: avg(top.map((l) => l.roi * 100).filter(isNum)),
-    avg_fee_pct_of_capital: avg(top.map((l) => l.fee_percent * 100).filter(isNum)),
-    best_roi: (Math.max(...top.map((l) => l.roi)) * 100).toFixed(2) + "%",
-    // Scalpers (hold < 1h) vs holders (> 4h)
-    scalper_count: top.filter((l) => l.avg_age_hour < 1).length,
-    holder_count: top.filter((l) => l.avg_age_hour >= 4).length,
+    top_lper_count: ownerCount,
+    active_position_count: Number(data.activePositionCount || 0),
+    avg_hold_hours: avg(numericRows.map((row) => row.avgAgeHours).filter(isNum)),
+    avg_win_rate: winnersByPct.length > 0 && ownerCount > 0
+      ? Math.round((winnersByPct.length / ownerCount) * 100)
+      : null,
+    avg_roi_pct: avg(numericRows.map((row) => row.pnlPct).filter(isNum)),
+    avg_fee_pct_of_capital: avg(numericRows.map((row) => row.feePercent).filter(isNum)),
+    best_roi: winnersByPct.length > 0 && isNum(winnersByPct[0]?.pnlPct)
+      ? `${winnersByPct[0].pnlPct.toFixed(2)}%`
+      : null,
+    scalper_count: numericRows.filter((row) => isNum(row.avgAgeHours) && row.avgAgeHours < 1).length,
+    holder_count: numericRows.filter((row) => isNum(row.avgAgeHours) && row.avgAgeHours >= 4).length,
+    suggested_strategy: data.suggestedStyle?.strategy || null,
+    suggested_range_style: data.suggestedStyle?.rangeStyle || null,
   };
-
-  // Aggregate range % from all historical positions
-  const allRanges = historicalSamples
-    .flatMap(s => s.positions)
-    .map(p => p.range_pct)
-    .filter(isNum);
-  if (allRanges.length > 0) {
-    patterns.historical_avg_range_pct = Math.round(avg(allRanges) * 10) / 10;
-    patterns.historical_min_range_pct = Math.min(...allRanges);
-    patterns.historical_max_range_pct = Math.max(...allRanges);
-    patterns.range_note = "Historical ranges are informational only — size YOUR range from the volatility table, not these numbers. Market conditions (mcap, volume, volatility) may have changed significantly since these positions were opened.";
-  }
 
   return {
     pool: pool_address,
     patterns,
-    lpers: historicalSamples,
+    lpers,
+    raw_study: {
+      poolAddress: data.poolAddress,
+      ownerCount,
+      activePositionCount: Number(data.activePositionCount || 0),
+      suggestedStyle: data.suggestedStyle || null,
+    },
   };
 }
-
-// ─── Pool Info (deep intel) ─────────────────────────────────
 
 /**
  * Get detailed pool info from LP Agent API.
@@ -216,7 +111,7 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
 export async function getPoolInfo({ pool_address }) {
   const apiKey = await getKey();
   if (!apiKey) {
-    return { error: "LPAGENT_API_KEY not set — get_pool_info is disabled." };
+    return { error: "LPAGENT_API_KEY not set - get_pool_info is disabled." };
   }
 
   const res = await fetchWithRetry(
@@ -232,15 +127,11 @@ export async function getPoolInfo({ pool_address }) {
   const d = raw.data;
   if (!d) return { error: "No data returned for this pool." };
 
-  // Extract token info
   const tokens = d.tokenInfo?.[0]?.data || [];
   const tokenX = tokens[0] || {};
   const tokenY = tokens[1] || {};
-
-  // Extract fee info
   const feeInfo = d.feeInfo || {};
 
-  // Condensed response for LLM
   const result = {
     pool: pool_address,
     type: d.type,
@@ -287,13 +178,12 @@ export async function getPoolInfo({ pool_address }) {
       sell_volume: tokenX.stats1h.sellVolume,
       num_traders: tokenX.stats1h.numTraders,
     } : null,
-    fee_trend_7d: (d.feeStats || []).slice(-24).map(h => ({
+    fee_trend_7d: (d.feeStats || []).slice(-24).map((h) => ({
       hour: h.hour,
       fee_usd: h.feeUsd,
     })),
   };
 
-  // Auto-store in nuggets memory
   try {
     const { rememberFact } = await import("../memory.js");
     const pair = `${tokenX.symbol || "?"}-${tokenY.symbol || "SOL"}`;
@@ -315,9 +205,9 @@ export async function getPoolInfo({ pool_address }) {
 
 function avg(arr) {
   if (!arr.length) return null;
-  return Math.round((arr.reduce((s, x) => s + x, 0) / arr.length) * 100) / 100;
+  return Math.round((arr.reduce((sum, value) => sum + value, 0) / arr.length) * 100) / 100;
 }
 
-function isNum(n) {
-  return typeof n === "number" && isFinite(n);
+function isNum(value) {
+  return typeof value === "number" && Number.isFinite(value);
 }

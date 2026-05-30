@@ -173,6 +173,141 @@ function formatUsd(value) {
   return `$${Math.round(value)}`;
 }
 
+/* ============================== INDICATOR MATH (ported verbatim from okx.js) ============================== */
+
+function sma(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(-period);
+  return slice.reduce((sum, value) => sum + value, 0) / period;
+}
+
+function stddev(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(-period);
+  const mean = slice.reduce((sum, value) => sum + value, 0) / period;
+  const variance = slice.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / period;
+  return Math.sqrt(variance);
+}
+
+function emaSeries(values, period) {
+  if (values.length < period) return [];
+  const alpha = 2 / (period + 1);
+  const result = [];
+  let ema = values.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+  result[period - 1] = ema;
+  for (let i = period; i < values.length; i++) {
+    ema = (values[i] - ema) * alpha + ema;
+    result[i] = ema;
+  }
+  return result;
+}
+
+function rsi(values, period = 2) {
+  if (values.length <= period) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = values.length - period; i < values.length; i++) {
+    const change = values[i] - values[i - 1];
+    if (change >= 0) gains += change;
+    else losses += Math.abs(change);
+  }
+  if (losses === 0) return gains === 0 ? 50 : 100;
+  const rs = gains / losses;
+  return 100 - (100 / (1 + rs));
+}
+
+function macd(closes, fast = 12, slow = 26, signal = 9) {
+  if (closes.length < slow + signal) return null;
+  const fastEma = emaSeries(closes, fast);
+  const slowEma = emaSeries(closes, slow);
+  const macdLine = closes.map((_, i) =>
+    fastEma[i] != null && slowEma[i] != null ? fastEma[i] - slowEma[i] : null
+  );
+  const compact = macdLine.filter((value) => value != null);
+  if (compact.length < signal) return null;
+  const signalCompact = emaSeries(compact, signal);
+  const hist = compact.map((value, i) =>
+    signalCompact[i] != null ? value - signalCompact[i] : null
+  ).filter((value) => value != null);
+  const latestHist = hist.at(-1);
+  const prevHist = hist.at(-2);
+  return {
+    line: roundTo(compact.at(-1), 10),
+    signal: roundTo(signalCompact.filter((value) => value != null).at(-1), 10),
+    histogram: roundTo(latestHist, 10),
+    first_green_histogram: prevHist != null && prevHist <= 0 && latestHist > 0,
+  };
+}
+
+function averageTrueRange(candles, period = 10) {
+  if (candles.length <= period) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const prevClose = candles[i - 1].close;
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - prevClose),
+      Math.abs(candles[i].low - prevClose)
+    ));
+  }
+  return sma(trs, period);
+}
+
+function supertrend(candles, period = 10, multiplier = 3) {
+  if (candles.length <= period + 1) return null;
+  const states = [];
+
+  for (let i = period; i < candles.length; i++) {
+    const window = candles.slice(0, i + 1);
+    const atr = averageTrueRange(window, period);
+    if (atr == null) continue;
+
+    const candle = candles[i];
+    const hl2 = (candle.high + candle.low) / 2;
+    const basicUpper = hl2 + multiplier * atr;
+    const basicLower = hl2 - multiplier * atr;
+    const prev = states.at(-1);
+
+    const finalUpper = !prev || basicUpper < prev.finalUpper || candles[i - 1].close > prev.finalUpper
+      ? basicUpper
+      : prev.finalUpper;
+    const finalLower = !prev || basicLower > prev.finalLower || candles[i - 1].close < prev.finalLower
+      ? basicLower
+      : prev.finalLower;
+
+    let direction = "green";
+    let value = finalLower;
+    if (prev?.direction === "green") {
+      direction = candle.close < finalLower ? "red" : "green";
+    } else if (prev?.direction === "red") {
+      direction = candle.close > finalUpper ? "green" : "red";
+    }
+    value = direction === "green" ? finalLower : finalUpper;
+
+    states.push({
+      direction,
+      value,
+      finalUpper,
+      finalLower,
+      close: candle.close,
+    });
+  }
+
+  const latest = states.at(-1);
+  const previous = states.at(-2);
+  if (!latest) return null;
+  return {
+    direction: latest.direction,
+    value: roundTo(latest.value, 12),
+    price_above: latest.close > latest.value,
+    flipped_green: previous?.direction === "red" && latest.direction === "green",
+  };
+}
+
+function roundTo(value, decimals = 2) {
+  return Number.isFinite(value) ? Number(value.toFixed(decimals)) : null;
+}
+
 /* ============================== TOKEN INFO (shared) ============================== */
 
 /**
@@ -220,18 +355,23 @@ async function fetchKlines(mint) {
 }
 
 /**
- * Summarize the most recent 6x 5m candles into actionable signals.
- * Algorithm reused verbatim from okx.js fetchCandleSummary.
+ * Summarize ~50x 5m candles into actionable signals + Evil Panda indicators.
+ * Volume/price_direction/range/acceleration use the LAST 6 candles (recent6, as
+ * okx did). RSI(2)/MACD/Bollinger/Supertrend use ALL candles (allCloses/parsed,
+ * as okx did). Algorithm + indicator math ported verbatim from okx.js
+ * fetchCandleSummary.
  */
 function summarizeCandles(allCandles) {
   if (!allCandles?.length) return null;
-  const candles = allCandles.slice(-6);
-  if (!candles.length) return null;
+  const parsed = allCandles.filter((c) => c.high > 0 && c.low > 0 && c.close > 0);
+  if (!parsed.length) return null;
 
-  const vols = candles.map((c) => c.volume);
-  const closes = candles.map((c) => c.close);
-  const highs = candles.map((c) => c.high);
-  const lows = candles.map((c) => c.low);
+  const recent6 = parsed.slice(-6);
+  const vols = recent6.map((c) => c.volume);
+  const closes = recent6.map((c) => c.close);
+  const highs = recent6.map((c) => c.high);
+  const lows = recent6.map((c) => c.low);
+  const allCloses = parsed.map((c) => c.close);
 
   const firstAvg = vols.slice(0, 3).reduce((s, v) => s + v, 0) / 3;
   const lastAvg = vols.slice(-3).reduce((s, v) => s + v, 0) / 3;
@@ -260,6 +400,17 @@ function summarizeCandles(allCandles) {
     acceleration = "decelerating";
   }
 
+  const bbMid = sma(allCloses, 20);
+  const bbStd = stddev(allCloses, 20);
+  const bbUpper = bbMid != null && bbStd != null ? bbMid + (2 * bbStd) : null;
+  const latestClose = allCloses.at(-1);
+  const latestRsi2 = rsi(allCloses, 2);
+  const macdResult = macd(allCloses);
+  const supertrendResult = supertrend(parsed, 10, 3);
+  const closesAboveBbUpper = bbUpper != null && latestClose > bbUpper;
+  const rsi2Above90 = latestRsi2 != null && latestRsi2 > 90;
+  const macdFirstGreen = !!macdResult?.first_green_histogram;
+
   return {
     volume_trend,
     volume_dying,
@@ -267,6 +418,24 @@ function summarizeCandles(allCandles) {
     price_range_pct,
     acceleration,
     latest_3_volumes_usd: vols.slice(-3).map((v) => Math.round(v)),
+    candle_count: parsed.length,
+    rsi_2: roundTo(latestRsi2, 2),
+    rsi_2_above_90: rsi2Above90,
+    bb_upper: roundTo(bbUpper, 12),
+    close_above_bb_upper: closesAboveBbUpper,
+    macd: macdResult,
+    macd_first_green_histogram: macdFirstGreen,
+    supertrend: supertrendResult,
+    supertrend_direction: supertrendResult?.direction || null,
+    supertrend_green: supertrendResult?.direction === "green",
+    supertrend_price_above: !!supertrendResult?.price_above,
+    evil_panda_entry_ok: supertrendResult?.direction === "green" && !!supertrendResult?.price_above,
+    evil_panda_exit_signal: rsi2Above90 && (closesAboveBbUpper || macdFirstGreen),
+    evil_panda_exit_reason: rsi2Above90 && closesAboveBbUpper
+      ? "RSI(2)>90 + close above BB upper"
+      : rsi2Above90 && macdFirstGreen
+        ? "RSI(2)>90 + MACD first green histogram"
+        : null,
   };
 }
 
@@ -316,6 +485,10 @@ export async function fetchGmgnPriceInfo(mint) {
       change_24h: pct(p.price, p.price_24h),
       volume_5m: Math.round(toNum(p.volume_5m) * 100) / 100,
       volume_1h: Math.round(toNum(p.volume_1h) * 100) / 100,
+      volume_24h: Math.round(toNum(p.volume_24h) * 100) / 100,
+      market_cap: Math.round(toNum(p.price) * toNum(info?.circulating_supply) * 100) / 100,
+      holders: Math.trunc(toNum(info?.holder_count)) || null,
+      liquidity: Math.round(toNum(info?.liquidity) * 100) / 100,
       candles: summarizeCandles(candles),
     };
 

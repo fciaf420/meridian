@@ -18,7 +18,7 @@ There is also an autoresearch subsystem that tests prompt changes after real clo
 
 ## LLM Providers
 
-Meridian supports four provider modes. Set via `LLM_PROVIDER` in `.env` or `llmProvider` in `user-config.json`:
+Meridian supports five provider modes. Set via `LLM_PROVIDER` in `.env` or `llmProvider` in `user-config.json`:
 
 | Provider | How it works | Auth | Cost |
 | --- | --- | --- | --- |
@@ -26,6 +26,7 @@ Meridian supports four provider modes. Set via `LLM_PROVIDER` in `.env` or `llmP
 | `codex` | Runs model turns through `codex exec` (Codex CLI) | OAuth login (`codex login`) | Uses your Codex/OpenAI subscription |
 | `openrouter` | Direct HTTP API calls to any model | `OPENROUTER_API_KEY` | Pay-per-token via OpenRouter |
 | `deepseek` | Direct HTTP API calls | `DEEPSEEK_API_KEY` | Pay-per-token via DeepSeek |
+| `minimax` | Direct HTTP API calls to MiniMax's OpenAI-compatible API | `MINIMAX_API_KEY` | Uses your MiniMax Token Plan or pay-as-you-go key |
 
 ### Claude Provider (recommended)
 
@@ -50,6 +51,16 @@ Uses `codex exec` with your OpenAI/Codex subscription. Same CLI harness pattern 
 ### OpenRouter Provider
 
 Uses the OpenRouter API to access any model (minimax, qwen, etc.). Requires `OPENROUTER_API_KEY` in `.env`. Good for cheap models like `minimax/minimax-m2.7` or free models like `qwen/qwen3.6-plus:free`.
+
+### MiniMax Provider
+
+Uses MiniMax's OpenAI-compatible API directly at `https://api.minimax.io/v1`. This is the right option if you want to use a MiniMax Token Plan key directly instead of routing MiniMax through OpenRouter.
+
+Typical models:
+
+- `MiniMax-M2.7`
+- `MiniMax-M2.7-highspeed`
+- `MiniMax-M2.5`
 
 All providers use the same ReAct loop with your custom tools — the provider only affects which LLM processes the prompts.
 
@@ -105,6 +116,9 @@ codex login
 
 **OpenRouter (pay-per-token, any model):**
 Add `OPENROUTER_API_KEY=sk-or-...` to `.env`
+
+**MiniMax Token Plan (direct MiniMax access):**
+Add `MINIMAX_API_KEY=...` to `.env`
 
 Then run:
 
@@ -198,6 +212,7 @@ WALLET_PRIVATE_KEY=your_base58_key
 HELIUS_API_KEY=your_helius_key
 OPENROUTER_API_KEY=sk-or-...
 DEEPSEEK_API_KEY=sk-...
+MINIMAX_API_KEY=...
 LPAGENT_API_KEY=key1,key2
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=
@@ -206,9 +221,10 @@ DRY_RUN=true
 
 Notes:
 
-- `LLM_PROVIDER` can be `claude`, `codex`, `openrouter`, or `deepseek`
+- `LLM_PROVIDER` can be `claude`, `codex`, `openrouter`, `deepseek`, or `minimax`
 - `OPENROUTER_API_KEY` is only needed when provider is `openrouter`
 - `DEEPSEEK_API_KEY` is only needed when provider is `deepseek`
+- `MINIMAX_API_KEY` is only needed when provider is `minimax`
 - `claude` and `codex` providers use OAuth login, no API key needed
 - `TELEGRAM_CHAT_ID` can be left empty; Meridian can register it automatically
 - `DRY_RUN=true` is the safest default until you validate behavior
@@ -347,10 +363,11 @@ Everything in `user-config.json` is optional, but these are the main knobs.
 | `rpcUrl` | Solana RPC URL |
 | `walletKey` | Solana wallet private key |
 | `dryRun` | Simulate or trade live |
-| `llmProvider` | `codex`, `openrouter`, or `deepseek` |
+| `llmProvider` | `claude`, `codex`, `openrouter`, `deepseek`, or `minimax` |
 | `managementModel` | manager model |
 | `screeningModel` | screener model |
 | `generalModel` | chat model |
+| `autoresearchModel` | prompt-optimizer model |
 
 ### Screening
 
