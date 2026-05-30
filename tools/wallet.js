@@ -149,6 +149,14 @@ export async function swapToken({
     }
     const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
 
+    // Output decimals — used to normalize the received amount to UI units.
+    let outDecimals = 9; // SOL default
+    if (output_mint !== config.tokens.SOL) {
+      const outInfo = await connection.getParsedAccountInfo(new PublicKey(output_mint));
+      outDecimals = outInfo.value?.data?.parsed?.info?.decimals ?? 9;
+    }
+    const toUi = (raw, dec) => (raw != null && !isNaN(Number(raw)) ? Number(raw) / Math.pow(10, dec) : null);
+
     // ─── Get Ultra order (unsigned tx + requestId) ─────────────
     const orderUrl =
       `${JUPITER_ULTRA_API}/order` +
@@ -164,7 +172,7 @@ export async function swapToken({
       const body = await orderRes.text();
       if (orderRes.status === 500) {
         log("swap", `Ultra failed for ${input_mint}, falling back to regular swap API`);
-        return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr });
+        return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
       }
       throw new Error(`Ultra order failed: ${orderRes.status} ${body}`);
     }
@@ -209,6 +217,8 @@ export async function swapToken({
       output_mint,
       amount_in: result.inputAmountResult,
       amount_out: result.outputAmountResult,
+      in_ui: toUi(result.inputAmountResult, decimals),
+      out_ui: toUi(result.outputAmountResult, outDecimals),
     };
   } catch (error) {
     log("swap_error", error.message);
@@ -216,7 +226,7 @@ export async function swapToken({
   }
 }
 
-async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr }) {
+async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals = 9, outDecimals = 9 }) {
   // ─── Get quote ─────────────────────────────────────────────
   const quoteRes = await fetch(
     `${JUPITER_QUOTE_API}/quote?inputMint=${input_mint}&outputMint=${output_mint}&amount=${amountStr}&slippageBps=300`,
@@ -246,5 +256,15 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   await connection.confirmTransaction(txHash, "confirmed");
 
   log("swap", `SUCCESS (fallback) tx: ${txHash}`);
-  return { success: true, tx: txHash, input_mint, output_mint };
+  const toUi = (raw, dec) => (raw != null && !isNaN(Number(raw)) ? Number(raw) / Math.pow(10, dec) : null);
+  return {
+    success: true,
+    tx: txHash,
+    input_mint,
+    output_mint,
+    amount_in: quote.inAmount,
+    amount_out: quote.outAmount,
+    in_ui: toUi(quote.inAmount, decimals),
+    out_ui: toUi(quote.outAmount, outDecimals),
+  };
 }

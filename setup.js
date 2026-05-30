@@ -189,6 +189,40 @@ const maxDeployAmount = await askNum(
   { min: deployAmountSol }
 );
 
+// ─── USDC Mode ──────────────────────────────────────────────────────────────────
+console.log("\n── USDC Mode ─────────────────────────────────");
+console.log("  Hold capital in USDC: auto-swap USDC→SOL on entry, settle back to USDC on exit.");
+
+const usdcModeAns = await ask(
+  "Enable USDC mode? (true/false)",
+  String(e("usdcMode", false))
+);
+const usdcMode = usdcModeAns === "true" || usdcModeAns === true;
+
+let deployAmountUsd, maxDeployUsd, minUsdcToOpen, gasReserveSol;
+if (usdcMode) {
+  deployAmountUsd = await askNum(
+    "USD to deploy per position",
+    e("deployAmountUsd", 50),
+    { min: 1 }
+  );
+  maxDeployUsd = await askNum(
+    "Max USD per single position (safety cap)",
+    e("maxDeployUsd", Math.max(500, deployAmountUsd)),
+    { min: deployAmountUsd }
+  );
+  minUsdcToOpen = await askNum(
+    "Min USDC balance to open a new position",
+    e("minUsdcToOpen", deployAmountUsd),
+    { min: 0 }
+  );
+  gasReserveSol = await askNum(
+    "Native SOL gas reserve to keep (warn-only, no auto top-up)",
+    e("gasReserveSol", 0.05),
+    { min: 0.01 }
+  );
+}
+
 // ─── Risk ─────────────────────────────────────────────────────────────────────
 console.log("\n── Risk & Filters ────────────────────────────");
 
@@ -307,6 +341,8 @@ const userConfig = {
   maxPositions,
   minSolToOpen,
   maxDeployAmount,
+  usdcMode,
+  ...(usdcMode ? { deployAmountUsd, maxDeployUsd, minUsdcToOpen, gasReserveSol } : {}),
   timeframe,
   maxVolatility,
   maxPriceChangePct,
@@ -339,7 +375,9 @@ Preset:       ${presetName}
 Timeframe:    ${timeframe}
 
   Deploy:     ${deployAmountSol} SOL/position  |  Max: ${maxPositions} positions
-  Min balance: ${minSolToOpen} SOL to open
+  Min balance: ${minSolToOpen} SOL to open${usdcMode ? `
+  USDC mode:  ON — $${deployAmountUsd}/position  |  max $${maxDeployUsd}  |  gas reserve ${gasReserveSol} SOL` : `
+  USDC mode:  OFF`}
   Take profit: fees >= ${takeProfitFeePct}%
   Volatility:  max ${maxVolatility}
   Organic:     min ${minOrganic}

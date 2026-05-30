@@ -10,6 +10,7 @@ import {
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
+import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
@@ -252,6 +253,31 @@ export async function executeTool(name, args) {
     return { error };
   }
 
+  // ─── USDC-mode entry: fund the deploy from USDC ───
+  // Runs BEFORE safety checks/execution so we only swap USDC→SOL once the
+  // deploy is known to be eligible (no swap-then-block left holding SOL).
+  if (name === "deploy_position" && usdcModeEnabled()) {
+    const elig = await checkDeployEligibility(args);
+    if (!elig.pass) {
+      log("safety_block", `deploy_position blocked (usdc preflight): ${elig.reason}`);
+      return { blocked: true, reason: elig.reason };
+    }
+    const entry = await prepareUsdcEntry({ amountUsd: args.amount_usd });
+    if (!entry.ok) {
+      log("usdc", `Entry blocked: ${entry.reason}`);
+      if (entry.gas_low) emit("gas_low", { reason: entry.reason });
+      return { blocked: true, reason: entry.reason, gas_low: !!entry.gas_low };
+    }
+    // Force single-sided SOL deposit — in USDC mode we only acquire SOL.
+    args.amount_y = entry.amount_y;
+    args.amount_sol = entry.amount_y;
+    args.amount_x = 0;
+    args.strategy = "bid_ask";
+    args.bins_above = 0;
+    if (args.initial_value_usd == null) args.initial_value_usd = entry.usd_spent;
+    log("usdc", `Entry funded: deploying ${entry.amount_y} SOL (~$${entry.usd_spent})${entry.dry_run ? " [DRY RUN]" : ""}`);
+  }
+
   // ─── Pre-execution safety checks ──────────
   if (WRITE_TOOLS.has(name)) {
     const safetyCheck = await runSafetyChecks(name, args);
@@ -280,9 +306,20 @@ export async function executeTool(name, args) {
 
     if (success) {
       if (name === "deploy_position") {
-        emit("deploy", { pair: args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.tx });
+        emit("deploy", { pair: args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, amountUsd: usdcModeEnabled() ? (args.initial_value_usd ?? null) : null, position: result.position, tx: result.tx });
       } else if (name === "close_position") {
         emit("close", { pair: args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? 0 });
+        // USDC mode: auto-settle recovered base token + surplus SOL back to USDC.
+        if (usdcModeEnabled()) {
+          try {
+            const settle = await settleToUsdc();
+            result.usdc_settled = settle;
+            log("usdc", `Post-close settle: ${settle.settled ?? 0} swap(s) to USDC${settle.dry_run ? " [DRY RUN]" : ""}`);
+          } catch (e) {
+            log("usdc", `Post-close settle failed: ${e.message}`);
+            result.usdc_settle_error = e.message;
+          }
+        }
       }
 
       // ─── Capture screening signals from tool results ────────
@@ -312,62 +349,74 @@ export async function executeTool(name, args) {
 }
 
 /**
+ * Amount-independent deploy eligibility checks (bin step, position count,
+ * duplicate pool/token). Shared between the USDC-mode entry preflight and the
+ * standard safety checks so USDC mode never swaps before confirming the deploy
+ * is even allowed.
+ */
+async function checkDeployEligibility(args) {
+  // Resolve bin_step — fall back to the pool detail API if the caller didn't pass it.
+  let effectiveBinStep = args.bin_step;
+  if (effectiveBinStep == null && args.pool_address) {
+    try {
+      const { getPoolDetail } = await import("./screening.js");
+      const poolDetail = await getPoolDetail({ pool_address: args.pool_address });
+      effectiveBinStep = poolDetail?.bin_step ?? null;
+    } catch {
+      effectiveBinStep = null;
+    }
+  }
+
+  // Reject pools with bin_step out of configured range
+  const minStep = config.screening.minBinStep;
+  const maxStep = config.screening.maxBinStep;
+  if (effectiveBinStep != null && (effectiveBinStep < minStep || effectiveBinStep > maxStep)) {
+    return {
+      pass: false,
+      reason: `bin_step ${effectiveBinStep} is outside the allowed range of [${minStep}-${maxStep}].`,
+    };
+  }
+
+  // Check position count limit + duplicate pool guard
+  const positions = await getMyPositions();
+  if (positions.total_positions >= config.risk.maxPositions) {
+    return {
+      pass: false,
+      reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
+    };
+  }
+  const alreadyInPool = positions.positions.some((p) => p.pool === args.pool_address);
+  if (alreadyInPool) {
+    return {
+      pass: false,
+      reason: `Already have an open position in pool ${args.pool_address}. Cannot open duplicate.`,
+    };
+  }
+
+  // Block same base token across different pools
+  if (args.base_mint) {
+    const alreadyHasMint = positions.positions.some((p) => p.base_mint === args.base_mint);
+    if (alreadyHasMint) {
+      return {
+        pass: false,
+        reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
+      };
+    }
+  }
+
+  return { pass: true };
+}
+
+/**
  * Run safety checks before executing write operations.
  */
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
-      let effectiveBinStep = args.bin_step;
-      if (effectiveBinStep == null && args.pool_address) {
-        try {
-          const { getPoolDetail } = await import("./screening.js");
-          const poolDetail = await getPoolDetail({ pool_address: args.pool_address });
-          effectiveBinStep = poolDetail?.bin_step ?? null;
-        } catch {
-          effectiveBinStep = null;
-        }
-      }
+      const elig = await checkDeployEligibility(args);
+      if (!elig.pass) return elig;
 
-      // Reject pools with bin_step out of configured range
-      const minStep = config.screening.minBinStep;
-      const maxStep = config.screening.maxBinStep;
-      if (effectiveBinStep != null && (effectiveBinStep < minStep || effectiveBinStep > maxStep)) {
-        return {
-          pass: false,
-          reason: `bin_step ${effectiveBinStep} is outside the allowed range of [${minStep}-${maxStep}].`,
-        };
-      }
-
-      // Check position count limit + duplicate pool guard
-      const positions = await getMyPositions();
-      if (positions.total_positions >= config.risk.maxPositions) {
-        return {
-          pass: false,
-          reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
-        };
-      }
-      const alreadyInPool = positions.positions.some(
-        (p) => p.pool === args.pool_address
-      );
-      if (alreadyInPool) {
-        return {
-          pass: false,
-          reason: `Already have an open position in pool ${args.pool_address}. Cannot open duplicate.`,
-        };
-      }
-
-      // Block same base token across different pools
-      if (args.base_mint) {
-        const alreadyHasMint = positions.positions.some(
-          (p) => p.base_mint === args.base_mint
-        );
-        if (alreadyHasMint) {
-          return {
-            pass: false,
-            reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
-          };
-        }
-      }
+      const usdc = usdcModeEnabled();
 
       // Check amount limits
       const amountY = args.amount_y ?? args.amount_sol ?? 0;
@@ -378,13 +427,17 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Enforce minimum deploy amount — must be at least deployAmountSol (configured) or 0.1 SOL absolute floor.
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
-      if (amountY < minDeploy) {
-        return {
-          pass: false,
-          reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
-        };
+      // Enforce minimum deploy amount. In USDC mode the USD floor is enforced
+      // in the entry preflight, so skip the SOL floor (a small $ deploy can be
+      // < 0.1 SOL and that's intentional).
+      if (!usdc) {
+        const minDeploy = Math.max(0.1, config.management.deployAmountSol);
+        if (amountY < minDeploy) {
+          return {
+            pass: false,
+            reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
+          };
+        }
       }
       if (amountY > config.risk.maxDeployAmount) {
         return {
@@ -393,9 +446,10 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check SOL balance — must have enough to deploy + gas reserve
+      // Check SOL balance — must have enough to deploy + gas reserve.
+      // In USDC mode the USDC→SOL swap has already run, so the acquired SOL is present.
       const balance = await getWalletBalances();
-      const gasReserve = config.management.gasReserve ?? 0.05;
+      const gasReserve = usdc ? config.usdc.gasReserveSol : (config.management.gasReserve ?? 0.05);
       const minRequired = getRequiredSolBalance({ deployAmountSol: amountY, gasReserve });
       if (balance.sol < minRequired) {
         return {

@@ -17,6 +17,7 @@ if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
 if (u.llmProvider) process.env.LLM_PROVIDER     ||= u.llmProvider;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
+if (u.usdcMode !== undefined) process.env.USDC_MODE ||= String(u.usdcMode);
 
 const DEFAULT_MODEL = getDefaultModelForProvider(getLlmProvider());
 
@@ -81,6 +82,20 @@ export const config = {
       minMcap: u.evilPandaMinMcap ?? 200_000,
       priceRangePct: u.evilPandaPriceRangePct ?? 80,
     },
+  },
+
+  // ─── USDC Mode ──────────────────────────
+  // When enabled, the agent holds capital in USDC. On entry it swaps the
+  // configured USD amount into SOL and LPs single-sided (bid_ask); on exit
+  // it settles all recovered tokens + surplus SOL back to USDC, keeping only
+  // a small native-SOL buffer for gas. Pools are still SOL-quoted; USDC is
+  // just the home/accounting currency.
+  usdc: {
+    enabled:         u.usdcMode ?? (process.env.USDC_MODE === "true"),
+    deployAmountUsd: u.deployAmountUsd ?? 50,    // USD deployed per position
+    maxDeployUsd:    u.maxDeployUsd    ?? 500,   // hard per-position USD cap
+    minUsdcToOpen:   u.minUsdcToOpen   ?? (u.deployAmountUsd ?? 50), // min USDC to start screening
+    gasReserveSol:   u.gasReserveSol   ?? 0.05,  // native SOL kept for gas (warn-only floor)
   },
 
   // ─── Scheduling ─────────────────────────

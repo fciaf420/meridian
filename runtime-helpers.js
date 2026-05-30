@@ -39,6 +39,12 @@ export const CONFIG_KEY_MAP = {
   screeningModel: ["llm", "screeningModel"],
   generalModel: ["llm", "generalModel"],
   binsBelow: ["strategy", "binsBelow"],
+  // usdc mode
+  usdcMode: ["usdc", "enabled"],
+  deployAmountUsd: ["usdc", "deployAmountUsd"],
+  maxDeployUsd: ["usdc", "maxDeployUsd"],
+  minUsdcToOpen: ["usdc", "minUsdcToOpen"],
+  gasReserveSol: ["usdc", "gasReserveSol"],
 };
 
 export function calculateBinsForPriceRange(binStep, priceRangePct) {
