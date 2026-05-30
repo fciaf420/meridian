@@ -9,7 +9,8 @@ import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
-import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
+import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, notifyGasLow, isEnabled as telegramEnabled } from "./telegram.js";
+import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing } from "./briefing.js";
 import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot } from "./memory.js";
 import { updatePnlAndCheckExits } from "./state.js";
@@ -23,6 +24,45 @@ initMemory();
 
 const TP_PCT  = config.management.takeProfitFeePct;
 const DEPLOY  = config.management.deployAmountSol;
+
+// Human-readable "how much to deploy" directive, mode-aware. In USDC mode the
+// agent thinks in USD and the executor auto-funds the SOL from USDC.
+function deployDirective() {
+  return usdcModeEnabled()
+    ? `$${config.usdc.deployAmountUsd} (USD — the system auto-swaps USDC→SOL to fund it)`
+    : `${config.management.deployAmountSol} SOL`;
+}
+
+// Toggle USDC mode in live config and persist to user-config.json.
+// Shared by the CLI `/usdc` command and the Telegram `/usdc` command.
+async function setUsdcMode(enabled) {
+  config.usdc.enabled = !!enabled;
+  try {
+    const cfgPath = new URL("./user-config.json", import.meta.url);
+    const fs = await import("fs");
+    const cur = fs.existsSync(cfgPath) ? JSON.parse(fs.readFileSync(cfgPath, "utf8")) : {};
+    cur.usdcMode = config.usdc.enabled;
+    fs.writeFileSync(cfgPath, JSON.stringify(cur, null, 2));
+  } catch (e) {
+    log("config", `Failed to persist usdcMode: ${e.message}`);
+  }
+  log("config", `USDC mode ${config.usdc.enabled ? "ENABLED" : "DISABLED"}`);
+}
+
+// Plain-text USDC-mode status block (used by CLI and Telegram).
+function usdcStatusText() {
+  if (!config.usdc.enabled) {
+    return "💵 USDC mode: OFF\nToggle with: /usdc on";
+  }
+  return [
+    "💵 USDC mode: ON",
+    `Deploy:       $${config.usdc.deployAmountUsd} per position`,
+    `Max/position: $${config.usdc.maxDeployUsd}`,
+    `Min to open:  $${config.usdc.minUsdcToOpen} USDC`,
+    `Gas reserve:  ${config.usdc.gasReserveSol} SOL (warn-only, no auto top-up)`,
+    "Toggle with: /usdc off",
+  ].join("\n");
+}
 
 // ═══════════════════════════════════════════
 //  CYCLE TIMERS
@@ -116,7 +156,9 @@ MANAGEMENT CYCLE${memoryHints}${exitAlerts}
    - INSTRUCTION OVERRIDE: If instruction condition IS MET → close immediately, no further analysis.
    - INSTRUCTION OVERRIDE: If instruction condition NOT YET MET → hold, regardless of other signals.
    - If no instruction: BIAS = STAY. Only close if yield died, pool collapsed, or extreme loss.
-3. If closing: swap base tokens to SOL.
+3. If closing: ${usdcModeEnabled()
+    ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
+    : `swap base tokens to SOL.`}
 4. After any close — recalibrate management interval (MANDATORY):
    - No positions remaining → update_config management.managementIntervalMin = 10 (reset to default)
    - Positions still open → keep current interval (already set by deploy volatility)
@@ -155,7 +197,18 @@ REPORT FORMAT (Strictly follow this for each position):
         log("cron", `Screening skipped — max positions reached (${positions.total_positions}/${config.risk.maxPositions})`);
         return;
       }
-      if (balance.sol < config.management.minSolToOpen) {
+      if (usdcModeEnabled()) {
+        // Warn-only gas reserve: don't auto top-up, just pause + alert.
+        if (balance.sol < config.usdc.gasReserveSol) {
+          log("cron", `Screening skipped — SOL ${balance.sol.toFixed(4)} below gas reserve ${config.usdc.gasReserveSol}`);
+          if (telegramEnabled()) notifyGasLow({ sol: balance.sol, reserve: config.usdc.gasReserveSol }).catch(() => {});
+          return;
+        }
+        if ((balance.usdc ?? 0) < config.usdc.minUsdcToOpen) {
+          log("cron", `Screening skipped — insufficient USDC ($${(balance.usdc ?? 0).toFixed(2)} < $${config.usdc.minUsdcToOpen})`);
+          return;
+        }
+      } else if (balance.sol < config.management.minSolToOpen) {
         log("cron", `Screening skipped — insufficient SOL (${balance.sol.toFixed(3)} < ${config.management.minSolToOpen})`);
         return;
       }
@@ -195,10 +248,14 @@ REPORT FORMAT (Strictly follow this for each position):
 SCREENING CYCLE — DEPLOY ONLY${memoryHints}
 
 1. get_my_positions first. Only proceed if positions < ${config.risk.maxPositions}.
-2. get_wallet_balance. Proceed if SOL >= ${config.management.minSolToOpen}.
+2. get_wallet_balance. ${usdcModeEnabled()
+    ? `USDC MODE is ON — proceed if USDC >= $${config.usdc.minUsdcToOpen} and native SOL >= ${config.usdc.gasReserveSol} (gas reserve).`
+    : `Proceed if SOL >= ${config.management.minSolToOpen}.`}
 3. get_top_candidates, pick the best one, and call study_top_lpers.
 4. Call check_smart_wallets_on_pool for the chosen pool. Smart wallet presence = strong confidence boost. No presence = neutral, rely on fundamentals.
-5. If the pool is high-quality: get_active_bin and deploy_position.
+5. If the pool is high-quality: get_active_bin and deploy_position with ${deployDirective()}.${usdcModeEnabled()
+    ? ` In USDC mode you do NOT pick a SOL amount or swap manually — the system swaps USDC→SOL and deploys single-sided automatically. Just call deploy_position for the chosen pool.`
+    : ""}
 6. Report result and reasoning including smart wallet signal and interval set.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel);
       screenReport = content;
@@ -362,6 +419,9 @@ if (isTTY) {
     startupCandidates = candidates;
 
     console.log(`Wallet:    ${wallet.sol} SOL  ($${wallet.sol_usd})  |  SOL price: $${wallet.sol_price}`);
+    if (usdcModeEnabled()) {
+      console.log(`Mode:      💵 USDC MODE — USDC: $${wallet.usdc}  |  deploy $${config.usdc.deployAmountUsd}/position  |  gas reserve ${config.usdc.gasReserveSol} SOL`);
+    }
     console.log(`Positions: ${positions.total_positions} open\n`);
 
     if (positions.total_positions > 0) {
@@ -402,6 +462,30 @@ if (isTTY) {
       return;
     }
 
+    // ── /usdc [on|off]: show or toggle USDC mode (parity with CLI) ──
+    if (text === "/usdc" || text.toLowerCase().startsWith("/usdc ")) {
+      const arg = text.slice(5).trim().toLowerCase();
+      if (arg === "on" || arg === "off") await setUsdcMode(arg === "on");
+      await sendMessage(usdcStatusText()).catch(() => {});
+      return;
+    }
+
+    if (text === "/status") {
+      try {
+        const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+        let msg = `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`;
+        if (usdcModeEnabled()) msg += `\n💵 USDC: $${wallet.usdc} | deploy $${config.usdc.deployAmountUsd} | gas reserve ${config.usdc.gasReserveSol} SOL`;
+        msg += `\nPositions: ${positions.total_positions}`;
+        for (const p of positions.positions) {
+          msg += `\n  ${p.pair} ${p.in_range ? "in-range ✓" : "OOR ⚠"}  fees: $${p.unclaimed_fees_usd}`;
+        }
+        await sendMessage(msg).catch(() => {});
+      } catch (e) {
+        await sendMessage(`Error: ${e.message}`).catch(() => {});
+      }
+      return;
+    }
+
     busy = true;
     try {
       log("telegram", `Incoming: ${text}`);
@@ -419,10 +503,11 @@ if (isTTY) {
 
   console.log(`
 Commands:
-  1 / 2 / 3 ...  Deploy ${DEPLOY} SOL into that pool
+  1 / 2 / 3 ...  Deploy ${deployDirective()} into that pool
   auto           Let the agent pick and deploy automatically
   /status        Refresh wallet + positions
   /candidates    Refresh top pool list
+  /usdc          Show USDC-mode status   (/usdc on | /usdc off to toggle)
   /briefing      Show morning briefing (last 24h)
   /learn         Study top LPers from the best current pool and save lessons
   /learn <addr>  Study top LPers from a specific pool address
@@ -442,9 +527,9 @@ Commands:
     if (!isNaN(pick) && pick >= 1 && pick <= startupCandidates.length) {
       await runBusy(async () => {
         const pool = startupCandidates[pick - 1];
-        console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
+        console.log(`\nDeploying ${deployDirective()} into ${pool.name}...\n`);
         const { content: reply } = await agentLoop(
-          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+          `Deploy ${deployDirective()} into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -460,7 +545,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${DEPLOY} SOL. Execute now, don't ask.`,
+          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${deployDirective()}. Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -485,6 +570,9 @@ Commands:
       await runBusy(async () => {
         const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
         console.log(`\nWallet: ${wallet.sol} SOL  ($${wallet.sol_usd})`);
+        if (usdcModeEnabled()) {
+          console.log(`💵 USDC MODE — USDC: $${wallet.usdc}  |  deploy $${config.usdc.deployAmountUsd}  |  gas reserve ${config.usdc.gasReserveSol} SOL`);
+        }
         console.log(`Positions: ${positions.total_positions}`);
         for (const p of positions.positions) {
           const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
@@ -492,6 +580,15 @@ Commands:
         }
         console.log();
       });
+      return;
+    }
+
+    // ── /usdc [on|off]: show or toggle USDC mode ──
+    if (input === "/usdc" || input.toLowerCase().startsWith("/usdc ")) {
+      const arg = input.slice(5).trim().toLowerCase();
+      if (arg === "on" || arg === "off") await setUsdcMode(arg === "on");
+      console.log(`\n${usdcStatusText()}\n`);
+      rl.prompt();
       return;
     }
 

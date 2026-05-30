@@ -135,12 +135,23 @@ export function stopPolling() {
 }
 
 // ─── Notification helpers ────────────────────────────────────────
-export async function notifyDeploy({ pair, amountSol, position, tx }) {
+export async function notifyDeploy({ pair, amountSol, amountUsd, position, tx }) {
+  const amountLine = amountUsd != null
+    ? `Amount: $${Number(amountUsd).toFixed(2)} (${Number(amountSol).toFixed(4)} SOL)\n`
+    : `Amount: ${amountSol} SOL\n`;
   await sendHTML(
     `✅ <b>Deployed</b> ${pair}\n` +
-    `Amount: ${amountSol} SOL\n` +
+    amountLine +
     `Position: <code>${position?.slice(0, 8)}...</code>\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
+  );
+}
+
+export async function notifyGasLow({ sol, reserve, reason }) {
+  await sendHTML(
+    `⛽ <b>Gas low — deploy paused</b>\n` +
+    (reason ? `${reason}` : `Native SOL ${sol} is below the gas reserve${reserve != null ? ` of ${reserve} SOL` : ""}.`) +
+    `\nTop up SOL to resume USDC-mode deploys.`
   );
 }
 
