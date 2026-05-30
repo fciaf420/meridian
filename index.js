@@ -191,18 +191,22 @@ function startCronJobs() {
       return;
     }
 
+    // Acquire the management lock BEFORE any awaited precheck so a Telegram
+    // command / web request / overlapping cron can't slip in during the await.
+    setManagementBusy(true);
+    timers.managementLastRun = Date.now();
+
     // Skip management entirely if no open positions — saves LLM tokens
     try {
       const preCheck = await getMyPositions();
       if (!preCheck?.positions?.length) {
         log("cron", "Management skipped — no open positions");
         timers.managementLastRun = Date.now();
+        setManagementBusy(false);
         return;
       }
     } catch { /* proceed if check fails */ }
 
-    setManagementBusy(true);
-    timers.managementLastRun = Date.now();
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
     let mgmtReport = null;
     try {
@@ -398,39 +402,42 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
       return;
     }
 
-    // Hard guards — don't even run the agent if preconditions aren't met
-    try {
-      const [positions, balance] = await Promise.all([getMyPositions(), getWalletBalances()]);
-      if (positions.total_positions >= config.risk.maxPositions) {
-        log("cron", `Screening skipped — max positions reached (${positions.total_positions}/${config.risk.maxPositions})`);
-        return;
-      }
-      if (usdcModeEnabled()) {
-        // Warn-only gas reserve: don't auto top-up, just pause + alert.
-        if (balance.sol < config.usdc.gasReserveSol) {
-          log("cron", `Screening skipped — SOL ${balance.sol.toFixed(4)} below gas reserve ${config.usdc.gasReserveSol}`);
-          emit("gas_low", { sol: balance.sol, reserve: config.usdc.gasReserveSol });
-          return;
-        }
-        if ((balance.usdc ?? 0) < config.usdc.minUsdcToOpen) {
-          log("cron", `Screening skipped — insufficient USDC ($${(balance.usdc ?? 0).toFixed(2)} < $${config.usdc.minUsdcToOpen})`);
-          return;
-        }
-      } else if (balance.sol < config.management.minSolToOpen) {
-        log("cron", `Screening skipped — insufficient SOL (${balance.sol.toFixed(3)} < ${config.management.minSolToOpen})`);
-        return;
-      }
-    } catch (e) {
-      log("cron_error", `Screening pre-check failed: ${e.message}`);
-      return;
-    }
-
+    // Acquire the screening lock BEFORE the awaited wallet/position prechecks
+    // so a Telegram command / web request / overlapping cron can't slip in
+    // during the await window. Released in finally on every path below.
     setScreeningBusy(true);
     timers.screeningLastRun = Date.now();
-    const screenModel = getScreenerModelLabel();
-    log("cron", `Starting screening cycle [model: ${screenModel}]`);
     let screenReport = null;
     try {
+      // Hard guards — don't even run the agent if preconditions aren't met
+      try {
+        const [positions, balance] = await Promise.all([getMyPositions(), getWalletBalances()]);
+        if (positions.total_positions >= config.risk.maxPositions) {
+          log("cron", `Screening skipped — max positions reached (${positions.total_positions}/${config.risk.maxPositions})`);
+          return;
+        }
+        if (usdcModeEnabled()) {
+          // Warn-only gas reserve: don't auto top-up, just pause + alert.
+          if (balance.sol < config.usdc.gasReserveSol) {
+            log("cron", `Screening skipped — SOL ${balance.sol.toFixed(4)} below gas reserve ${config.usdc.gasReserveSol}`);
+            emit("gas_low", { sol: balance.sol, reserve: config.usdc.gasReserveSol });
+            return;
+          }
+          if ((balance.usdc ?? 0) < config.usdc.minUsdcToOpen) {
+            log("cron", `Screening skipped — insufficient USDC ($${(balance.usdc ?? 0).toFixed(2)} < $${config.usdc.minUsdcToOpen})`);
+            return;
+          }
+        } else if (balance.sol < config.management.minSolToOpen) {
+          log("cron", `Screening skipped — insufficient SOL (${balance.sol.toFixed(3)} < ${config.management.minSolToOpen})`);
+          return;
+        }
+      } catch (e) {
+        log("cron_error", `Screening pre-check failed: ${e.message}`);
+        return;
+      }
+
+      const screenModel = getScreenerModelLabel();
+      log("cron", `Starting screening cycle [model: ${screenModel}]`);
       // Compute dynamic deploy amount based on current wallet (compounding)
       const currentBalance = await getWalletBalances().catch(() => null);
       const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
@@ -1058,7 +1065,7 @@ if (runtimeMode.interactive) {
   }
 
   async function runScreeningBusy(fn) {
-    if (isBusy() || isScreeningBusy()) { console.log("Agent is busy, please wait..."); rl.prompt(); return; }
+    if (isBusy() || isScreeningBusy() || isManagementBusy()) { console.log("Agent is busy, please wait..."); rl.prompt(); return; }
     setBusy(true);
     setScreeningBusy(true);
     rl.pause();
@@ -1368,6 +1375,13 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   // Telegram bot — full remote control works headless too.
   startPolling(handleTelegramCommand);
   if (runtimeMode.runStartupCheck) (async () => {
+    // Guard the startup screener with the screening busy flag so it can't
+    // overlap a cron screening cycle or a remote-deploy command.
+    if (isBusy() || isScreeningBusy() || isManagementBusy()) {
+      log("startup", "Startup check skipped — another cycle already in progress");
+      return;
+    }
+    setScreeningBusy(true);
     try {
       const currentBalance = await getWalletBalances().catch(() => null);
       const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : DEPLOY;
@@ -1377,6 +1391,8 @@ STARTUP CHECK
       `, config.llm.maxSteps, []);
     } catch (e) {
       log("startup_error", e.message);
+    } finally {
+      setScreeningBusy(false);
     }
   })();
 }

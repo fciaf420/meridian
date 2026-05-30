@@ -329,12 +329,16 @@ export async function fetchDynamicFee(poolAddress) {
     const { Connection, PublicKey } = await import("@solana/web3.js");
     if (!_feeConn) _feeConn = new Connection(process.env.RPC_URL, "confirmed");
     const pool = await DLMM.create(_feeConn, new PublicKey(poolAddress));
-    const dynamicFee = pool.getDynamicFee();
-    const p = pool.lbPair.parameters;
-    const baseFee = (p.baseFactor * pool.lbPair.binStep) / 1_000_000;
+    // getDynamicFee() returns the TOTAL current fee % (base + variable), not the
+    // variable component alone. Take base from getFeeInfo() (which correctly
+    // accounts for baseFeePowerFactor) and derive the true dynamic part.
+    const feeInfo = pool.getFeeInfo();
+    const baseFeePct = Number(feeInfo.baseFeeRatePercentage?.toString?.() ?? feeInfo.baseFeeRatePercentage);
+    const totalFeePct = Number(pool.getDynamicFee().toString());
     return {
-      base_fee_pct: baseFee,
-      dynamic_fee_pct: parseFloat(dynamicFee.toString()),
+      base_fee_pct: baseFeePct,
+      dynamic_fee_pct: Math.max(0, totalFeePct - baseFeePct),
+      total_fee_pct: totalFeePct,
     };
   } catch { return null; }
 }

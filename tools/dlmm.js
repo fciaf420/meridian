@@ -122,9 +122,21 @@ async function estimatePriorityFeeMicroLamports(tx, feePayer, label = "tx") {
 async function applyPriorityFee(tx, feePayer, label) {
   if (!tx?.instructions?.length) return tx;
 
-  const microLamports = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
-  if (!microLamports) return tx;
+  const estimated = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
+  // Fall back to a sane default rather than sending with no priority fee.
+  const microLamports = estimated || (config.management.fallbackPriorityFeeMicroLamports || 50_000);
 
+  // Raise the compute-unit limit: position/bin-array init and extended
+  // add-liquidity are compute-heavy and exceed the 200k default, failing AFTER
+  // fees are paid. Skip if the SDK tx already set its own CU limit (discriminator 2).
+  const hasCuLimit = tx.instructions.some(
+    (ix) => ix.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 2,
+  );
+  if (!hasCuLimit) {
+    tx.instructions.unshift(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: config.management.computeUnitLimit || 400_000 })
+    );
+  }
   tx.instructions.unshift(
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports })
   );
@@ -228,23 +240,30 @@ export async function deployPosition({
   let resolvedBinStep = bin_step;
   let totalSolAmount = amount_y ?? amount_sol ?? 0;
 
-  // ─── Hard guard: enforce minimum deploy amount from computeDeployAmount ───
-  // Models sometimes ignore the prompt and pass tiny amounts (0.1, 0.2 SOL).
-  // Override with the computed amount based on wallet balance + positionSizePct.
+  // ─── Deploy amount handling ───
+  // Real-funds safety: do NOT silently bump an explicitly-provided amount up to
+  // the wallet-scaled amount. Only DEFAULT the amount when the caller omitted it
+  // (amount_y, amount_sol, and amount_x all missing/null). When the caller did
+  // pass an explicit amount, respect it exactly; the only enforced floor is the
+  // existing 0.1 SOL hard minimum, which we apply by REJECTING (never raising).
+  const callerProvidedAmount = (amount_y != null) || (amount_sol != null) || (amount_x != null);
   try {
     const { computeDeployAmount } = await import("../config.js");
     const { getWalletBalances } = await import("./wallet.js");
     const bal = await getWalletBalances();
-    if (bal?.sol > 0) {
+    if (!callerProvidedAmount && bal?.sol > 0) {
+      // Amount missing entirely — default it from wallet balance + positionSizePct.
       const computed = computeDeployAmount(bal.sol);
-      if (totalSolAmount < computed * 0.5) {
-        log("deploy", `Amount ${totalSolAmount} SOL overridden to ${computed} SOL (model passed too little, computed from ${bal.sol} SOL wallet)`);
-        totalSolAmount = computed;
-        if (amount_y != null) amount_y = computed;
-        else if (amount_sol != null) amount_sol = computed;
-      }
+      log("deploy", `Amount not provided; defaulting to ${computed} SOL (computed from ${bal.sol} SOL wallet)`);
+      totalSolAmount = computed;
+      amount_y = computed;
     }
   } catch { /* best-effort — use what the model passed */ }
+
+  // Hard floor: reject (do not silently raise) explicit amounts below 0.1 SOL.
+  if (callerProvidedAmount && totalSolAmount > 0 && totalSolAmount < 0.1) {
+    throw new Error(`Deploy amount ${totalSolAmount} SOL is below the 0.1 SOL minimum. Pass at least 0.1 SOL or omit the amount to use the wallet-scaled default.`);
+  }
 
   if (!["bid_ask", "spot"].includes(activeStrategy)) {
     throw new Error("Only 'bid_ask' or 'spot' strategies are allowed.");
@@ -618,14 +637,43 @@ export async function deployPosition({
   const finalAmountY = amount_y ?? amount_sol ?? 0;
   const finalAmountX = amount_x ?? 0;
 
-  const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
-  // For X, we assume it's also 9 decimals for now, or we'd need to fetch mint decimals.
-  // Most Meteora pools base tokens are 6 or 9. To be safe, we should fetch.
+  // Decimal-safe UI -> raw integer BN (string-based; avoids JS float precision
+  // loss that Math.floor(amount * 10**decimals) suffers for some token amounts).
+  const uiToRawBN = (amount, decimals) => {
+    if (amount == null || !Number.isFinite(Number(amount))) return new BN(0);
+    let s = typeof amount === "string" ? amount.trim() : Number(amount).toFixed(decimals);
+    if (/[eE]/.test(s)) s = Number(s).toFixed(decimals); // expand scientific notation
+    if (s.startsWith("-")) return new BN(0);
+    const [whole = "0", frac = ""] = s.split(".");
+    const fracPadded = (frac + "0".repeat(decimals)).slice(0, decimals);
+    const raw = ((whole || "0") + fracPadded).replace(/^0+(?=\d)/, "");
+    return new BN(raw === "" ? "0" : raw);
+  };
+
+  // Resolve decimals from the mints — do NOT assume token Y is 9-decimal SOL.
+  // Correct for BOTH SOL mode and USDC mode: the agent deploys into SOL-quoted
+  // pools in both, but we read the actual mint decimals so sizing is right for
+  // any quote/base token (SOL=9, USDC=6, etc.).
+  const getMintDecimals = async (mint) => {
+    const info = await getConnection().getParsedAccountInfo(new PublicKey(mint));
+    return info.value?.data?.parsed?.info?.decimals ?? null;
+  };
+
+  let totalYLamports = new BN(0);
+  if (finalAmountY > 0) {
+    const yDecimals = await getMintDecimals(pool.lbPair.tokenYMint);
+    if (yDecimals == null) {
+      throw new Error(`Could not resolve token Y decimals for ${pool.lbPair.tokenYMint.toBase58()}; refusing to size deposit.`);
+    }
+    totalYLamports = uiToRawBN(finalAmountY, yDecimals);
+  }
   let totalXLamports = new BN(0);
   if (finalAmountX > 0) {
-    const mintInfo = await getConnection().getParsedAccountInfo(new PublicKey(pool.lbPair.tokenXMint));
-    const decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
-    totalXLamports = new BN(Math.floor(finalAmountX * Math.pow(10, decimals)));
+    const xDecimals = await getMintDecimals(pool.lbPair.tokenXMint);
+    if (xDecimals == null) {
+      throw new Error(`Could not resolve token X decimals for ${pool.lbPair.tokenXMint.toBase58()}; refusing to size deposit.`);
+    }
+    totalXLamports = uiToRawBN(finalAmountX, xDecimals);
   }
 
   const isWideRange = totalBins > 69;
@@ -686,7 +734,10 @@ export async function deployPosition({
       });
       log("deploy", `Pre-tracked position ${posAddr.slice(0, 8)} (wide-range: liquidity pending)`);
 
-      // Phase 2: Add liquidity (may be multiple txs)
+      // Phase 2: Add liquidity (may be multiple txs).
+      // Refresh pool state after the create txs so the strategy/slippage math
+      // uses a fresh activeId rather than the stale pre-create snapshot.
+      await pool.refetchStates();
       try {
         const addTxs = await pool.addLiquidityByStrategyChunkable({
           positionPubKey: newPosition.publicKey,
@@ -722,7 +773,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { maxBinId, minBinId, strategyType },
-        slippage: 1000, // 10% in bps
+        slippage: 10, // 10% (SDK liquidity slippage is a percentage, NOT bps)
       });
       const txHash = await sendManagedTransaction(tx, [wallet, newPosition], "deploy standard");
       txHashes.push(txHash);
@@ -1431,6 +1482,26 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     const positionPubKey = new PublicKey(position_address);
     const positionData = await pool.getPosition(positionPubKey);
 
+    // ─── Snapshot wallet base-token balance BEFORE close/withdraw ───
+    // The post-close auto-swap must sell ONLY what this close withdraws, not the
+    // entire wallet balance of the base token (which may include unrelated holdings
+    // or other open positions' tokens). Capture the pre-close balance so we can
+    // compute the positive delta after close. If we cannot determine it, we will
+    // skip the auto-swap rather than risk dumping the whole balance.
+    const SOL_MINT = "So11111111111111111111111111111111111111112";
+    const baseMintPre = getTrackedPosition(position_address)?.base_mint || null;
+    let preCloseBaseBalance = null; // null => unknown (do NOT swap whole balance)
+    if (baseMintPre && baseMintPre !== SOL_MINT) {
+      try {
+        const preBals = await getWalletBalances();
+        const preTok = preBals.tokens?.find((t) => t.mint === baseMintPre);
+        preCloseBaseBalance = preTok?.balance ?? 0;
+      } catch (preErr) {
+        log("close_warn", `Could not snapshot pre-close base balance for ${baseMintPre}: ${preErr.message}`);
+        preCloseBaseBalance = null;
+      }
+    }
+
     // ─── Snapshot PnL BEFORE closing (position is still on-chain) ───
     // If PnL watcher provided an override (the value that triggered the close), trust it
     // over the cache which may have been refreshed with stale/wrong API data
@@ -1486,6 +1557,10 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     } catch (e) {
       log("close_warn", `Step 1 (Claim) failed or nothing to claim: ${e.message}`);
     }
+
+    // Refresh pool state after the claim txs so removeLiquidity (Step 2) operates
+    // on fresh on-chain state rather than the pre-claim snapshot.
+    try { await pool.refetchStates(); } catch { /* best-effort */ }
 
     // ─── Step 2: Remove Liquidity & Close ──────────────────────
     log("close", `Step 2: Removing liquidity and closing account`);
@@ -1575,87 +1650,113 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         forgetPositionSnapshot(tracked);
       } catch { /* best-effort */ }
 
-      // ─── Hard rule: always swap base token back to SOL after close ───
-      // Retries up to MAX_ATTEMPTS with backoff; re-fetches wallet balance
-      // between attempts so a silently-landed first tx doesn't cause a
-      // false insufficient-funds failure on retry.
-      const SOL = "So11111111111111111111111111111111111111112";
+      // ─── Hard rule: swap ONLY the withdrawn base token back to SOL ───
+      // Sell only the DELTA this close added to the wallet (post - pre), never
+      // the entire base-token balance. Retries up to MAX_ATTEMPTS with backoff;
+      // re-fetches wallet balance between attempts so a silently-landed first tx
+      // doesn't cause a false insufficient-funds failure on retry. On each
+      // attempt the swap amount is re-clamped to (current - pre) so retries can't
+      // eat into a pre-existing balance.
+      const SOL = SOL_MINT;
       const baseMint = tracked.base_mint;
-      let swapOutcome = null; // { success, mint, attempts, error? } when a swap was attempted
+      let swapOutcome = null;     // { success, mint, attempts, error? } when a swap was attempted
+      let exposureFlag = false;   // true when we skipped the swap to avoid dumping whole balance
 
       if (baseMint && baseMint !== SOL) {
-        const MAX_ATTEMPTS = 3;
-        const BACKOFF_MS = [0, 1500, 3000]; // delay BEFORE attempt N
-        let lastError = null;
-        let attempts = 0;
-        let succeeded = false;
+        if (preCloseBaseBalance == null) {
+          // Pre-balance unknown — do NOT swap the whole balance. Flag leftover exposure.
+          exposureFlag = true;
+          swapOutcome = {
+            success: false,
+            mint: baseMint,
+            attempts: 0,
+            error: "pre-close base balance unknown; auto-swap skipped to avoid selling whole wallet balance",
+          };
+          log("close_warn", `Post-close swap skipped: pre-close balance for ${baseMint} unknown — leftover base token exposure, swap manually.`);
+        } else {
+          const MAX_ATTEMPTS = 3;
+          const BACKOFF_MS = [0, 1500, 3000]; // delay BEFORE attempt N
+          let lastError = null;
+          let attempts = 0;
+          let succeeded = false;
 
-        for (let i = 0; i < MAX_ATTEMPTS; i++) {
-          if (BACKOFF_MS[i]) await new Promise((r) => setTimeout(r, BACKOFF_MS[i]));
+          for (let i = 0; i < MAX_ATTEMPTS; i++) {
+            if (BACKOFF_MS[i]) await new Promise((r) => setTimeout(r, BACKOFF_MS[i]));
 
-          let baseToken;
-          try {
-            const walletBals = await getWalletBalances();
-            baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
-          } catch (balErr) {
-            lastError = `balance fetch failed: ${balErr.message}`;
-            log("close_warn", `Post-close swap attempt ${i + 1}: ${lastError}`);
+            let baseToken;
+            try {
+              const walletBals = await getWalletBalances();
+              baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
+            } catch (balErr) {
+              lastError = `balance fetch failed: ${balErr.message}`;
+              log("close_warn", `Post-close swap attempt ${i + 1}: ${lastError}`);
+              attempts = i + 1;
+              continue;
+            }
+
+            // Only the amount withdrawn by THIS close: current - pre (clamped >= 0).
+            const currentBal = baseToken?.balance ?? 0;
+            const swapAmount = Math.max(0, currentBal - preCloseBaseBalance);
+
+            // Per-unit USD value to gate dust on the delta (not the whole balance).
+            const unitUsd = (baseToken && currentBal > 0) ? (baseToken.usd ?? 0) / currentBal : 0;
+            const deltaUsd = unitUsd * swapAmount;
+
+            // Nothing meaningful to swap — fully swapped by a prior attempt, or dust delta.
+            if (swapAmount <= 0 || deltaUsd < 0.10) {
+              if (attempts > 0) succeeded = true; // prior attempt effectively cleared it
+              break;
+            }
+
             attempts = i + 1;
-            continue;
+            log("close", `Auto-swapping ${swapAmount} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (withdrawn delta, worth ~$${deltaUsd.toFixed(2)}) [attempt ${attempts}/${MAX_ATTEMPTS}]`);
+
+            let swapResult;
+            try {
+              swapResult = await swapToken({
+                input_mint: baseMint,
+                output_mint: SOL,
+                amount: swapAmount,
+              });
+            } catch (swapErr) {
+              lastError = swapErr.message;
+              log("close_warn", `Post-close swap attempt ${attempts} threw: ${lastError}`);
+              continue;
+            }
+
+            if (swapResult?.success) {
+              log("close", `Post-close swap OK on attempt ${attempts}: tx ${swapResult.tx}`);
+              txHashes.push(swapResult.tx);
+              succeeded = true;
+              break;
+            }
+
+            lastError = swapResult?.error || "unknown";
+            log("close_warn", `Post-close swap attempt ${attempts} failed: ${lastError}`);
+
+            // Terminal errors — no point retrying
+            const terminal = /no route|route not found|unsupported|invalid mint|mint not found/i.test(lastError);
+            if (terminal) {
+              log("close_warn", `Post-close swap terminal error, not retrying: ${lastError}`);
+              break;
+            }
           }
 
-          // Nothing to swap — either fully swapped by a prior attempt, or dust
-          if (!baseToken || baseToken.balance <= 0 || (baseToken.usd ?? 0) < 0.10) {
-            if (attempts > 0) succeeded = true; // prior attempt effectively cleared it
-            break;
-          }
-
-          attempts = i + 1;
-          log("close", `Auto-swapping ${baseToken.balance} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (worth $${baseToken.usd}) [attempt ${attempts}/${MAX_ATTEMPTS}]`);
-
-          let swapResult;
-          try {
-            swapResult = await swapToken({
-              input_mint: baseMint,
-              output_mint: SOL,
-              amount: baseToken.balance,
-            });
-          } catch (swapErr) {
-            lastError = swapErr.message;
-            log("close_warn", `Post-close swap attempt ${attempts} threw: ${lastError}`);
-            continue;
-          }
-
-          if (swapResult?.success) {
-            log("close", `Post-close swap OK on attempt ${attempts}: tx ${swapResult.tx}`);
-            txHashes.push(swapResult.tx);
-            succeeded = true;
-            break;
-          }
-
-          lastError = swapResult?.error || "unknown";
-          log("close_warn", `Post-close swap attempt ${attempts} failed: ${lastError}`);
-
-          // Terminal errors — no point retrying
-          const terminal = /no route|route not found|unsupported|invalid mint|mint not found/i.test(lastError);
-          if (terminal) {
-            log("close_warn", `Post-close swap terminal error, not retrying: ${lastError}`);
-            break;
-          }
-        }
-
-        if (attempts > 0) {
-          swapOutcome = succeeded
-            ? { success: true, mint: baseMint, attempts }
-            : { success: false, mint: baseMint, attempts, error: lastError };
-          if (!succeeded) {
-            log("close_warn", `Post-close swap failed after ${attempts} attempt(s); base token remains in wallet: ${baseMint}`);
+          if (attempts > 0) {
+            swapOutcome = succeeded
+              ? { success: true, mint: baseMint, attempts }
+              : { success: false, mint: baseMint, attempts, error: lastError };
+            if (!succeeded) {
+              exposureFlag = true;
+              log("close_warn", `Post-close swap failed after ${attempts} attempt(s); withdrawn base token remains in wallet: ${baseMint}`);
+            }
           }
         }
       }
 
       return {
         success: true,
+        ...(exposureFlag && { status: "success_with_exposure" }),
         position: position_address,
         pool: poolAddress,
         txs: txHashes,
@@ -1695,7 +1796,9 @@ async function lookupPoolForPosition(position_address, walletAddress) {
     new PublicKey(walletAddress)
   );
 
-  for (const [lbPairKey, positionData] of Object.entries(allPositions)) {
+  // getAllLbPairPositionsByUser returns a Map<string, PositionInfo>, not a plain
+  // object — Object.entries() would always be empty. Iterate the Map directly.
+  for (const [lbPairKey, positionData] of allPositions.entries()) {
     for (const pos of positionData.lbPairPositionsData || []) {
       if (pos.publicKey.toString() === position_address) return lbPairKey;
     }

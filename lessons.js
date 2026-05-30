@@ -34,18 +34,42 @@ function writeUserConfig(userConfig) {
   fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 }
 
+// Set when the persisted lessons file is present but unparseable. While
+// degraded we refuse to overwrite the (recoverable) bad file with defaults.
+let _lessonsDegraded = false;
+
 function load() {
   if (!fs.existsSync(LESSONS_FILE)) {
+    // File absent — safe to create fresh defaults.
     return { lessons: [], performance: [] };
   }
   try {
     return JSON.parse(fs.readFileSync(LESSONS_FILE, "utf8"));
-  } catch {
-    return { lessons: [], performance: [] };
+  } catch (err) {
+    // File PRESENT but corrupt: do NOT silently fall back to empty defaults
+    // (a later save() would wipe real history). Preserve the bad file for
+    // recovery and enter a degraded, read-only state.
+    if (!_lessonsDegraded) {
+      try {
+        const backup = `${LESSONS_FILE}.corrupt-${Date.now()}`;
+        fs.copyFileSync(LESSONS_FILE, backup);
+        log("lessons_error", `lessons.json is corrupt (${err.message}); preserved as ${backup}. Refusing to overwrite until recovered.`);
+      } catch (backupErr) {
+        log("lessons_error", `lessons.json is corrupt (${err.message}) and backup failed: ${backupErr.message}. Refusing to overwrite until recovered.`);
+      }
+    }
+    _lessonsDegraded = true;
+    throw new Error(`lessons.json is corrupt and was preserved for recovery: ${err.message}`);
   }
 }
 
 function save(data) {
+  // Never persist over a corrupt-but-present file; that would destroy
+  // recoverable history. Skip saves until the file is restored.
+  if (_lessonsDegraded) {
+    log("lessons_error", "Skipping lessons.json save: file is in degraded (corrupt) state. Restore or remove the corrupt backup to re-enable saves.");
+    return;
+  }
   fs.writeFileSync(LESSONS_FILE, JSON.stringify(data, null, 2));
 }
 
@@ -1031,7 +1055,10 @@ export function getLessonRecordsForPrompt(opts = {}) {
 }
 
 export function getLessonsForPrompt(opts = {}) {
-  const { pinned, roleMatched, recent, selected } = getLessonRecordsForPrompt(opts);
+  // Support legacy call signature: getLessonsForPrompt(20)
+  const normalizedOpts = typeof opts === "number" ? { maxLessons: opts } : opts;
+  const { agentType = "GENERAL" } = normalizedOpts;
+  const { pinned, roleMatched, recent, selected } = getLessonRecordsForPrompt(normalizedOpts);
   if (selected.length === 0) return null;
 
   const sections = [];

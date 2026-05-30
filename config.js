@@ -95,7 +95,7 @@ export const config = {
     deployAmountUsd: u.deployAmountUsd ?? 50,    // USD deployed per position
     maxDeployUsd:    u.maxDeployUsd    ?? 500,   // hard per-position USD cap
     minUsdcToOpen:   u.minUsdcToOpen   ?? (u.deployAmountUsd ?? 50), // min USDC to start screening
-    gasReserveSol:   u.gasReserveSol   ?? 0.05,  // native SOL kept for gas (warn-only floor)
+    gasReserveSol:   u.gasReserveSol   ?? 0.2,   // native SOL kept for gas (hard floor — enforced in swapToken + settle; matches upstream)
   },
 
   // ─── Scheduling ─────────────────────────

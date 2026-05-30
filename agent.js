@@ -26,7 +26,10 @@ const client = CLI_PROVIDERS.has(PROVIDER) ? null : createLlmClient(PROVIDER);
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || getDefaultModelForProvider();
 const RETRYABLE = new Set([402, 408, 429, 502, 503, 504, 529]);
-const WRITE_TOOLS = new Set(["deploy_position", "close_position", "claim_fees", "swap_token"]);
+// update_config mutates live risk params, so treat it as a guarded write: it must
+// run through the strict-parse write path (no {} fallback) and serially, not in the
+// lenient parallel read batch.
+const WRITE_TOOLS = new Set(["deploy_position", "close_position", "claim_fees", "swap_token", "update_config"]);
 const TOOL_SUMMARIES = tools.map((tool) => ({
   name: tool.function.name,
   description: tool.function.description,
@@ -522,8 +525,19 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         try {
           functionArgs = JSON.parse(toolCall.function.arguments);
         } catch (parseError) {
-          log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
-          functionArgs = {};
+          // Write tools mutate on-chain state / live risk params. Do NOT fall back to
+          // {} and execute with defaults — return a tool error so the LLM must re-issue
+          // the call with well-formed arguments.
+          log("error", `Failed to parse args for write tool ${functionName}: ${parseError.message}`);
+          writeResults.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({
+              error: `Malformed JSON arguments for write tool "${functionName}": ${parseError.message}. Not executed. Re-issue the call with valid JSON arguments.`,
+              tool: functionName,
+            }),
+          });
+          continue;
         }
         const result = await executeTool(functionName, functionArgs);
         writeResults.push({

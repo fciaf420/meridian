@@ -237,7 +237,61 @@ const WRITE_TOOLS = new Set([
   "kb_write",
   "kb_delete",
   "kb_migrate",
+  // update_config changes live risk params (maxDeployAmount, maxPositions, stop loss,
+  // trailing, intervals) — route it through the write-safety path for bounded validation.
+  "update_config",
 ]);
+
+// Sane bounded ranges for risk-relevant config keys. Any update_config change that
+// targets one of these keys with an out-of-range (or non-numeric) value is rejected
+// before it can touch live config. Keys not listed here keep their existing behavior.
+const RISK_CONFIG_BOUNDS = {
+  maxDeployAmount: { min: 0, max: 100 },        // SOL per position
+  maxPositions: { min: 1, max: 50, integer: true },
+  stopLossPct: { min: 0, max: 100 },            // percent loss
+  trailingTriggerPct: { min: 0, max: 1000 },    // percent gain to arm trailing
+  trailingDropPct: { min: 0, max: 100 },        // percent drop from peak to exit
+  managementIntervalMin: { min: 1, max: 1440, integer: true },
+  screeningIntervalMin: { min: 1, max: 1440, integer: true },
+  pnlWatcherIntervalSec: { min: 5, max: 86400, integer: true },
+};
+
+/**
+ * Validate the risk-relevant keys inside an update_config call against bounded ranges.
+ * Returns { pass: true } or { pass: false, reason }. Boolean toggles (e.g.
+ * trailingTakeProfit) are left to update_config's own handling; only numeric
+ * risk levers are range-checked here.
+ */
+function validateConfigUpdate(args) {
+  // Normalize into a flat { key: value } map matching update_config's own parsing.
+  let changes;
+  if (args.setting && args.value !== undefined) {
+    const key = args.setting.includes(".") ? args.setting.split(".").pop() : args.setting;
+    changes = { [key]: args.value };
+  } else if (args.changes && typeof args.changes === "object") {
+    changes = args.changes;
+  } else {
+    const { reason: _r, ...rest } = args;
+    changes = rest;
+  }
+
+  for (const [key, rawVal] of Object.entries(changes)) {
+    const bounds = RISK_CONFIG_BOUNDS[key];
+    if (!bounds) continue;
+    // Coerce numeric strings the same way update_config does.
+    const val = typeof rawVal === "string" && /^-?\d+(\.\d+)?$/.test(rawVal) ? Number(rawVal) : rawVal;
+    if (typeof val !== "number" || !Number.isFinite(val)) {
+      return { pass: false, reason: `update_config rejected: ${key} must be a finite number, got ${JSON.stringify(rawVal)}.` };
+    }
+    if (bounds.integer && !Number.isInteger(val)) {
+      return { pass: false, reason: `update_config rejected: ${key} must be an integer, got ${val}.` };
+    }
+    if (val < bounds.min || val > bounds.max) {
+      return { pass: false, reason: `update_config rejected: ${key}=${val} is outside the allowed range [${bounds.min}-${bounds.max}].` };
+    }
+  }
+  return { pass: true };
+}
 
 /**
  * Execute a tool call with safety checks and logging.
@@ -367,10 +421,18 @@ async function checkDeployEligibility(args) {
     }
   }
 
-  // Reject pools with bin_step out of configured range
+  // Reject pools with bin_step out of configured range. Fail closed: if we could
+  // not resolve a numeric bin_step (caller omitted it AND the pool detail lookup
+  // failed / lacked it), block the deploy rather than skip the risk limit.
   const minStep = config.screening.minBinStep;
   const maxStep = config.screening.maxBinStep;
-  if (effectiveBinStep != null && (effectiveBinStep < minStep || effectiveBinStep > maxStep)) {
+  if (typeof effectiveBinStep !== "number" || !Number.isFinite(effectiveBinStep)) {
+    return {
+      pass: false,
+      reason: `Could not resolve bin_step for pool ${args.pool_address ?? "(unknown)"}; cannot verify it is within the allowed range [${minStep}-${maxStep}]. Provide bin_step explicitly.`,
+    };
+  }
+  if (effectiveBinStep < minStep || effectiveBinStep > maxStep) {
     return {
       pass: false,
       reason: `bin_step ${effectiveBinStep} is outside the allowed range of [${minStep}-${maxStep}].`,
@@ -466,6 +528,9 @@ async function runSafetyChecks(name, args) {
       // (handled inside swapToken itself, but belt-and-suspenders)
       return { pass: true };
     }
+
+    case "update_config":
+      return validateConfigUpdate(args);
 
     default:
       return { pass: true };

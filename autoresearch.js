@@ -104,8 +104,13 @@ function getTrialPositionsForExperiment(experiment, perfData) {
     });
 }
 
+// Set when autoresearch.json is present but unparseable. While degraded we
+// refuse to overwrite the (recoverable) bad file with defaults.
+let _autoresearchDegraded = false;
+
 export function loadAutoresearch() {
   if (!fs.existsSync(AUTORESEARCH_FILE)) {
+    // File absent — safe to create fresh defaults.
     saveAutoresearch(DEFAULTS);
     return { ...DEFAULTS };
   }
@@ -113,12 +118,31 @@ export function loadAutoresearch() {
     const data = JSON.parse(fs.readFileSync(AUTORESEARCH_FILE, "utf8"));
     // Merge with DEFAULTS so existing files gain new fields (e.g. kept_overrides)
     return { ...DEFAULTS, ...data };
-  } catch {
-    return { ...DEFAULTS };
+  } catch (err) {
+    // File PRESENT but corrupt: do NOT silently fall back to DEFAULTS (a later
+    // save would wipe experiment history and kept overrides). Preserve the bad
+    // file for recovery and enter a degraded, read-only state.
+    if (!_autoresearchDegraded) {
+      try {
+        const backup = `${AUTORESEARCH_FILE}.corrupt-${Date.now()}`;
+        fs.copyFileSync(AUTORESEARCH_FILE, backup);
+        log("autoresearch", `autoresearch.json is corrupt (${err.message}); preserved as ${backup}. Refusing to overwrite until recovered.`);
+      } catch (backupErr) {
+        log("autoresearch", `autoresearch.json is corrupt (${err.message}) and backup failed: ${backupErr.message}. Refusing to overwrite until recovered.`);
+      }
+    }
+    _autoresearchDegraded = true;
+    throw new Error(`autoresearch.json is corrupt and was preserved for recovery: ${err.message}`);
   }
 }
 
 export function saveAutoresearch(data) {
+  // Never persist over a corrupt-but-present file; that would destroy
+  // recoverable history. Skip saves until the file is restored.
+  if (_autoresearchDegraded) {
+    log("autoresearch", "Skipping autoresearch.json save: file is in degraded (corrupt) state. Restore or remove the corrupt backup to re-enable saves.");
+    return;
+  }
   fs.writeFileSync(AUTORESEARCH_FILE, JSON.stringify(data, null, 2));
 }
 

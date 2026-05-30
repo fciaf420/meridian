@@ -17,6 +17,9 @@ const LESSONS_FILE = "./lessons.json";
 const CALIBRATION_WINDOW_DAYS = 90;
 const MIN_CALIBRATION_SAMPLES = 20;
 let _signalCalibrationCache = { mtimeMs: null, calibration: null };
+// Set when signal-weights.json is present but unparseable. While degraded we
+// refuse to overwrite the (recoverable) bad file with defaults.
+let _weightsDegraded = false;
 
 // ─── Signal Definitions ─────────────────────────────────────────
 
@@ -99,19 +102,30 @@ export function loadWeights() {
     }
     return data;
   } catch (err) {
-    log("signal_weights_error", `Failed to read signal-weights.json: ${err.message}`);
-    return {
-      weights: { ...DEFAULT_WEIGHTS },
-      directions: { ...DEFAULT_DIRECTIONS },
-      calibration: {},
-      last_recalc: null,
-      recalc_count: 0,
-      history: [],
-    };
+    // File PRESENT but corrupt: do NOT silently fall back to defaults (a later
+    // saveWeights would wipe the learned weights/history). Preserve the bad
+    // file for recovery and enter a degraded, read-only state.
+    if (!_weightsDegraded) {
+      try {
+        const backup = `${WEIGHTS_FILE}.corrupt-${Date.now()}`;
+        fs.copyFileSync(WEIGHTS_FILE, backup);
+        log("signal_weights_error", `signal-weights.json is corrupt (${err.message}); preserved as ${backup}. Refusing to overwrite until recovered.`);
+      } catch (backupErr) {
+        log("signal_weights_error", `signal-weights.json is corrupt (${err.message}) and backup failed: ${backupErr.message}. Refusing to overwrite until recovered.`);
+      }
+    }
+    _weightsDegraded = true;
+    throw new Error(`signal-weights.json is corrupt and was preserved for recovery: ${err.message}`);
   }
 }
 
 export function saveWeights(data) {
+  // Never persist over a corrupt-but-present file; that would destroy
+  // recoverable learned weights. Skip saves until the file is restored.
+  if (_weightsDegraded) {
+    log("signal_weights_error", "Skipping signal-weights.json save: file is in degraded (corrupt) state. Restore or remove the corrupt backup to re-enable saves.");
+    return;
+  }
   try {
     fs.writeFileSync(WEIGHTS_FILE, JSON.stringify(data, null, 2));
   } catch (err) {

@@ -252,10 +252,15 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config) 
       log("state", `Position ${position_address} trailing TP activated (peak: ${currentPnlPct.toFixed(1)}%)`);
     }
 
-    // Check if profit has dropped from peak by trailingDropPct
-    if (pos.trailing_active) {
+    // Check if profit has dropped from peak by trailingDropPct.
+    // Guard: only apply trailing-TP exit when trailingDropPct is a sane value
+    // (finite, > 0 and < 100). An invalid/zero/NaN config must NOT trigger an
+    // immediate exit — skip the trailing logic entirely in that case.
+    const dropPct = mgmt.trailingDropPct;
+    const dropPctValid = Number.isFinite(dropPct) && dropPct > 0 && dropPct < 100;
+    if (pos.trailing_active && dropPctValid) {
       const dropFromPeak = pos.peak_pnl_pct - currentPnlPct;
-      if (dropFromPeak >= mgmt.trailingDropPct) {
+      if (dropFromPeak >= dropPct) {
         action = `TRAILING_TP: PnL dropped ${dropFromPeak.toFixed(1)}% from peak ${pos.peak_pnl_pct.toFixed(1)}% (trail: ${mgmt.trailingDropPct}%)`;
         pos.notes.push(action);
         save(state);
@@ -432,25 +437,48 @@ export async function syncOpenPositions(active_addresses) {
       log("state_warn", `Could not fetch LP Agent data for closed position ${posId}: ${e.message}`);
     }
 
-    // ─── Hard rule: swap base token back to SOL after sync-close ───
+    // ─── Hard rule: swap ONLY the withdrawn base token back to SOL ───
+    // The position was closed externally before we observed it, so we no longer
+    // have a clean pre-close snapshot. We use pos.pre_close_base_balance if some
+    // upstream step recorded it; otherwise the pre-close balance is UNKNOWN and
+    // we must NOT swap the whole wallet balance (it may include unrelated holdings
+    // or other open positions' base tokens). In that case skip the swap and flag
+    // the leftover exposure rather than risk dumping everything.
     try {
       const baseMint = pos.base_mint;
       const SOL = "So11111111111111111111111111111111111111112";
       if (baseMint && baseMint !== SOL) {
         const { getWalletBalances, swapToken } = await import("./tools/wallet.js");
-        const walletBals = await getWalletBalances();
-        const baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
-        if (baseToken && baseToken.balance > 0 && (baseToken.usd ?? 0) >= 0.10) {
-          log("state", `Post-sync-close: swapping ${baseToken.balance} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (worth $${baseToken.usd})`);
-          const swapResult = await swapToken({
-            input_mint: baseMint,
-            output_mint: SOL,
-            amount: baseToken.balance,
-          });
-          if (swapResult?.success) {
-            log("state", `Post-sync-close swap OK: tx ${swapResult.tx}`);
-          } else {
-            log("state_warn", `Post-sync-close swap failed: ${swapResult?.error || "unknown"}`);
+        const preBal =
+          typeof pos.pre_close_base_balance === "number"
+            ? pos.pre_close_base_balance
+            : null;
+
+        if (preBal == null) {
+          pos.exposure = { mint: baseMint, reason: "pre-close base balance unknown; auto-swap skipped" };
+          pos.notes.push(`Leftover base-token exposure (${baseMint.slice(0, 8)}): pre-close balance unknown, swap manually`);
+          log("state_warn", `Post-sync-close swap skipped for ${baseMint}: pre-close balance unknown — leftover exposure flagged.`);
+        } else {
+          const walletBals = await getWalletBalances();
+          const baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
+          const currentBal = baseToken?.balance ?? 0;
+          const swapAmount = Math.max(0, currentBal - preBal);
+          const unitUsd = (baseToken && currentBal > 0) ? (baseToken.usd ?? 0) / currentBal : 0;
+          const deltaUsd = unitUsd * swapAmount;
+
+          if (swapAmount > 0 && deltaUsd >= 0.10) {
+            log("state", `Post-sync-close: swapping ${swapAmount} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (withdrawn delta, worth ~$${deltaUsd.toFixed(2)})`);
+            const swapResult = await swapToken({
+              input_mint: baseMint,
+              output_mint: SOL,
+              amount: swapAmount,
+            });
+            if (swapResult?.success) {
+              log("state", `Post-sync-close swap OK: tx ${swapResult.tx}`);
+            } else {
+              pos.exposure = { mint: baseMint, reason: swapResult?.error || "swap failed" };
+              log("state_warn", `Post-sync-close swap failed: ${swapResult?.error || "unknown"}`);
+            }
           }
         }
       }

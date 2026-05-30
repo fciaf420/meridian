@@ -46,6 +46,10 @@ const TRACK_EMPTY_TTL = 60_000;
 // min-gap so we never burst; a 429 -> RATE_LIMIT_BANNED can extend the ban.
 const GMGN_MIN_REQUEST_GAP_MS = 200;
 
+// When a spawn comes back rate-limited (429 / RATE_LIMIT), back off for this long
+// so queued calls fail fast instead of hammering the limiter and extending the ban.
+const GMGN_RATE_LIMIT_COOLDOWN_MS = 60_000;
+
 // Global track feed size — recent trades across all tokens, filtered to the mint.
 const TRACK_LIMIT = 200;
 
@@ -63,6 +67,8 @@ let _trackSnapshotInflight = null;
 
 let _gmgnRequestChain = Promise.resolve();
 let _lastGmgnRequestAt = 0;
+// Epoch-ms until which we treat GMGN as rate-limited and skip spawning.
+let _rateLimitedUntil = 0;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -74,6 +80,8 @@ function sleep(ms) {
  */
 async function queueGmgnRequest(task) {
   const run = _gmgnRequestChain.then(async () => {
+    // Fail fast while a rate-limit cooldown is in effect — don't spawn into a ban.
+    if (Date.now() < _rateLimitedUntil) return null;
     const waitMs = Math.max(0, GMGN_MIN_REQUEST_GAP_MS - (Date.now() - _lastGmgnRequestAt));
     if (waitMs > 0) await sleep(waitMs);
     try {
@@ -125,7 +133,8 @@ function spawnGmgn(args) {
             if (error) {
               const blob = `${stderr || ""}${error.message || ""}`;
               if (looksRateLimited(blob)) {
-                log("gmgn", `Rate limited: ${args.join(" ")}`);
+                _rateLimitedUntil = Date.now() + GMGN_RATE_LIMIT_COOLDOWN_MS;
+                log("gmgn", `Rate limited: ${args.join(" ")} (backing off ${Math.round(GMGN_RATE_LIMIT_COOLDOWN_MS / 1000)}s)`);
               } else if (error.killed) {
                 log("gmgn", `Timeout: ${args.join(" ")}`);
               } else {
@@ -473,6 +482,14 @@ export async function fetchGmgnPriceInfo(mint) {
     const highs = candles?.map((c) => c.high).filter((h) => h > 0) || [];
     const maxPrice = athPrice > 0 ? athPrice : highs.length ? Math.max(...highs) : 0;
 
+    // market_cap = price * circulating_supply, but only when BOTH are real/positive.
+    // If either is missing/zero, leave it null so a fake $0 doesn't fail Evil Panda's
+    // >= mcap gate — null means "unknown", not "zero".
+    const mcapPrice = toNum(p.price);
+    const mcapSupply = toNum(info?.circulating_supply);
+    const marketCap =
+      mcapPrice > 0 && mcapSupply > 0 ? Math.round(mcapPrice * mcapSupply * 100) / 100 : null;
+
     const data = {
       ath_proximity_pct:
         maxPrice > 0 && price > 0 ? Math.round((price / maxPrice) * 1000) / 10 : null,
@@ -486,7 +503,7 @@ export async function fetchGmgnPriceInfo(mint) {
       volume_5m: Math.round(toNum(p.volume_5m) * 100) / 100,
       volume_1h: Math.round(toNum(p.volume_1h) * 100) / 100,
       volume_24h: Math.round(toNum(p.volume_24h) * 100) / 100,
-      market_cap: Math.round(toNum(p.price) * toNum(info?.circulating_supply) * 100) / 100,
+      market_cap: marketCap,
       holders: Math.trunc(toNum(info?.holder_count)) || null,
       liquidity: Math.round(toNum(info?.liquidity) * 100) / 100,
       candles: summarizeCandles(candles),
@@ -624,8 +641,14 @@ function overlayFromTrackRows(rows, now = Date.now()) {
     if (r.ts >= cutoff30m) amt30 += r.amountUsd;
   }
 
-  const latest = rows.slice().sort((a, b) => b.ts - a.ts)[0];
+  // Only treat the overlay as a live signal when there's at least one row inside
+  // the 2h window. Stale rows (all > 2h old) must not mark the token "present" or
+  // produce a recency age; recency is taken from the latest IN-WINDOW row only.
+  const inWindow = rows.filter((r) => r.ts >= cutoff2h);
+  const hasInWindow = inWindow.length > 0;
+  const latest = hasInWindow ? inWindow.slice().sort((a, b) => b.ts - a.ts)[0] : null;
   return {
+    has_in_window: hasInWindow,
     signal_amount_usd_30m: Math.round(amt30 * 100) / 100,
     signal_amount_usd_2h: Math.round(amt2h * 100) / 100,
     latest_signal_age_min: latest ? Math.max(0, Math.round((now - latest.ts) / 60_000)) : null,
@@ -662,7 +685,11 @@ export async function fetchGmgnSignal(mint) {
     const nativeSignals = Math.trunc(toNum(info?.stat?.signal_count));
 
     const overlay = overlayFromTrackRows(trackSnapshot.get(mint));
-    const present = smart > 0 || kol > 0 || whale > 0 || nativeSignals > 0 || !!overlay;
+    // Only the in-window overlay counts toward "present". Tagged-holder counts and
+    // the native signal still drive presence on their own; a stale (>2h) overlay
+    // does not, and leaves latest_signal_age_min null.
+    const overlayInWindow = !!overlay?.has_in_window;
+    const present = smart > 0 || kol > 0 || whale > 0 || nativeSignals > 0 || overlayInWindow;
 
     if (!present) {
       const empty = emptySignalMetrics(mint);

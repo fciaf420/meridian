@@ -17,6 +17,9 @@ import fs from "fs";
 const STATE_FILE = "./state.json";
 
 let _intervalHandle = null;
+// Per-tick inflight guard: prevents overlapping setInterval ticks from
+// processing stale data / racing closes when a tick runs longer than the interval.
+let _tickRunning = false;
 
 function loadState() {
   if (!fs.existsSync(STATE_FILE)) {
@@ -39,6 +42,10 @@ function saveState(state) {
 }
 
 export async function runPnlWatcher() {
+  // Inflight guard: if a previous tick is still running, skip this one so
+  // overlapping ticks can't process stale data or race position closes.
+  if (_tickRunning) return;
+  _tickRunning = true;
   try {
     // Skip while other agent flows are already active.
     if (isBusy() || isManagementBusy() || isScreeningBusy()) return;
@@ -122,6 +129,8 @@ export async function runPnlWatcher() {
     }
   } catch (err) {
     log("pnl_watcher_error", `Tick failed: ${err.message}`);
+  } finally {
+    _tickRunning = false;
   }
 }
 

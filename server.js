@@ -166,6 +166,83 @@ export function startServer(timersFn) {
   const wss = new WebSocketServer({ server, path: "/ws" });
 
   // ═══════════════════════════════════════════
+  //  DASHBOARD AUTH (fund-moving surfaces)
+  // ═══════════════════════════════════════════
+  //
+  // DASHBOARD_TOKEN gates every state-mutating / fund-moving WebSocket message
+  // (deploys, /auto, /learn, /evolve) and the full settings dump. Read-only
+  // status / subscribe / data views remain open so the dashboard still renders.
+  //
+  // If DASHBOARD_TOKEN is set: clients must present it (via the `?token=` query
+  // string on the /ws URL, or an `{ type: "auth", token }` message) before any
+  // fund-moving command is honored.
+  //
+  // If DASHBOARD_TOKEN is UNSET: we log a warning and REFUSE all fund-moving
+  // commands (fail-closed) while continuing to serve read-only data.
+  const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || "";
+  if (!DASHBOARD_TOKEN) {
+    log(
+      "server",
+      "WARNING: DASHBOARD_TOKEN is not set — fund-moving dashboard commands " +
+        "(deploy, /auto, /learn, /evolve, full settings) are DISABLED. " +
+        "Read-only views remain available. Set DASHBOARD_TOKEN to enable them.",
+    );
+  }
+
+  /** Constant-time-ish equality for the shared token. */
+  function tokenMatches(provided) {
+    if (!DASHBOARD_TOKEN || typeof provided !== "string") return false;
+    if (provided.length !== DASHBOARD_TOKEN.length) return false;
+    let diff = 0;
+    for (let i = 0; i < provided.length; i++) {
+      diff |= provided.charCodeAt(i) ^ DASHBOARD_TOKEN.charCodeAt(i);
+    }
+    return diff === 0;
+  }
+
+  /**
+   * Whether a WebSocket connection is allowed to run fund-moving / secret-
+   * exposing commands. Requires DASHBOARD_TOKEN to be configured AND the client
+   * to have presented a matching token (query string or auth message).
+   */
+  function isAuthorized(ws) {
+    return Boolean(DASHBOARD_TOKEN) && ws._authed === true;
+  }
+
+  /**
+   * Recursively redact secret-looking fields from a config object so the
+   * dashboard never leaks the wallet key or any private credential. Matches
+   * `walletKey`, anything ending in `Key`/`Token`, and anything containing
+   * `private`/`secret`/`mnemonic`/`seed` (case-insensitive).
+   */
+  function redactSecrets(value) {
+    const SECRET_RE = /(walletkey|key$|token$|private|secret|mnemonic|seed|passphrase)/i;
+    if (Array.isArray(value)) {
+      return value.map((v) => redactSecrets(v));
+    }
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) {
+        if (SECRET_RE.test(k)) {
+          out[k] = "***REDACTED***";
+        } else {
+          out[k] = redactSecrets(v);
+        }
+      }
+      return out;
+    }
+    return value;
+  }
+
+  /** Reject an unauthorized fund-moving request with a clear reason. */
+  function denyUnauthorized(ws) {
+    const reason = DASHBOARD_TOKEN
+      ? "Unauthorized — this action requires a valid dashboard token."
+      : "Unauthorized — fund-moving actions are disabled because DASHBOARD_TOKEN is not configured on the server.";
+    wsSend(ws, { type: "error", text: reason });
+  }
+
+  // ═══════════════════════════════════════════
   //  HTTP ROUTES
   // ═══════════════════════════════════════════
 
@@ -283,8 +360,23 @@ export function startServer(timersFn) {
   //  WEBSOCKET CONNECTION HANDLING
   // ═══════════════════════════════════════════
 
-  wss.on("connection", async (ws) => {
+  wss.on("connection", async (ws, req) => {
     log("server", "WebSocket client connected");
+
+    // Per-connection auth state. Read-only views work regardless; fund-moving
+    // commands require this to be true (which also requires DASHBOARD_TOKEN).
+    ws._authed = false;
+    if (DASHBOARD_TOKEN && req?.url) {
+      try {
+        const qs = new URL(req.url, "http://localhost").searchParams;
+        const provided = qs.get("token");
+        if (provided && tokenMatches(provided)) {
+          ws._authed = true;
+        }
+      } catch {
+        // Malformed URL — leave unauthenticated.
+      }
+    }
 
     // Send init payload with status, history, timers, and data
     const timerInfo = typeof timersFn === "function" ? timersFn() : {};
@@ -307,6 +399,8 @@ export function startServer(timersFn) {
 
     wsSend(ws, {
       type: "init",
+      authed: isAuthorized(ws),
+      authRequired: Boolean(DASHBOARD_TOKEN),
       status: {
         busy: isBusy(),
         managementBusy: isManagementBusy(),
@@ -333,7 +427,17 @@ export function startServer(timersFn) {
         return;
       }
 
-      if (msg.type === "quick-action") {
+      if (msg.type === "auth") {
+        // Authenticate an already-open connection (alternative to the ?token=
+        // query string). Never reveal the expected token; just report success.
+        if (DASHBOARD_TOKEN && tokenMatches(msg.token)) {
+          ws._authed = true;
+          wsSend(ws, { type: "auth:result", ok: true });
+        } else {
+          ws._authed = false;
+          wsSend(ws, { type: "auth:result", ok: false });
+        }
+      } else if (msg.type === "quick-action") {
         await handleQuickAction(ws, msg.action);
       } else if (msg.type === "chat") {
         await handleChat(ws, wss, msg.text);
@@ -499,6 +603,10 @@ export function startServer(timersFn) {
         }
 
         case "/learn": {
+          if (!isAuthorized(ws)) {
+            denyUnauthorized(ws);
+            break;
+          }
           setBusy(true);
           try {
             const { candidates } = await getTopCandidates({ limit: 5 });
@@ -519,6 +627,10 @@ export function startServer(timersFn) {
         }
 
         case "/evolve": {
+          if (!isAuthorized(ws)) {
+            denyUnauthorized(ws);
+            break;
+          }
           const perf = getPerformanceSummary();
           if (!perf || perf.total_positions_closed < 5) {
             const needed = 5 - (perf?.total_positions_closed || 0);
@@ -542,6 +654,10 @@ export function startServer(timersFn) {
         }
 
         case "/auto": {
+          if (!isAuthorized(ws)) {
+            denyUnauthorized(ws);
+            break;
+          }
           if (isBusy() || isManagementBusy() || isScreeningBusy()) {
             wsSend(ws, { type: "error", text: "Agent is busy right now — try again in a moment." });
             break;
@@ -565,9 +681,17 @@ export function startServer(timersFn) {
         }
 
         default: {
-          // Handle number picks: "1", "2", "3" etc. — deploy into that candidate
-          const pick = parseInt(command.replace("/", ""), 10);
-          if (!isNaN(pick) && pick >= 1) {
+          // Handle number picks: "1", "2", "3" etc. — deploy into that candidate.
+          // Require a STRICT all-digits command (optionally prefixed with "/") so
+          // garbage like "/1abc" is NOT treated as pool pick #1.
+          const isNumericPick = /^\/?\d+$/.test(command.trim());
+          const pick = isNumericPick ? parseInt(command.replace("/", ""), 10) : NaN;
+          if (isNumericPick && !isNaN(pick) && pick >= 1) {
+            // Deploying real funds — gate behind the dashboard token.
+            if (!isAuthorized(ws)) {
+              denyUnauthorized(ws);
+              break;
+            }
             if (isBusy() || isManagementBusy() || isScreeningBusy()) {
               wsSend(ws, { type: "error", text: "Agent is busy right now." });
               break;
@@ -648,7 +772,22 @@ export function startServer(timersFn) {
         }
         case "settings": {
           const raw = fs.readFileSync(path.join(__dirname, "user-config.json"), "utf8");
-          data = JSON.parse(raw);
+          const parsed = JSON.parse(raw);
+          // Always strip secret fields (walletKey, *Key, *token, private*, …) so
+          // the wallet key is never sent to any client.
+          const safe = redactSecrets(parsed);
+          if (isAuthorized(ws)) {
+            // Authorized clients get the full (still secret-redacted) settings.
+            data = safe;
+          } else {
+            // Unauthorized clients only see that settings are gated; no full dump.
+            data = {
+              gated: true,
+              message: DASHBOARD_TOKEN
+                ? "Full settings require a valid dashboard token."
+                : "Full settings are unavailable because DASHBOARD_TOKEN is not configured on the server.",
+            };
+          }
           break;
         }
         case "briefing": {

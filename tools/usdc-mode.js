@@ -145,11 +145,19 @@ export async function settleToUsdc() {
   const reserve = config.usdc.gasReserveSol;
   const results = [];
 
+  // SOL shows up in balances as EITHER the native sentinel mint (…111) or wrapped
+  // SOL (…112 = config.tokens.SOL). BOTH must be skipped in the token loop so that
+  // step 2 — which preserves the gas reserve — is the ONLY thing that settles SOL.
+  // (Previously only …112 was skipped, so the native-…111 balance entry got fully
+  // swapped here, bypassing the reserve and draining the wallet to 0 SOL.)
+  const NATIVE_SOL_MINT = "So11111111111111111111111111111111111111111";
+  const isSol = (mint) => mint === NATIVE_SOL_MINT || mint === config.tokens.SOL;
+
   // ── 1. Non-USDC / non-SOL token holdings → USDC ──────────────
   for (const t of bal.tokens || []) {
     if (!t.mint) continue;
     if (t.mint === config.tokens.USDC) continue;
-    if (t.mint === config.tokens.SOL) continue; // handled separately below
+    if (isSol(t.mint) || t.symbol === "SOL") continue; // SOL handled separately below (preserves gas reserve)
     if ((t.usd ?? 0) < DUST_USD) continue;
     if (!(t.balance > 0)) continue;
     log("usdc", `Settle: ${t.symbol} ($${t.usd}) → USDC`);
@@ -158,10 +166,18 @@ export async function settleToUsdc() {
   }
 
   // ── 2. Surplus SOL (above gas reserve) → USDC ────────────────
-  const surplusSol = (bal.sol ?? 0) - reserve;
+  // Re-read SOL: the token swaps above consume a little gas, so this fresh read is
+  // the single source of truth for how much SOL to settle (avoids a stale-balance
+  // double-swap that tries to send more SOL than the wallet holds).
+  let currentSol = bal.sol ?? 0;
+  try {
+    const fresh = await getWalletBalances();
+    if (!fresh.error && typeof fresh.sol === "number") currentSol = fresh.sol;
+  } catch { /* fall back to initial balance read */ }
+  const surplusSol = currentSol - reserve;
   const surplusUsd = surplusSol * (bal.sol_price ?? 0);
   if (surplusSol > 0 && surplusUsd >= DUST_USD) {
-    log("usdc", `Settle: ${surplusSol} surplus SOL ($${surplusUsd.toFixed(2)}) → USDC`);
+    log("usdc", `Settle: ${surplusSol.toFixed(6)} surplus SOL ($${surplusUsd.toFixed(2)}) → USDC (keeping ${reserve} SOL gas reserve)`);
     const r = await swapToken({ input_mint: config.tokens.SOL, output_mint: config.tokens.USDC, amount: surplusSol });
     results.push({ token: "SOL", mint: config.tokens.SOL, success: r.success, tx: r.tx, error: r.error });
   }
