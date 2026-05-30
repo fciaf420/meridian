@@ -24,7 +24,7 @@ import { startPnlWatcher, stopPnlWatcher } from "./pnl-watcher.js";
 import { recordPositionSnapshot as recordPoolSnapshot, recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
-import { fetchOkxPriceInfo, fetchOkxDexSignal } from "./tools/okx.js";
+import { fetchGmgnPriceInfo, fetchGmgnSignal } from "./tools/gmgn.js";
 import {
   sessionHistory, appendHistory, getHistory,
   isBusy, setBusy,
@@ -232,19 +232,6 @@ function startCronJobs() {
             memoryHints += `\n\nDYNAMIC FEES (current):\n${feeLines.join("\n")}\n`;
           }
         } catch { /* best-effort */ }
-        // Hive mind pattern consensus (if enabled, min 10 deploys for signal)
-        try {
-          const hiveMind = await import("./hive-mind.js");
-          if (hiveMind.isEnabled()) {
-            const patterns = await hiveMind.queryPatternConsensus();
-            if (patterns && patterns.length > 0) {
-              const significant = patterns.filter(p => p.count >= 10);
-              if (significant.length > 0) {
-                memoryHints += `\n\nHIVE MIND PATTERNS (supplementary):\n${significant.slice(0, 3).map(p => `[HIVE] ${p.strategy}: ${p.win_rate}% win, ${p.avg_pnl}% avg PnL (${p.count} deploys)`).join("\n")}\n`;
-              }
-            }
-          }
-        } catch { /* hive is best-effort */ }
       } catch { /* best-effort */ }
 
       // Inject recent auto-closes from PnL watcher so LLM knows what happened
@@ -455,24 +442,24 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
         }
         const blocks = await Promise.allSettled(candidates.map(async (c) => {
           const baseMint = c.base_mint || c.base?.mint || null;
-          const [sw, holders, narrative, poolMem, tokenInfo, okxData, okxSignal] = await Promise.allSettled([
+          const [sw, holders, narrative, poolMem, tokenInfo, gmgnData, gmgnSignal] = await Promise.allSettled([
             checkSmartWalletsOnPool({ pool_address: c.pool }),
             baseMint ? getTokenHolders({ mint: baseMint }) : null,
             baseMint ? getTokenNarrative({ mint: baseMint }) : null,
             recallForPool(c.pool),
             baseMint ? getTokenInfo({ query: baseMint }) : null,
-            baseMint ? fetchOkxPriceInfo(baseMint) : null,
-            baseMint ? fetchOkxDexSignal(baseMint) : null,
+            baseMint ? fetchGmgnPriceInfo(baseMint) : null,
+            baseMint ? fetchGmgnSignal(baseMint) : null,
           ]);
           const swResult = sw.status === "fulfilled" ? sw.value : null;
           const holdResult = holders.status === "fulfilled" ? holders.value : null;
           const narrResult = narrative.status === "fulfilled" ? narrative.value : null;
           const memResult = poolMem.status === "fulfilled" ? poolMem.value : null;
           const infoResult = tokenInfo.status === "fulfilled" ? tokenInfo.value : null;
-          const okxResult = okxData.status === "fulfilled" ? okxData.value : null;
-          const okxSignalResult = okxSignal.status === "fulfilled" ? okxSignal.value : null;
-          c._okxResult = okxResult;  // attach to candidate for signal staging
-          c._okxSignal = okxSignalResult;
+          const gmgnResult = gmgnData.status === "fulfilled" ? gmgnData.value : null;
+          const gmgnSignalResult = gmgnSignal.status === "fulfilled" ? gmgnSignal.value : null;
+          c._gmgnResult = gmgnResult;  // attach to candidate for signal staging
+          c._gmgnSignal = gmgnSignalResult;
           const dynFeeResult = dynFeeMap[c.pool] || null;
           const tokenData = infoResult?.results?.[0];
           const smartWalletCount = swResult?.in_pool?.length || 0;
@@ -491,18 +478,18 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
           if (holdResult?.top_10_real_holders_pct != null) block += ` | top10: ${holdResult.top_10_real_holders_pct}%`;
           if (narrResult?.narrative) block += `\n  Narrative: ${narrResult.narrative.slice(0, 500)}`;
           if (memResult) block += `\n  Memory: ${memResult}`;
-          if (okxResult) {
-            block += ` | ath: ${okxResult.ath_proximity_pct ?? "?"}%`;
-            block += ` | momentum: 5m=${okxResult.change_5m ?? "?"}% 1h=${okxResult.change_1h ?? "?"}%`;
-            if (okxResult.ath_proximity_pct != null && okxResult.ath_proximity_pct >= config.screening.athTopThresholdPct) {
-              block += `\n  ATH WARNING: ${okxResult.ath_proximity_pct}% of ATH (>=${config.screening.athTopThresholdPct}%) — override bid_ask range to 65-80%`;
+          if (gmgnResult) {
+            block += ` | ath: ${gmgnResult.ath_proximity_pct ?? "?"}%`;
+            block += ` | momentum: 5m=${gmgnResult.change_5m ?? "?"}% 1h=${gmgnResult.change_1h ?? "?"}%`;
+            if (gmgnResult.ath_proximity_pct != null && gmgnResult.ath_proximity_pct >= config.screening.athTopThresholdPct) {
+              block += `\n  ATH WARNING: ${gmgnResult.ath_proximity_pct}% of ATH (>=${config.screening.athTopThresholdPct}%) — override bid_ask range to 65-80%`;
             }
-            if (okxResult.change_1h > 10 && okxResult.change_5m < -2) {
-              block += `\n  MOMENTUM WARNING: pump fading (1h +${okxResult.change_1h}%, 5m ${okxResult.change_5m}%) — widen range or consider skipping`;
+            if (gmgnResult.change_1h > 10 && gmgnResult.change_5m < -2) {
+              block += `\n  MOMENTUM WARNING: pump fading (1h +${gmgnResult.change_1h}%, 5m ${gmgnResult.change_5m}%) — widen range or consider skipping`;
             }
           }
-          if (okxSignalResult) {
-            block += `\n  OKX signal: ${okxSignalResult.summary}`;
+          if (gmgnSignalResult) {
+            block += `\n  GMGN signal: ${gmgnSignalResult.summary}`;
           }
           return block;
         }));
@@ -523,28 +510,16 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
               smart_wallets_present: (c._smartWalletCount || 0) > 0,
               narrative_quality: null, // filled by tool signal capture in executor
               study_win_rate: null,    // filled by tool signal capture in executor
-              hive_consensus: null,    // filled by hive mind if available
-              ath_proximity: c._okxResult?.ath_proximity_pct ?? null,
-              okx_signal_count_30m: c._okxSignal?.signal_count_30m ?? null,
-              okx_signal_count_2h: c._okxSignal?.signal_count_2h ?? null,
-              okx_signal_amount_30m: c._okxSignal?.signal_amount_usd_30m ?? null,
-              okx_signal_amount_2h: c._okxSignal?.signal_amount_usd_2h ?? null,
-              okx_latest_signal_age_min: c._okxSignal?.latest_signal_age_min ?? null,
-              okx_latest_sold_ratio: c._okxSignal?.latest_sold_ratio_percent ?? null,
+              ath_proximity: c._gmgnResult?.ath_proximity_pct ?? null,
+              gmgn_signal_count_30m: c._gmgnSignal?.signal_count_30m ?? null,
+              gmgn_signal_count_2h: c._gmgnSignal?.signal_count_2h ?? null,
+              gmgn_signal_amount_30m: c._gmgnSignal?.signal_amount_usd_30m ?? null,
+              gmgn_signal_amount_2h: c._gmgnSignal?.signal_amount_usd_2h ?? null,
+              gmgn_latest_signal_age_min: c._gmgnSignal?.latest_signal_age_min ?? null,
+              gmgn_latest_sold_ratio: c._gmgnSignal?.latest_sold_ratio_percent ?? null,
             }, c.base_mint || c.base?.mint || null);
           } catch { /* staging is best-effort */ }
         }
-        // Hive mind consensus (if enabled)
-        try {
-          const hiveMind = await import("./hive-mind.js");
-          if (hiveMind.isEnabled()) {
-            const poolAddresses = candidates.map(c => c.pool).filter(Boolean);
-            if (poolAddresses.length > 0) {
-              const hiveConsensus = await hiveMind.formatPoolConsensusForPrompt(poolAddresses);
-              if (hiveConsensus) candidateBlocks += "\n" + hiveConsensus;
-            }
-          }
-        } catch { /* hive is best-effort */ }
       } catch (e) {
         log("cron", `Pre-load failed (${e.message}), agent will fetch manually`);
       }
@@ -565,19 +540,19 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
         if (kbHints) kbScreenContext = `\n\n${kbHints}`;
       } catch { /* best-effort */ }
 
-      const okxSignalGuide = candidateBlocks
-        ? `\n\nOKX SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher wallet interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent wallet conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use OKX signal as confirmation only, never as a standalone deploy trigger\n- Missing OKX signal is neutral, not a hard fail\n`
+      const gmgnSignalGuide = candidateBlocks
+        ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n`
         : "";
 
       const { content } = await screenerLoop(`
-SCREENING CYCLE — DEPLOY ONLY${memoryHints}${signalWeightsBlock}${kbScreenContext}${candidateBlocks}${okxSignalGuide}
+SCREENING CYCLE — DEPLOY ONLY${memoryHints}${signalWeightsBlock}${kbScreenContext}${candidateBlocks}${gmgnSignalGuide}
 ${strategyBlock}
-${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and OKX signal data.
+${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and GMGN signal data.
 Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
 HARD SKIP rules still apply:
 - global_fees_sol < ${config.screening.minTokenFeesSol} SOL → skip (bundled/scam)
 - top_10_real_holders_pct > 60% OR bundlers > 30% → skip
-- No smart wallets or OKX confirmation + empty/hype narrative → skip
+- No smart wallets or GMGN confirmation + empty/hype narrative → skip
 
 Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL.
 Size your price_range_pct from the VOLATILITY TABLE in the range selection rules below — NOT from study avg_range_pct.
@@ -712,6 +687,230 @@ function launchCron(options = {}) {
   }
 }
 
+// ═══════════════════════════════════════════
+//  TELEGRAM REMOTE CONTROL
+//  Full command parity with the terminal REPL. Works in both interactive and
+//  headless (non-TTY) mode — never touches readline so it runs as a service.
+// ═══════════════════════════════════════════
+let startupCandidates = [];
+
+const TELEGRAM_HELP = [
+  "DLMM LP Agent — Telegram control",
+  "",
+  "/status — wallet + open positions",
+  "/candidates — refresh top pools (then reply a number to deploy)",
+  "1 / 2 / 3 … — deploy into that pool",
+  "auto — agent picks the best pool and deploys",
+  "go — start autonomous cycles",
+  "/briefing — last-24h briefing",
+  "/thresholds — screening thresholds + performance",
+  "/learn [pool] — study top LPers (all top pools, or one address)",
+  "/evolve — evolve thresholds from performance",
+  "/stop — shut the agent down",
+  "/help — this list",
+  "",
+  "Anything else is sent to the agent as a chat message.",
+].join("\n");
+
+// Telegram caps a single message at 4096 chars — chunk longer replies.
+async function tgSend(text) {
+  const s = String(text ?? "").trim();
+  if (!s) return;
+  for (let i = 0; i < s.length; i += 3900) {
+    await sendMessage(s.slice(i, i + 3900));
+  }
+}
+
+// Remote busy-guard — mirror of the terminal runBusy/runScreeningBusy, but
+// replies over Telegram and never references readline (safe when headless).
+async function runRemote(fn, { screening = false } = {}) {
+  if (isBusy() || isManagementBusy() || isScreeningBusy()) {
+    await tgSend("⏳ Agent is busy right now — try again in a moment.");
+    return;
+  }
+  setBusy(true);
+  if (screening) setScreeningBusy(true);
+  try {
+    await fn();
+  } catch (e) {
+    await tgSend(`❌ Error: ${e.message}`);
+  } finally {
+    if (screening) setScreeningBusy(false);
+    setBusy(false);
+  }
+}
+
+async function handleTelegramCommand(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) return;
+  log("telegram", `Incoming: ${text}`);
+  const lower = text.toLowerCase();
+
+  // ── Help ──
+  if (text === "/help" || text === "/start" || text === "/commands") {
+    return tgSend(TELEGRAM_HELP);
+  }
+
+  // ── Shutdown ──
+  if (text === "/stop") {
+    await tgSend("🛑 Shutting down the agent…");
+    await shutdown("telegram /stop");
+    return;
+  }
+
+  // ── Start cron (no busy needed) ──
+  if (lower === "go") {
+    launchCron({ announce: true });
+    return tgSend("▶️ Autonomous cycles are running.");
+  }
+
+  // ── Status ──
+  if (text === "/status") {
+    return runRemote(async () => {
+      const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+      const unit = config.management.pnlUnit || "sol";
+      const lines = [
+        `💰 Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
+        `📊 Positions: ${positions.total_positions}`,
+      ];
+      for (const p of positions.positions) {
+        const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
+        const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
+        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
+        lines.push(`• ${p.pair}  ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
+      }
+      await tgSend(lines.join("\n"));
+    });
+  }
+
+  // ── Candidates (refresh + number the list for deploy) ──
+  if (text === "/candidates") {
+    return runRemote(async () => {
+      const result = await getTopCandidates({ limit: 5 });
+      const candidates = result.candidates || [];
+      startupCandidates = candidates;
+      const header = `🔍 Top pools (${result.total_eligible ?? candidates.length} eligible from ${result.total_screened ?? 0} screened):`;
+      const hint = candidates.length
+        ? `\n\nReply with a number (1-${candidates.length}) to deploy ${DEPLOY} SOL.`
+        : "";
+      await tgSend(`${header}\n\n${formatCandidates(candidates)}${hint}`);
+    });
+  }
+
+  // ── Number pick: deploy into pool N ──
+  const pick = parseInt(text, 10);
+  const isBareNumber = !Number.isNaN(pick) && String(pick) === text;
+  if (isBareNumber && pick >= 1 && pick <= startupCandidates.length) {
+    return runRemote(async () => {
+      const pool = startupCandidates[pick - 1];
+      const balance = await getWalletBalances().catch(() => null);
+      const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
+      await tgSend(`🚀 Deploying ${amt} SOL into ${pool.name}…`);
+      const { content } = await screenerLoop(
+        `Deploy ${amt} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+        config.llm.maxSteps,
+      );
+      launchCron({ announce: true });
+      await tgSend(content);
+    }, { screening: true });
+  }
+  if (isBareNumber) {
+    return tgSend(`No pool #${pick} in the current list. Send /candidates first.`);
+  }
+
+  // ── auto: agent picks and deploys ──
+  if (lower === "auto") {
+    return runRemote(async () => {
+      await tgSend("🤖 Agent is picking and deploying…");
+      const balance = await getWalletBalances().catch(() => null);
+      const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
+      const { content } = await screenerLoop(
+        `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${amt} SOL. Execute now, don't ask.`,
+        config.llm.maxSteps,
+      );
+      launchCron({ announce: true });
+      await tgSend(content);
+    }, { screening: true });
+  }
+
+  // ── Briefing (uses the same HTML path as notifications) ──
+  if (text === "/briefing") {
+    return runRemote(async () => {
+      const briefing = await generateBriefing();
+      emit("briefing", { html: briefing });
+    });
+  }
+
+  // ── Thresholds (read-only) ──
+  if (text === "/thresholds") {
+    const lines = ["⚙️ Screening thresholds"];
+    for (const [label, value] of getScreeningThresholdSummary(config.screening)) {
+      lines.push(`• ${label}: ${value}`);
+    }
+    const perf = getPerformanceSummary();
+    if (perf) {
+      lines.push("", `Based on ${perf.total_positions_closed} closed positions`, `Win rate: ${perf.win_rate_pct}% | Avg PnL: ${perf.avg_pnl_pct}%`);
+    } else {
+      lines.push("", "No closed positions yet — preset defaults.");
+    }
+    return tgSend(lines.join("\n"));
+  }
+
+  // ── Learn (study top LPers) ──
+  if (lower.startsWith("/learn")) {
+    return runRemote(async () => {
+      const parts = text.split(/\s+/);
+      const poolArg = parts[1] || null;
+      let poolsToStudy = [];
+      if (poolArg) {
+        poolsToStudy = [{ pool: poolArg, name: poolArg }];
+      } else {
+        const { candidates } = await getTopCandidates({ limit: 10 });
+        if (!candidates.length) { await tgSend("No eligible pools found to study."); return; }
+        poolsToStudy = candidates.map((c) => ({ pool: c.pool, name: c.name }));
+      }
+      await tgSend(`📚 Studying top LPers across ${poolsToStudy.length} pool(s)…`);
+      const poolList = poolsToStudy.map((p, i) => `${i + 1}. ${p.name} (${p.pool})`).join("\n");
+      const { content } = await agentLoop(
+        `Study top LPers across these ${poolsToStudy.length} pools by calling study_top_lpers for each:\n\n${poolList}\n\nFor each pool, call study_top_lpers then move to the next. After studying all pools:\n1. Identify cross-pool patterns (hold time, scalping vs holding, win rates).\n2. Note pool-specific differences.\n3. Derive 4-8 concrete lessons using add_lesson. Prioritize cross-pool patterns.\n4. Summarize what you learned.`,
+        config.llm.maxSteps, [], "GENERAL", config.llm.generalModel,
+      );
+      await tgSend(content);
+    });
+  }
+
+  // ── Evolve thresholds ──
+  if (text === "/evolve") {
+    return runRemote(async () => {
+      const perf = getPerformanceSummary();
+      if (!perf || perf.total_positions_closed < 5) {
+        const needed = 5 - (perf?.total_positions_closed || 0);
+        await tgSend(`Need at least 5 closed positions to evolve. ${needed} more needed.`);
+        return;
+      }
+      const fsMod = await import("fs");
+      const lessonsData = JSON.parse(fsMod.default.readFileSync("./lessons.json", "utf8"));
+      const result = evolveThresholds(lessonsData.performance, config);
+      if (!result || Object.keys(result.changes).length === 0) {
+        await tgSend("No threshold changes needed — current settings already match performance data.");
+      } else {
+        reloadScreeningThresholds();
+        const lines = ["✅ Thresholds evolved:"];
+        for (const [key] of Object.entries(result.changes)) lines.push(`• ${key}: ${result.rationale[key]}`);
+        lines.push("", "Saved to user-config.json. Applied immediately.");
+        await tgSend(lines.join("\n"));
+      }
+    });
+  }
+
+  // ── Free-form chat ──
+  return runRemote(async () => {
+    const { content } = await lightChat(text, sessionHistory, config.llm.generalModel);
+    appendHistory(text, content);
+    await tgSend(content);
+  });
+}
+
 ensureServerStarted();
 
 if (runtimeMode.interactive) {
@@ -763,7 +962,7 @@ if (runtimeMode.interactive) {
   console.log("Fetching wallet and top pool candidates...\n");
 
   setBusy(true);
-  let startupCandidates = [];
+  startupCandidates = [];
 
   try {
     const positions = await getMyPositions();
@@ -811,37 +1010,8 @@ if (runtimeMode.interactive) {
   launchCron({ announce: true });
   maybeRunMissedBriefing().catch(() => {});
 
-  // Telegram bot
-  startPolling(async (text) => {
-    if (isManagementBusy() || isScreeningBusy() || isBusy()) {
-      sendMessage("Agent is busy right now — try again in a moment.").catch(() => {});
-      return;
-    }
-
-    if (text === "/briefing") {
-      try {
-        const briefing = await generateBriefing();
-        emit("briefing", { html: briefing });
-      } catch (e) {
-        await sendMessage(`Error: ${e.message}`).catch(() => {});
-      }
-      return;
-    }
-
-    setBusy(true);
-    try {
-      log("telegram", `Incoming: ${text}`);
-      const { content } = await lightChat(text, sessionHistory, config.llm.generalModel);
-      appendHistory(text, content);
-      await sendMessage(content);
-    } catch (e) {
-      await sendMessage(`Error: ${e.message}`).catch(() => {});
-    } finally {
-      setBusy(false);
-      rl.setPrompt(buildPrompt());
-      rl.prompt(true);
-    }
-  });
+  // Telegram bot — full remote control (shared dispatcher, terminal-parity).
+  startPolling(handleTelegramCommand);
 
   console.log(`
 Commands:
@@ -1055,6 +1225,9 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
   launchCron();
   maybeRunMissedBriefing().catch(() => {});
+
+  // Telegram bot — full remote control works headless too.
+  startPolling(handleTelegramCommand);
   if (runtimeMode.runStartupCheck) (async () => {
     try {
       const currentBalance = await getWalletBalances().catch(() => null);

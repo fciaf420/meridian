@@ -16,7 +16,6 @@ const SIGNALS = [
   {label: 'smart_wallets', targetValue: 1.40},
   {label: 'narrative_quality', targetValue: 0.7},
   {label: 'study_win_rate', targetValue: 1.2},
-  {label: 'hive_consensus', targetValue: 0.95},
   {label: 'volatility', targetValue: 0.75},
   {label: 'ath_proximity', targetValue: 1.1},
 ];

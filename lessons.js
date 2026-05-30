@@ -233,9 +233,6 @@ export async function recordPerformance(perf) {
       log("autoresearch", `Error: ${e.message}`);
     }
   }
-
-  // Fire-and-forget sync to hive mind (if enabled)
-  import("./hive-mind.js").then(m => m.syncToHive()).catch(() => {});
 }
 
 /**

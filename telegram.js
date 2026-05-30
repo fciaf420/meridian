@@ -107,7 +107,7 @@ async function poll(onMessage) {
           chatId = incomingChatId;
           saveChatId(chatId);
           log("telegram", `Registered chat ID: ${chatId}`);
-          await sendMessage("Connected! I'm your LP agent. Ask me anything or use commands like /status.");
+          await sendMessage("Connected! I'm your DLMM LP agent. Send /help to see everything you can control, or just chat.");
         }
 
         // Only accept messages from the registered chat

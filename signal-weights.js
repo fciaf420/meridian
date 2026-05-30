@@ -25,7 +25,6 @@ const SIGNAL_NAMES = [
   "smart_wallets_present",
   "narrative_quality",
   "study_win_rate",
-  "hive_consensus",
   "volatility",
   "ath_proximity",
 ];
@@ -39,7 +38,6 @@ const HIGHER_IS_BETTER = new Set([
   "volume",
   "holder_count",
   "study_win_rate",
-  "hive_consensus",
 ]);
 
 // Boolean signals — compared by win rate when present vs absent

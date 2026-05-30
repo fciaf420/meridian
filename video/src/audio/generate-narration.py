@@ -20,8 +20,6 @@ SCENES = [
     ("scene6-memory", "Meridian never forgets. Nuggets, a holographic memory system, stores facts as vector superpositions, retrievable in under a millisecond via fuzzy matching. Pool memory tracks every deploy's PnL, strategy, and outcome per pool. Structured lessons tag each closed position as prefer or avoid. Facts recalled three or more times auto-promote to permanent context. The agent checks all three layers before every decision."),
 
     ("scene7-autolearn", "Every close triggers a learning cascade. Lessons are derived and deduplicated. Screening thresholds evolve automatically: volatility ceilings, organic floors, stop losses, take profits, each bounded to twenty percent change per step. And Autoresearch runs A B tests on the agent's own prompt. It attributes losses to specific prompt sections, generates hypotheses, tests over seven real positions, and keeps or reverts based on actual PnL improvement. A circuit breaker auto-reverts after three consecutive losses. The agent literally rewrites its own instructions."),
-
-    ("scene8-hivemind", "Optional Hive Mind integration lets agents share lessons, deploy outcomes, and evolved thresholds, without ever exposing private keys. Query pool consensus across the swarm before deploying. Meridian: screening, deploying, managing, learning, and evolving, twenty-four-seven, without you lifting a finger."),
 ]
 
 async def generate_scene(name: str, text: str, output_dir: str, public_dir: str):

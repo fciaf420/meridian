@@ -22,7 +22,7 @@ const _mintToPool = new Map();
  * Stage signals for a pool during screening.
  * Called after candidate data is loaded, before the LLM decides.
  * @param {string} poolAddress
- * @param {object} signals — { organic_score, fee_tvl_ratio, volume, mcap, holder_count, smart_wallets_present, narrative_quality, study_win_rate, hive_consensus, volatility }
+ * @param {object} signals — { organic_score, fee_tvl_ratio, volume, mcap, holder_count, smart_wallets_present, narrative_quality, study_win_rate, volatility }
  * @param {string} [baseMint] — optional base token mint to register in the mint→pool reverse map
  */
 export function stageSignals(poolAddress, signals, baseMint) {

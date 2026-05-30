@@ -101,8 +101,8 @@ function _defaultScreenerCriteria() {
    - global_fees_sol = total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees — completely different).
    - HARD SKIP if global_fees_sol < minTokenFeesSol (default 30 SOL). Low fees = bundled txs or scam. No exceptions.
    - Smart wallets present + fees pass → strong signal, proceed to deploy.
-   - If OKX signal metrics are preloaded in the cycle context, treat them as an external wallet-confirmation layer.
-   - No smart wallets and no OKX confirmation → also call get_token_narrative before deciding:
+   - If GMGN smart-money/KOL signal metrics are preloaded in the cycle context, treat them as an external wallet-confirmation layer.
+   - No smart wallets and no GMGN confirmation → also call get_token_narrative before deciding:
      * SKIP if top_10_real_holders_pct > 60% OR bundlers > 30% OR narrative is empty/null/pure hype with no specific story
      * CAUTION if bundlers 15–30% AND top_10 > 40% — check organic + buy/sell pressure
      * Bundlers 5–15% are normal, not a skip signal on their own

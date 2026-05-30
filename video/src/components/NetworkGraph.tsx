@@ -26,7 +26,7 @@ const PACKET_TRAVEL_DURATION = 60; // frames for packet to travel from outer to 
 
 export const NetworkGraph: React.FC<NetworkGraphProps> = ({
   nodes,
-  centerLabel = 'Hive Mind',
+  centerLabel = 'Network',
   delay = 0,
 }) => {
   const frame = useCurrentFrame();

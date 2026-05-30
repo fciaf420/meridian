@@ -10,7 +10,6 @@ import { SignalWeighting } from "./scenes/SignalWeighting";
 import { DeploymentExitRules } from "./scenes/DeploymentExitRules";
 import { MemorySystems } from "./scenes/MemorySystems";
 import { AutoLearning } from "./scenes/AutoLearning";
-import { HiveMindClosing } from "./scenes/HiveMindClosing";
 
 // Per-scene audio: delay = frames before narration starts (visual intro time)
 // Each scene duration is sized so audio plays fully without cutoff
@@ -22,7 +21,6 @@ const SCENE_AUDIO = [
   { file: "scene5-deployment.mp3",   scene: SCENES.DEPLOYMENT,       audioDelay: 15  },
   { file: "scene6-memory.mp3",       scene: SCENES.MEMORY_SYSTEMS,   audioDelay: 15  },
   { file: "scene7-autolearn.mp3",    scene: SCENES.AUTO_LEARNING,    audioDelay: 15  },
-  { file: "scene8-hivemind.mp3",     scene: SCENES.HIVE_MIND,        audioDelay: 15  },
 ] as const;
 
 export const Video: React.FC = () => {
@@ -78,11 +76,6 @@ export const Video: React.FC = () => {
       {/* Scene 7: Auto-Learning */}
       <Sequence from={SCENES.AUTO_LEARNING.start} durationInFrames={SCENES.AUTO_LEARNING.duration}>
         <AutoLearning />
-      </Sequence>
-
-      {/* Scene 8: Hive Mind + Closing */}
-      <Sequence from={SCENES.HIVE_MIND.start} durationInFrames={SCENES.HIVE_MIND.duration}>
-        <HiveMindClosing />
       </Sequence>
     </AbsoluteFill>
   );

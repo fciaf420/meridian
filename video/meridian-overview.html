@@ -168,22 +168,6 @@ body{background:var(--bg);color:var(--white);font-family:'Inter','Segoe UI',syst
 .circuit-breaker{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--gray)}
 .cb-dot{width:10px;height:10px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red);animation:cbPulse 1.5s ease-in-out infinite}
 @keyframes cbPulse{0%,100%{opacity:.4}50%{opacity:1}}
-
-/* ===== SECTION 7: HIVE MIND ===== */
-.hive-layout{max-width:900px;width:100%;text-align:center}
-.network{position:relative;width:100%;height:400px;margin-bottom:32px}
-.net-node{position:absolute;transition:all .3s}
-.net-node:hover{transform:scale(1.1)}
-.net-center{left:50%;top:50%;transform:translate(-50%,-50%);z-index:2}
-.net-center .hex{width:100px;height:100px;font-size:14px;font-weight:700}
-.net-line{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}
-.hive-stats{display:flex;gap:24px;justify-content:center;flex-wrap:wrap}
-.hive-stat{padding:16px 24px;border-radius:10px;background:var(--bg-card);border:1px solid var(--dark-gray);font-size:14px;display:flex;align-items:center;gap:10px}
-.hive-stat .val{font-weight:700;font-size:20px}
-
-/* Data packets on network */
-.data-pkt{position:absolute;width:8px;height:8px;border-radius:50%;animation:travelToCenter 2.5s linear infinite;pointer-events:none}
-@keyframes travelToCenter{0%{offset-distance:0%}100%{offset-distance:100%}}
 </style>
 </head>
 <body>
@@ -403,30 +387,6 @@ body{background:var(--bg);color:var(--white);font-family:'Inter','Segoe UI',syst
   </div>
 </div>
 
-<!-- ===== SECTION 7: HIVE MIND ===== -->
-<div class="section" id="hivemind">
-  <div class="section-title">Step 6</div>
-  <h2 class="glow-purple">Hive Mind</h2>
-  <div class="hive-layout">
-    <div class="network" id="networkArea">
-      <svg class="net-line" id="netSvg" viewBox="0 0 900 400"></svg>
-      <div class="net-node net-center">
-        <div class="hex purple" style="width:90px;height:90px"><span style="font-size:12px;-webkit-text-fill-color:var(--white)">Hive<br>Mind</span></div>
-      </div>
-      <div class="net-node" style="left:10%;top:15%"><div class="hex green" style="width:60px;height:60px"><span style="font-size:11px;-webkit-text-fill-color:var(--white)">A1</span></div></div>
-      <div class="net-node" style="left:30%;top:5%"><div class="hex blue" style="width:60px;height:60px"><span style="font-size:11px;-webkit-text-fill-color:var(--white)">A2</span></div></div>
-      <div class="net-node" style="right:30%;top:5%"><div class="hex green" style="width:60px;height:60px"><span style="font-size:11px;-webkit-text-fill-color:var(--white)">A3</span></div></div>
-      <div class="net-node" style="right:10%;top:15%"><div class="hex blue" style="width:60px;height:60px"><span style="font-size:11px;-webkit-text-fill-color:var(--white)">A4</span></div></div>
-      <div class="net-node" style="left:50%;top:2%;transform:translateX(-50%)"><div class="hex purple" style="width:60px;height:60px"><span style="font-size:11px;-webkit-text-fill-color:var(--white)">A5</span></div></div>
-    </div>
-    <div class="hive-stats">
-      <div class="hive-stat"><span class="val" style="color:var(--green)">3</span> agents deployed</div>
-      <div class="hive-stat"><span class="val" style="color:var(--green)">67%</span> win rate</div>
-      <div class="hive-stat">&#128274; <span style="color:var(--gray)">No private keys shared</span></div>
-    </div>
-  </div>
-</div>
-
 <script>
 // ===== PARTICLES =====
 (function(){
@@ -457,8 +417,8 @@ body{background:var(--bg);color:var(--white);font-family:'Inter','Segoe UI',syst
 })();
 
 // ===== NAV DOTS =====
-const sections=['hero','screening','signals','deployment','memory','autolearn','hivemind'];
-const labels=['Overview','Screening','Signals','Deploy','Memory','Auto-Learn','Hive Mind'];
+const sections=['hero','screening','signals','deployment','memory','autolearn'];
+const labels=['Overview','Screening','Signals','Deploy','Memory','Auto-Learn'];
 const nav=document.getElementById('nav');
 sections.forEach((id,i)=>{
   const d=document.createElement('div');d.className='nav-dot';
@@ -489,7 +449,7 @@ const signalData=[
   {label:'smart_wallets',value:1.40},{label:'organic_score',value:1.35},
   {label:'fee_tvl_ratio',value:1.25},{label:'study_win_rate',value:1.20},
   {label:'holder_count',value:1.15},{label:'ath_proximity',value:1.10},
-  {label:'mcap',value:1.05},{label:'hive_consensus',value:0.95},
+  {label:'mcap',value:1.05},
   {label:'volume',value:0.85},{label:'volatility',value:0.75},
   {label:'narrative_quality',value:0.70}
 ];
@@ -571,20 +531,6 @@ function spawnDot(){
   funnelArea.appendChild(dot);
 }
 setInterval(spawnDot,400);
-
-// ===== NETWORK LINES =====
-const svgNS='http://www.w3.org/2000/svg';
-const netSvg=document.getElementById('netSvg');
-const agentPositions=[[10,15],[30,5],[50,2],[70,5],[90,15]];
-const colors=['var(--green)','var(--blue)','var(--purple)','var(--green)','var(--blue)'];
-agentPositions.forEach(([lp,tp],i)=>{
-  const line=document.createElementNS(svgNS,'line');
-  line.setAttribute('x1',(lp/100*900+30)+'');line.setAttribute('y1',(tp/100*400+30)+'');
-  line.setAttribute('x2','450');line.setAttribute('y2','200');
-  line.setAttribute('stroke','rgba(153,69,255,.2)');line.setAttribute('stroke-width','1');
-  line.setAttribute('stroke-dasharray','4');
-  netSvg.appendChild(line);
-});
 </script>
 </body>
 </html>

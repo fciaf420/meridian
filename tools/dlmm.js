@@ -274,14 +274,14 @@ export async function deployPosition({
     // Condition 3: Price must be stabilizing (not pumping >10% in 1h)
     let priceStable = false;
     try {
-      const { fetchOkxPriceInfo } = await import("../tools/okx.js");
+      const { fetchGmgnPriceInfo } = await import("../tools/gmgn.js");
       const resolvedMint = base_mint || (await (async () => {
         const pool = await getPool(pool_address);
         return pool.lbPair.tokenXMint.toBase58();
       })());
-      const okx = await fetchOkxPriceInfo(resolvedMint);
-      priceStable = okx && Math.abs(okx.change_1h || 0) <= 10;
-    } catch { priceStable = true; /* if OKX unavailable, don't block on this alone */ }
+      const gmgn = await fetchGmgnPriceInfo(resolvedMint);
+      priceStable = gmgn && Math.abs(gmgn.change_1h || 0) <= 10;
+    } catch { priceStable = true; /* if GMGN unavailable, don't block on this alone */ }
     if (!priceStable) failures.push("price pumping >10% in 1h");
 
     // Condition 4: Pool memory shows prior spot profits

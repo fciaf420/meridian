@@ -495,31 +495,6 @@ Meridian uses:
 - Jupiter for token data and swaps
 - LP Agent for overview, history, and top-LPer study
 
-## Hive Mind
-
-Hive Mind is optional collective intelligence.
-
-What it can share:
-
-- lessons
-- deploy outcomes
-- threshold tendencies
-- pool and strategy consensus
-
-What it should not share:
-
-- wallet private keys
-- raw wallet balances
-- wallet addresses
-
-Registration:
-
-```bash
-node -e "import('./hive-mind.js').then(m => m.register('https://meridian-hive-api-production.up.railway.app', 'YOUR_TOKEN'))"
-```
-
-This stores Hive Mind credentials in `user-config.json`.
-
 ## Project Structure
 
 ```text
