@@ -35,3 +35,6 @@ context.md
 
 # Personal Claude Code config
 CLAUDE.local.md
+
+# Chorus iOS CLI binary (installed locally, not source)
+build-ios-apps/
