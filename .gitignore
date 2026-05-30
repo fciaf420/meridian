@@ -35,3 +35,8 @@ context.md
 
 # Personal Claude Code config
 CLAUDE.local.md
+
+# Chorus iOS CLI binary (60MB — installed locally, not source)
+build-ios-apps/
+# iOS build artifacts
+MeridianApp/**/xcuserdata/
