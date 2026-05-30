@@ -33,10 +33,11 @@ export function stageSignals(poolAddress, signals, baseMint) {
   if (baseMint) {
     _mintToPool.set(baseMint, poolAddress);
   }
-  // Clean up stale entries
+  // Clean up stale entries (and their reverse mint→pool mappings)
   for (const [addr, data] of _staged) {
     if (Date.now() - data.staged_at > STAGE_TTL_MS) {
       _staged.delete(addr);
+      _pruneMintMappings(addr);
     }
   }
 }
@@ -85,10 +86,33 @@ export function getPoolForMint(mint) {
 export function getAndClearStagedSignals(poolAddress) {
   const data = _staged.get(poolAddress);
   if (!data) return null;
+
+  // Always clear the staged entry and its reverse mint→pool mappings, so a
+  // consumed or expired snapshot can't be reused or leave stale lookups behind.
   _staged.delete(poolAddress);
+  _pruneMintMappings(poolAddress);
+
+  // Enforce TTL on retrieval: a snapshot older than STAGE_TTL_MS belongs to an
+  // earlier screening pass and must not be attributed to this later deploy.
+  if (Date.now() - data.staged_at > STAGE_TTL_MS) {
+    log("signals", `Dropped stale staged signals for ${poolAddress.slice(0, 8)} (age ${Math.round((Date.now() - data.staged_at) / 1000)}s > TTL)`);
+    return null;
+  }
+
   const { staged_at, ...signals } = data;
   log("signals", `Retrieved staged signals for ${poolAddress.slice(0, 8)}: ${Object.keys(signals).filter(k => signals[k] != null).length} signals`);
   return signals;
+}
+
+/**
+ * Delete every mint→pool reverse mapping pointing at the given pool address.
+ * Keeps _mintToPool from accumulating stale entries after a pool is cleared/expired.
+ * @param {string} poolAddress
+ */
+function _pruneMintMappings(poolAddress) {
+  for (const [mint, pool] of _mintToPool) {
+    if (pool === poolAddress) _mintToPool.delete(mint);
+  }
 }
 
 /**

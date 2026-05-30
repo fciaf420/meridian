@@ -32,6 +32,51 @@ const _cache = {
 };
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
+// Cap on retained recent entries per in-article history section (Deploy History,
+// Recent Results, Recent Cases). Bounds KB article growth so synthesized prompts
+// don't balloon over time. Older bullets are dropped; the article itself is kept.
+const MAX_HISTORY_ENTRIES = 50;
+
+/**
+ * Prepend a bullet line directly after a section marker header, then trim that
+ * section's leading "- " bullet run to MAX_HISTORY_ENTRIES (most-recent kept).
+ * If the marker is absent, append a fresh section. Returns updated content.
+ */
+function insertCappedHistoryLine(content, marker, line) {
+  const idx = content.indexOf(marker);
+  if (idx < 0) {
+    return content + `\n\n${marker}\n\n${line}\n`;
+  }
+  const afterHeader = content.indexOf("\n", idx) + 1;
+  let updated = content.slice(0, afterHeader) + "\n" + line + "\n" + content.slice(afterHeader);
+
+  // Bound the contiguous bullet block that follows the header.
+  const lines = updated.split("\n");
+  // Find first line index after the marker header line.
+  let start = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith(marker)) { start = i + 1; break; }
+  }
+  let kept = 0;
+  let trimming = false;
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (i < start) { out.push(lines[i]); continue; }
+    if (lines[i].startsWith("- ")) {
+      if (trimming) continue; // drop overflow bullets
+      kept++;
+      out.push(lines[i]);
+      if (kept >= MAX_HISTORY_ENTRIES) trimming = true;
+      continue;
+    }
+    // Non-bullet line: if we were trimming, the section's bullet run is over.
+    if (trimming && lines[i].trim() === "") continue; // swallow blank gaps within overflow
+    trimming = false;
+    out.push(lines[i]);
+  }
+  return out.join("\n");
+}
+
 function invalidateCache() {
   _cache.summary.ts = 0;
   _cache.stats.ts = 0;
@@ -837,14 +882,7 @@ export function filePositionClose(perf) {
       // Append to existing pool article under Deploy History section
       let content = fs.readFileSync(fullPath, "utf8");
       const historyMarker = "## Deploy History";
-      if (content.includes(historyMarker)) {
-        // Insert new close after the section header line
-        const idx = content.indexOf(historyMarker);
-        const afterHeader = content.indexOf("\n", idx) + 1;
-        content = content.slice(0, afterHeader) + "\n" + closeLine + "\n" + content.slice(afterHeader);
-      } else {
-        content += `\n\n${historyMarker}\n\n${closeLine}\n`;
-      }
+      content = insertCappedHistoryLine(content, historyMarker, closeLine);
       writeArticle(articlePath, content);
     } else {
       // Create new pool article
@@ -888,13 +926,7 @@ function _updateConceptArticles(perf, outcome, pnl, name, strategy, reason, vol,
   if (fs.existsSync(stratFull)) {
     let content = fs.readFileSync(stratFull, "utf8");
     const marker = "## Recent Results";
-    if (content.includes(marker)) {
-      const idx = content.indexOf(marker);
-      const after = content.indexOf("\n", idx) + 1;
-      content = content.slice(0, after) + "\n" + line + "\n" + content.slice(after);
-    } else {
-      content += `\n\n${marker}\n\n${line}\n`;
-    }
+    content = insertCappedHistoryLine(content, marker, line);
     // Add cross-reference to pool article
     const poolRef = `pools/${name.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase()}.md`;
     if (!content.includes(poolRef)) {
@@ -915,13 +947,7 @@ function _updateConceptArticles(perf, outcome, pnl, name, strategy, reason, vol,
     if (fs.existsSync(oorFull)) {
       let content = fs.readFileSync(oorFull, "utf8");
       const marker = "## Recent Cases";
-      if (content.includes(marker)) {
-        const idx = content.indexOf(marker);
-        const after = content.indexOf("\n", idx) + 1;
-        content = content.slice(0, after) + "\n" + line + "\n" + content.slice(after);
-      } else {
-        content += `\n\n${marker}\n\n${line}\n`;
-      }
+      content = insertCappedHistoryLine(content, marker, line);
       writeArticle(oorPath, content);
     } else {
       let content = `# OOR ${oorDir.charAt(0).toUpperCase() + oorDir.slice(1)} Patterns\n\n`;
@@ -938,13 +964,7 @@ function _updateConceptArticles(perf, outcome, pnl, name, strategy, reason, vol,
     if (fs.existsSync(bsFull)) {
       let content = fs.readFileSync(bsFull, "utf8");
       const marker = "## Recent Results";
-      if (content.includes(marker)) {
-        const idx = content.indexOf(marker);
-        const after = content.indexOf("\n", idx) + 1;
-        content = content.slice(0, after) + "\n" + line + "\n" + content.slice(after);
-      } else {
-        content += `\n\n${marker}\n\n${line}\n`;
-      }
+      content = insertCappedHistoryLine(content, marker, line);
       writeArticle(bsPath, content);
     } else {
       let content = `# Bin Step ${binStep} Performance\n\nResults for pools with bin_step=${binStep}.\n\n## Recent Results\n\n${line}\n`;

@@ -46,10 +46,20 @@ export function getProviderApiKey(provider = getLlmProvider()) {
   if (provider === "claude") {
     throw new Error("Claude provider uses the Claude CLI (OAuth), not direct API key access.");
   }
-  if (provider === "deepseek") return process.env.DEEPSEEK_API_KEY;
-  if (provider === "minimax") return process.env.MINIMAX_API_KEY;
-  if (provider === "openrouter") return process.env.OPENROUTER_API_KEY;
-  throw new Error(`Unknown LLM provider: ${provider}`);
+  const envVarByProvider = {
+    deepseek: "DEEPSEEK_API_KEY",
+    minimax: "MINIMAX_API_KEY",
+    openrouter: "OPENROUTER_API_KEY",
+  };
+  const envVar = envVarByProvider[provider];
+  if (!envVar) {
+    throw new Error(`Unknown LLM provider: ${provider}`);
+  }
+  const key = process.env[envVar];
+  if (!key || !key.trim()) {
+    throw new Error(`${envVar} is not set — required for LLM_PROVIDER=${provider}`);
+  }
+  return key;
 }
 
 export function getProviderClientConfig(provider = getLlmProvider()) {
@@ -323,21 +333,117 @@ export function isClaudeRateLimited() {
   return Date.now() < _claudeRateLimitedUntil;
 }
 
+// Conservative fallback cooldown when we cannot reliably determine the reset
+// time. Better to wait too long than to under-wait and re-trip the limit.
+const RATE_LIMIT_FALLBACK_MS = 3600_000; // 1 hour
+
+// Given an IANA time zone, return that zone's UTC offset in minutes at the
+// instant `at` (e.g. America/New_York during EDT -> -240). Returns null if the
+// zone is unknown / unsupported by the runtime.
+function getZoneOffsetMinutes(timeZone, at) {
+  try {
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    const parts = dtf.formatToParts(at).reduce((acc, p) => {
+      acc[p.type] = p.value;
+      return acc;
+    }, {});
+    // Interpret the wall-clock components the zone reports as if they were UTC,
+    // then compare to the real UTC instant to recover the offset.
+    const asUtc = Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour),
+      Number(parts.minute),
+      Number(parts.second),
+    );
+    return Math.round((asUtc - at.getTime()) / 60000);
+  } catch {
+    return null;
+  }
+}
+
 function parseRateLimitReset(msg) {
   // "You've hit your limit · resets 10pm (America/New_York)"
   // "You've hit your limit · resets 12pm (America/New_York)"
+  const now = Date.now();
+
+  // Prefer an explicit relative form ("resets in 45 minutes / 2 hours") — it is
+  // timezone-independent and unambiguous.
+  const relMatch = msg?.match(/resets?\s+in\s+(\d+)\s*(second|minute|hour|day)s?/i);
+  if (relMatch) {
+    const amount = parseInt(relMatch[1], 10);
+    const unitMs = {
+      second: 1000,
+      minute: 60_000,
+      hour: 3600_000,
+      day: 86_400_000,
+    }[relMatch[2].toLowerCase()];
+    return now + amount * unitMs;
+  }
+
   const match = msg?.match(/resets?\s+(\d{1,2})(am|pm)/i);
-  if (!match) return Date.now() + 3600_000; // default 1 hour
-  let hour = parseInt(match[1]);
+  if (!match) return now + RATE_LIMIT_FALLBACK_MS;
+
+  let hour = parseInt(match[1], 10);
   if (match[2].toLowerCase() === "pm" && hour < 12) hour += 12;
   if (match[2].toLowerCase() === "am" && hour === 12) hour = 0;
 
-  // Build target time in ET (approximate — use local offset)
-  const now = new Date();
-  const target = new Date(now);
-  target.setHours(hour + 4, 0, 0, 0); // ET is roughly UTC-4/5
-  if (target <= now) target.setDate(target.getDate() + 1);
-  return target.getTime();
+  // Resolve the time zone from the message (e.g. "(America/New_York)") rather
+  // than assuming the host runs in ET. A hardcoded +4h offset is wrong on any
+  // non-ET host and can hugely over- or under-extend the cooldown.
+  const zoneMatch = msg?.match(/\(([A-Za-z]+\/[A-Za-z_]+)\)/);
+  const timeZone = zoneMatch?.[1];
+  if (!timeZone) {
+    // No zone we can trust — use a conservative fixed cooldown instead of
+    // guessing an offset (which risks under-waiting).
+    return now + RATE_LIMIT_FALLBACK_MS;
+  }
+
+  const offsetMin = getZoneOffsetMinutes(timeZone, new Date(now));
+  if (offsetMin === null) {
+    return now + RATE_LIMIT_FALLBACK_MS;
+  }
+
+  // Compute the wall-clock target date in the target zone, then convert that
+  // zone-local time to a UTC instant using the zone's offset.
+  const zoneNowParts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(now)).reduce((acc, p) => {
+    acc[p.type] = p.value;
+    return acc;
+  }, {});
+
+  // Target instant = the zone wall-clock (today @ hour:00) expressed in UTC.
+  // UTC instant = wallclock-as-utc - offset.
+  let targetUtc = Date.UTC(
+    Number(zoneNowParts.year),
+    Number(zoneNowParts.month) - 1,
+    Number(zoneNowParts.day),
+    hour,
+    0,
+    0,
+  ) - offsetMin * 60_000;
+
+  // If that instant is already in the past, the reset is tomorrow.
+  if (targetUtc <= now) {
+    targetUtc += 86_400_000;
+  }
+
+  return targetUtc;
 }
 
 export function runClaudeCli(model, prompt, {

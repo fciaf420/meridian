@@ -57,9 +57,16 @@ export async function generateBriefing() {
     allTimeLine = null;
   }
 
-  // 3. Lessons Learned — cap at 5 most recent (regardless of time window)
+  // 3. Lessons Learned — only those created in the last 24h (honest "Last 24h"),
+  //    then cap at the 5 most recent. Lessons missing a parseable created_at are
+  //    excluded so stale entries can't masquerade as recent.
   const allLessons = lessonsData.lessons || [];
-  const recentLessons = allLessons.slice(-5);
+  const recentLessons = allLessons
+    .filter(l => {
+      const ts = l.created_at ? new Date(l.created_at) : null;
+      return ts && !isNaN(ts.getTime()) && ts > last24h;
+    })
+    .slice(-5);
 
   // 4. Current State
   const openPositions = allPositions.filter(p => !p.closed);

@@ -1,5 +1,14 @@
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
 
+// Coerce API-sourced values (which may arrive as numeric strings or unexpected
+// types) before formatting, so a type change upstream can't throw and break the
+// whole lookup. Returns null for non-finite input instead of throwing.
+const fix = (v, d) => (Number.isFinite(Number(v)) ? Number(Number(v).toFixed(d)) : null);
+// String-returning variant: preserves the existing `?.toFixed(d)` shape (a
+// string, or undefined when absent) but won't throw if the field is a numeric
+// string or other unexpected type.
+const fixStr = (v, d) => (v == null ? undefined : (Number.isFinite(Number(v)) ? Number(v).toFixed(d) : undefined));
+
 /**
  * Get the narrative/story behind a token from Jupiter ChainInsight.
  * Useful for understanding if a token has a real community/theme vs nothing.
@@ -44,25 +53,25 @@ export async function getTokenInfo({ query }) {
       graduated: !!t.graduatedPool,
       // Global fees paid by traders (priority + jito tips) in SOL.
       // Low value = bundled txs or scam token. Minimum threshold: ~30 SOL.
-      global_fees_sol: t.fees != null ? parseFloat(t.fees.toFixed(2)) : null,
+      global_fees_sol: fix(t.fees, 2),
       audit: t.audit ? {
         mint_disabled: t.audit.mintAuthorityDisabled,
         freeze_disabled: t.audit.freezeAuthorityDisabled,
-        top_holders_pct: t.audit.topHoldersPercentage?.toFixed(2),
-        bot_holders_pct: t.audit.botHoldersPercentage?.toFixed(2),
+        top_holders_pct: fixStr(t.audit.topHoldersPercentage, 2),
+        bot_holders_pct: fixStr(t.audit.botHoldersPercentage, 2),
         dev_migrations: t.audit.devMigrations,
       } : null,
       stats_1h: t.stats1h ? {
-        price_change: t.stats1h.priceChange?.toFixed(2),
-        buy_vol: t.stats1h.buyVolume?.toFixed(0),
-        sell_vol: t.stats1h.sellVolume?.toFixed(0),
+        price_change: fixStr(t.stats1h.priceChange, 2),
+        buy_vol: fixStr(t.stats1h.buyVolume, 0),
+        sell_vol: fixStr(t.stats1h.sellVolume, 0),
         buyers: t.stats1h.numOrganicBuyers,
         net_buyers: t.stats1h.numNetBuyers,
       } : null,
       stats_24h: t.stats24h ? {
-        price_change: t.stats24h.priceChange?.toFixed(2),
-        buy_vol: t.stats24h.buyVolume?.toFixed(0),
-        sell_vol: t.stats24h.sellVolume?.toFixed(0),
+        price_change: fixStr(t.stats24h.priceChange, 2),
+        buy_vol: fixStr(t.stats24h.buyVolume, 0),
+        sell_vol: fixStr(t.stats24h.sellVolume, 0),
         buyers: t.stats24h.numOrganicBuyers,
         net_buyers: t.stats24h.numNetBuyers,
       } : null,
@@ -95,7 +104,7 @@ export async function getTokenHolders({ mint, limit = 20 }) {
     return {
       address: h.address || h.wallet,
       amount: h.amount,
-      pct: pct != null ? parseFloat(pct.toFixed(4)) : null,
+      pct: fix(pct, 4),
       sol_balance: h.solBalanceDisplay ?? h.solBalance,
       tags: tags.length ? tags : undefined,
       is_pool: isPool || undefined,
@@ -184,7 +193,7 @@ export async function getTokenHolders({ mint, limit = 20 }) {
 
     await Promise.all(matchedHolders.map(async (h) => {
       const wallet = smartWalletMap.get(h.addr);
-      const pct = totalSupply ? parseFloat(((Number(h.amount) / totalSupply) * 100).toFixed(4)) : null;
+      const pct = totalSupply ? fix((Number(h.amount) / totalSupply) * 100, 4) : null;
 
       let pnl = null;
       try {
@@ -225,11 +234,11 @@ export async function getTokenHolders({ mint, limit = 20 }) {
 
   return {
     mint,
-    global_fees_sol: tokenInfo?.fees != null ? parseFloat(tokenInfo.fees.toFixed(2)) : null,
+    global_fees_sol: fix(tokenInfo?.fees, 2),
     total_fetched: holders.length,
     showing: mapped.length,
-    top_10_real_holders_pct: top10Pct.toFixed(2),
-    bundlers_pct_in_top_100: totalBundlersPct.toFixed(4),
+    top_10_real_holders_pct: fixStr(top10Pct, 2),
+    bundlers_pct_in_top_100: fixStr(totalBundlersPct, 4),
     bundlers,
     smart_wallets_holding: smartWalletsHolding,
     holders: mapped,

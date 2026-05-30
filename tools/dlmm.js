@@ -151,14 +151,49 @@ async function sendManagedTransaction(tx, signers, label) {
   const feePayer = signers?.[0]?.publicKey;
   await applyPriorityFee(tx, feePayer, label);
   let lastError = null;
+  let lastSig = null; // signature of the most recent submit attempt, if obtainable
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       if (attempt > 0) {
+        // Before resubmitting on a prior expiry error, check whether the previous
+        // submission actually landed. Resubmitting a non-idempotent tx that already
+        // confirmed would double-execute it (e.g. double remove/claim).
+        if (lastSig) {
+          try {
+            const { value } = await getConnection().getSignatureStatuses([lastSig]);
+            const status = value?.[0];
+            if (status && !status.err &&
+                (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized")) {
+              log("tx_retry", `${label}: prior tx ${lastSig} already landed (${status.confirmationStatus}); not resubmitting`);
+              return lastSig;
+            }
+          } catch (statusErr) {
+            // If we can't read the status, fall through to resubmit (prior behavior).
+            log("tx_retry", `${label}: could not verify prior tx status (${statusErr?.message || statusErr}); resubmitting`);
+          }
+        } else {
+          // sendAndConfirmTransaction did not surface a signature on throw, so we
+          // cannot confirm whether the prior tx landed. Add a short delay before
+          // resubmit to reduce (not eliminate) the double-submit window.
+          // LIMITATION: a silently-landed prior tx could still be resubmitted here.
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+
         const { blockhash } = await getConnection().getLatestBlockhash("confirmed");
         tx.recentBlockhash = blockhash;
         tx.feePayer ??= feePayer;
+        lastSig = null;
       }
+
+      // Capture the signature for this attempt so a later expiry retry can check
+      // whether it landed before resubmitting. signTransaction is idempotent and
+      // does not broadcast; it just lets us derive the signature up-front.
+      try {
+        tx.partialSign?.(...signers);
+        const sig = tx.signature ? bs58.encode(tx.signature) : null;
+        if (sig) lastSig = sig;
+      } catch { /* best-effort sig capture; not fatal */ }
 
       return await sendAndConfirmTransaction(getConnection(), tx, signers, {
         skipPreflight: true,
@@ -169,6 +204,10 @@ async function sendManagedTransaction(tx, signers, label) {
     } catch (error) {
       lastError = error;
       const message = error?.message || String(error);
+      // Some errors carry the signature of the submitted tx; capture it if present.
+      if (!lastSig && typeof error?.signature === "string") lastSig = error.signature;
+      const sigMatch = !lastSig && /signature\s+([1-9A-HJ-NP-Za-km-z]{32,})/i.exec(message);
+      if (sigMatch) lastSig = sigMatch[1];
       const retryableExpiry =
         /block height exceeded/i.test(message) ||
         /blockhash not found/i.test(message) ||
@@ -1373,13 +1412,23 @@ export async function getWalletPositions({ wallet_address }) {
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
 
+      const lower = p?.lowerBinId ?? null;
+      const upper = p?.upperBinId ?? null;
+      const active = p?.poolActiveBinId ?? null;
+      // Prefer an authoritative active-bin-vs-bounds check when all three are
+      // available; fall back to the API's isOutOfRange flag only when bounds are
+      // missing (and to null when there is no position data at all).
+      const inRange = (active != null && lower != null && upper != null)
+        ? (active >= lower && active <= upper)
+        : (p ? !p.isOutOfRange : null);
+
       return {
         position:           r.position,
         pool:               r.pool,
-        lower_bin:          p?.lowerBinId      ?? null,
-        upper_bin:          p?.upperBinId      ?? null,
-        active_bin:         p?.poolActiveBinId ?? null,
-        in_range:           p ? !p.isOutOfRange : null,
+        lower_bin:          lower,
+        upper_bin:          upper,
+        active_bin:         active,
+        in_range:           inRange,
         unclaimed_fees_usd: Math.round((p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0) * 100) / 100,
         total_value_usd:    Math.round((p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0) * 100) / 100,
         pnl_usd:            Math.round((p?.pnlUsd ?? 0) * 100) / 100,
@@ -1586,15 +1635,80 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         || removeErr.message?.includes("Cannot read properties of undefined");
       if (!isBinIdErr) throw removeErr;
 
-      log("close", `Position appears empty (zombie) — falling back to closePositionIfEmpty`);
+      // The SDK error text alone is not proof the position is empty. Before
+      // force-closing, re-fetch the position and confirm it actually holds zero
+      // liquidity / fees / rewards. Only then is closePositionIfEmpty safe — closing
+      // a still-funded account would strand or burn the funds. Best-effort: if the
+      // verification itself cannot run, fall back to the prior (error-text) behavior.
+      let verifiedEmpty = null; // null => could not verify
+      let freshPositionData = positionData;
+      try {
+        try { await pool.refetchStates(); } catch { /* best-effort */ }
+        freshPositionData = await pool.getPosition(positionPubKey);
+        const pd = freshPositionData?.positionData || {};
+        const binData = pd.positionBinData || [];
+        const num = (v) => { const n = Number(v ?? 0); return Number.isFinite(n) ? n : 0; };
+        const totalX = num(pd.totalXAmount);
+        const totalY = num(pd.totalYAmount);
+        const feeX = num(pd.feeX);
+        const feeY = num(pd.feeY);
+        const rwd1 = num(pd.rewardOne);
+        const rwd2 = num(pd.rewardTwo);
+        const binLiquidity = binData.some(
+          (b) => num(b.positionXAmount) > 0 || num(b.positionYAmount) > 0,
+        );
+        verifiedEmpty =
+          totalX === 0 && totalY === 0 &&
+          feeX === 0 && feeY === 0 &&
+          rwd1 === 0 && rwd2 === 0 &&
+          !binLiquidity;
+      } catch (verifyErr) {
+        verifiedEmpty = null; // verification unavailable — keep prior behavior
+        log("close_warn", `Zombie-empty verification could not run: ${verifyErr.message}`);
+      }
+
+      if (verifiedEmpty === false) {
+        // Position still holds liquidity/fees — do NOT force-close. Surface the
+        // original error so the caller retries the real remove rather than burning
+        // the account.
+        log("close_warn", `closePositionIfEmpty skipped: position still has liquidity/fees — surfacing original error`);
+        throw removeErr;
+      }
+
+      if (verifiedEmpty === null) {
+        log("close", `Position appears empty (zombie, unverified) — falling back to closePositionIfEmpty`);
+      } else {
+        log("close", `Position verified empty (zombie) — closing via closePositionIfEmpty`);
+      }
       const closeTx = await pool.closePositionIfEmpty({
         owner: wallet.publicKey,
-        position: positionData,
+        position: freshPositionData,
       });
       const txHash = await sendManagedTransaction(closeTx, [wallet], "close zombie position");
       txHashes.push(txHash);
     }
-    log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
+    log("close", `Close txs sent: ${txHashes.join(", ")}`);
+
+    // ─── Verify the position account is actually gone on-chain ───
+    // The remove/close txs returning success only proves they confirmed, not that
+    // the position account was actually closed (a partial remove, a not-yet-empty
+    // account, or an unconfirmed close can all leave the account alive). Refetch
+    // pool state and read the account directly before recording a clean win.
+    try { await pool.refetchStates(); } catch { /* best-effort */ }
+    const info = await getConnection().getAccountInfo(positionPubKey);
+    const actuallyClosed = info === null;
+    if (!actuallyClosed) {
+      log("close_warn", `Close txs confirmed but position account ${position_address} still exists — not recording as closed`);
+      return {
+        success: false,
+        status: "close_unconfirmed",
+        position: position_address,
+        pool: poolAddress,
+        txs: txHashes,
+        error: "Close txs sent but position account still exists — verify/retry",
+      };
+    }
+    log("close", `SUCCESS (account closed) txs: ${txHashes.join(", ")}`);
 
     // Record performance for learning
     const tracked = getTrackedPosition(position_address);

@@ -344,9 +344,11 @@ export async function fetchDynamicFee(poolAddress) {
 }
 
 function round(n) {
-  return n != null ? Math.round(n) : null;
+  const num = Number(n);
+  return Number.isFinite(num) ? Math.round(num) : null;
 }
 
 function fix(n, decimals) {
-  return n != null ? Number(n.toFixed(decimals)) : null;
+  const num = Number(n);
+  return Number.isFinite(num) ? Number(num.toFixed(decimals)) : null;
 }

@@ -296,7 +296,9 @@ BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, 
 ${_sectionOverrides.manager_logic || _defaultManagerLogic()}
 
 IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
-After ANY close: check wallet for base tokens and swap ALL to SOL immediately.
+${config.usdc.enabled
+  ? `After ANY close: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
+  : `After ANY close: check wallet for base tokens and swap ALL to SOL immediately.`}
 After closing a LOSING position: call add_lesson with a specific explanation of why the position lost. Include what signal you missed and what to do differently. Generic stats-only lessons are not useful.
 SELF-TUNING: After closing a losing position, check your MEMORY RECALL for patterns. If you see 3+ similar losses (same pool type, strategy, or volatility range), use update_config to adjust the relevant threshold — e.g., tighten maxVolatility, raise minOrganic, adjust stopLossPct. Only change thresholds you have evidence for.
 `;
@@ -310,7 +312,9 @@ INTENT DETECTION — before acting, determine whether the user is:
   (b) ASKING A QUESTION or exploring an idea (e.g. "can I make wider positions?", "what happens if I change bins?")
 
 If (a): Execute immediately and autonomously — do NOT ask for confirmation. The user's instruction IS the confirmation.
-  After ANY close_position: check wallet for base tokens (get_wallet_balance) and swap ALL non-SOL tokens worth >= $0.10 to SOL immediately. This is MANDATORY — do not skip the swap step.
+${config.usdc.enabled
+  ? `  After ANY close_position: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
+  : `  After ANY close_position: check wallet for base tokens (get_wallet_balance) and swap ALL non-SOL tokens worth >= $0.10 to SOL immediately. This is MANDATORY — do not skip the swap step.`}
 If (b): Answer the question with useful context. Do NOT take any on-chain actions (deploy, close, swap, claim). Only use read-only tools (get_my_positions, get_pool_detail, etc.) to inform your answer.
 If UNCLEAR: Ask the user to clarify — e.g. "Would you like me to do this now, or are you just exploring the idea?" Do NOT default to taking action when intent is ambiguous.
 

@@ -20,7 +20,12 @@ function load() {
 }
 
 function save(data) {
-  fs.writeFileSync(POOL_MEMORY_FILE, JSON.stringify(data, null, 2));
+  // Atomic write: serialize to a temp file then rename over the real file.
+  // rename is atomic on the same filesystem, so concurrent snapshot/note/deploy
+  // saves can never observe a partial/corrupt JSON file.
+  const tmp = `${POOL_MEMORY_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, POOL_MEMORY_FILE);
 }
 
 // ─── Write ─────────────────────────────────────────────────────

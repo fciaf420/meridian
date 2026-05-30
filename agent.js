@@ -619,7 +619,7 @@ export async function lightChat(goal, sessionHistory = [], model = null) {
       return { content, userMessage: goal };
     } catch (error) {
       const status = error.status || error.statusCode;
-      const retryable = PROVIDER === "codex" || RETRYABLE.has(status);
+      const retryable = PROVIDER === "codex" || PROVIDER === "claude" || RETRYABLE.has(status);
       if (fallbackModel && tryModel !== fallbackModel && retryable) {
         log("agent", `Light chat primary failed (${status || error.message}), trying fallback ${fallbackModel}`);
         continue;
