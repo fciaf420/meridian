@@ -340,6 +340,7 @@ export async function deployPosition({
     const gmgn = await fetchGmgnPriceInfo(resolvedMint);
     const tokenVolume24h = gmgn?.volume_24h ?? 0;
     const tokenMcap = gmgn?.market_cap ?? 0;
+    const tokenAgeHours = gmgn?.token_age_hours ?? null;
     const indicators = gmgn?.candles || null;
     const supertrendOk = !!indicators?.evil_panda_entry_ok;
 
@@ -349,6 +350,15 @@ export async function deployPosition({
     }
     if (tokenMcap < (ep.minMcap ?? 200_000)) {
       failures.push(`token mcap $${Math.round(tokenMcap)} < $${ep.minMcap ?? 200_000}`);
+    }
+    // Token-age window (config.screening.minTokenAgeHours / maxTokenAgeHours; null = no bound)
+    const minAge = config.screening.minTokenAgeHours;
+    const maxAge = config.screening.maxTokenAgeHours;
+    if (minAge != null && tokenAgeHours != null && tokenAgeHours < minAge) {
+      failures.push(`token age ${tokenAgeHours}h < ${minAge}h min`);
+    }
+    if (maxAge != null && tokenAgeHours != null && tokenAgeHours > maxAge) {
+      failures.push(`token age ${tokenAgeHours}h > ${maxAge}h max`);
     }
     if (!supertrendOk) {
       failures.push(`5m Supertrend not green/above price (direction=${indicators?.supertrend_direction ?? "unknown"})`);

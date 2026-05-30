@@ -46,6 +46,8 @@ export const config = {
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     athTopThresholdPct: u.athTopThresholdPct ?? 90,
+    minTokenAgeHours:  u.minTokenAgeHours  ?? null, // null = no minimum (token age from GMGN creation_timestamp)
+    maxTokenAgeHours:  u.maxTokenAgeHours  ?? null, // null = no maximum
   },
 
   // ─── Position Management ────────────────
@@ -323,6 +325,8 @@ export function reloadScreeningThresholds() {
     if (fresh.timeframe      != null) s.timeframe      = fresh.timeframe;
     if (fresh.category       != null) s.category       = fresh.category;
     if (fresh.athTopThresholdPct != null) s.athTopThresholdPct = fresh.athTopThresholdPct;
+    if (fresh.minTokenAgeHours !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
+    if (fresh.maxTokenAgeHours !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     // Also reload management thresholds that evolution may have changed
     const m = config.management;
     if (fresh.stopLossPct           != null) m.stopLossPct           = fresh.stopLossPct;

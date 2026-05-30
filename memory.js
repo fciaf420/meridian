@@ -24,11 +24,18 @@ export function initMemory() {
   shelf = new NuggetShelf({ saveDir: SAVE_DIR, autoSave: true });
   shelf.loadAll();
 
-  // Ensure core nuggets exist
-  shelf.getOrCreate("pools", { maxFacts: 150 });       // pool outcomes and patterns
-  shelf.getOrCreate("strategies", { maxFacts: 80 });    // strategy effectiveness
-  shelf.getOrCreate("lessons", { maxFacts: 100 });      // general learned lessons
-  shelf.getOrCreate("patterns", { maxFacts: 80 });      // market patterns
+  // Ensure core nuggets exist. Defensively set maxFacts directly on each
+  // nugget instance too, so the cap applies even if the shelf drops the option.
+  const pools = shelf.getOrCreate("pools", { maxFacts: 150 });       // pool outcomes (durable)
+  pools.maxFacts = 150;
+  const strategies = shelf.getOrCreate("strategies", { maxFacts: 80 });    // strategy effectiveness
+  strategies.maxFacts = 80;
+  const lessons = shelf.getOrCreate("lessons", { maxFacts: 100 });      // general learned lessons
+  lessons.maxFacts = 100;
+  const patterns = shelf.getOrCreate("patterns", { maxFacts: 80 });      // market patterns
+  patterns.maxFacts = 80;
+  const snapshots = shelf.getOrCreate("snapshots", { maxFacts: 100 });   // transient mid-position snapshots
+  snapshots.maxFacts = 100;
 
   log("memory", `Nuggets memory initialized (${shelf.size} nuggets loaded from ${SAVE_DIR})`);
   return shelf;
@@ -291,7 +298,10 @@ export function rememberPositionSnapshot(position) {
   const age = position.age_minutes != null ? `${position.age_minutes}m` : "?";
 
   const snapshot = `${inRange}, PnL ${pnl}, fees ${fees}, age ${age}`;
-  s.remember("pools", key, snapshot);
+  // Write transient snapshots to a dedicated namespace so they never collide
+  // with durable pool outcomes written by rememberPoolOutcome under the same key.
+  s.getOrCreate("snapshots", { maxFacts: 100 });
+  s.remember("snapshots", key, snapshot);
 
   // Track pool patterns (volume/fee trends)
   if (position.fee_tvl_ratio != null) {
@@ -327,8 +337,10 @@ export function forgetPositionSnapshot(position) {
   if (!pair) return;
   const key = pair.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
 
-  // Remove transient snapshot (the "in-range, PnL X%" entry)
-  // Pool outcomes stored by rememberPoolOutcome are different keys and kept
+  // Remove the transient snapshot (the "in-range, PnL X%" entry) from its own
+  // namespace. Durable pool outcomes live in the "pools" nugget and are kept.
+  try { s.forget("snapshots", key); } catch { /* ignore */ }
+  // Remove the transient fee/TVL pattern entry too.
   try { s.forget("patterns", `${key}_feeTvl`); } catch { /* ignore */ }
 
   log("memory", `Cleaned up transient snapshot for ${key}`);

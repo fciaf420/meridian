@@ -326,10 +326,12 @@ export async function executeTool(name, args) {
     args.amount_y = entry.amount_y;
     args.amount_sol = entry.amount_y;
     args.amount_x = 0;
-    args.strategy = "bid_ask";
+    // Respect the active strategy: Evil Panda is ALWAYS single-sided SOL SPOT,
+    // never bid_ask — even in USDC mode. Other strategies stay bid_ask single-sided.
+    args.strategy = config.strategy.activeStrategy === "evil_panda" ? "spot" : "bid_ask";
     args.bins_above = 0;
     if (args.initial_value_usd == null) args.initial_value_usd = entry.usd_spent;
-    log("usdc", `Entry funded: deploying ${entry.amount_y} SOL (~$${entry.usd_spent})${entry.dry_run ? " [DRY RUN]" : ""}`);
+    log("usdc", `Entry funded: deploying ${entry.amount_y} SOL (~$${entry.usd_spent}) as ${args.strategy}${entry.dry_run ? " [DRY RUN]" : ""}`);
   }
 
   // ─── Pre-execution safety checks ──────────

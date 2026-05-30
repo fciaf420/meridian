@@ -46,6 +46,13 @@
   "category": "trending",
   "minTokenFeesSol": 30,
   "maxVolatility": 3.6,
+  "minTokenAgeHours": null,
+  "maxTokenAgeHours": null,
+
+  "usdcMode": false,
+  "deployAmountUsd": 50,
+  "maxDeployUsd": 500,
+  "minUsdcToOpen": 50,
 
   "takeProfitFeePct": 7,
   "priorityFeeLevel": "Medium",

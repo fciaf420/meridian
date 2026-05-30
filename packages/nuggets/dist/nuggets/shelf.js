@@ -25,6 +25,7 @@ export class NuggetShelf {
             D: opts?.D ?? 16384,
             banks: opts?.banks ?? 4,
             ensembles: opts?.ensembles ?? 1,
+            maxFacts: opts?.maxFacts ?? 0,
             autoSave: this.autoSave,
             saveDir: this.saveDir,
         });
@@ -37,10 +38,10 @@ export class NuggetShelf {
             throw new Error(`Nugget ${JSON.stringify(name)} not found`);
         return n;
     }
-    getOrCreate(name) {
+    getOrCreate(name, opts) {
         if (this._nuggets.has(name))
             return this._nuggets.get(name);
-        return this.create(name);
+        return this.create(name, opts);
     }
     remove(name) {
         if (!this._nuggets.has(name)) {

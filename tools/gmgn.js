@@ -490,7 +490,15 @@ export async function fetchGmgnPriceInfo(mint) {
     const marketCap =
       mcapPrice > 0 && mcapSupply > 0 ? Math.round(mcapPrice * mcapSupply * 100) / 100 : null;
 
+    // Token age in hours from the on-chain creation time (GMGN gives epoch seconds).
+    // Fall back to open_timestamp if creation_timestamp is absent.
+    const createdSec = toNum(info?.creation_timestamp) || toNum(info?.open_timestamp);
+    const tokenAgeHours = createdSec > 0
+      ? Math.round(((Date.now() / 1000 - createdSec) / 3600) * 100) / 100
+      : null;
+
     const data = {
+      token_age_hours: tokenAgeHours,
       ath_proximity_pct:
         maxPrice > 0 && price > 0 ? Math.round((price / maxPrice) * 1000) / 10 : null,
       price,
