@@ -65,6 +65,26 @@ function getWallet() {
   return _wallet;
 }
 
+// ─── Decimal-safe amount helpers (module scope; shared by deploy + MM) ──
+// Decimal-safe UI -> raw integer BN (string-based; avoids JS float precision
+// loss that Math.floor(amount * 10**decimals) suffers for some token amounts).
+function uiToRawBN(amount, decimals) {
+  if (amount == null || !Number.isFinite(Number(amount))) return new BN(0);
+  let s = typeof amount === "string" ? amount.trim() : Number(amount).toFixed(decimals);
+  if (/[eE]/.test(s)) s = Number(s).toFixed(decimals); // expand scientific notation
+  if (s.startsWith("-")) return new BN(0);
+  const [whole = "0", frac = ""] = s.split(".");
+  const fracPadded = (frac + "0".repeat(decimals)).slice(0, decimals);
+  const raw = ((whole || "0") + fracPadded).replace(/^0+(?=\d)/, "");
+  return new BN(raw === "" ? "0" : raw);
+}
+
+// Resolve on-chain mint decimals (returns null if unreadable so callers can refuse to size).
+async function getMintDecimals(mint) {
+  const info = await getConnection().getParsedAccountInfo(new PublicKey(mint));
+  return info.value?.data?.parsed?.info?.decimals ?? null;
+}
+
 function getHeliusPriorityFeeRpcUrl() {
   const heliusKey = process.env.HELIUS_API_KEY;
   if (!heliusKey) return null;
@@ -238,7 +258,9 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+// .unref() so this housekeeping timer never keeps the process (or a test run)
+// alive on its own — it only fires while other work holds the event loop open.
+setInterval(() => poolCache.clear(), 5 * 60 * 1000).unref();
 
 // ─── Get Active Bin ────────────────────────────────────────────
 export async function getActiveBin({ pool_address }) {
@@ -686,28 +708,11 @@ export async function deployPosition({
   const finalAmountY = amount_y ?? amount_sol ?? 0;
   const finalAmountX = amount_x ?? 0;
 
-  // Decimal-safe UI -> raw integer BN (string-based; avoids JS float precision
-  // loss that Math.floor(amount * 10**decimals) suffers for some token amounts).
-  const uiToRawBN = (amount, decimals) => {
-    if (amount == null || !Number.isFinite(Number(amount))) return new BN(0);
-    let s = typeof amount === "string" ? amount.trim() : Number(amount).toFixed(decimals);
-    if (/[eE]/.test(s)) s = Number(s).toFixed(decimals); // expand scientific notation
-    if (s.startsWith("-")) return new BN(0);
-    const [whole = "0", frac = ""] = s.split(".");
-    const fracPadded = (frac + "0".repeat(decimals)).slice(0, decimals);
-    const raw = ((whole || "0") + fracPadded).replace(/^0+(?=\d)/, "");
-    return new BN(raw === "" ? "0" : raw);
-  };
-
   // Resolve decimals from the mints — do NOT assume token Y is 9-decimal SOL.
   // Correct for BOTH SOL mode and USDC mode: the agent deploys into SOL-quoted
   // pools in both, but we read the actual mint decimals so sizing is right for
-  // any quote/base token (SOL=9, USDC=6, etc.).
-  const getMintDecimals = async (mint) => {
-    const info = await getConnection().getParsedAccountInfo(new PublicKey(mint));
-    return info.value?.data?.parsed?.info?.decimals ?? null;
-  };
-
+  // any quote/base token (SOL=9, USDC=6, etc.). uiToRawBN/getMintDecimals are
+  // module-scope helpers (shared with the market-maker primitives below).
   let totalYLamports = new BN(0);
   if (finalAmountY > 0) {
     const yDecimals = await getMintDecimals(pool.lbPair.tokenYMint);
@@ -1901,6 +1906,275 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
 
   closeInflight.set(position_address, closePromise);
   return closePromise;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Market Maker primitives — Meteora DLMM Limit Orders
+//
+// A DLMM limit order places token liquidity at chosen bins so it behaves
+// like an on-chain buy (bid, token Y at/below active bin) or sell (ask,
+// token X at/above active bin) order, filled when swap flow crosses the bin.
+// These wrap the SDK's native placeLimitOrder/cancelLimitOrder/getLimitOrder
+// and reuse the same connection/wallet/priority-fee/retry plumbing as the LP
+// tools above. They are intentionally self-contained: they do NOT call
+// trackPosition, so the autonomous LP agent never manages MM orders.
+// ═══════════════════════════════════════════════════════════════
+
+let _LimitOrderHelpers = null;
+async function getLimitOrderHelpers() {
+  if (!_LimitOrderHelpers) {
+    const mod = await import("@meteora-ag/dlmm");
+    _LimitOrderHelpers = {
+      isSupportLimitOrder: mod.isSupportLimitOrder,
+      MAX_BIN_PER_LIMIT_ORDER: mod.MAX_BIN_PER_LIMIT_ORDER,
+      LIMIT_ORDER_FEE_SHARE: mod.LIMIT_ORDER_FEE_SHARE,
+      MAX_ACTIVE_BIN_SLIPPAGE: mod.MAX_ACTIVE_BIN_SLIPPAGE,
+      LimitOrderStatus: mod.LimitOrderStatus,
+    };
+  }
+  return _LimitOrderHelpers;
+}
+
+/** The on-chain cap on bins per limit-order account (50). */
+export async function maxBinsPerLimitOrder() {
+  const { MAX_BIN_PER_LIMIT_ORDER } = await getLimitOrderHelpers();
+  return MAX_BIN_PER_LIMIT_ORDER ? Number(MAX_BIN_PER_LIMIT_ORDER.toString()) : 50;
+}
+
+// ─── Does this pool support limit orders? ──────────────────────
+// Limit orders only work on DLMM pools whose function mode is LimitOrder
+// (a pool is either liquidity-mining OR limit-order, never both).
+export async function poolSupportsLimitOrder({ pool_address }) {
+  pool_address = normalizeMint(pool_address);
+  try {
+    const { isSupportLimitOrder } = await getLimitOrderHelpers();
+    const pool = await getPool(pool_address);
+    const supported = !!isSupportLimitOrder(pool.lbPair);
+    return {
+      supported,
+      pool: pool_address,
+      bin_step: pool.lbPair?.binStep ?? null,
+      token_x: pool.lbPair?.tokenXMint?.toBase58?.() ?? null,
+      token_y: pool.lbPair?.tokenYMint?.toBase58?.() ?? null,
+    };
+  } catch (error) {
+    return { supported: false, pool: pool_address, error: error.message };
+  }
+}
+
+// ─── Place a limit order ───────────────────────────────────────
+// bins: [{ id: <absolute binId>, amount: <UI amount> }]
+//   - is_ask_side=true  → deposit token X (base), sell X for Y at bins >= active
+//   - is_ask_side=false → deposit token Y (quote), buy X with Y at bins <= active
+// relativeBin carries the observed active bin + max slippage so the order is
+// rejected on-chain if price has already jumped past max_active_bin_slippage.
+export async function placeMmLimitOrder({
+  pool_address,
+  is_ask_side,
+  bins,
+  max_active_bin_slippage = 3,
+  label = "mm place limit order",
+}) {
+  pool_address = normalizeMint(pool_address);
+  if (!Array.isArray(bins) || bins.length === 0) {
+    return { success: false, error: "bins must be a non-empty array of { id, amount }" };
+  }
+  const maxBins = await maxBinsPerLimitOrder();
+  if (bins.length > maxBins) {
+    return { success: false, error: `Too many bins (${bins.length}); max ${maxBins} per limit order.` };
+  }
+
+  const pool = await getPool(pool_address);
+  const activeBin = await pool.getActiveBin();
+
+  // ask deposits base (X); bid deposits quote (Y)
+  const depositMint = is_ask_side ? pool.lbPair.tokenXMint : pool.lbPair.tokenYMint;
+  const decimals = await getMintDecimals(depositMint);
+  if (decimals == null) {
+    return { success: false, error: `Could not resolve decimals for ${depositMint.toBase58?.() ?? depositMint}` };
+  }
+
+  const binAmounts = bins.map((b) => ({ id: b.id, amount: uiToRawBN(b.amount, decimals) }));
+
+  if (process.env.DRY_RUN === "true") {
+    return {
+      dry_run: true,
+      would_place: {
+        pool: pool_address,
+        is_ask_side: !!is_ask_side,
+        active_bin: activeBin.binId,
+        deposit_mint: depositMint.toBase58?.() ?? String(depositMint),
+        bins: bins.map((b) => ({ id: b.id, amount: b.amount })),
+      },
+      message: "DRY RUN — no transaction sent",
+    };
+  }
+
+  const wallet = getWallet();
+  const limitOrder = Keypair.generate();
+  try {
+    const tx = await pool.placeLimitOrder({
+      owner: wallet.publicKey,
+      payer: wallet.publicKey,
+      sender: wallet.publicKey,
+      limitOrder: limitOrder.publicKey,
+      params: {
+        isAskSide: !!is_ask_side,
+        relativeBin: { activeId: activeBin.binId, maxActiveBinSlippage: max_active_bin_slippage },
+        bins: binAmounts,
+      },
+    });
+
+    const txArr = Array.isArray(tx) ? tx : [tx];
+    const txHashes = [];
+    for (let i = 0; i < txArr.length; i++) {
+      // limitOrder is a fresh signer account — sign it on the first tx only.
+      const signers = i === 0 ? [wallet, limitOrder] : [wallet];
+      txHashes.push(await sendManagedTransaction(txArr[i], signers, `${label} ${i + 1}/${txArr.length}`));
+    }
+
+    log("mm_place", `${is_ask_side ? "ASK" : "BID"} order ${limitOrder.publicKey.toString().slice(0, 8)} on ${pool_address.slice(0, 8)}: ${bins.length} bin(s) around active ${activeBin.binId}`);
+    return {
+      success: true,
+      limit_order: limitOrder.publicKey.toString(),
+      is_ask_side: !!is_ask_side,
+      active_bin: activeBin.binId,
+      bins,
+      txs: txHashes,
+    };
+  } catch (error) {
+    log("mm_place_error", error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+// ─── Read a limit order's fill status (flattened) ──────────────
+export async function getMmLimitOrder({ pool_address, limit_order }) {
+  pool_address = normalizeMint(pool_address);
+  limit_order = normalizeMint(limit_order);
+  try {
+    const pool = await getPool(pool_address);
+    const parsed = await pool.getLimitOrder(new PublicKey(limit_order));
+    const d = parsed?.limitOrderData || {};
+    const binData = (d.limitOrderBinData || []).map((b) => ({
+      bin_id: b.binId,
+      status: b.status,
+      is_ask_side: b.isAskSide,
+      empty: b.empty,
+      filled_x: b.filledAmountX,
+      filled_y: b.filledAmountY,
+      unfilled_x: b.unfilledAmountX,
+      unfilled_y: b.unfilledAmountY,
+      fee_x: b.feeAmountX,
+      fee_y: b.feeAmountY,
+    }));
+    return {
+      limit_order,
+      pool: pool_address,
+      total_deposit_x: d.totalDepositAmountX,
+      total_deposit_y: d.totalDepositAmountY,
+      total_filled_x: d.totalFilledAmountX,
+      total_filled_y: d.totalFilledAmountY,
+      total_unfilled_x: d.totalUnfilledAmountX,
+      total_unfilled_y: d.totalUnfilledAmountY,
+      total_fee_x: d.totalFeeAmountX,
+      total_fee_y: d.totalFeeAmountY,
+      withdrawable_x: d.transferFeeExcludedWithdrawableAmountX,
+      withdrawable_y: d.transferFeeExcludedWithdrawableAmountY,
+      bins: binData,
+    };
+  } catch (error) {
+    return { limit_order, pool: pool_address, error: error.message };
+  }
+}
+
+// ─── List all of the wallet's limit orders on a pool ───────────
+export async function listMmLimitOrders({ pool_address }) {
+  pool_address = normalizeMint(pool_address);
+  try {
+    const wallet = getWallet();
+    const pool = await getPool(pool_address);
+    const orders = await pool.getLimitOrderByUserAndLbPair(wallet.publicKey);
+    return {
+      pool: pool_address,
+      count: orders.length,
+      orders: orders.map((o) => ({
+        limit_order: o.publicKey.toString(),
+        total_unfilled_x: o.limitOrderData?.totalUnfilledAmountX,
+        total_unfilled_y: o.limitOrderData?.totalUnfilledAmountY,
+        total_filled_x: o.limitOrderData?.totalFilledAmountX,
+        total_filled_y: o.limitOrderData?.totalFilledAmountY,
+      })),
+    };
+  } catch (error) {
+    return { pool: pool_address, count: 0, orders: [], error: error.message };
+  }
+}
+
+// ─── Cancel a limit order (harvest filled + unfilled funds) ────
+// Cancels the given bins (defaults to ALL bins on the order), which withdraws
+// both filled proceeds and unfilled deposits to the wallet, then closes the
+// account to reclaim rent. Returns withdrawn amounts via balance deltas.
+export async function cancelMmLimitOrder({ pool_address, limit_order, bin_ids = null, label = "mm cancel limit order" }) {
+  pool_address = normalizeMint(pool_address);
+  limit_order = normalizeMint(limit_order);
+
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, would_cancel: { pool: pool_address, limit_order, bin_ids }, message: "DRY RUN — no transaction sent" };
+  }
+
+  try {
+    const wallet = getWallet();
+    const pool = await getPool(pool_address);
+
+    // Resolve bins to cancel if not provided.
+    let binIds = bin_ids;
+    if (!Array.isArray(binIds) || binIds.length === 0) {
+      const parsed = await pool.getLimitOrder(new PublicKey(limit_order));
+      binIds = (parsed?.limitOrderData?.limitOrderBinData || [])
+        .filter((b) => !b.empty)
+        .map((b) => b.binId);
+    }
+    if (!binIds || binIds.length === 0) {
+      // Nothing left to cancel — just try to close the empty account.
+      const closeTx = await pool.closeLimitOrderIfEmpty({
+        limitOrder: new PublicKey(limit_order),
+        owner: wallet.publicKey,
+        rentReceiver: wallet.publicKey,
+      });
+      const closeHash = await sendManagedTransaction(closeTx, [wallet], `${label} close-empty`);
+      return { success: true, limit_order, pool: pool_address, cancelled_bins: [], txs: [closeHash] };
+    }
+
+    const txHashes = [];
+    const cancelTx = await pool.cancelLimitOrder({
+      limitOrderPubkey: new PublicKey(limit_order),
+      owner: wallet.publicKey,
+      rentReceiver: wallet.publicKey,
+      binIds,
+    });
+    for (const tx of Array.isArray(cancelTx) ? cancelTx : [cancelTx]) {
+      txHashes.push(await sendManagedTransaction(tx, [wallet], `${label} cancel`));
+    }
+
+    // Best-effort: close the now-empty account to reclaim rent.
+    try {
+      const closeTx = await pool.closeLimitOrderIfEmpty({
+        limitOrder: new PublicKey(limit_order),
+        owner: wallet.publicKey,
+        rentReceiver: wallet.publicKey,
+      });
+      txHashes.push(await sendManagedTransaction(closeTx, [wallet], `${label} close`));
+    } catch (closeErr) {
+      log("mm_cancel_warn", `close-after-cancel skipped: ${closeErr.message}`);
+    }
+
+    log("mm_cancel", `Cancelled order ${limit_order.slice(0, 8)} (${binIds.length} bin(s)) on ${pool_address.slice(0, 8)}`);
+    return { success: true, limit_order, pool: pool_address, cancelled_bins: binIds, txs: txHashes };
+  } catch (error) {
+    log("mm_cancel_error", error.message);
+    return { success: false, limit_order, pool: pool_address, error: error.message };
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────

@@ -173,6 +173,29 @@ export const config = {
     },
   },
 
+  // ─── Market Maker (DLMM Limit Orders) ───
+  // Standalone two-sided market maker run via `npm run mm`. Quotes a ladder of
+  // DLMM limit orders around the active bin and requotes on fill/drift. All keys
+  // are overridable per-run via CLI flags (see scripts/market-maker.js).
+  marketMaker: {
+    enabled:               u.mmEnabled               ?? false,
+    mode:                  u.mmMode                  ?? "two_sided", // two_sided | bid_only | ask_only
+    levels:                u.mmLevels                ?? 3,    // orders (bins) per side
+    spreadBins:            u.mmSpreadBins            ?? 1,    // bins from active to nearest quote
+    stepBins:              u.mmStepBins              ?? 1,    // bins between successive levels
+    orderSizeQuote:        u.mmOrderSizeQuote        ?? null, // quote (Y) per bid; null = 25% of balance
+    orderSizeBase:         u.mmOrderSizeBase         ?? null, // base (X) per ask; null = 25% of balance
+    maxInventoryBase:      u.mmMaxInventoryBase      ?? null, // pause bids once base held >= this
+    maxInventoryQuote:     u.mmMaxInventoryQuote     ?? null, // pause asks once quote held >= this
+    driftBins:             u.mmDriftBins             ?? 2,    // requote when active drifts > this from center
+    requoteFillPct:        u.mmRequoteFillPct        ?? 50,   // requote a side once it's >= this % filled
+    volatilityPauseBins:   u.mmVolatilityPauseBins   ?? null, // pull quotes if active jumps > this in one tick
+    maxActiveBinSlippage:  u.mmMaxActiveBinSlippage  ?? 3,    // on-chain active-bin slippage guard
+    tickIntervalSec:       u.mmTickIntervalSec       ?? 15,
+    minRequoteIntervalSec: u.mmMinRequoteIntervalSec ?? 30,   // anti-thrash throttle per side
+    priorityFeeLevel:      u.mmPriorityFeeLevel      ?? "Medium",
+  },
+
   // ─── USDC Mode ──────────────────────────
   // When enabled, the agent holds capital in USDC. On entry it swaps the
   // configured USD amount into SOL and LPs single-sided (bid_ask); on exit
@@ -288,6 +311,7 @@ const SECTION_MAP = {
   risk: new Set(Object.keys(config.risk)),
   schedule: new Set(Object.keys(config.schedule)),
   strategy: new Set(Object.keys(config.strategy)),
+  marketMaker: new Set(Object.keys(config.marketMaker)),
   llm: new Set(Object.keys(config.llm)),
   memory: new Set(Object.keys(config.memory)),
   knowledgeBase: new Set(Object.keys(config.knowledgeBase)),

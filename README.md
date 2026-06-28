@@ -352,6 +352,67 @@ cd ..
 
 `npm run dev:web` is for frontend development only. It is not required for normal bot operation.
 
+## Market Maker (DLMM Limit Orders)
+
+A standalone, configurable market maker for a single Meteora DLMM pool, built on
+Meteora's **DLMM Limit Order** feature. It is independent of the autonomous LP
+agent above — run it on its own with `npm run mm`.
+
+### How it works
+
+A DLMM limit order places token liquidity at chosen bins so it behaves like an
+on-chain order: a **bid** (token Y placed at/below the active bin) buys the base
+token as price falls into it; an **ask** (token X placed at/above the active bin)
+sells the base token as price rises into it. The market maker keeps a two-sided
+ladder of these orders around the active bin and, as orders fill or price drifts
+past the ladder, cancels the stale side (harvesting filled proceeds + unfilled
+deposits) and re-quotes recentered on the new active bin.
+
+**Profit model:** `net P&L = bid/ask spread captured + limit-order fee share −
+adverse selection − gas`. Filled limit-order liquidity earns a 50% share of the
+limit-order portion of swap fees (`LIMIT_ORDER_FEE_SHARE`). The main risk is
+adverse selection — a trending market sweeps one side at progressively worse
+prices — which is bounded by the spread, inventory caps, and a volatility pause.
+
+> The target pool **must be limit-order-enabled** (`isSupportLimitOrder`). Most
+> standard liquidity-mining pools are not; the runner refuses to start otherwise.
+
+### Run it
+
+```bash
+# Dry run first — logs intended places/cancels, sends no transactions
+npm run mm:dry -- --pool <LIMIT_ORDER_POOL_ADDRESS>
+
+# Live
+npm run mm -- --pool <LIMIT_ORDER_POOL_ADDRESS> --mode two_sided --levels 3 --spread-bins 1
+```
+
+`RPC_URL` and `WALLET_PRIVATE_KEY` are read from `.env` (same as the agent).
+`Ctrl-C` cancels and closes all open orders before exiting, so funds are never
+left stranded in orders.
+
+### Config (`config.marketMaker`, all overridable via CLI flags)
+
+| Field (`user-config.json`) | CLI flag | Default | Purpose |
+| --- | --- | --- | --- |
+| `mmMode` | `--mode` | `two_sided` | `two_sided`, `bid_only`, or `ask_only` |
+| `mmLevels` | `--levels` | `3` | Orders (bins) per side |
+| `mmSpreadBins` | `--spread-bins` | `1` | Bins from active to the nearest quote (the spread) |
+| `mmStepBins` | `--step-bins` | `1` | Bins between successive levels |
+| `mmOrderSizeQuote` | `--order-size-quote` | `null` | Quote (Y) per bid order; `null` = 25% of balance |
+| `mmOrderSizeBase` | `--order-size-base` | `null` | Base (X) per ask order; `null` = 25% of balance |
+| `mmMaxInventoryBase` | `--max-inventory-base` | `null` | Pause bids once base held ≥ this |
+| `mmMaxInventoryQuote` | `--max-inventory-quote` | `null` | Pause asks once quote held ≥ this |
+| `mmDriftBins` | `--drift-bins` | `2` | Requote when active drifts > this from ladder center |
+| `mmRequoteFillPct` | `--requote-fill-pct` | `50` | Requote a side once it is ≥ this % filled |
+| `mmVolatilityPauseBins` | `--volatility-pause-bins` | `null` | Pull quotes if active jumps > this in one tick |
+| `mmMaxActiveBinSlippage` | `--max-active-bin-slippage` | `3` | On-chain active-bin slippage guard at placement |
+| `mmTickIntervalSec` | `--tick` | `15` | Loop interval |
+| `mmMinRequoteIntervalSec` | `--min-requote-sec` | `30` | Per-side anti-thrash throttle |
+
+A limit order spans at most 50 bins (`MAX_BIN_PER_LIMIT_ORDER`); the runner
+rejects a ladder whose `spreadBins + (levels-1)*stepBins + 1` exceeds that.
+
 ## Configuration Reference
 
 Everything in `user-config.json` is optional, but these are the main knobs.
