@@ -26,6 +26,7 @@ import {
   getActiveBin,
 } from "./dlmm.js";
 import { getWalletBalances } from "./wallet.js";
+import { getPoolConfig } from "../market-maker-config.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const ABSOLUTE_MAX_BINS = 50; // on-chain MAX_BIN_PER_LIMIT_ORDER
@@ -94,10 +95,40 @@ export function decideRequote({
   return { requoteBid: b.requote, requoteAsk: a.requote, reasons: { bid: b.reason, ask: a.reason } };
 }
 
-// ─── Resolve the runnable MM config (config.marketMaker + overrides) ──
-export function loadMarketMakerConfig(overrides = {}) {
+// ─── Pure: per-side skew from inventory imbalance ──────────────
+// imbalance = baseValue/(baseValue+quoteValue) − targetBaseRatio  (>0 = heavy base)
+// Heavy base → unwind base: asks closer + bigger, bids further + smaller. Mirror for quote.
+// Returns per-side { spreadDelta (bins, applied as spreadBins+delta), sizeMult }.
+export function computeSkew({ imbalance = 0, targetBaseRatio = 0.5, maxSkewBins = 2, maxSkewSizePct = 50 } = {}) {
+  const denom = Math.max(targetBaseRatio, 1 - targetBaseRatio, 1e-9);
+  const strength = Math.max(-1, Math.min(1, imbalance / denom)); // signed, clamped
+  const a = Math.abs(strength);
+  const binShift = Math.round(a * maxSkewBins);
+  const sizeFrac = a * (maxSkewSizePct / 100);
+  if (strength > 0) {
+    // heavy base → favor asks (sell base), starve bids
+    return {
+      ask: { spreadDelta: -binShift, sizeMult: 1 + sizeFrac },
+      bid: { spreadDelta: +binShift, sizeMult: Math.max(0, 1 - sizeFrac) },
+      strength,
+    };
+  }
+  if (strength < 0) {
+    // heavy quote → favor bids (buy base), starve asks
+    return {
+      bid: { spreadDelta: -binShift, sizeMult: 1 + sizeFrac },
+      ask: { spreadDelta: +binShift, sizeMult: Math.max(0, 1 - sizeFrac) },
+      strength,
+    };
+  }
+  return { ask: { spreadDelta: 0, sizeMult: 1 }, bid: { spreadDelta: 0, sizeMult: 1 }, strength: 0 };
+}
+
+// ─── Resolve the runnable MM config (defaults ← per-pool file ← overrides) ──
+export function loadMarketMakerConfig(overrides = {}, { poolAddress } = {}) {
   const base = config.marketMaker || {};
-  const mm = { ...base, ...clean(overrides) };
+  const perPool = poolAddress ? (getPoolConfig(poolAddress) || {}) : {};
+  const mm = { ...base, ...clean(perPool), ...clean(overrides) };
 
   const validModes = ["two_sided", "bid_only", "ask_only"];
   if (!validModes.includes(mm.mode)) {
@@ -111,6 +142,11 @@ export function loadMarketMakerConfig(overrides = {}) {
   mm.minRequoteIntervalSec = num(mm.minRequoteIntervalSec, 30);
   mm.requoteFillPct = num(mm.requoteFillPct, 50);
   mm.maxActiveBinSlippage = int(mm.maxActiveBinSlippage, 3);
+  mm.inventorySkew = mm.inventorySkew !== false; // default on
+  mm.targetBaseRatio = num(mm.targetBaseRatio, 0.5);
+  mm.maxSkewBins = int(mm.maxSkewBins, 2);
+  mm.maxSkewSizePct = num(mm.maxSkewSizePct, 50);
+  if (mm.targetBaseRatio <= 0 || mm.targetBaseRatio >= 1) throw new Error("targetBaseRatio must be between 0 and 1");
 
   if (mm.levels < 1) throw new Error("levels must be >= 1");
   if (mm.levels > 1 && mm.stepBins < 1) throw new Error("stepBins must be >= 1 when levels > 1");
@@ -157,11 +193,26 @@ function filledPctOf(order, isAsk) {
 // ─── The control loop ──────────────────────────────────────────
 // Runs until `signal` aborts (CLI wires SIGINT → abort). On stop, cancels and
 // closes all live orders so funds are never stranded.
-export async function runMarketMaker({ poolAddress, config: mmIn, signal } = {}) {
-  const mm = mmIn && mmIn.__resolved ? mmIn : loadMarketMakerConfig(mmIn || {});
+export async function runMarketMaker({ poolAddress, config: mmIn, signal, onStatus } = {}) {
   poolAddress = (poolAddress || "").trim();
   if (!poolAddress) throw new Error("poolAddress is required");
+  const mm = mmIn && mmIn.__resolved ? mmIn : loadMarketMakerConfig(mmIn || {}, { poolAddress });
   const dry = process.env.DRY_RUN === "true";
+  const emitStatus = (extra = {}) => {
+    if (typeof onStatus !== "function") return;
+    try {
+      onStatus({
+        pool: poolAddress, dry,
+        activeBin: state.lastActive,
+        bid: state.bid ? { limit_order: state.bid.limit_order, center: state.bid.center, sizeUi: state.bid.sizeUi } : null,
+        ask: state.ask ? { limit_order: state.ask.limit_order, center: state.ask.center, sizeUi: state.ask.sizeUi } : null,
+        requotes: state.requotes,
+        skewStrength: state.skewStrength ?? 0,
+        ranForMs: Date.now() - state.startedAt,
+        ...extra,
+      });
+    } catch { /* status sink must never break the loop */ }
+  };
 
   const support = await poolSupportsLimitOrder({ pool_address: poolAddress });
   if (!support.supported) {
@@ -179,6 +230,7 @@ export async function runMarketMaker({ poolAddress, config: mmIn, signal } = {})
     requotes: 0,
     startedAt: Date.now(),
     lastActive: null,
+    skewStrength: 0,
   };
   let stopped = false;
   const stop = () => { stopped = true; };
@@ -203,16 +255,33 @@ export async function runMarketMaker({ poolAddress, config: mmIn, signal } = {})
     return { quoteSize, baseSize };
   }
 
-  async function quoteSide(side, activeBin, inv) {
+  // Per-tick inventory skew (software stand-in for a perp hedge). Returns the
+  // per-side { spreadDelta, sizeMult } biasing the ladder toward neutral inventory.
+  function skewFor(inv, price) {
+    if (!mm.inventorySkew || !(price > 0) || inv.base == null || inv.quote == null) {
+      state.skewStrength = 0;
+      return { bid: { spreadDelta: 0, sizeMult: 1 }, ask: { spreadDelta: 0, sizeMult: 1 } };
+    }
+    const baseValue = inv.base * price;
+    const total = baseValue + inv.quote;
+    const imbalance = total > 0 ? baseValue / total - mm.targetBaseRatio : 0;
+    const s = computeSkew({ imbalance, targetBaseRatio: mm.targetBaseRatio, maxSkewBins: mm.maxSkewBins, maxSkewSizePct: mm.maxSkewSizePct });
+    state.skewStrength = s.strength;
+    return s;
+  }
+
+  async function quoteSide(side, activeBin, inv, skew) {
     const isAsk = side === "ask";
     const { quoteSize, baseSize } = await resolveSizes(inv);
-    const orderSizeUi = isAsk ? baseSize : quoteSize;
+    const sideSkew = (skew && skew[side]) || { spreadDelta: 0, sizeMult: 1 };
+    const orderSizeUi = (isAsk ? baseSize : quoteSize) * sideSkew.sizeMult;
     if (!(orderSizeUi > 0)) {
-      log("mm", `Skip ${side}: resolved order size is 0 (need ${isAsk ? "base (X)" : "quote (Y)"} inventory).`);
+      log("mm", `Skip ${side}: order size 0 (need ${isAsk ? "base (X)" : "quote (Y)"} inventory${sideSkew.sizeMult === 0 ? " / skewed off" : ""}).`);
       return null;
     }
+    const effSpread = Math.max(0, mm.spreadBins + sideSkew.spreadDelta);
     const ladder = computeLadder({
-      activeBin, levels: mm.levels, spreadBins: mm.spreadBins, stepBins: mm.stepBins,
+      activeBin, levels: mm.levels, spreadBins: effSpread, stepBins: mm.stepBins,
       orderSizeUi, side,
     });
     const res = await placeMmLimitOrder({
@@ -246,15 +315,15 @@ export async function runMarketMaker({ poolAddress, config: mmIn, signal } = {})
     state[side] = null;
   }
 
-  async function requoteSide(side, activeBin, inv) {
+  async function requoteSide(side, activeBin, inv, skew) {
     await cancelSide(side);
-    const placed = await quoteSide(side, activeBin, inv);
+    const placed = await quoteSide(side, activeBin, inv, skew);
     if (placed) { state[side] = placed; state.requotes++; }
   }
 
-  async function readActiveBin() {
+  async function readActive() {
     const ab = await getActiveBin({ pool_address: poolAddress });
-    return ab.binId;
+    return { binId: ab.binId, price: Number(ab.price) || 0 };
   }
 
   async function sideStatus(side) {
@@ -267,17 +336,21 @@ export async function runMarketMaker({ poolAddress, config: mmIn, signal } = {})
 
   // ── Initial quote ──
   let inv = await readInventory(support);
-  const startBin = await readActiveBin();
-  state.lastActive = startBin;
-  if (mm.mode !== "ask_only") await requoteSide("bid", startBin, inv);
-  if (mm.mode !== "bid_only") await requoteSide("ask", startBin, inv);
+  const start = await readActive();
+  state.lastActive = start.binId;
+  {
+    const skew = skewFor(inv, start.price);
+    if (mm.mode !== "ask_only") await requoteSide("bid", start.binId, inv, skew);
+    if (mm.mode !== "bid_only") await requoteSide("ask", start.binId, inv, skew);
+  }
+  emitStatus();
 
   // ── Tick loop ──
   await new Promise((resolve) => {
     const tick = async () => {
       if (stopped) return resolve();
       try {
-        const activeBin = await readActiveBin();
+        const { binId: activeBin, price } = await readActive();
         inv = await readInventory(support);
 
         // Volatility pause: if active bin jumped more than the configured bins in one
@@ -288,11 +361,13 @@ export async function runMarketMaker({ poolAddress, config: mmIn, signal } = {})
           await cancelSide("bid");
           await cancelSide("ask");
           state.lastActive = activeBin;
+          emitStatus({ paused: true });
           if (!stopped) setTimeout(tick, mm.tickIntervalSec * 1000);
           return;
         }
         state.lastActive = activeBin;
 
+        const skew = skewFor(inv, price);
         const bidS = await sideStatus("bid");
         const askS = await sideStatus("ask");
         const decision = decideRequote({
@@ -304,12 +379,13 @@ export async function runMarketMaker({ poolAddress, config: mmIn, signal } = {})
 
         if (decision.requoteBid) {
           log("mm", `Requote BID (${decision.reasons.bid}) @ active ${activeBin}`);
-          await requoteSide("bid", activeBin, inv);
+          await requoteSide("bid", activeBin, inv, skew);
         }
         if (decision.requoteAsk) {
           log("mm", `Requote ASK (${decision.reasons.ask}) @ active ${activeBin}`);
-          await requoteSide("ask", activeBin, inv);
+          await requoteSide("ask", activeBin, inv, skew);
         }
+        emitStatus();
       } catch (e) {
         log("mm_tick_error", e.message);
       }
@@ -335,5 +411,6 @@ export async function runMarketMaker({ poolAddress, config: mmIn, signal } = {})
     }
   }
   log("mm", "Market maker stopped.");
+  emitStatus({ stopped: true });
   return { requotes: state.requotes, ranForMs: Date.now() - state.startedAt };
 }

@@ -81,7 +81,8 @@ async function main() {
 
   let mm;
   try {
-    mm = loadMarketMakerConfig(toOverrides(args));
+    // Merge: global defaults ← per-pool config file ← CLI overrides.
+    mm = loadMarketMakerConfig(toOverrides(args), { poolAddress });
     mm.__resolved = true;
   } catch (e) {
     console.error(`Config error: ${e.message}`);

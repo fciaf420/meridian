@@ -194,6 +194,16 @@ export const config = {
     tickIntervalSec:       u.mmTickIntervalSec       ?? 15,
     minRequoteIntervalSec: u.mmMinRequoteIntervalSec ?? 30,   // anti-thrash throttle per side
     priorityFeeLevel:      u.mmPriorityFeeLevel      ?? "Medium",
+    // Inventory skew — software stand-in for a perp hedge (we do NOT hedge with perps).
+    // Bias the ladder toward unwinding whichever side we're heavy on, to mean-revert
+    // inventory back toward targetBaseRatio (0.5 = balanced 50/50 base/quote by value).
+    inventorySkew:         u.mmInventorySkew         ?? true,
+    targetBaseRatio:       u.mmTargetBaseRatio       ?? 0.5,  // desired base value / total value
+    maxSkewBins:           u.mmMaxSkewBins           ?? 2,    // max bins to shift a side at full imbalance
+    maxSkewSizePct:        u.mmMaxSkewSizePct        ?? 50,   // max % to grow/shrink a side's size
+    // Standalone control panel (independent of the agent dashboard).
+    panelPort:             u.mmPanelPort             ?? 3838,
+    panelHost:             u.mmPanelHost             ?? "127.0.0.1",
   },
 
   // ─── USDC Mode ──────────────────────────

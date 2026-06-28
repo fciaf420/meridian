@@ -413,6 +413,48 @@ left stranded in orders.
 A limit order spans at most 50 bins (`MAX_BIN_PER_LIMIT_ORDER`); the runner
 rejects a ladder whose `spreadBins + (levels-1)*stepBins + 1` exceeds that.
 
+### Inventory skew (no perp hedge)
+
+Unlike order-book market makers (e.g. Wagyu on Hyperliquid) that stay delta-neutral
+by hedging inventory with a **short perp**, this MM does **not** use perps. Instead it
+manages inventory in software: hard caps (`maxInventoryBase/Quote`), a volatility pause,
+configurable spread, and **inventory skew**. When the book gets heavy on one asset, the
+ladder is biased to unwind it — heavy base → asks move closer + larger and bids move
+further + smaller (mirrored when heavy quote) — mean-reverting toward `targetBaseRatio`
+(0.5 = balanced by value). Tune with `inventorySkew` (on/off), `targetBaseRatio`,
+`maxSkewBins`, `maxSkewSizePct`.
+
+### Per-pool config file
+
+Settings live per pool in `market-maker-config.json` (gitignored, user-specific):
+
+```json
+{ "pools": { "<POOL_ADDRESS>": { "label": "SOL/USDC", "mode": "two_sided", "levels": 4, "spreadBins": 2 } } }
+```
+
+Resolution order is **global defaults (`config.marketMaker`) ← per-pool file ← CLI/UI
+overrides**, so a pool entry only sets what differs. Both the CLI (`--pool`) and the
+control panel read and write this file, so they share configuration.
+
+### Control panel UI (standalone)
+
+A self-contained web panel — **independent of the agent dashboard** (its own server +
+page, own port, no shared code):
+
+```bash
+DRY_RUN=true npm run mm:panel:dry      # simulated
+npm run mm:panel                        # live
+# → open http://127.0.0.1:3838
+```
+
+The panel lets you create/edit/delete per-pool configs, **Start/Stop** a market maker
+per pool (each runs as its own in-process loop), and watch **live status** (active bin,
+open bid/ask orders, requote count, skew strength, uptime). Env: `MM_PANEL_PORT`
+(default 3838), `MM_PANEL_HOST` (default `127.0.0.1`), and an optional `MM_PANEL_TOKEN`
+— if set, mutating actions require the matching `x-mm-token` (enter it in the panel's
+token field). On shutdown the panel stops every running loop, which cancels and closes
+all open orders.
+
 ## Configuration Reference
 
 Everything in `user-config.json` is optional, but these are the main knobs.

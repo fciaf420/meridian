@@ -11,6 +11,8 @@
     "dev:web": "cd web && npm run dev",
     "mm": "node scripts/market-maker.js",
     "mm:dry": "DRY_RUN=true node scripts/market-maker.js",
+    "mm:panel": "node scripts/mm-panel.js",
+    "mm:panel:dry": "DRY_RUN=true node scripts/mm-panel.js",
     "build:web": "cd web && npm run build",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",

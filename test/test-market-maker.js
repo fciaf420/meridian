@@ -4,8 +4,10 @@ import assert from "node:assert/strict";
 import {
   computeLadder,
   decideRequote,
+  computeSkew,
   loadMarketMakerConfig,
 } from "../tools/market-maker.js";
+import { upsertPoolConfig, removePoolConfig } from "../market-maker-config.js";
 
 // ─── computeLadder ─────────────────────────────────────────────
 test("computeLadder bid places bins below the active bin", () => {
@@ -140,4 +142,56 @@ test("loadMarketMakerConfig rejects an invalid mode", () => {
 
 test("loadMarketMakerConfig rejects a ladder span over 50 bins", () => {
   assert.throws(() => loadMarketMakerConfig({ levels: 50, spreadBins: 1, stepBins: 5 }));
+});
+
+test("loadMarketMakerConfig rejects an out-of-range targetBaseRatio", () => {
+  assert.throws(() => loadMarketMakerConfig({ targetBaseRatio: 1 }));
+  assert.throws(() => loadMarketMakerConfig({ targetBaseRatio: 0 }));
+});
+
+// ─── computeSkew ───────────────────────────────────────────────
+test("computeSkew is neutral at zero imbalance", () => {
+  const s = computeSkew({ imbalance: 0, targetBaseRatio: 0.5, maxSkewBins: 2, maxSkewSizePct: 50 });
+  assert.equal(s.strength, 0);
+  assert.deepEqual(s.bid, { spreadDelta: 0, sizeMult: 1 });
+  assert.deepEqual(s.ask, { spreadDelta: 0, sizeMult: 1 });
+});
+
+test("computeSkew favours asks when heavy base", () => {
+  const s = computeSkew({ imbalance: 0.25, targetBaseRatio: 0.5, maxSkewBins: 2, maxSkewSizePct: 50 });
+  assert.equal(s.strength, 0.5);
+  assert.equal(s.ask.spreadDelta, -1); // asks closer
+  assert.ok(s.ask.sizeMult > 1);       // asks bigger
+  assert.equal(s.bid.spreadDelta, 1);  // bids further
+  assert.ok(s.bid.sizeMult < 1);       // bids smaller
+});
+
+test("computeSkew favours bids when heavy quote", () => {
+  const s = computeSkew({ imbalance: -0.25, targetBaseRatio: 0.5, maxSkewBins: 2, maxSkewSizePct: 50 });
+  assert.ok(s.strength < 0);
+  assert.equal(s.bid.spreadDelta, -1);
+  assert.ok(s.bid.sizeMult > 1);
+  assert.equal(s.ask.spreadDelta, 1);
+});
+
+test("computeSkew clamps strength to [-1,1] and floors size at 0", () => {
+  const s = computeSkew({ imbalance: 5, targetBaseRatio: 0.5, maxSkewBins: 2, maxSkewSizePct: 200 });
+  assert.equal(s.strength, 1);
+  assert.equal(s.bid.sizeMult, 0); // fully starved, never negative
+});
+
+// ─── per-pool config merge ─────────────────────────────────────
+test("loadMarketMakerConfig merges per-pool file under overrides", () => {
+  const pool = "TEST_POOL_MERGE_DO_NOT_USE";
+  try {
+    upsertPoolConfig(pool, { levels: 7, spreadBins: 5 });
+    const fromFile = loadMarketMakerConfig({}, { poolAddress: pool });
+    assert.equal(fromFile.levels, 7);   // per-pool file wins over global default
+    assert.equal(fromFile.spreadBins, 5);
+    const withOverride = loadMarketMakerConfig({ levels: 9 }, { poolAddress: pool });
+    assert.equal(withOverride.levels, 9); // explicit override wins over file
+    assert.equal(withOverride.spreadBins, 5);
+  } finally {
+    removePoolConfig(pool);
+  }
 });

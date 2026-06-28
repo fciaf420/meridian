@@ -16,6 +16,7 @@ smart-wallets.json
 pool-memory.json
 token-blacklist.json
 strategy-library.json
+market-maker-config.json
 
 # Knowledge base (LLM-maintained, user-specific)
 knowledge/

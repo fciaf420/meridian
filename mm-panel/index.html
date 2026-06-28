@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Market Maker Control Panel</title>
+  <style>
+    :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --ink:#e6edf3; --muted:#8b949e;
+            --teal:#2dd4bf; --green:#3fb950; --red:#f85149; --amber:#d29922; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif; }
+    header { display:flex; align-items:center; gap:12px; padding:14px 20px; border-bottom:1px solid var(--line); }
+    header h1 { font-size:16px; margin:0; font-weight:600; }
+    .badge { font:600 11px/1 ui-monospace,monospace; padding:5px 8px; border-radius:6px; letter-spacing:.05em; }
+    .badge.dry { background:rgba(210,153,34,.15); color:var(--amber); border:1px solid rgba(210,153,34,.4); }
+    .badge.live { background:rgba(63,185,80,.15); color:var(--green); border:1px solid rgba(63,185,80,.4); }
+    .wrap { display:grid; grid-template-columns: 1fr 1fr; gap:18px; padding:20px; max-width:1200px; margin:0 auto; }
+    @media (max-width:900px){ .wrap{ grid-template-columns:1fr; } }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+    .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 12px; }
+    label { display:block; font-size:12px; color:var(--muted); margin:0 0 4px; }
+    input, select { width:100%; background:var(--bg); color:var(--ink); border:1px solid var(--line);
+            border-radius:6px; padding:7px 9px; font:13px ui-monospace,monospace; }
+    input[type=checkbox]{ width:auto; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 14px; }
+    .field.full { grid-column:1/-1; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:14px; }
+    button { cursor:pointer; border:1px solid var(--line); background:#21262d; color:var(--ink);
+            border-radius:6px; padding:8px 12px; font:600 13px/1 inherit; }
+    button:hover { border-color:var(--teal); }
+    button.primary { background:var(--teal); color:#06120f; border-color:var(--teal); }
+    button.danger { color:var(--red); }
+    button.go { color:var(--green); }
+    .pool { border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; }
+    .pool .addr { font:600 13px ui-monospace,monospace; word-break:break-all; }
+    .pool .meta { color:var(--muted); font-size:12px; margin:4px 0 8px; }
+    .pill { display:inline-block; font:600 10px/1 ui-monospace,monospace; padding:3px 6px; border-radius:5px; margin-right:6px; }
+    .pill.on { background:rgba(63,185,80,.15); color:var(--green); }
+    .pill.off { background:rgba(139,148,158,.15); color:var(--muted); }
+    .status { font:12px ui-monospace,monospace; white-space:pre-wrap; color:var(--ink); }
+    .muted { color:var(--muted); }
+    .toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:var(--panel);
+            border:1px solid var(--line); border-radius:8px; padding:10px 16px; font-size:13px; opacity:0;
+            transition:opacity .2s; pointer-events:none; }
+    .toast.show { opacity:1; }
+    .toast.err { border-color:var(--red); color:var(--red); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Market Maker Control Panel</h1>
+    <span id="modeBadge" class="badge dry">…</span>
+    <span class="muted" style="margin-left:auto; font-size:12px;">DLMM Limit-Order MM · independent of the agent dashboard</span>
+  </header>
+
+  <div class="wrap">
+    <!-- Left: editor -->
+    <section class="card">
+      <h2>Pool configuration</h2>
+      <div class="field full">
+        <label>Pool address (limit-order-enabled DLMM pool)</label>
+        <input id="poolAddr" placeholder="pool address" autocomplete="off" />
+      </div>
+      <div id="formFields" class="grid" style="margin-top:10px;"></div>
+      <div class="field full" style="margin-top:10px;">
+        <label>Panel token (x-mm-token) — only if the server requires one</label>
+        <input id="token" type="password" placeholder="leave blank if not set" autocomplete="off" />
+      </div>
+      <div class="row">
+        <button class="primary" onclick="saveConfig()">Save config</button>
+        <button class="go" onclick="startPool()">Start</button>
+        <button onclick="stopPool()">Stop</button>
+        <button class="danger" onclick="deleteConfig()">Delete</button>
+        <button onclick="loadAll()" style="margin-left:auto;">Refresh</button>
+      </div>
+    </section>
+
+    <!-- Right: saved pools + live status -->
+    <section class="card">
+      <h2>Saved pools</h2>
+      <div id="poolList"><span class="muted">Loading…</span></div>
+      <h2 style="margin-top:18px;">Live status</h2>
+      <div id="statusBox" class="status"><span class="muted">No market makers running.</span></div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    let DEFAULTS = {};
+    const SKIP = new Set(["panelPort", "panelHost"]); // server-level, not per-pool
+
+    function tok() { return document.getElementById("token").value.trim(); }
+    function headers() { const h = { "Content-Type": "application/json" }; const t = tok(); if (t) h["x-mm-token"] = t; return h; }
+    function toast(msg, err) {
+      const el = document.getElementById("toast");
+      el.textContent = msg; el.className = "toast show" + (err ? " err" : "");
+      setTimeout(() => { el.className = "toast"; }, 2600);
+    }
+
+    function fieldFor(key, val) {
+      const wrap = document.createElement("div"); wrap.className = "field";
+      const id = "f_" + key;
+      const lbl = document.createElement("label"); lbl.textContent = key; lbl.htmlFor = id;
+      wrap.appendChild(lbl);
+      let input;
+      if (key === "mode") {
+        input = document.createElement("select");
+        ["two_sided", "bid_only", "ask_only"].forEach((o) => {
+          const opt = document.createElement("option"); opt.value = o; opt.textContent = o; input.appendChild(opt);
+        });
+        input.value = val ?? "two_sided";
+      } else if (typeof val === "boolean") {
+        input = document.createElement("input"); input.type = "checkbox"; input.checked = !!val;
+      } else if (typeof val === "number" || val === null || key.startsWith("max") || key.startsWith("order") || key.endsWith("Bins") || key.endsWith("Sec") || key.endsWith("Pct") || key === "levels") {
+        input = document.createElement("input"); input.type = "number"; input.step = "any";
+        input.placeholder = val === null ? "(auto / default)" : String(val);
+        if (typeof val === "number") input.value = val;
+      } else {
+        input = document.createElement("input"); input.type = "text";
+        if (val != null) input.value = val;
+      }
+      input.id = id; input.dataset.key = key;
+      wrap.appendChild(input);
+      return wrap;
+    }
+
+    function buildForm(values) {
+      const host = document.getElementById("formFields");
+      host.innerHTML = "";
+      // label first, then every default key (except server-level ones)
+      const keys = ["label", ...Object.keys(DEFAULTS).filter((k) => !SKIP.has(k))];
+      const seen = new Set();
+      for (const k of keys) {
+        if (seen.has(k)) continue; seen.add(k);
+        const v = values && k in values ? values[k] : (k === "label" ? "" : DEFAULTS[k]);
+        host.appendChild(fieldFor(k, v));
+      }
+    }
+
+    function collectForm() {
+      const out = {};
+      document.querySelectorAll("#formFields [data-key]").forEach((el) => {
+        const k = el.dataset.key;
+        if (el.type === "checkbox") { out[k] = el.checked; return; }
+        const raw = el.value.trim();
+        if (raw === "") return; // omit → inherits default
+        if (el.type === "number") { const n = Number(raw); if (Number.isFinite(n)) out[k] = n; return; }
+        out[k] = raw;
+      });
+      return out;
+    }
+
+    async function loadAll() {
+      try {
+        const r = await fetch("/api/configs"); const data = await r.json();
+        DEFAULTS = data.defaults || {};
+        if (!document.querySelector("#formFields [data-key]")) buildForm(null);
+        renderPools(data.pools || []);
+      } catch (e) { toast("Load failed: " + e.message, true); }
+      pollStatus();
+    }
+
+    function renderPools(pools) {
+      const host = document.getElementById("poolList");
+      if (!pools.length) { host.innerHTML = '<span class="muted">No saved pools yet.</span>'; return; }
+      host.innerHTML = "";
+      pools.forEach((p) => {
+        const div = document.createElement("div"); div.className = "pool";
+        div.innerHTML =
+          '<div class="addr">' + (p.label ? "<b>" + p.label + "</b> · " : "") + p.pool + "</div>" +
+          '<div class="meta">mode=' + (p.mode ?? DEFAULTS.mode) + " · levels=" + (p.levels ?? DEFAULTS.levels) +
+          " · spread=" + (p.spreadBins ?? DEFAULTS.spreadBins) + " · skew=" + (p.inventorySkew ?? DEFAULTS.inventorySkew) + "</div>";
+        const row = document.createElement("div"); row.className = "row";
+        const edit = document.createElement("button"); edit.textContent = "Edit";
+        edit.onclick = () => { document.getElementById("poolAddr").value = p.pool; buildForm(p); };
+        const start = document.createElement("button"); start.className = "go"; start.textContent = "Start";
+        start.onclick = () => startPool(p.pool);
+        const stop = document.createElement("button"); stop.textContent = "Stop";
+        stop.onclick = () => stopPool(p.pool);
+        row.append(edit, start, stop);
+        div.appendChild(row);
+        host.appendChild(div);
+      });
+    }
+
+    function poolFromInput() {
+      const a = document.getElementById("poolAddr").value.trim();
+      if (!a) { toast("Enter a pool address.", true); return null; }
+      return a;
+    }
+
+    async function saveConfig() {
+      const pool = poolFromInput(); if (!pool) return;
+      try {
+        const r = await fetch("/api/configs/" + pool, { method: "POST", headers: headers(), body: JSON.stringify(collectForm()) });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+        toast("Saved config for " + pool.slice(0, 8)); loadAll();
+      } catch (e) { toast("Save failed: " + e.message, true); }
+    }
+
+    async function deleteConfig() {
+      const pool = poolFromInput(); if (!pool) return;
+      try {
+        const r = await fetch("/api/configs/" + pool, { method: "DELETE", headers: headers() });
+        const d = await r.json(); if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+        toast("Deleted " + pool.slice(0, 8)); loadAll();
+      } catch (e) { toast("Delete failed: " + e.message, true); }
+    }
+
+    async function startPool(addr) {
+      const pool = addr || poolFromInput(); if (!pool) return;
+      try {
+        const r = await fetch("/api/run/" + pool, { method: "POST", headers: headers(), body: JSON.stringify({ overrides: addr ? {} : collectForm() }) });
+        const d = await r.json(); if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+        toast("Started " + pool.slice(0, 8) + (d.dry ? " (DRY)" : "")); pollStatus();
+      } catch (e) { toast("Start failed: " + e.message, true); }
+    }
+
+    async function stopPool(addr) {
+      const pool = addr || poolFromInput(); if (!pool) return;
+      try {
+        const r = await fetch("/api/stop/" + pool, { method: "POST", headers: headers() });
+        const d = await r.json(); if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+        toast("Stopping " + pool.slice(0, 8)); pollStatus();
+      } catch (e) { toast("Stop failed: " + e.message, true); }
+    }
+
+    async function pollStatus() {
+      try {
+        const r = await fetch("/api/status"); const s = await r.json();
+        const badge = document.getElementById("modeBadge");
+        badge.textContent = s.dry ? "DRY RUN" : "LIVE";
+        badge.className = "badge " + (s.dry ? "dry" : "live");
+        const box = document.getElementById("statusBox");
+        if (!s.count) { box.innerHTML = '<span class="muted">No market makers running.</span>'; return; }
+        box.textContent = s.pools.map((p) => {
+          const st = p.status || {};
+          const up = Math.floor(p.uptimeMs / 1000);
+          const bid = st.bid ? ("bid@" + st.bid.center + " (" + st.bid.sizeUi + ")") : "bid: —";
+          const ask = st.ask ? ("ask@" + st.ask.center + " (" + st.ask.sizeUi + ")") : "ask: —";
+          return p.pool.slice(0, 8) + "  active=" + (st.activeBin ?? "?") +
+            "  " + bid + "  " + ask +
+            "  requotes=" + (st.requotes ?? 0) + "  skew=" + (st.skewStrength ?? 0).toFixed(2) +
+            "  up=" + up + "s" + (p.error ? "  ERR:" + p.error : "");
+        }).join("\n");
+      } catch { /* server may be briefly down */ }
+    }
+
+    loadAll();
+    setInterval(pollStatus, 2000);
+  </script>
+</body>
+</html>
