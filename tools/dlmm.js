@@ -1,4 +1,5 @@
 import {
+  ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
@@ -29,6 +30,7 @@ import { normalizeMint } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { computePositions, fetchDlmmPnlForPool } from "./pnl.js";
+import { validateSingleSidedSolOrientation } from "../deployment-policy.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -78,12 +80,71 @@ async function getDLMM() {
 // (e.g. during screening-only tests).
 let _connection = null;
 let _wallet = null;
+let _priorityFeeCache = null;
+let _priorityFeeCacheAt = 0;
 
 function getConnection() {
   if (!_connection) {
     _connection = new Connection(process.env.RPC_URL, "confirmed");
   }
   return _connection;
+}
+
+async function getPriorityFee() {
+  const rpcUrl = process.env.RPC_URL || "";
+  if (!rpcUrl) return null;
+  // Cache for 30 seconds to avoid spamming RPC across multiple deploy TXs
+  if (_priorityFeeCache && Date.now() - _priorityFeeCacheAt < 30000) return _priorityFeeCache;
+  try {
+    const res = await fetch(rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "1",
+        method: "getPriorityFeeEstimate",
+        params: [{ transaction: null, options: { priorityLevel: "Medium", recommended: true } }],
+      }),
+    });
+    const json = await res.json();
+    const fee = json?.result?.priorityFeeEstimate;
+    if (typeof fee === "number" && fee > 0) {
+      _priorityFeeCache = Math.round(fee);
+      _priorityFeeCacheAt = Date.now();
+      return _priorityFeeCache;
+    }
+  } catch { /* fall through to 50k default */ }
+  // Hard fallback: 50,000 microlamports (safe Medium estimate)
+  return 50000;
+}
+
+async function sendWithPriorityFee(tx, signers, maxRetries = 3) {
+  let lastError = null;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const priorityFee = await getPriorityFee();
+      if (priorityFee) {
+        tx.instructions.unshift(
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
+        );
+      }
+      const blockhash = (await getConnection().getLatestBlockhash("finalized")).blockhash;
+      tx.recentBlockhash = blockhash;
+      const hash = await sendAndConfirmTransaction(getConnection(), tx, signers);
+      return hash;
+    } catch (e) {
+      lastError = e;
+      if (i < maxRetries - 1) {
+        log("deploy", `Tx failed (${e.message}), retrying ${i + 2}/${maxRetries}...`);
+        // Remove stale priority fee instruction so next attempt gets a fresh one
+        if (tx.instructions[0]?.programId?.equals?.(ComputeBudgetProgram.programId)) {
+          tx.instructions.shift();
+        }
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+  }
+  throw lastError;
 }
 
 function getWallet() {
@@ -553,10 +614,27 @@ export async function getActiveBin({ pool_address }) {
   const pool = await getPool(pool_address);
   const activeBin = await pool.getActiveBin();
 
+  const tokenXMint = pool.lbPair.tokenXMint.toString();
+  const tokenYMint = pool.lbPair.tokenYMint.toString();
+  const [tokenXInfo, tokenYInfo] = await Promise.all([
+    getConnection().getParsedAccountInfo(pool.lbPair.tokenXMint),
+    getConnection().getParsedAccountInfo(pool.lbPair.tokenYMint),
+  ]);
+  const tokenXDecimals = tokenXInfo.value?.data?.parsed?.info?.decimals;
+  const tokenYDecimals = tokenYInfo.value?.data?.parsed?.info?.decimals;
+  if (!Number.isInteger(tokenXDecimals) || !Number.isInteger(tokenYDecimals)) {
+    throw new Error("Could not read authoritative token mint decimals from RPC");
+  }
   return {
     binId: activeBin.binId,
     price: pool.fromPricePerLamport(Number(activeBin.price)),
     pricePerLamport: activeBin.price.toString(),
+    binStep: Number(pool.lbPair.binStep),
+    tokenXMint,
+    tokenYMint,
+    tokenXDecimals,
+    tokenYDecimals,
+    priceOrientation: `${tokenYMint} per ${tokenXMint}`,
   };
 }
 
@@ -587,6 +665,7 @@ export async function deployPosition({
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
+  const isHybridStrategy = activeStrategy === "hybrid";
   let activeBinsBelow = bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow;
   let activeBinsAbove = bins_above ?? 0;
   const parsedVolatility = volatility == null ? null : Number(volatility);
@@ -604,6 +683,7 @@ export async function deployPosition({
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
   const pool = await getPool(pool_address);
   const baseMint = pool.lbPair.tokenXMint.toString();
+  const tokenYMint = pool.lbPair.tokenYMint.toString();
   if (isBaseMintOnCooldown(baseMint)) {
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
@@ -650,6 +730,7 @@ export async function deployPosition({
     throw new Error("Invalid deploy amount: provide a positive amount_y/amount_sol.");
   }
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
+  validateSingleSidedSolOrientation({ tokenYMint }, { amountY: finalAmountY, amountX: finalAmountX });
   if (isSingleSidedSol && (Number(bins_above ?? 0) > 0 || Number(upside_pct ?? 0) > 0)) {
     throw new Error(
       "Single-side SOL deploy cannot use bins_above or upside_pct. Use amount_y with bins_below only; the upper bin is the SDK active bin.",
@@ -670,11 +751,15 @@ export async function deployPosition({
     throw new Error("Invalid bin range: bins_below and bins_above must be whole-bin integers.");
   }
   const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+  const maxBinsBelow = Math.max(minBinsBelow, Number(config.strategy.maxBinsBelow ?? minBinsBelow));
   const totalBins = activeBinsBelow + activeBinsAbove;
   if (totalBins < minBinsBelow) {
     throw new Error(
       `Invalid deploy range: total bins ${totalBins} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
     );
+  }
+  if (isSingleSidedSol && activeBinsBelow > maxBinsBelow) {
+    throw new Error(`Invalid deploy range: bins_below ${activeBinsBelow} exceeds configured maximum ${maxBinsBelow}.`);
   }
 
   const strategyMap = {
@@ -684,26 +769,18 @@ export async function deployPosition({
   };
 
   const strategyType = strategyMap[activeStrategy];
-  if (strategyType === undefined) {
-    throw new Error(`Invalid strategy: ${activeStrategy}. Use spot, curve, or bid_ask.`);
+  if (!isHybridStrategy && strategyType === undefined) {
+    throw new Error(`Invalid strategy: ${activeStrategy}. Use spot, curve, bid_ask, or hybrid.`);
   }
 
-  if (process.env.DRY_RUN === "true") {
-    return {
-      dry_run: true,
-      would_deploy: {
-        pool_address,
-        strategy: activeStrategy,
-        bins_below: activeBinsBelow,
-        bins_above: activeBinsAbove,
-        downside_pct: downside_pct ?? null,
-        upside_pct: upside_pct ?? null,
-        amount_x: finalAmountX,
-        amount_y: finalAmountY,
-        wide_range: totalBins > 69,
-      },
-      message: "DRY RUN — no transaction sent",
-    };
+  const rawHybridBidAskPct = Number(config.strategy.hybridBidAskPct ?? 60);
+  const rawHybridSpotPct = Number(config.strategy.hybridSpotPct ?? (100 - rawHybridBidAskPct));
+  const hybridTotalPct = rawHybridBidAskPct + rawHybridSpotPct;
+  const hybridBidAskPct = hybridTotalPct > 0 ? rawHybridBidAskPct / hybridTotalPct * 100 : 60;
+  const hybridSpotPct = hybridTotalPct > 0 ? rawHybridSpotPct / hybridTotalPct * 100 : 40;
+
+  if (isHybridStrategy && (!Number.isFinite(hybridBidAskPct) || !Number.isFinite(hybridSpotPct) || hybridBidAskPct <= 0 || hybridSpotPct < 0)) {
+    throw new Error("Invalid hybrid strategy ratios: hybridBidAskPct must be > 0 and hybridSpotPct must be >= 0.");
   }
 
   const isWideRange = totalBins > 69;
@@ -719,26 +796,70 @@ export async function deployPosition({
     );
   }
 
-  await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
-
   const minPrice = Number(getPriceOfBinByBinId(minBinId, actualBinStep).toString());
   const maxPrice = Number(getPriceOfBinByBinId(maxBinId, actualBinStep).toString());
   const downsideCoveragePct = activePrice > 0 ? ((activePrice - minPrice) / activePrice) * 100 : null;
   const upsideCoveragePct = activePrice > 0 ? ((maxPrice - activePrice) / activePrice) * 100 : null;
   const totalWidthPct = minPrice > 0 ? ((maxPrice - minPrice) / minPrice) * 100 : null;
 
+  if (process.env.DRY_RUN === "true") {
+    return {
+      dry_run: true,
+      would_deploy: {
+        pool_address,
+        strategy: activeStrategy,
+        bins_below: activeBinsBelow,
+        bins_above: activeBinsAbove,
+        downside_pct: downside_pct ?? null,
+        upside_pct: upside_pct ?? null,
+        amount_x: finalAmountX,
+        amount_y: finalAmountY,
+        wide_range: totalBins > 69,
+        bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
+        price_range: { min: minPrice, max: maxPrice },
+        range_coverage: {
+          downside_pct: downsideCoveragePct,
+          upside_pct: upsideCoveragePct,
+          width_pct: totalWidthPct,
+          active_price: activePrice,
+        },
+        ...(isHybridStrategy ? {
+          strategy_mix: { bid_ask_pct: hybridBidAskPct, spot_pct: hybridSpotPct },
+          legs: [
+            { strategy: "bid_ask", amount_y: finalAmountY * hybridBidAskPct / 100 },
+            { strategy: "spot", amount_y: finalAmountY * hybridSpotPct / 100 },
+          ],
+        } : {}),
+      },
+      message: "DRY RUN — no transaction sent",
+    };
+  }
+
+  await assertRangeDoesNotRequireBinArrayInitialization(pool, minBinId, maxBinId);
+
   // Read base fee directly from pool — baseFactor * binStep / 10^6 gives fee in %
   const baseFactor = pool.lbPair.parameters?.baseFactor ?? 0;
   const actualBaseFee = base_fee ?? (baseFactor > 0 ? parseFloat((baseFactor * actualBinStep / 1e6 * 100).toFixed(4)) : null);
 
-  const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
-  // For X, we assume it's also 9 decimals for now, or we'd need to fetch mint decimals.
-  // Most Meteora pools base tokens are 6 or 9. To be safe, we should fetch.
+  const tokenYInfo = await getConnection().getParsedAccountInfo(new PublicKey(pool.lbPair.tokenYMint));
+  const tokenYDecimals = tokenYInfo.value?.data?.parsed?.info?.decimals;
+  if (!Number.isInteger(tokenYDecimals)) throw new Error("Could not read authoritative token Y decimals from RPC");
+  const totalYLamports = new BN(Math.floor(finalAmountY * Math.pow(10, tokenYDecimals)));
+  const hybridBidAskLamports = isHybridStrategy
+    ? totalYLamports.mul(new BN(Math.round(hybridBidAskPct * 10_000))).div(new BN(1_000_000))
+    : new BN(0);
+  const hybridSpotLamports = isHybridStrategy
+    ? totalYLamports.sub(hybridBidAskLamports)
+    : new BN(0);
   let totalXLamports = new BN(0);
   if (finalAmountX > 0) {
     const mintInfo = await getConnection().getParsedAccountInfo(new PublicKey(pool.lbPair.tokenXMint));
     const decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
     totalXLamports = new BN(Math.floor(finalAmountX * Math.pow(10, decimals)));
+  }
+
+  if (isHybridStrategy && shouldUseLpAgentRelayForDeploy()) {
+    return { success: false, error: "Hybrid strategy is not supported by the Agent Meridian relay path; disable lpAgentRelayEnabled for hybrid deploys." };
   }
 
   if (shouldUseLpAgentRelayForDeploy()) {
@@ -888,10 +1009,61 @@ export async function deployPosition({
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
+  let positionAccountCreated = false;
+  const txHashes = [];
   try {
-    const txHashes = [];
 
-    if (isWideRange) {
+    if (isHybridStrategy) {
+      // ── Hybrid Path: one position, two overlays ─────────────────────
+      // Create the position first, then add BidAsk and Spot legs into the same range.
+      const createTxs = isWideRange
+        ? await pool.createExtendedEmptyPosition(minBinId, maxBinId, newPosition.publicKey, wallet.publicKey)
+        : await pool.createEmptyPosition({
+            positionPubKey: newPosition.publicKey,
+            minBinId,
+            maxBinId,
+            user: wallet.publicKey,
+          });
+      const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
+      for (let i = 0; i < createTxArray.length; i++) {
+        const signers = i === 0 ? [wallet, newPosition] : [wallet];
+        const txHash = await sendWithPriorityFee(createTxArray[i], signers);
+        txHashes.push(txHash);
+        if (i === 0) positionAccountCreated = true;
+        log("deploy", `Create hybrid position tx ${i + 1}/${createTxArray.length}: ${txHash}`);
+      }
+
+      const hybridLegs = [
+        { name: "bid_ask", strategyType: StrategyType.BidAsk, amountY: hybridBidAskLamports },
+        { name: "spot", strategyType: StrategyType.Spot, amountY: hybridSpotLamports },
+      ].filter((leg) => leg.amountY.gt(new BN(0)));
+
+      for (const leg of hybridLegs) {
+        const addTxs = isWideRange
+          ? await pool.addLiquidityByStrategyChunkable({
+              positionPubKey: newPosition.publicKey,
+              user: wallet.publicKey,
+              totalXAmount: new BN(0),
+              totalYAmount: leg.amountY,
+              strategy: { minBinId, maxBinId, strategyType: leg.strategyType },
+              slippage: 10,
+            })
+          : await pool.addLiquidityByStrategy({
+              positionPubKey: newPosition.publicKey,
+              user: wallet.publicKey,
+              totalXAmount: new BN(0),
+              totalYAmount: leg.amountY,
+              strategy: { minBinId, maxBinId, strategyType: leg.strategyType },
+              slippage: 1000,
+            });
+        const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
+        for (let i = 0; i < addTxArray.length; i++) {
+          const txHash = await sendWithPriorityFee(addTxArray[i], [wallet]);
+          txHashes.push(txHash);
+          log("deploy", `Add hybrid ${leg.name} liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+        }
+      }
+    } else if (isWideRange) {
       // ── Wide Range Path (>69 bins) ─────────────────────────────────
       // Solana limits inner instruction realloc to 10240 bytes, so we can't create
       // a large position in a single initializePosition ix.
@@ -908,8 +1080,9 @@ export async function deployPosition({
       const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
       for (let i = 0; i < createTxArray.length; i++) {
         const signers = i === 0 ? [wallet, newPosition] : [wallet];
-        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers);
+        const txHash = await sendWithPriorityFee(createTxArray[i], signers);
         txHashes.push(txHash);
+        if (i === 0) positionAccountCreated = true;
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
 
@@ -924,7 +1097,7 @@ export async function deployPosition({
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet]);
+        const txHash = await sendWithPriorityFee(addTxArray[i], [wallet]);
         txHashes.push(txHash);
         log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
       }
@@ -938,7 +1111,7 @@ export async function deployPosition({
         strategy: { maxBinId, minBinId, strategyType },
         slippage: 1000, // 10% in bps
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
+      const txHash = await sendWithPriorityFee(tx, [wallet, newPosition]);
       txHashes.push(txHash);
     }
 
@@ -960,6 +1133,7 @@ export async function deployPosition({
       organic_score,
       amount_sol: finalAmountY,
       amount_x: finalAmountX,
+      strategy_mix: isHybridStrategy ? { bid_ask_pct: hybridBidAskPct, spot_pct: hybridSpotPct } : null,
       active_bin: activeBin.binId,
       initial_value_usd,
       signal_snapshot: signalSnapshot,
@@ -1011,11 +1185,62 @@ export async function deployPosition({
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
+      strategy_mix: isHybridStrategy ? { bid_ask_pct: hybridBidAskPct, spot_pct: hybridSpotPct } : null,
       txs: txHashes,
     };
   } catch (error) {
     log("deploy_error", error.message);
-    return { success: false, error: error.message };
+    let emptyPositionCleanup = null;
+    if (positionAccountCreated) {
+      try {
+        const positionAddress = newPosition.publicKey.toString();
+        const positionData = await pool.getPosition(new PublicKey(positionAddress));
+        if (hasPositionAccountValue(positionData)) {
+          _positionsCacheAt = 0;
+          const warning = `Deployment transaction sequence failed after liquidity reached the on-chain position: ${error.message}`;
+          log("deploy_warn", `${warning}. Position ${positionAddress} remains live and will be managed from authoritative on-chain state.`);
+          appendDecision({
+            type: "deploy_partial",
+            actor: "SCREENER",
+            pool: pool_address,
+            pool_name,
+            position: positionAddress,
+            summary: `Partial ${activeStrategy} deployment remains live on-chain`,
+            reason: error.message,
+            risks: ["Not all planned liquidity legs completed"],
+            metrics: {
+              requested_amount_sol: finalAmountY,
+              strategy: activeStrategy,
+              successful_transactions: txHashes.length,
+            },
+          });
+          return {
+            success: true,
+            partial: true,
+            warning,
+            position: positionAddress,
+            pool: pool_address,
+            pool_name,
+            strategy: activeStrategy,
+            requested_amount_y: finalAmountY,
+            amount_y_verified: null,
+            txs: txHashes,
+          };
+        }
+      } catch (inspectionError) {
+        log("deploy_warn", `Could not verify failed position ${newPosition.publicKey.toString()} on-chain: ${inspectionError.message}`);
+      }
+
+      emptyPositionCleanup = await closeEmptyPosition({
+        position_address: newPosition.publicKey.toString(),
+        pool_address,
+        reason: "Automatic cleanup after failed liquidity add",
+      }).catch((cleanupError) => ({ success: false, error: cleanupError.message }));
+      if (!emptyPositionCleanup?.success) {
+        log("deploy_warn", `Empty-position cleanup did not complete for ${newPosition.publicKey.toString()}: ${emptyPositionCleanup?.error || "unknown error"}`);
+      }
+    }
+    return { success: false, error: error.message, empty_position_cleanup: emptyPositionCleanup };
   }
 }
 
@@ -1274,10 +1499,11 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
   const loadPositions = async () => { try {
     // ── Primary path: public infra (on-chain RPC + Jupiter + Meteora deposits) ──
     // No LPAgent / agentmeridian dependency, so the poller runs aggressively on
-    // fully public resources. Falls through to the Meteora-API path on any error.
+    // fully public resources. On-chain SDK state is authoritative; never replace
+    // position existence or balances with an off-chain portfolio response.
     if (config.pnl.source === "rpc") {
       try {
-        if (!silent) log("positions", `Computing PnL from RPC (${config.pnl.rpcUrl})...`);
+        if (!silent) log("positions", `Computing PnL from RPC (${new URL(config.pnl.rpcUrl).origin})...`);
         const rpcResult = await computePositions(walletAddress);
         if (useLocalWallet) {
           syncOpenPositions(rpcResult.positions.map((p) => p.position));
@@ -1286,9 +1512,34 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
         }
         return rpcResult;
       } catch (error) {
-        log("positions_warn", `RPC PnL path failed; falling back to Meteora portfolio API: ${error.message}`);
+        log("positions_warn", `Authoritative SDK/on-chain position read failed; off-chain position fallback disabled: ${error.message}`);
+        if (useLocalWallet && _positionsCache) {
+          return {
+            ..._positionsCache,
+            authoritative: false,
+            stale: true,
+            error: error.message,
+          };
+        }
+        return {
+          wallet: walletAddress,
+          total_positions: null,
+          positions: [],
+          source: "rpc",
+          authoritative: false,
+          error: error.message,
+        };
       }
     }
+
+    return {
+      wallet: walletAddress,
+      total_positions: null,
+      positions: [],
+      source: config.pnl.source,
+      authoritative: false,
+      error: "On-chain SDK position source is required; off-chain position discovery is disabled",
+    };
 
     // ── Fallback path: Meteora portfolio + /pnl APIs (no LPAgent) ──
     if (!silent) log("positions", "Fetching portfolio via Meteora portfolio API...");
@@ -1593,7 +1844,7 @@ export async function claimFees({ position_address }) {
 
     const txHashes = [];
     for (const tx of txs) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+      const txHash = await sendWithPriorityFee(tx, [wallet]);
       txHashes.push(txHash);
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
@@ -1605,6 +1856,52 @@ export async function claimFees({ position_address }) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
   }
+}
+
+function hasPositionAccountValue(positionData) {
+  const processed = positionData?.positionData || positionData || {};
+  const values = [processed.totalXAmount, processed.totalYAmount, processed.feeX, processed.feeY];
+  if (values.some((value) => {
+    try {
+      return new BN(value?.toString?.() ?? value ?? 0).gt(new BN(0));
+    } catch {
+      return false;
+    }
+  })) return true;
+
+  const bins = Array.isArray(processed.positionBinData) ? processed.positionBinData : [];
+  return bins.some((bin) => {
+    try {
+      return new BN(bin.positionLiquidity?.toString?.() ?? bin.positionLiquidity ?? 0).gt(new BN(0));
+    } catch {
+      return false;
+    }
+  });
+}
+
+export async function closeEmptyPosition({ position_address, pool_address, reason = "Empty position cleanup" }) {
+  position_address = normalizeMint(position_address);
+  pool_address = normalizeMint(pool_address);
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, would_close_empty: position_address, pool: pool_address };
+  }
+
+  const wallet = getWallet();
+  const pool = await getPool(pool_address);
+  const positionPubKey = new PublicKey(position_address);
+  const positionData = await pool.getPosition(positionPubKey);
+  if (hasPositionAccountValue(positionData)) {
+    return { success: false, error: "Refusing empty-position cleanup because on-chain liquidity or fees are nonzero" };
+  }
+
+  const closeTx = await pool.closePosition({
+    owner: wallet.publicKey,
+    position: { publicKey: positionPubKey },
+  });
+  const tx = await sendWithPriorityFee(closeTx, [wallet]);
+  _positionsCacheAt = 0;
+  log("close", `Closed empty position ${position_address}: ${tx} (${reason})`);
+  return { success: true, position: position_address, pool: pool_address, tx };
 }
 
 // ─── Close Position ────────────────────────────────────────────
@@ -1803,6 +2100,8 @@ export async function closePosition({ position_address, reason }) {
             entry_tvl: tracked.entry_tvl ?? null,
             entry_volume: tracked.entry_volume ?? null,
             entry_holders: tracked.entry_holders ?? null,
+            peak_pnl_pct: tracked.peak_pnl_pct ?? 0,
+            trailing_active: tracked.trailing_active ?? false,
             ...exitMarket,
           });
 
@@ -1869,7 +2168,7 @@ export async function closePosition({ position_address, reason }) {
         });
         if (claimTxs && claimTxs.length > 0) {
           for (const tx of claimTxs) {
-            const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+            const claimHash = await sendWithPriorityFee(tx, [wallet]);
             claimTxHashes.push(claimHash);
           }
           log("close", `Step 1 OK (claim only): ${claimTxHashes.join(", ")}`);
@@ -1908,7 +2207,7 @@ export async function closePosition({ position_address, reason }) {
       });
 
       for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
+        const txHash = await sendWithPriorityFee(tx, [wallet]);
         closeTxHashes.push(txHash);
       }
     } else {
@@ -1917,7 +2216,7 @@ export async function closePosition({ position_address, reason }) {
         owner: wallet.publicKey,
         position: { publicKey: positionPubKey },
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), closeTx, [wallet]);
+      const txHash = await sendWithPriorityFee(closeTx, [wallet]);
       closeTxHashes.push(txHash);
     }
     const txHashes = [...claimTxHashes, ...closeTxHashes];
@@ -2084,6 +2383,8 @@ export async function closePosition({ position_address, reason }) {
         entry_tvl: tracked.entry_tvl ?? null,
         entry_volume: tracked.entry_volume ?? null,
         entry_holders: tracked.entry_holders ?? null,
+        peak_pnl_pct: tracked.peak_pnl_pct ?? 0,
+        trailing_active: tracked.trailing_active ?? false,
         ...exitMarket,
       });
 

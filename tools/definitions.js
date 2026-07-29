@@ -106,8 +106,10 @@ IMPORTANT: Only call this with a real pool address from get_my_positions or get_
       description: `Get the current active bin and price for a DLMM pool.
 This is an on-chain call via the SDK. Returns:
 - binId: the current active bin number
-- price: human-readable price (token X per token Y)
-- pricePerLamport: raw price in lamports
+- price: human-readable token Y per token X
+- priceOrientation: explicit "<token Y mint> per <token X mint>"
+- tokenXMint/tokenYMint and decimals: authoritative mint identity and orientation
+- pricePerLamport: raw SDK price
 
 Only call this if you need the current price to calculate a specific bin range (e.g. user requested a % range). Do NOT call before every deploy — deploy_position fetches the active bin internally.`,
       parameters: {
@@ -129,20 +131,20 @@ Only call this if you need the current price to calculate a specific bin range (
       name: "deploy_position",
       description: `Open a new DLMM liquidity position.
 
-PRIORITY ORDER for strategy and bins:
-1. User explicitly specifies → always follow exactly (user override is absolute)
-2. No user spec → use the configured strategy from config.strategy.strategy and choose bins based on volatility
+AUTONOMOUS SCREENER: the model supplies only pool_address. The trusted host-computed plan enforces amount, hybrid strategy, range, token orientation, active bin, bin step, and mints. Model-supplied values for those fields are ignored.
+MANUAL USER REQUESTS: explicit user parameters remain supported, subject to on-chain safety checks and configured range bounds.
 
 HARD RULES:
 - Never use 'curve'.
 - Bin Step: Only deploy in pools with bin_step between 80 and 125.
-- Range: Never deploy a tiny range. Total bins must be at least the configured minimum, with a hard floor of 35 bins.
+- Range: Total bins must stay within the configured minimum and maximum.
 - For single-side SOL deploys (amount_y only, amount_x=0), do not request upside exposure:
   use bins_below only, keep bins_above=0, and the upper bin will be pinned to the current active bin.
 
 Guidelines (only when user hasn't specified):
 - Strategy: omit the strategy field — the system will use the configured default from config.strategy.strategy
-- Bins: choose from configured minBinsBelow/maxBinsBelow by positive volatility. The hard lower floor is 35 bins.
+- Hybrid strategy is supported: it opens one position and overlays BidAsk + Spot using configured ratios.
+- Bins: autonomous range is derived from target downside coverage and the authoritative on-chain bin step.
 - Deposit: single-sided SOL only: set amount_y/amount_sol, keep amount_x=0.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
@@ -155,7 +157,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           amount_y: {
             type: "number",
-            description: "Amount of quote token (usually SOL) to deposit."
+            description: "Amount of token Y to deposit. Runtime verifies token Y is wrapped SOL before a single-sided SOL deployment."
           },
           amount_x: {
             type: "number",
@@ -167,8 +169,8 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           strategy: {
             type: "string",
-            enum: ["bid_ask", "spot"],
-            description: "DLMM strategy type. If user specifies, use exactly what they said. Otherwise omit — the system default from config.strategy.strategy will be used automatically."
+            enum: ["bid_ask", "spot", "hybrid"],
+            description: "DLMM strategy type. hybrid uses one position with configured BidAsk/Spot overlay ratios. If user specifies, use exactly what they said. Otherwise omit — the system default from config.strategy.strategy will be used automatically."
           },
           bins_below: {
             type: "number",
@@ -187,8 +189,8 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
             description: "Optional human-friendly upside range in percent above the current active price. Do not use this for single-side SOL deploys."
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
-          base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
-          bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
+          base_mint: { type: "string", description: "Manual hint only; runtime derives the authoritative token X mint from the Meteora SDK." },
+          bin_step: { type: "number", description: "Manual hint only; runtime derives the authoritative bin step from the Meteora SDK." },
           base_fee: { type: "number", description: "Pool base fee percentage (from discover_pools)" },
           volatility: { type: "number", description: "Pool volatility at deploy time, sourced from max(screening timeframe, 30m)" },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
@@ -209,7 +211,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       name: "get_position_pnl",
       description: `Get detailed PnL and real-time Fee/TVL metrics for an open position.
 Use this during management to check if yield has dropped significantly.
-Returns current feePerTvl24h which indicates the current APY of the pool.`,
+Returns fee_tvl_24h_pct, the observed 24-hour fee/TVL percentage. It is not an annualized APY.`,
       parameters: {
         type: "object",
         properties: {
@@ -272,7 +274,7 @@ WARNING: This executes a real on-chain transaction.`,
       description: `Remove all liquidity and close a position.
 This withdraws all tokens back to the wallet and closes the position account.
 Use when:
-- Position has been out of range for > 30 minutes
+- Position meets the configured deterministic out-of-range rule
 - IL exceeds accumulated fees
 - Token shows danger signals (organic score drop, volume crash)
 - Rebalancing (close old + open new)

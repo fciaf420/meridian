@@ -4,6 +4,10 @@ import { repoPath } from "./repo-root.js";
 const DECISION_LOG_FILE = repoPath("decision-log.json");
 const MAX_DECISIONS = 100;
 
+export function retainNewestDecisions(decisions, max = MAX_DECISIONS) {
+  return (Array.isArray(decisions) ? decisions : []).slice(0, Math.max(0, max));
+}
+
 function load() {
   if (!fs.existsSync(DECISION_LOG_FILE)) {
     return { decisions: [] };
@@ -41,7 +45,7 @@ export function appendDecision(entry) {
     rejected: Array.isArray(entry.rejected) ? entry.rejected.map((r) => sanitize(r, 180)).filter(Boolean).slice(0, 8) : [],
   };
   data.decisions.unshift(decision);
-  data.decisions = data.decisions.slice(0, MAX_DECISIONS);
+  data.decisions = retainNewestDecisions(data.decisions);
   save(data);
   return decision;
 }

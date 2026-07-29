@@ -93,13 +93,54 @@ import { getDecisionSummary } from "./decision-log.js";
 
 // Supports OpenRouter (default) or any OpenAI-compatible local server (e.g. LM Studio)
 // To use LM Studio: set LLM_BASE_URL=http://localhost:1234/v1 and LLM_API_KEY=lm-studio in .env
-const client = new OpenAI({
-  baseURL: process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1",
-  apiKey: process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY,
-  timeout: 5 * 60 * 1000,
-});
+const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1";
+const LLM_API_KEY = process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY;
+// Keep module import side-effect free so the loop can be tested with injected
+// dependencies without requiring production credentials or opening provider handles.
+let client = null;
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+
+async function createChatCompletion(reqParams) {
+  if (!/api\.deepseek\.com/i.test(LLM_BASE_URL)) {
+    if (!LLM_API_KEY) throw new Error("LLM_API_KEY or OPENROUTER_API_KEY is required");
+    client ??= new OpenAI({ baseURL: LLM_BASE_URL, apiKey: LLM_API_KEY, timeout: 5 * 60 * 1000 });
+    return client.chat.completions.create(reqParams);
+  }
+
+  const base = LLM_BASE_URL.replace(/\/$/, "").replace(/\/v1$/i, "");
+  const body = {
+    ...reqParams,
+    // DeepSeek v4 Pro supports tool calls with thinking, but rejects tool_choice="required".
+    // Keep thinking enabled and let the model choose tools naturally.
+    thinking: { type: "enabled", reasoning_effort: "high" },
+    stream: false,
+  };
+  if (body.tool_choice === "required") delete body.tool_choice;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 180_000); // 3 min timeout
+  const res = await fetch(`${base}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${LLM_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timer));
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`DeepSeek returned non-JSON response (${res.status}): ${text.slice(0, 300)}`);
+  }
+  if (!res.ok) {
+    throw new Error(json?.error?.message || json?.message || `DeepSeek API error ${res.status}`);
+  }
+  return json;
+}
 
 const MUTATING_TOOL_INTENTS = /\b(deploy|open position|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|add smart wallet|remove smart wallet|add wallet|remove wallet|pin|unpin|clear lesson|add lesson|set active strategy|remove strategy|add strategy|set |change |update |self.?update|pull latest|git pull|update yourself)\b/i;
 const LIVE_DATA_TOOL_INTENTS = /\b(balance|wallet|position|portfolio|pnl|yield|range|show positions|open positions|screen|candidate|find pool|search|research|analyze|check pool|token holders|narrative|study top|top lpers?|lp behavior|who.?s lping|performance|history|stats|report|list smart wallets|list blacklist|list blocked deployers|list lessons)\b/i;
@@ -147,6 +188,36 @@ function isThinkingModeToolChoiceError(error) {
   return /thinking mode does not support/i.test(message) && /tool_choice/i.test(message);
 }
 
+function isTransientProviderError(error) {
+  const message = String(error?.message || error?.error?.message || error || "");
+  const status = error?.status || error?.code || error?.error?.code;
+  return [408, 409, 429, 500, 502, 503, 504, 529].includes(Number(status))
+    || /premature close|socket hang up|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(message);
+}
+
+export function normalizeScreenerOutcome(modelContent, deployOutcome) {
+  const content = String(modelContent || "").trim();
+  if (deployOutcome?.success === true) {
+    const status = deployOutcome.partial
+      ? "⚠️ PARTIAL DEPLOY — VERIFIED TOOL RESULT"
+      : "🚀 DEPLOYED — VERIFIED TOOL RESULT";
+    const verified = [
+      status,
+      deployOutcome.pool_name || deployOutcome.pool ? `Pool: ${deployOutcome.pool_name || deployOutcome.pool}` : null,
+      deployOutcome.position ? `Position: ${deployOutcome.position}` : null,
+      deployOutcome.tx || deployOutcome.txs?.[0] ? `Transaction: ${deployOutcome.tx || deployOutcome.txs[0]}` : null,
+      deployOutcome.warning ? `Warning: ${deployOutcome.warning}` : null,
+    ].filter(Boolean).join("\n");
+    const notes = content.replace(/^\s*(?:🚀\s*DEPLOYED[^\n]*|⛔\s*NO DEPLOY)\s*/i, "").trim();
+    return notes ? `${verified}\n\nMODEL ASSESSMENT\n${notes}` : verified;
+  }
+  if (deployOutcome || /🚀\s*DEPLOYED|position opened|deploy(?:ment)? successful/i.test(content)) {
+    const why = deployOutcome?.error || deployOutcome?.reason || (deployOutcome ? "deployment did not succeed" : "deploy_position was not called");
+    return `⛔ NO DEPLOY\n\nDeployment failed: ${why}`;
+  }
+  return content;
+}
+
 /**
  * Core ReAct agent loop.
  *
@@ -155,9 +226,16 @@ function isThinkingModeToolChoiceError(error) {
  * @returns {string} - The agent's final text response
  */
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
-  const { interactive = false, onToolStart = null, onToolFinish = null } = options;
+  const { interactive = false, onToolStart = null, onToolFinish = null, dependencies = {}, autonomousDeploymentPlans = null, toolArgBindings = null } = options;
+  const deps = {
+    getWalletBalances,
+    getMyPositions,
+    createChatCompletion,
+    executeTool,
+    ...dependencies,
+  };
   // Build dynamic system prompt with current portfolio state
-  const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+  const [portfolio, positions] = await Promise.all([deps.getWalletBalances(), deps.getMyPositions()]);
   const stateSummary = getStateSummary();
   const lessons = getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();
@@ -184,6 +262,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
   let noToolRetryCount = 0;
+  let deployOutcome = null;
   // Stays true for the whole run once a thinking-mode provider rejects tool_choice
   let omitToolChoice = false;
 
@@ -200,7 +279,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       let usedModel = activeModel;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
-      let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
+      // A screener is allowed to make the safe choice (NO_DEPLOY) without a
+      // ceremonial tool call. Only an actual deployment must be tool-backed.
+      let toolChoice = (agentType !== "SCREENER" && step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -212,7 +293,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
           };
           if (!omitToolChoice) reqParams.tool_choice = toolChoice;
-          response = await client.chat.completions.create(reqParams);
+          response = await deps.createChatCompletion(reqParams);
         } catch (error) {
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
@@ -231,6 +312,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             omitToolChoice = true;
             log("agent", "Provider thinking mode does not support tool_choice — retrying without it");
             attempt -= 1;
+            continue;
+          }
+          if (isTransientProviderError(error) && attempt < 2) {
+            const wait = (attempt + 1) * 5000;
+            log("agent", `Transient provider error (${error?.message || error}), retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
+            await new Promise((r) => setTimeout(r, wait));
             continue;
           }
           throw error;
@@ -275,7 +362,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           }
         }
       }
-      messages.push(msg);
+      // DeepSeek thinking mode: push full message (content + reasoning_content + tool_calls)
+      const assistantMsg = { role: msg.role || "assistant", content: msg.content };
+      if (msg.reasoning_content) assistantMsg.reasoning_content = msg.reasoning_content;
+      if (msg.tool_calls) assistantMsg.tool_calls = msg.tool_calls;
+      messages.push(assistantMsg);
 
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
@@ -303,17 +394,27 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           });
           continue;
         }
+        const finalContent = agentType === "SCREENER"
+          ? normalizeScreenerOutcome(msg.content, deployOutcome)
+          : msg.content;
         log("agent", "Final answer reached");
-        log("agent", msg.content);
-        return { content: msg.content, userMessage: goal };
+        log("agent", finalContent);
+        return { content: finalContent, userMessage: goal };
       }
       sawToolCall = true;
 
-      // Execute each tool call in parallel
-      const toolResults = await Promise.all(msg.tool_calls.map(async (toolCall) => {
+      // Parse and reserve before starting any asynchronous work. This closes the
+      // duplicate-deploy TOCTOU window when a model emits two deploy calls in one batch.
+      const MUTATING_TOOLS = new Set([
+        "deploy_position", "close_position", "claim_fees", "swap_token",
+        "set_position_note", "self_update", "update_config", "add_strategy",
+        "set_active_strategy", "remove_strategy", "add_pool_note", "add_to_blacklist",
+        "remove_from_blacklist", "block_deployer", "unblock_deployer", "add_smart_wallet",
+        "remove_smart_wallet", "add_lesson", "pin_lesson", "unpin_lesson", "clear_lessons",
+      ]);
+      const parsedCalls = msg.tool_calls.map((toolCall) => {
         const functionName = toolCall.function.name.replace(/<.*$/, "").trim();
         let functionArgs;
-
         try {
           functionArgs = JSON.parse(toolCall.function.arguments);
         } catch {
@@ -325,44 +426,54 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             functionArgs = {};
           }
         }
+        const duplicate = ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName);
+        if (!duplicate && NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
+        return { toolCall, functionName, functionArgs, duplicate };
+      });
 
-        // Block once-per-session tools from firing a second time
-        if (ONCE_PER_SESSION.has(functionName) && firedOnce.has(functionName)) {
-          log("agent", `Blocked duplicate ${functionName} call — already executed this session`);
-          await onToolFinish?.({
-            name: functionName,
-            args: functionArgs,
-            result: { blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` },
-            success: false,
-            step,
+      let mutationChain = Promise.resolve();
+      const toolResults = await Promise.all(parsedCalls.map((call) => {
+        const run = async () => {
+          const { toolCall, functionName, duplicate } = call;
+          let { functionArgs } = call;
+          if (duplicate) {
+            const blocked = { blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` };
+            log("agent", `Blocked duplicate ${functionName} call — already reserved this session`);
+            await onToolFinish?.({ name: functionName, args: functionArgs, result: blocked, success: false, step });
+            return { role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(blocked) };
+          }
+
+          if (agentType === "SCREENER" && functionName === "deploy_position") {
+            const trustedPlan = autonomousDeploymentPlans?.get?.(functionArgs.pool_address)
+              || autonomousDeploymentPlans?.[functionArgs.pool_address];
+            if (!trustedPlan) {
+              const result = { blocked: true, reason: "Selected pool has no host-computed authoritative deployment plan" };
+              deployOutcome = { ...result, success: false };
+              await onToolFinish?.({ name: functionName, args: functionArgs, result, success: false, step });
+              return { role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(result) };
+            }
+            functionArgs = trustedPlan;
+          }
+          if (toolArgBindings?.[functionName]) {
+            functionArgs = { ...functionArgs, ...toolArgBindings[functionName] };
+          }
+          await onToolStart?.({ name: functionName, args: functionArgs, step });
+          const result = await deps.executeTool(functionName, functionArgs, {
+            autonomous: agentType === "SCREENER",
+            trustedAutonomousPlan: agentType === "SCREENER" && functionName === "deploy_position",
           });
-          return {
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
-          };
-        }
-
-        await onToolStart?.({ name: functionName, args: functionArgs, step });
-        const result = await executeTool(functionName, functionArgs);
-        await onToolFinish?.({
-          name: functionName,
-          args: functionArgs,
-          result,
-          success: result?.success !== false && !result?.error && !result?.blocked,
-          step,
-        });
-
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
-        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
-
-        return {
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: JSON.stringify(result),
+          const success = result?.success !== false && !result?.error && !result?.blocked;
+          if (functionName === "deploy_position") deployOutcome = { ...result, success };
+          await onToolFinish?.({ name: functionName, args: functionArgs, result, success, step });
+          // close/swap lock only after a successful attempt; deploy was reserved above.
+          if (!NO_RETRY_TOOLS.has(functionName) && ONCE_PER_SESSION.has(functionName) && success) firedOnce.add(functionName);
+          return { role: "tool", tool_call_id: toolCall.id, content: JSON.stringify(result) };
         };
+
+        if (!MUTATING_TOOLS.has(call.functionName) || call.duplicate) return run();
+        const queued = mutationChain.then(run, run);
+        mutationChain = queued.then(() => undefined, () => undefined);
+        return queued;
       }));
 
       messages.push(...toolResults);

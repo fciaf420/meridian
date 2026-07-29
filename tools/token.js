@@ -2,6 +2,10 @@ import { config } from "../config.js";
 import { getGmgnTokenFees, hasGmgnApiKey } from "./gmgn.js";
 
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
+const JUP_HEADERS = () => {
+  const key = config.jupiter?.apiKey || process.env.JUPITER_API_KEY;
+  return key ? { "x-api-key": key } : {};
+};
 
 // Resolve the global_fees_sol gate value. GMGN's /v1/token/info total_fee is the
 // accurate all-time fee figure; Jupiter's `fees` is slightly off and misleading.
@@ -19,7 +23,9 @@ async function resolveGlobalFeesSol(mint, jupiterFees) {
  * Useful for understanding if a token has a real community/theme vs nothing.
  */
 export async function getTokenNarrative({ mint }) {
-  const res = await fetch(`${DATAPI_BASE}/chaininsight/narrative/${mint}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  const res = await fetch(`${DATAPI_BASE}/chaininsight/narrative/${mint}`, { signal: controller.signal, headers: JUP_HEADERS() }).finally(() => clearTimeout(timer));
   if (!res.ok) throw new Error(`Narrative API error: ${res.status}`);
   const data = await res.json();
   return {
@@ -35,7 +41,9 @@ export async function getTokenNarrative({ mint }) {
  */
 export async function getTokenInfo({ query }) {
   const url = `${DATAPI_BASE}/assets/search?query=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  const res = await fetch(url, { signal: controller.signal, headers: JUP_HEADERS() }).finally(() => clearTimeout(timer));
   if (!res.ok) throw new Error(`Token search API error: ${res.status}`);
   const data = await res.json();
   const tokens = Array.isArray(data) ? data : [data];

@@ -33,14 +33,27 @@ function normalizeSymbol(symbol) {
 }
 
 export function scoreCandidate(pool) {
-  if (Number.isFinite(Number(pool.gmgn_score))) {
-    return Number(pool.gmgn_score) + Number(pool.fee_active_tvl_ratio || 0) * 500;
-  }
-  const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
+  const activityTimeframe = config.screening.activityTimeframe;
+  const feeTvl = Number(pool[`fee_active_tvl_ratio_${activityTimeframe}`] || 0);
   const organic = Number(pool.organic_score || 0);
-  const volume = Number(pool.volume_window || 0);
+  const volume = Number(pool[`volume_${activityTimeframe}`] || 0);
   const holders = Number(pool.holders || 0);
-  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
+  const degen = degenScore(pool, config.opportunity);
+  if (Number.isFinite(Number(pool.gmgn_score))) {
+    return Number(pool.gmgn_score) + degen * 100 + feeTvl * 500;
+  }
+  return degen * 100 + feeTvl * 500 + organic * 5 + volume / 200 + holders / 200;
+}
+
+export function formatOpportunityNearMisses(entries, triggerScore, limit = 3) {
+  const trigger = Number(triggerScore);
+  return entries.slice(0, limit).map(({ candidate, score }) => {
+    const value = Number(score);
+    const name = candidate.name || candidate.pool?.slice(0, 8) || "unknown";
+    const pool = candidate.pool?.slice(0, 8) || "unknown";
+    const gap = Math.max(0, trigger - value);
+    return `${name} ${pool} score=${value.toFixed(1)} trigger=${trigger.toFixed(1)} gap=${gap.toFixed(1)}`;
+  }).join(" | ");
 }
 
 /**
@@ -73,15 +86,23 @@ export function degenScore(pool, targets = {}) {
   const clamp01 = (x) => (Number.isFinite(x) ? Math.min(1, Math.max(0, x)) : 0);
 
   // Normalize window-dependent inputs to the 30m reference (rate × scale).
-  const tfMinutes = TIMEFRAME_MINUTES[config.screening.timeframe] || DEGEN_REFERENCE_MINUTES;
+  const activityTimeframe = config.screening.activityTimeframe;
+  const tfMinutes = TIMEFRAME_MINUTES[activityTimeframe] || DEGEN_REFERENCE_MINUTES;
   const tfScale = DEGEN_REFERENCE_MINUTES / tfMinutes;
 
   const volRatio = Number(pool.volume_active_tvl_ratio);
-  const tradingRatio = (Number.isFinite(volRatio) ? volRatio : Number(pool.volume_window || 0) / La) * tfScale;
-  const feeRatio = (Number.isFinite(Number(pool.fee_active_tvl_ratio))
-    ? Number(pool.fee_active_tvl_ratio)
+  const activityFeeRatio = pool[`fee_active_tvl_ratio_${activityTimeframe}`];
+  const activityVolume = pool[`volume_${activityTimeframe}`];
+  const tradingRatio = (Number.isFinite(Number(activityVolume)) ? Number(activityVolume) / La
+    : Number.isFinite(volRatio) ? volRatio
+    : Number(pool.volume_window || 0) / La) * tfScale;
+  const feeRatio = (Number.isFinite(Number(activityFeeRatio))
+    ? Number(activityFeeRatio)
     : Number(pool.fee_window || 0) / La) * tfScale;
-  const lpActivity = (Number(pool.unique_lps || 0) + Number(pool.positions_created || 0)) * tfScale;
+  const lpActivity = (
+    Number(pool[`unique_lps_${activityTimeframe}`] ?? pool.unique_lps ?? 0) +
+    Number(pool[`positions_created_${activityTimeframe}`] ?? pool.positions_created ?? 0)
+  ) * tfScale;
 
   const sTrading = clamp01(tradingRatio / targetVolRatio);
   const sLp      = clamp01(lpActivity / targetLpCount);
@@ -98,9 +119,104 @@ function numeric(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+export function getEligibilityActivityRejectReason(pool, {
+  timeframe,
+  minFeeActiveTvlRatio,
+  minVolume,
+}) {
+  const feeRatio = numeric(pool?.[`fee_active_tvl_ratio_${timeframe}`]);
+  const volume = numeric(pool?.[`volume_${timeframe}`]);
+  if (feeRatio == null || feeRatio < minFeeActiveTvlRatio) {
+    return `${timeframe} fee/active-TVL ${feeRatio ?? "unknown"} below ${minFeeActiveTvlRatio}`;
+  }
+  if (volume == null || volume < minVolume) {
+    return `${timeframe} volume ${volume ?? "unknown"} below ${minVolume}`;
+  }
+  return null;
+}
+
 function isUsableVolatility(value) {
   const n = numeric(value);
   return n != null && n > 0;
+}
+
+const METEORA_LIVE_POOL_FIELDS = [
+  "pool_type",
+  "bin_step",
+  "fee_pct",
+  "tvl",
+  "active_tvl",
+  "fee_window",
+  "volume_window",
+  "fee_active_tvl_ratio",
+  "volatility",
+  "volatility_timeframe",
+  "price",
+  "price_change_pct",
+  "price_trend",
+  "min_price",
+  "max_price",
+  "volume_change_pct",
+  "fee_change_pct",
+  "swap_count",
+];
+
+export function combineCandidateDiscoveries(meteoraDiscovery, gmgnDiscovery) {
+  const meteoraPools = Array.isArray(meteoraDiscovery?.pools) ? meteoraDiscovery.pools : [];
+  const gmgnPools = Array.isArray(gmgnDiscovery?.pools) ? gmgnDiscovery.pools : [];
+  const pools = [];
+  const indexByAddress = new Map();
+
+  function addPool(pool, source) {
+    const address = typeof pool?.pool === "string" && pool.pool.trim() ? pool.pool : null;
+    const existingIndex = address ? indexByAddress.get(address) : null;
+    if (existingIndex == null) {
+      if (address) indexByAddress.set(address, pools.length);
+      pools.push({ ...pool, sources: [source] });
+      return;
+    }
+
+    const existing = pools[existingIndex];
+    if (existing.sources.includes(source)) {
+      pools[existingIndex] = {
+        ...existing,
+        ...pool,
+        base: { ...existing.base, ...pool.base },
+        quote: { ...existing.quote, ...pool.quote },
+        sources: existing.sources,
+      };
+      return;
+    }
+
+    const meteoraPool = existing;
+    const gmgnPool = pool;
+    const merged = {
+      ...meteoraPool,
+      ...gmgnPool,
+      base: { ...gmgnPool.base, ...meteoraPool.base },
+      quote: { ...gmgnPool.quote, ...meteoraPool.quote },
+      sources: ["meteora", "gmgn"],
+    };
+    for (const field of METEORA_LIVE_POOL_FIELDS) {
+      if (meteoraPool[field] != null) merged[field] = meteoraPool[field];
+    }
+    pools[existingIndex] = merged;
+  }
+
+  meteoraPools.forEach((pool) => addPool(pool, "meteora"));
+  gmgnPools.forEach((pool) => addPool(pool, "gmgn"));
+
+  return {
+    total: Number(meteoraDiscovery?.total || 0) + Number(gmgnDiscovery?.total || 0),
+    pools,
+    filtered_examples: [
+      ...(meteoraDiscovery?.filtered_examples || []),
+      ...(gmgnDiscovery?.filtered_examples || []),
+    ],
+    stage_counts: gmgnDiscovery?.stage_counts
+      ? { ranked: Number(gmgnDiscovery?.total || 0), ...gmgnDiscovery.stage_counts }
+      : null,
+  };
 }
 
 function includesCaseInsensitive(values, value) {
@@ -139,9 +255,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
   const quote = pool?.token_y || {};
   const binStep = numeric(pool?.dlmm_params?.bin_step);
   const tvl = numeric(pool?.tvl ?? pool?.active_tvl);
-  const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
   const volatility = numeric(pool?.volatility);
-  const volume = numeric(pool?.volume);
   const holders = numeric(pool?.base_token_holders);
   const mcap = numeric(base?.market_cap);
   const baseOrganic = numeric(base?.organic_score);
@@ -160,15 +274,17 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
   if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
   if (holders == null || holders < s.minHolders) return `holders ${holders ?? "unknown"} below minHolders ${s.minHolders}`;
-  if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
   if (tvl == null || tvl < s.minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${s.minTvl}`;
   if (s.maxTvl != null && tvl > s.maxTvl) return `TVL ${tvl} above maxTvl ${s.maxTvl}`;
   if (binStep == null || binStep < s.minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${s.minBinStep}`;
   if (binStep > s.maxBinStep) return `bin_step ${binStep} above maxBinStep ${s.maxBinStep}`;
   if (!isUsableVolatility(volatility)) return `volatility ${volatility ?? "unknown"} unusable`;
-  if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
-    return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
-  }
+  const activityReason = getEligibilityActivityRejectReason(pool, {
+    timeframe: s.activityTimeframe,
+    minFeeActiveTvlRatio: s.minFeeActiveTvlRatio,
+    minVolume: s.minVolume,
+  });
+  if (activityReason) return activityReason;
   if (baseOrganic == null || baseOrganic < s.minOrganic) {
     return `base organic ${baseOrganic ?? "unknown"} below minOrganic ${s.minOrganic}`;
   }
@@ -247,8 +363,16 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   for (const pool of rawPools) {
     if (!pool) continue;
     pool[`volume_${sourceTimeframe}`] = pool.volume ?? null;
+    pool[`fee_${sourceTimeframe}`] = pool.fee ?? null;
+    pool[`fee_active_tvl_ratio_${sourceTimeframe}`] = pool.fee_active_tvl_ratio ?? null;
+    pool[`swap_count_${sourceTimeframe}`] = pool.swap_count ?? null;
+    pool[`unique_lps_${sourceTimeframe}`] = pool.unique_lps ?? null;
+    pool[`positions_created_${sourceTimeframe}`] = pool.positions_created ?? null;
     pool[`volatility_${sourceTimeframe}`] = pool.volatility ?? null;
     pool.volatility_timeframe = volatilityTimeframe;
+    pool.recent_activity_warning = Number(pool.swap_count ?? 0) <= 0
+      ? `${sourceTimeframe} has zero swaps`
+      : null;
   }
 
   if (sourceTimeframe === volatilityTimeframe) return rawPools;
@@ -261,6 +385,11 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
           poolAddress,
           volatility: numeric(pool?.volatility),
           volume: numeric(pool?.volume),
+          fee: numeric(pool?.fee),
+          feeActiveTvlRatio: numeric(pool?.fee_active_tvl_ratio),
+          swapCount: numeric(pool?.swap_count),
+          uniqueLps: numeric(pool?.unique_lps),
+          positionsCreated: numeric(pool?.positions_created),
         }))
     )
   );
@@ -277,14 +406,52 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
     if (!metrics) continue;
 
     pool[`volume_${volatilityTimeframe}`] = metrics.volume;
+    pool[`fee_${volatilityTimeframe}`] = metrics.fee;
+    pool[`fee_active_tvl_ratio_${volatilityTimeframe}`] = metrics.feeActiveTvlRatio;
+    pool[`swap_count_${volatilityTimeframe}`] = metrics.swapCount;
+    pool[`unique_lps_${volatilityTimeframe}`] = metrics.uniqueLps;
+    pool[`positions_created_${volatilityTimeframe}`] = metrics.positionsCreated;
     pool[`volatility_${volatilityTimeframe}`] = metrics.volatility;
 
-    // Use longer-timeframe values as the canonical ones for filtering
+    // Use longer-timeframe volatility as canonical, but preserve primary-timeframe volume
+    // as the filtering/screening volume so fresh 5m momentum cannot be faked by stale 30m volume.
     if (metrics.volatility != null) pool.volatility = metrics.volatility;
-    if (metrics.volume != null) pool.volume = metrics.volume;
   }
 
   return rawPools;
+}
+
+async function ensureEligibilityActivityMetrics(pools, timeframe) {
+  const missing = pools.filter((pool) =>
+    pool?.pool && (
+      numeric(pool[`fee_active_tvl_ratio_${timeframe}`]) == null ||
+      numeric(pool[`volume_${timeframe}`]) == null
+    )
+  );
+  if (missing.length === 0) return;
+
+  const results = await Promise.allSettled(
+    missing.map((pool) =>
+      fetchPoolDiscoveryDetail({ poolAddress: pool.pool, timeframe })
+        .then((detail) => ({ pool, detail }))
+    )
+  );
+  for (const result of results) {
+    if (result.status !== "fulfilled" || !result.value.detail) continue;
+    const { pool, detail } = result.value;
+    pool[`fee_${timeframe}`] = numeric(detail.fee);
+    pool[`fee_active_tvl_ratio_${timeframe}`] = numeric(detail.fee_active_tvl_ratio);
+    pool[`volume_${timeframe}`] = numeric(detail.volume);
+    pool[`swap_count_${timeframe}`] = numeric(detail.swap_count);
+    pool[`unique_lps_${timeframe}`] = numeric(detail.unique_lps);
+    pool[`positions_created_${timeframe}`] = numeric(detail.positions_created);
+    pool[`volatility_${timeframe}`] = numeric(detail.volatility);
+    pool.volatility = numeric(detail.volatility);
+    pool.volatility_timeframe = timeframe;
+    pool.recent_activity_warning = Number(pool.swap_count ?? 0) <= 0
+      ? `${config.screening.timeframe} has zero swaps`
+      : null;
+  }
 }
 
 async function searchAssetsBySymbol(symbol) {
@@ -445,12 +612,11 @@ export async function discoverPools({
     `base_token_market_cap>=${s.minMcap}`,
     `base_token_market_cap<=${s.maxMcap}`,
     `base_token_holders>=${s.minHolders}`,
-    `volume>=${s.minVolume}`,
     `tvl>=${s.minTvl}`,
     s.maxTvl != null ? `tvl<=${s.maxTvl}` : null,
     `dlmm_bin_step>=${s.minBinStep}`,
     `dlmm_bin_step<=${s.maxBinStep}`,
-    `fee_active_tvl_ratio>=${s.minFeeActiveTvlRatio}`,
+
     `base_token_organic_score>=${s.minOrganic}`,
     `quote_token_organic_score>=${s.minQuoteOrganic}`,
     s.minTokenAgeHours != null ? `base_token_created_at<=${Date.now() - s.minTokenAgeHours * 3_600_000}` : null,
@@ -597,17 +763,24 @@ export async function discoverPools({
 export async function getTopCandidates({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
   const source = String(config.screening.source || "meteora").toLowerCase();
-  if (!["meteora", "gmgn"].includes(source)) {
-    throw new Error(`Invalid screeningSource: ${config.screening.source}. Use meteora or gmgn.`);
+  if (!["meteora", "gmgn", "both"].includes(source)) {
+    throw new Error(`Invalid screeningSource: ${config.screening.source}. Use meteora, gmgn, or both.`);
   }
-  const discovery = source === "gmgn"
-    ? await discoverGmgnPools({ limit: Math.max(limit, config.gmgn.enrichLimit || 20) })
-    : await discoverPools({ page_size: 50 });
+  const gmgnLimit = Math.max(limit, config.gmgn.enrichLimit || 20);
+  const discovery = source === "both"
+    ? combineCandidateDiscoveries(...await Promise.all([
+        discoverPools({ page_size: 50 }),
+        discoverGmgnPools({ limit: gmgnLimit }),
+      ]))
+    : source === "gmgn"
+      ? await discoverGmgnPools({ limit: gmgnLimit })
+      : await discoverPools({ page_size: 50 });
   let { pools } = discovery;
+  await ensureEligibilityActivityMetrics(pools, config.screening.activityTimeframe);
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 
   // Token blacklist + dev blocklist (Meteora path runs these inside discoverPools; GMGN path does not)
-  if (source === "gmgn") {
+  if (source !== "meteora") {
     const before = pools.length;
     pools = pools.filter((p) => {
       if (isBlacklisted(p.base?.mint)) {
@@ -634,7 +807,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     ? Number(config.gmgn.minTvl ?? config.screening.minTvl ?? 0)
     : Number(config.screening.minTvl ?? 0);
   const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
-  const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
+  const activityThresholds = {
+    timeframe: config.screening.activityTimeframe,
+    minFeeActiveTvlRatio: Number(config.screening.minFeeActiveTvlRatio ?? 0),
+    minVolume: Number(config.screening.minVolume ?? 0),
+  };
 
   const eligible = pools
     .filter((p) => {
@@ -647,9 +824,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
         return false;
       }
-      const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
-      if (Number.isFinite(minFeeActiveTvlRatio) && minFeeActiveTvlRatio > 0 && (!Number.isFinite(feeActiveTvlRatio) || feeActiveTvlRatio < minFeeActiveTvlRatio)) {
-        pushFilteredReason(filteredOut, p, `fee/active-TVL ${Number.isFinite(feeActiveTvlRatio) ? feeActiveTvlRatio : "unknown"} below minFeeActiveTvlRatio ${minFeeActiveTvlRatio}`);
+      const activityReason = getEligibilityActivityRejectReason(p, activityThresholds);
+      if (activityReason) {
+        pushFilteredReason(filteredOut, p, activityReason);
         return false;
       }
       if (!isUsableVolatility(p.volatility)) {
@@ -678,6 +855,11 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     })
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
     .slice(0, limit);
+
+  if (filteredOut.length > 0) {
+    log("screening", `Post-Stage5 filter dropped ${filteredOut.length}: ${filteredOut.map(f => `${f.name}: ${f.reason}`).join(" | ")}`);
+  }
+  log("screening", `Post-Stage5: ${eligible.length}/${pools.length} eligible (limit ${limit})`);
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);
@@ -806,6 +988,14 @@ function condensePool(p) {
     ...(p.volatility_timeframe && p.volatility_timeframe !== config.screening.timeframe ? {
       [`volume_${config.screening.timeframe}`]: round(p[`volume_${config.screening.timeframe}`] ?? null),
       [`volume_${p.volatility_timeframe}`]: round(p[`volume_${p.volatility_timeframe}`] ?? null),
+      [`fee_${config.screening.timeframe}`]: round(p[`fee_${config.screening.timeframe}`] ?? null),
+      [`fee_${p.volatility_timeframe}`]: round(p[`fee_${p.volatility_timeframe}`] ?? null),
+      [`fee_active_tvl_ratio_${config.screening.timeframe}`]: fix(p[`fee_active_tvl_ratio_${config.screening.timeframe}`] ?? null, 4),
+      [`fee_active_tvl_ratio_${p.volatility_timeframe}`]: fix(p[`fee_active_tvl_ratio_${p.volatility_timeframe}`] ?? null, 4),
+      [`swap_count_${config.screening.timeframe}`]: p[`swap_count_${config.screening.timeframe}`] ?? null,
+      [`swap_count_${p.volatility_timeframe}`]: p[`swap_count_${p.volatility_timeframe}`] ?? null,
+      [`unique_lps_${p.volatility_timeframe}`]: p[`unique_lps_${p.volatility_timeframe}`] ?? null,
+      [`positions_created_${p.volatility_timeframe}`]: p[`positions_created_${p.volatility_timeframe}`] ?? null,
       [`volatility_${config.screening.timeframe}`]: fix(p[`volatility_${config.screening.timeframe}`] ?? null, 4),
       [`volatility_${p.volatility_timeframe}`]: fix(p[`volatility_${p.volatility_timeframe}`] ?? null, 4),
     } : {}),
@@ -842,6 +1032,7 @@ function condensePool(p) {
     fee_change_pct: fix(p.fee_change_pct, 1),
     swap_count: p.swap_count,
     unique_traders: p.unique_traders,
+    recent_activity_warning: p.recent_activity_warning || null,
 
     // Liquidity-relative + LP-activity metrics (Degen Score inputs)
     volume_active_tvl_ratio: p.volume_active_tvl_ratio != null ? fix(p.volume_active_tvl_ratio, 4) : null,

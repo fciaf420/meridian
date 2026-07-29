@@ -33,7 +33,7 @@ function getJupiterApiKey() {
   return config.jupiter.apiKey || process.env.JUPITER_API_KEY || DEFAULT_JUPITER_API_KEY;
 }
 
-function getJupiterReferralParams() {
+export function getJupiterReferralParams() {
   const referralAccount = String(config.jupiter.referralAccount || "").trim();
   const referralFee = Number(config.jupiter.referralFeeBps || 0);
   if (!referralAccount || !Number.isFinite(referralFee) || referralFee <= 0) {
@@ -56,6 +56,20 @@ function getJupiterReferralParams() {
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
  * Returns USD-denominated values provided by Helius.
  */
+export async function getRpcWalletBalanceFallback(walletAddress, errorMessage, connection = getConnection()) {
+  const lamports = await connection.getBalance(new PublicKey(walletAddress), "confirmed");
+  return {
+    wallet: walletAddress,
+    sol: Math.round((lamports / LAMPORTS_PER_SOL) * 1e6) / 1e6,
+    sol_price: 0,
+    sol_usd: 0,
+    usdc: 0,
+    tokens: [],
+    total_usd: 0,
+    error: `${errorMessage}; RPC SOL fallback active`,
+  };
+}
+
 export async function getWalletBalances() {
   let walletAddress;
   try {
@@ -67,12 +81,14 @@ export async function getWalletBalances() {
   const HELIUS_KEY = process.env.HELIUS_API_KEY;
   if (!HELIUS_KEY) {
     log("wallet_error", "HELIUS_API_KEY not set in .env");
-    return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
+    return getRpcWalletBalanceFallback(walletAddress, "Helius API key missing");
   }
 
   try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
     const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
     
     if (!res.ok) {
       throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
@@ -109,16 +125,23 @@ export async function getWalletBalances() {
     };
   } catch (error) {
     log("wallet_error", error.message);
-    return {
-      wallet: walletAddress,
-      sol: 0,
-      sol_price: 0,
-      sol_usd: 0,
-      usdc: 0,
-      tokens: [],
-      total_usd: 0,
-      error: error.message,
-    };
+    try {
+      const fallback = await getRpcWalletBalanceFallback(walletAddress, error.message);
+      log("wallet", `Using RPC SOL balance fallback: ${fallback.sol} SOL`);
+      return fallback;
+    } catch (fallbackError) {
+      log("wallet_error", `RPC balance fallback failed: ${fallbackError.message}`);
+      return {
+        wallet: walletAddress,
+        sol: 0,
+        sol_price: 0,
+        sol_usd: 0,
+        usdc: 0,
+        tokens: [],
+        total_usd: 0,
+        error: `${error.message}; RPC fallback failed: ${fallbackError.message}`,
+      };
+    }
   }
 }
 

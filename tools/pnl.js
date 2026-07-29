@@ -56,6 +56,16 @@ function unique(arr) {
   return [...new Set(arr.filter(Boolean))];
 }
 
+export function hasOnChainPositionValue(position) {
+  return [position?.xRaw, position?.yRaw, position?.feeXRaw, position?.feeYRaw].some((value) => {
+    try {
+      return BigInt(value?.toString?.() ?? value ?? 0) > 0n;
+    } catch {
+      return safeNum(value) > 0;
+    }
+  });
+}
+
 // ─── Meteora /pnl per pool (deposit history) ────────────────────
 // Exported because tools/dlmm.js (getPositionPnl + the Meteora fallback path)
 // also reads it.
@@ -279,17 +289,30 @@ export async function computePositions(walletAddress) {
     }
   }
 
-  if (flat.length === 0) {
-    return { wallet: walletAddress, total_positions: 0, positions: [], source: "rpc" };
+  const emptyPositions = flat.filter((position) => !hasOnChainPositionValue(position));
+  const fundedPositions = flat.filter(hasOnChainPositionValue);
+  if (emptyPositions.length > 0) {
+    log("pnl_warn", `Ignoring ${emptyPositions.length} empty DLMM position account(s): ${emptyPositions.map((p) => p.position.slice(0, 8)).join(", ")}`);
+  }
+
+  if (fundedPositions.length === 0) {
+    return { wallet: walletAddress, total_positions: 0, positions: [], source: "rpc", authoritative: true };
   }
 
   const [prices, meteoraByPosition] = await Promise.all([
-    getJupiterPrices([SOL_MINT, ...flat.map((f) => f.baseMint)]),
-    getMeteoraData(conn, walletAddress, flat),
+    getJupiterPrices([SOL_MINT, ...fundedPositions.map((f) => f.baseMint)]),
+    getMeteoraData(conn, walletAddress, fundedPositions),
   ]);
   const solUsd = prices[SOL_MINT] ?? null;
 
-  const positions = flat.map((f) => buildPosition(f, prices, solUsd, meteoraByPosition[f.position], solMode));
+  const positions = fundedPositions.map((f) => buildPosition(f, prices, solUsd, meteoraByPosition[f.position], solMode));
 
-  return { wallet: walletAddress, total_positions: positions.length, positions, source: "rpc" };
+  return {
+    wallet: walletAddress,
+    total_positions: positions.length,
+    positions,
+    source: "rpc",
+    authoritative: true,
+    ignored_empty_positions: emptyPositions.map((position) => position.position),
+  };
 }

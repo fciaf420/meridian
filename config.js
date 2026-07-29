@@ -29,7 +29,7 @@ function numericConfig(value) {
 const legacyBinsBelow = numericConfig(u.binsBelow);
 const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BELOW;
 const configuredMaxBinsBelow = numericConfig(u.maxBinsBelow)
-  ?? (legacyBinsBelow != null ? Math.max(legacyBinsBelow, configuredMinBinsBelow) : 69);
+  ?? (legacyBinsBelow != null ? Math.max(legacyBinsBelow, configuredMinBinsBelow) : 90);
 const configuredDefaultBinsBelow = numericConfig(u.defaultBinsBelow) ?? legacyBinsBelow ?? configuredMaxBinsBelow;
 const strategyMinBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.round(configuredMinBinsBelow));
 const strategyMaxBinsBelow = Math.max(strategyMinBinsBelow, Math.round(configuredMaxBinsBelow));
@@ -82,7 +82,8 @@ export const config = {
 
   // ─── Pool Screening Thresholds ───────────
   screening: {
-    source:            u.screeningSource    ?? "meteora", // meteora | gmgn
+    source:            u.screeningSource    ?? "meteora", // meteora | gmgn | both
+    activityTimeframe: u.screeningActivityTimeframe ?? "30m",
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
     minTvl:            u.minTvl            ?? 10_000,
@@ -171,11 +172,11 @@ export const config = {
   // ─── Position Management ────────────────
   management: {
     minClaimAmount:        u.minClaimAmount        ?? 5,
-    autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
+    autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? true,
     autoSwapRetryAttempts: u.autoSwapRetryAttempts ?? 3,    // retries for base→SOL auto-swap on Jupiter failure
     autoSwapRetryDelayMs:  u.autoSwapRetryDelayMs  ?? 3000, // delay between auto-swap retries
-    outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
-    outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
+    outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 7,
+    outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 10,
     oorCooldownTriggerCount: u.oorCooldownTriggerCount ?? 3,
     oorCooldownHours:       u.oorCooldownHours       ?? 12,
     repeatDeployCooldownEnabled: u.repeatDeployCooldownEnabled ?? true,
@@ -184,8 +185,8 @@ export const config = {
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
-    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
-    takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
+    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -20,
+    takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 15,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
@@ -204,9 +205,12 @@ export const config = {
   // ─── Strategy Mapping ───────────────────
   strategy: {
     strategy:     u.strategy     ?? "bid_ask",
+    hybridBidAskPct: u.hybridBidAskPct ?? 60,
+    hybridSpotPct:   u.hybridSpotPct   ?? 40,
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    targetDownsidePct: Number(u.targetDownsidePct ?? 55),
   },
 
   // ─── Scheduling ─────────────────────────
@@ -295,11 +299,9 @@ export const config = {
 
   jupiter: {
     apiKey: process.env.JUPITER_API_KEY ?? "",
-    referralAccount:
-      process.env.JUPITER_REFERRAL_ACCOUNT ??
-      "9MzhDUnq3KxecyPzvhguQMMPbooXQ3VAoCMPDnoijwey",
+    referralAccount: process.env.JUPITER_REFERRAL_ACCOUNT ?? "",
     referralFeeBps: Number(
-      process.env.JUPITER_REFERRAL_FEE_BPS ?? 50,
+      process.env.JUPITER_REFERRAL_FEE_BPS ?? 0,
     ),
   },
 

@@ -83,7 +83,7 @@ async function gmgnFetch(pathname, { method = "GET", params = {}, body = null } 
       const backoffMs = Number.isFinite(retryAfter)
         ? retryAfter * 1000
         : /temporarily banned/i.test(String(message))
-          ? 60000
+          ? 15000
           : Math.min(30000, 3000 * Math.pow(2, attempt));
       await sleep(backoffMs);
       continue;
@@ -574,14 +574,13 @@ export async function discoverGmgnPools({ limit = 10 } = {}) {
   for (const { token, info, infoCheck } of s2) {
     const mint = token.address;
     try {
-      const [holdersPayload, tradersPayload] = await Promise.all([
-        gmgnFetch("/v1/market/token_top_holders", {
-          params: { chain: "sol", address: mint, limit: g.holdersLimit || 100, order_by: "amount_percentage", direction: "desc" },
-        }),
-        gmgnFetch("/v1/market/token_top_traders", {
-          params: { chain: "sol", address: mint, limit: g.holdersLimit || 100, order_by: "profit", direction: "desc" },
-        }),
-      ]);
+      // Serialized to stay within GMGN 1 req/sec rate limit
+      const holdersPayload = await gmgnFetch("/v1/market/token_top_holders", {
+        params: { chain: "sol", address: mint, limit: g.holdersLimit || 100, order_by: "amount_percentage", direction: "desc" },
+      });
+      const tradersPayload = await gmgnFetch("/v1/market/token_top_traders", {
+        params: { chain: "sol", address: mint, limit: g.holdersLimit || 100, order_by: "profit", direction: "desc" },
+      });
       const holders = unwrapList(holdersPayload, ["list", "holders", "data"]);
       const traders = unwrapList(tradersPayload, ["list", "traders", "data"]);
       const holdersCheck = analyzeHoldersAndTraders(holders, traders);

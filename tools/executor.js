@@ -26,6 +26,7 @@ import fs from "fs";
 import { execSync, spawn } from "child_process";
 import { REPO_ROOT, repoPath } from "../repo-root.js";
 import { normalizeTimeframe, scaleScreeningToTimeframe } from "../screening-scales.js";
+import { validateSingleSidedSolOrientation } from "../deployment-policy.js";
 
 const USER_CONFIG_PATH = repoPath("user-config.json");
 const GMGN_CONFIG_PATH = repoPath("gmgn-config.json");
@@ -99,9 +100,20 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
 }
 
 async function validateDeployPoolThresholds(args) {
+  const activityTimeframe = config.screening.activityTimeframe;
+  let authoritative;
+  try {
+    authoritative = await getActiveBin({ pool_address: args.pool_address });
+    validateSingleSidedSolOrientation(authoritative, {
+      amountX: Number(args.amount_x ?? 0),
+      amountY: Number(args.amount_y ?? args.amount_sol ?? 0),
+    });
+  } catch (error) {
+    return { pass: false, reason: `Could not verify authoritative SDK pool orientation: ${error.message}` };
+  }
   let detail;
   try {
-    detail = await fetchFreshPoolDetail(args.pool_address);
+    detail = await fetchFreshPoolDetail(args.pool_address, activityTimeframe);
     if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
   } catch (error) {
     return {
@@ -141,13 +153,22 @@ async function validateDeployPoolThresholds(args) {
   ) {
     return {
       pass: false,
-      reason: `Pool fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
+      reason: `Pool ${activityTimeframe} fee/active-TVL ${feeActiveTvlRatio ?? "unknown"}% is below configured minFeeActiveTvlRatio ${minFeeActiveTvlRatio}%.`,
     };
   }
 
-  const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
+  const volume = numberOrNull(detail?.volume);
+  const minVolume = numberOrNull(config.screening.minVolume);
+  if (minVolume != null && minVolume > 0 && (volume == null || volume < minVolume)) {
+    return {
+      pass: false,
+      reason: `Pool ${activityTimeframe} volume $${volume ?? "unknown"} is below configured minVolume $${minVolume}.`,
+    };
+  }
+
+  const volatilityTimeframe = getVolatilityTimeframe(activityTimeframe);
   let volatilityDetail = detail;
-  if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
+  if (activityTimeframe !== volatilityTimeframe) {
     try {
       volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
     } catch (error) {
@@ -166,7 +187,7 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
-  const actualBinStep = poolDetailBinStep(detail);
+  const actualBinStep = numberOrNull(authoritative.binStep);
   const minStep = numberOrNull(config.screening.minBinStep);
   const maxStep = numberOrNull(config.screening.maxBinStep);
   if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
@@ -182,8 +203,14 @@ async function validateDeployPoolThresholds(args) {
     };
   }
 
-  const baseMint = detail?.token_x?.address || detail?.base_token_address || null;
   const entryMarketData = {
+    base_mint: authoritative.tokenXMint,
+    token_x_mint: authoritative.tokenXMint,
+    token_y_mint: authoritative.tokenYMint,
+    token_x_decimals: authoritative.tokenXDecimals,
+    token_y_decimals: authoritative.tokenYDecimals,
+    active_bin: authoritative.binId,
+    bin_step: actualBinStep,
     entry_mcap: numberOrNull(detail?.token_x?.market_cap ?? detail?.base_token_market_cap),
     entry_tvl: tvl,
     entry_volume: numberOrNull(detail?.volume),
@@ -660,11 +687,20 @@ async function swapBaseToSolWithRetry(baseMint, label) {
 /**
  * Execute a tool call with safety checks and logging.
  */
-export async function executeTool(name, args) {
+export async function executeTool(name, args, executionContext = {}) {
   const startTime = Date.now();
 
   // Strip model artifacts like "<|channel|>commentary" appended to tool names
   name = name.replace(/<.*$/, "").trim();
+
+  if (executionContext.autonomous && name === "deploy_position") {
+    if (!executionContext.trustedAutonomousPlan || args?.__trustedAutonomousPlan !== true) {
+      return { blocked: true, reason: "Autonomous deployment requires a host-computed trusted plan" };
+    }
+    // This marker is an internal capability, never part of the SDK contract or logs.
+    args = { ...args };
+    delete args.__trustedAutonomousPlan;
+  }
 
   // ─── Validate tool exists ─────────────────
   const fn = toolMap[name];
@@ -704,7 +740,8 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
-        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        const deployLabel = result.pool_name || args.pool_name || args.pool_address?.slice(0, 8);
+        notifyDeploy({ pair: result.partial ? `PARTIAL ${deployLabel}` : deployLabel, amountSol: result.amount_y_verified ?? result.amount_y ?? args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
         notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
@@ -778,6 +815,7 @@ async function runSafetyChecks(name, args) {
       const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
       const requestedBinsAbove = Number(args.bins_above ?? 0);
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
+      const maxBinsBelow = Math.max(minBinsBelow, Number(config.strategy.maxBinsBelow ?? minBinsBelow));
       const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
       const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
       const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
@@ -823,6 +861,12 @@ async function runSafetyChecks(name, args) {
         return {
           pass: false,
           reason: "Single-side SOL deploy must use bins_above=0.",
+        };
+      }
+      if (isSingleSidedSol && requestedBinsBelow > maxBinsBelow) {
+        return {
+          pass: false,
+          reason: `bins_below ${requestedBinsBelow} exceeds configured maximum ${maxBinsBelow}.`,
         };
       }
 

@@ -158,9 +158,12 @@ export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 
     .slice(0, maxLessons);
 
   if (!shared.length) return null;
-  return shared
-    .map((lesson) => `[HIVEMIND${lesson.score != null ? ` score=${lesson.score}` : ""}] ${lesson.rule}`)
-    .join("\n");
+  return JSON.stringify(shared.map((lesson) => ({
+    source: "hivemind_untrusted_advisory",
+    score: lesson.score,
+    tags: lesson.tags,
+    rule_untrusted: lesson.rule,
+  })));
 }
 
 export async function registerHiveMindAgent({ reason = "heartbeat" } = {}) {
