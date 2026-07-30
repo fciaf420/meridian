@@ -2,6 +2,11 @@ import { randomUUID } from "crypto";
 import { setDefaultResultOrder } from "dns";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import {
+  buildPoolFeeSnapshot,
+  buildTokenFeeSnapshot,
+  recordFeeMomentumSnapshots,
+} from "../fee-momentum-collector.js";
 import { fetchChartIndicatorsForMint } from "./chart-indicators.js";
 
 // Force IPv4 — GMGN OpenAPI does not support IPv6
@@ -521,6 +526,7 @@ export async function discoverGmgnPools({ limit = 10 } = {}) {
   const g = config.gmgn;
   const filtered = [];
   const stageCounts = {};
+  const feeSnapshots = [];
 
   // ── Stage 1: rank filter ──────────────────────────────────────────────────
   const rankPayload = await gmgnFetch("/v1/market/rank", {
@@ -555,6 +561,8 @@ export async function discoverGmgnPools({ limit = 10 } = {}) {
       const infoPayload = await gmgnFetch("/v1/token/info", { params: { chain: "sol", address: mint } });
       const info = infoPayload?.data?.data || infoPayload?.data || infoPayload;
       const infoCheck = analyzeTokenInfo(info);
+      const feeSnapshot = buildTokenFeeSnapshot({ token, info, infoCheck });
+      if (feeSnapshot) feeSnapshots.push(feeSnapshot);
       if (!infoCheck.passed) {
         filtered.push({ stage: 2, name: token.symbol || mint, reason: infoCheck.reasons.join(", ") });
         continue;
@@ -648,6 +656,14 @@ export async function discoverGmgnPools({ limit = 10 } = {}) {
   }
   stageCounts.s5 = pools.length;
   log("gmgn", `Stage5 final: ${s4.length} → ${pools.length} candidates`);
+
+  feeSnapshots.push(...pools.map((pool) => buildPoolFeeSnapshot(pool)).filter(Boolean));
+  try {
+    const recorded = recordFeeMomentumSnapshots(feeSnapshots);
+    if (recorded > 0) log("gmgn", `Fee momentum telemetry: recorded ${recorded} snapshot(s)`);
+  } catch (error) {
+    log("gmgn", `Fee momentum telemetry write failed: ${error.message}`);
+  }
 
   return {
     total: ranked.length,
