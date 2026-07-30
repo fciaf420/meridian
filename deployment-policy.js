@@ -19,6 +19,33 @@ export function binsForDownsidePct(targetDownsidePct, actualBinStep, bounds) {
   return Math.min(max, Math.max(min, raw));
 }
 
+export function downsidePctForVolatility(volatility, strategyConfig = {}) {
+  const defaultDownside = finiteNumber(strategyConfig.targetDownsidePct ?? 60, "targetDownsidePct");
+  const minDownside = finiteNumber(strategyConfig.minDownsidePct ?? defaultDownside, "minDownsidePct");
+  const maxDownside = finiteNumber(strategyConfig.maxDownsidePct ?? defaultDownside, "maxDownsidePct");
+  const minVolatility = finiteNumber(strategyConfig.minDownsideVolatilityPct ?? 2.5, "minDownsideVolatilityPct");
+  const defaultVolatility = finiteNumber(strategyConfig.defaultDownsideVolatilityPct ?? 5, "defaultDownsideVolatilityPct");
+  const maxVolatility = finiteNumber(strategyConfig.maxDownsideVolatilityPct ?? 12, "maxDownsideVolatilityPct");
+
+  if (!(0 < minDownside && minDownside <= defaultDownside && defaultDownside <= maxDownside && maxDownside < 100)) {
+    throw new Error("Downside percentages must satisfy 0 < min <= default <= max < 100");
+  }
+  if (!(0 <= minVolatility && minVolatility < defaultVolatility && defaultVolatility < maxVolatility)) {
+    throw new Error("Volatility anchors must satisfy 0 <= min < default < max");
+  }
+  if (volatility == null || volatility === "" || !Number.isFinite(Number(volatility))) return defaultDownside;
+
+  const value = Number(volatility);
+  if (value <= minVolatility) return minDownside;
+  if (value >= maxVolatility) return maxDownside;
+  if (value <= defaultVolatility) {
+    const progress = (value - minVolatility) / (defaultVolatility - minVolatility);
+    return minDownside + progress * (defaultDownside - minDownside);
+  }
+  const progress = (value - defaultVolatility) / (maxVolatility - defaultVolatility);
+  return defaultDownside + progress * (maxDownside - defaultDownside);
+}
+
 export function validateSingleSidedSolOrientation(authoritative, amounts) {
   const amountY = finiteNumber(amounts?.amountY ?? 0, "amountY");
   const amountX = finiteNumber(amounts?.amountX ?? 0, "amountX");
@@ -45,8 +72,9 @@ export function buildAutonomousDeploymentPlan({
   const amountY = finiteNumber(deployAmountSol, "host deploy amount");
   if (amountY <= 0) throw new Error("host deploy amount must be positive");
   validateSingleSidedSolOrientation(authoritative, { amountY, amountX: 0 });
+  const targetDownsidePct = downsidePctForVolatility(candidate.volatility, strategyConfig);
   const binsBelow = binsForDownsidePct(
-    strategyConfig.targetDownsidePct,
+    targetDownsidePct,
     authoritative.binStep,
     { min: strategyConfig.minBinsBelow, max: strategyConfig.maxBinsBelow },
   );
@@ -66,7 +94,7 @@ export function buildAutonomousDeploymentPlan({
     token_y_decimals: finiteNumber(authoritative.tokenYDecimals, "token Y decimals"),
     bin_step: finiteNumber(authoritative.binStep, "bin step"),
     active_bin: finiteNumber(authoritative.activeBin, "active bin"),
-    target_downside_pct: finiteNumber(strategyConfig.targetDownsidePct, "target downside"),
+    target_downside_pct: targetDownsidePct,
     volatility: candidate.volatility ?? null,
     fee_tvl_ratio: candidate.fee_active_tvl_ratio_30m ?? candidate.fee_active_tvl_ratio ?? null,
     organic_score: candidate.organic_score ?? null,

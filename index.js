@@ -643,7 +643,7 @@ ${candidateBlocks.join("\n\n")}
 STEPS:
 1. Decide whether any candidate is worth deploying. A single remaining candidate is not automatically good enough.
 2. Pick the best candidate only if it has real conviction from a strong specific narrative OR the configured degen trigger plus clean pool metrics. Smart wallets are a bonus only; absence alone is never a skip reason.
-3. If a pool qualifies, call deploy_position with ONLY pool_address. The trusted host supplies and enforces exact amount, hybrid strategy, SDK mints/bin step/active bin, wrapped-SOL orientation, and downside range.
+3. If a pool qualifies, call deploy_position with ONLY pool_address. The trusted host supplies and enforces exact amount, hybrid strategy, SDK mints/bin step/active bin, wrapped-SOL orientation, and the volatility-adjusted minimum/default/maximum downside percentage converted to bins.
 4. Report in this exact format (no tables, no extra sections):
    🚀 DEPLOYED
 
@@ -1083,16 +1083,6 @@ function getLoneCandidateSkipReason({ pool, sw, n, ti } = {}) {
     return `only candidate lacks a strong narrative and has weak degen score (${degen.toFixed(1)} < ${config.screening.loneCandidateMinDegen ?? 50})`;
   }
   return null;
-}
-
-function computeBinsBelow(volatility) {
-  const parsedVolatility = Number(volatility);
-  if (!Number.isFinite(parsedVolatility) || parsedVolatility <= 0) {
-    throw new Error(`Invalid volatility ${volatility ?? "unknown"} — refusing volatility-scaled deploy.`);
-  }
-  const lo = config.strategy.minBinsBelow;
-  const hi = config.strategy.maxBinsBelow;
-  return Math.max(lo, Math.min(hi, Math.round(lo + (parsedVolatility / 5) * (hi - lo))));
 }
 
 // ═══════════════════════════════════════════
@@ -1604,26 +1594,29 @@ async function deployLatestCandidate(index) {
     }
   }
   const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
-  const binsBelow = computeBinsBelow(candidate.volatility);
-  const result = await executeTool("deploy_position", {
-    pool_address: candidate.pool,
-    amount_y: deployAmount,
-    strategy: config.strategy.strategy,
-    bins_below: binsBelow,
-    bins_above: 0,
-    pool_name: candidate.name,
-    base_mint: candidate.base?.mint || candidate.base_mint || null,
-    bin_step: candidate.bin_step,
-    base_fee: candidate.base_fee,
-    volatility: candidate.volatility,
-    fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio,
-    organic_score: candidate.organic_score,
-    initial_value_usd: candidate.tvl ?? candidate.active_tvl ?? null,
+  const sdk = await getActiveBin({ pool_address: candidate.pool });
+  const plan = buildAutonomousDeploymentPlan({
+    modelSelection: { pool_address: candidate.pool },
+    candidate,
+    authoritative: {
+      tokenXMint: sdk.tokenXMint,
+      tokenYMint: sdk.tokenYMint,
+      tokenXDecimals: sdk.tokenXDecimals,
+      tokenYDecimals: sdk.tokenYDecimals,
+      binStep: sdk.binStep,
+      activeBin: sdk.binId,
+    },
+    deployAmountSol: deployAmount,
+    strategyConfig: config.strategy,
+  });
+  const result = await executeTool("deploy_position", plan, {
+    autonomous: true,
+    trustedAutonomousPlan: true,
   });
   if (result?.success === false || result?.error) {
     throw new Error(result.error || "Deploy failed");
   }
-  return { result, candidate, deployAmount, binsBelow };
+  return { result, candidate, deployAmount, binsBelow: plan.bins_below };
 }
 
 function appendHistory(userMsg, assistantMsg) {

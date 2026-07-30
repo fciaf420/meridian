@@ -412,6 +412,12 @@ const toolMap = {
       minBinsBelow: ["strategy", "minBinsBelow"],
       maxBinsBelow: ["strategy", "maxBinsBelow"],
       defaultBinsBelow: ["strategy", "defaultBinsBelow"],
+      minDownsidePct: ["strategy", "minDownsidePct"],
+      targetDownsidePct: ["strategy", "targetDownsidePct"],
+      maxDownsidePct: ["strategy", "maxDownsidePct"],
+      minDownsideVolatilityPct: ["strategy", "minDownsideVolatilityPct"],
+      defaultDownsideVolatilityPct: ["strategy", "defaultDownsideVolatilityPct"],
+      maxDownsideVolatilityPct: ["strategy", "maxDownsideVolatilityPct"],
       // hivemind
       hiveMindUrl: ["hiveMind", "url"],
       hiveMindApiKey: ["hiveMind", "apiKey"],
@@ -493,6 +499,10 @@ const toolMap = {
       Object.entries(CONFIG_MAP).map(([k, v]) => [k.toLowerCase(), [k, v]])
     );
     const STRATEGY_BIN_KEYS = new Set(["binsBelow", "minBinsBelow", "maxBinsBelow", "defaultBinsBelow"]);
+    const STRATEGY_PERCENT_KEYS = new Set([
+      "minDownsidePct", "targetDownsidePct", "maxDownsidePct",
+      "minDownsideVolatilityPct", "defaultDownsideVolatilityPct", "maxDownsideVolatilityPct",
+    ]);
 
     for (const [key, val] of Object.entries(changes)) {
       const match = CONFIG_MAP[key] ? [key, CONFIG_MAP[key]] : CONFIG_MAP_LOWER[key.toLowerCase()];
@@ -505,6 +515,13 @@ const toolMap = {
           continue;
         }
         normalizedVal = Math.max(MIN_SAFE_BINS_BELOW, Math.round(numericVal));
+      } else if (STRATEGY_PERCENT_KEYS.has(match[0])) {
+        const numericVal = Number(val);
+        if (!Number.isFinite(numericVal)) {
+          unknown.push(key);
+          continue;
+        }
+        normalizedVal = numericVal;
       }
       applied[match[0]] = normalizedVal;
     }
@@ -512,6 +529,19 @@ const toolMap = {
     if (Object.keys(applied).length === 0) {
       log("config", `update_config failed — unknown keys: ${JSON.stringify(unknown)}, raw changes: ${JSON.stringify(changes)}`);
       return { success: false, unknown, reason };
+    }
+
+    const nextMinDownside = Number(applied.minDownsidePct ?? config.strategy.minDownsidePct);
+    const nextDefaultDownside = Number(applied.targetDownsidePct ?? config.strategy.targetDownsidePct);
+    const nextMaxDownside = Number(applied.maxDownsidePct ?? config.strategy.maxDownsidePct);
+    if (!(0 < nextMinDownside && nextMinDownside <= nextDefaultDownside && nextDefaultDownside <= nextMaxDownside && nextMaxDownside < 100)) {
+      return { success: false, error: "Downside percentages must satisfy 0 < min <= default <= max < 100", reason };
+    }
+    const nextMinVolatility = Number(applied.minDownsideVolatilityPct ?? config.strategy.minDownsideVolatilityPct);
+    const nextDefaultVolatility = Number(applied.defaultDownsideVolatilityPct ?? config.strategy.defaultDownsideVolatilityPct);
+    const nextMaxVolatility = Number(applied.maxDownsideVolatilityPct ?? config.strategy.maxDownsideVolatilityPct);
+    if (!(0 <= nextMinVolatility && nextMinVolatility < nextDefaultVolatility && nextDefaultVolatility < nextMaxVolatility)) {
+      return { success: false, error: "Volatility anchors must satisfy 0 <= min < default < max", reason };
     }
 
     let userConfig = {};

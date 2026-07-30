@@ -16,8 +16,8 @@ const USER_CONFIG_PATH = repoPath("user-config.json");
 const LESSONS_FILE = repoPath("lessons.json");
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
-const RANGE_CHANGE_PER_STEP = 0.10;
-const RANGE_EVOLUTION_WINDOW = 5;
+const DOWNSIDE_EVOLUTION_WINDOW = 5;
+const DOWNSIDE_CHANGE_POINTS = 2.5;
 const PERFORMANCE_SIGNAL_FIELDS = [
   "organic_score",
   "fee_tvl_ratio",
@@ -332,53 +332,59 @@ function derivLesson(perf) {
  * @param {Object} config   - Live config object (mutated in place)
  * @returns {{ changes: Object, rationale: Object } | null}
  */
-export function calculateRangeEvolution(perfData, config) {
-  const recent = (perfData || []).slice(-RANGE_EVOLUTION_WINDOW);
-  const currentMin = Number(config?.strategy?.minBinsBelow);
-  const currentMax = Number(config?.strategy?.maxBinsBelow);
-  if (!Number.isFinite(currentMin) || !Number.isFinite(currentMax)) {
+export function calculateDownsideEvolution(perfData, config) {
+  const recent = (perfData || []).slice(-DOWNSIDE_EVOLUTION_WINDOW);
+  const strategy = config?.strategy || {};
+  const current = {
+    minDownsidePct: Number(strategy.minDownsidePct),
+    targetDownsidePct: Number(strategy.targetDownsidePct),
+    maxDownsidePct: Number(strategy.maxDownsidePct),
+  };
+  if (recent.length !== DOWNSIDE_EVOLUTION_WINDOW || Object.values(current).some((value) => !Number.isFinite(value))) {
     return { changes: {}, rationale: {} };
   }
 
-  const oorLosses = recent.filter((p) => {
-    const reason = String(p.close_reason || "").toLowerCase();
-    return Number(p.pnl_pct) < 0 && (reason.includes("out of range") || reason.includes("oor") || reason.includes("far below range") || reason.includes("far above range"));
+  const downsideLosses = recent.filter((position) => {
+    const reason = String(position.close_reason || "").toLowerCase();
+    const explicitlyBelow = reason.includes("below") && /range|bin|oor|out of range/.test(reason);
+    return Number(position.pnl_pct) < 0 && explicitlyBelow;
   });
-
-  if (oorLosses.length >= 2) {
-    const minBinsBelow = clamp(Math.round(currentMin * (1 + RANGE_CHANGE_PER_STEP)), 35, 70);
-    const maxBinsBelow = clamp(Math.round(currentMax * (1 + RANGE_CHANGE_PER_STEP)), 70, 140);
-    if (minBinsBelow === currentMin && maxBinsBelow === currentMax) {
-      return { changes: {}, rationale: {} };
-    }
-    return {
-      changes: { minBinsBelow, maxBinsBelow },
-      rationale: {
-        rangeBins: `${oorLosses.length} out-of-range losses in the latest ${recent.length} closes — widened range from ${currentMin}-${currentMax} to ${minBinsBelow}-${maxBinsBelow} bins`,
-      },
-    };
-  }
-
   const consistentlyEfficient =
-    recent.length === RANGE_EVOLUTION_WINDOW &&
-    recent.every((p) => Number(p.range_efficiency) >= 85) &&
-    avg(recent.map((p) => Number(p.pnl_pct))) > 0;
+    recent.every((position) => Number(position.range_efficiency) >= 85) &&
+    avg(recent.map((position) => Number(position.pnl_pct))) > 0;
 
-  if (consistentlyEfficient) {
-    const minBinsBelow = clamp(Math.round(currentMin * (1 - RANGE_CHANGE_PER_STEP)), 35, 70);
-    const maxBinsBelow = clamp(Math.round(currentMax * (1 - RANGE_CHANGE_PER_STEP)), 70, 140);
-    if (minBinsBelow === currentMin && maxBinsBelow === currentMax) {
-      return { changes: {}, rationale: {} };
-    }
-    return {
-      changes: { minBinsBelow, maxBinsBelow },
-      rationale: {
-        rangeBins: `All latest ${recent.length} closes had at least 85% range efficiency with positive average PnL — tightened range from ${currentMin}-${currentMax} to ${minBinsBelow}-${maxBinsBelow} bins`,
-      },
-    };
+  let delta = 0;
+  let reason = null;
+  if (downsideLosses.length >= 2) {
+    delta = DOWNSIDE_CHANGE_POINTS;
+    reason = `${downsideLosses.length} genuine downside range losses in the latest ${recent.length} closes`;
+  } else if (consistentlyEfficient) {
+    delta = -DOWNSIDE_CHANGE_POINTS;
+    reason = `All latest ${recent.length} closes had at least 85% range efficiency with positive average PnL`;
+  } else {
+    return { changes: {}, rationale: {} };
   }
 
-  return { changes: {}, rationale: {} };
+  const next = {
+    minDownsidePct: clamp(current.minDownsidePct + delta, 40, 60),
+    targetDownsidePct: clamp(current.targetDownsidePct + delta, 45, 70),
+    maxDownsidePct: clamp(current.maxDownsidePct + delta, 60, 75),
+  };
+  next.targetDownsidePct = clamp(next.targetDownsidePct, next.minDownsidePct, next.maxDownsidePct);
+  next.maxDownsidePct = Math.max(next.targetDownsidePct, next.maxDownsidePct);
+
+  const changes = {};
+  for (const [key, value] of Object.entries(next)) {
+    const rounded = Number(value.toFixed(2));
+    if (rounded !== current[key]) changes[key] = rounded;
+  }
+  if (Object.keys(changes).length === 0) return { changes: {}, rationale: {} };
+  return {
+    changes,
+    rationale: {
+      downsidePercentages: `${reason} — adjusted downside targets from ${current.minDownsidePct}/${current.targetDownsidePct}/${current.maxDownsidePct}% to ${next.minDownsidePct}/${next.targetDownsidePct}/${next.maxDownsidePct}%`,
+    },
+  };
 }
 
 export function evolveThresholds(perfData, config) {
@@ -394,9 +400,9 @@ export function evolveThresholds(perfData, config) {
   const changes   = {};
   const rationale = {};
 
-  const rangeEvolution = calculateRangeEvolution(perfData, config);
-  Object.assign(changes, rangeEvolution.changes);
-  Object.assign(rationale, rangeEvolution.rationale);
+  const downsideEvolution = calculateDownsideEvolution(perfData, config);
+  Object.assign(changes, downsideEvolution.changes);
+  Object.assign(rationale, downsideEvolution.rationale);
 
   // ── 1. minFeeActiveTvlRatio ────────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
@@ -600,8 +606,9 @@ export function evolveThresholds(perfData, config) {
   if (changes.trailingDropPct    != null) m.trailingDropPct    = changes.trailingDropPct;
 
   const strategy = config.strategy;
-  if (changes.minBinsBelow != null) strategy.minBinsBelow = changes.minBinsBelow;
-  if (changes.maxBinsBelow != null) strategy.maxBinsBelow = changes.maxBinsBelow;
+  if (changes.minDownsidePct != null) strategy.minDownsidePct = changes.minDownsidePct;
+  if (changes.targetDownsidePct != null) strategy.targetDownsidePct = changes.targetDownsidePct;
+  if (changes.maxDownsidePct != null) strategy.maxDownsidePct = changes.maxDownsidePct;
 
   // Log a lesson summarizing the evolution
   const data = load();

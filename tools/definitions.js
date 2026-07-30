@@ -144,7 +144,7 @@ HARD RULES:
 Guidelines (only when user hasn't specified):
 - Strategy: omit the strategy field — the system will use the configured default from config.strategy.strategy
 - Hybrid strategy is supported: it opens one position and overlays BidAsk + Spot using configured ratios.
-- Bins: autonomous range is derived from target downside coverage and the authoritative on-chain bin step.
+- Bins: autonomous range uses volatility to interpolate the configured minimum/default/maximum downside percentages, then converts that percentage using the authoritative on-chain bin step.
 - Deposit: single-sided SOL only: set amount_y/amount_sol, keep amount_x=0.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,

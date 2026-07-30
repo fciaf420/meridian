@@ -29,7 +29,7 @@ function numericConfig(value) {
 const legacyBinsBelow = numericConfig(u.binsBelow);
 const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BELOW;
 const configuredMaxBinsBelow = numericConfig(u.maxBinsBelow)
-  ?? (legacyBinsBelow != null ? Math.max(legacyBinsBelow, configuredMinBinsBelow) : 90);
+  ?? (legacyBinsBelow != null ? Math.max(legacyBinsBelow, configuredMinBinsBelow) : 180);
 const configuredDefaultBinsBelow = numericConfig(u.defaultBinsBelow) ?? legacyBinsBelow ?? configuredMaxBinsBelow;
 const strategyMinBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Math.round(configuredMinBinsBelow));
 const strategyMaxBinsBelow = Math.max(strategyMinBinsBelow, Math.round(configuredMaxBinsBelow));
@@ -210,7 +210,12 @@ export const config = {
     minBinsBelow: strategyMinBinsBelow,
     maxBinsBelow: strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
-    targetDownsidePct: Number(u.targetDownsidePct ?? 55),
+    minDownsidePct: Number(u.minDownsidePct ?? 50),
+    targetDownsidePct: Number(u.targetDownsidePct ?? 60),
+    maxDownsidePct: Number(u.maxDownsidePct ?? 75),
+    minDownsideVolatilityPct: Number(u.minDownsideVolatilityPct ?? 2.5),
+    defaultDownsideVolatilityPct: Number(u.defaultDownsideVolatilityPct ?? 5),
+    maxDownsideVolatilityPct: Number(u.maxDownsideVolatilityPct ?? 12),
   },
 
   // ─── Scheduling ─────────────────────────
