@@ -136,7 +136,7 @@ MANUAL USER REQUESTS: explicit user parameters remain supported, subject to on-c
 
 HARD RULES:
 - Never use 'curve'.
-- Bin Step: Only deploy in pools with bin_step between 80 and 125.
+- Bin Step: Only deploy in pools within the configured screening minBinStep/maxBinStep; runtime enforces the effective bounds.
 - Range: Total bins must stay within the configured minimum and maximum.
 - For single-side SOL deploys (amount_y only, amount_x=0), do not request upside exposure:
   use bins_below only, keep bins_above=0, and the upper bin will be pinned to the current active bin.
