@@ -521,6 +521,7 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
       // Pre-load top 3 candidates with recon data in parallel
       let candidateBlocks = "";
       let loadedCandidates = [];
+      const hardSkipped = [];
       try {
         const result = await getTopCandidates({ limit: 5 });
         const candidates = result?.candidates || [];
@@ -555,6 +556,8 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
           const tokenData = infoResult?.results?.[0];
           const smartWalletCount = swResult?.in_pool?.length || 0;
           c._smartWalletCount = smartWalletCount;
+          c._globalFeesSol = holdResult?.global_fees_sol ?? null;
+          c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
 
           let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
 
@@ -584,6 +587,7 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
               const epPass = gmgnResult.volume_24h >= (config.strategy.evilPanda?.minTokenVolume24h ?? 750000)
                 && gmgnResult.market_cap >= (config.strategy.evilPanda?.minMcap ?? 200000)
                 && gmgnResult.candles.evil_panda_entry_ok;
+              c._evilPandaPass = !!epPass;
               block += `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, mcap>=${config.strategy.evilPanda?.minMcap ?? 200000}, 5m Supertrend green/price above`;
               block += ` | supertrend=${gmgnResult.candles.supertrend_direction ?? "?"}/${gmgnResult.candles.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${gmgnResult.candles.rsi_2 ?? "?"}`;
             }
@@ -606,7 +610,23 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
             .filter((b) => b.status === "fulfilled")
             .map((b) => [b.value.pool, b.value.block])
         );
-        const validBlocks = rankedCandidates
+        // Hard skips are threshold checks on pre-loaded data: drop failing candidates in
+        // code so the model only judges the survivors (narrative, momentum, pick-or-skip).
+        // Unknown values (null) never cause a skip here; the model still sees them.
+        const hardSkipReason = (c) => {
+          if (c._globalFeesSol != null && c._globalFeesSol < config.screening.minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${config.screening.minTokenFeesSol}`;
+          if (Number.isFinite(c._top10Pct) && c._top10Pct > 60) return `top10 ${c._top10Pct}% > 60%`;
+          if (config.strategy.activeStrategy === "evil_panda" && c._evilPandaPass === false) return "Evil Panda entry FAIL";
+          return null;
+        };
+        const survivors = [];
+        for (const c of rankedCandidates) {
+          const reason = hardSkipReason(c);
+          if (reason) hardSkipped.push(`${c.name}: ${reason}`);
+          else survivors.push(c);
+        }
+        if (hardSkipped.length > 0) log("cron", `Screening hard-skipped in code: ${hardSkipped.join("; ")}`);
+        const validBlocks = survivors
           .map((c) => blockMap.get(c.pool))
           .filter(Boolean);
         if (validBlocks.length > 0) {
@@ -647,6 +667,13 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
         }
       } catch (e) {
         log("cron", `Pre-load failed (${e.message}), agent will fetch manually`);
+      }
+
+      // Every pre-loaded candidate failed a hard skip: nothing is left to judge, and the
+      // no-preload fallback would only re-fetch the same shortlist. Skip the LLM call.
+      if (loadedCandidates.length > 0 && hardSkipped.length >= loadedCandidates.length) {
+        screenReport = `Screening: all ${loadedCandidates.length} candidate(s) failed hard-skip rules in code — no deploy.\n${hardSkipped.map((s) => `- ${s}`).join("\n")}`;
+        return; // finally{} still releases the screening lock and emits the report
       }
 
       // Inject Darwinian signal weights if available
