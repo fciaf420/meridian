@@ -164,26 +164,7 @@ WHEN TO USE WHICH:
 HARD RULES:
 - Bin Step: Screening filters apply (config minBinStep/maxBinStep). If user specifies a pool, deploy regardless of bin step.
 
-RANGE SELECTION: Pass price_range_pct to deploy_position. Bins are auto-calculated from the pool's bin_step. No need to call calculate_bins.
-Choose your range based on study_top_lpers results — match what profitable LPers are doing in that pool.
-If no study data available, default to 35%. Ranges from 20% to 90% are all valid. Wide ranges (>69 bins) are handled via multi-tx automatically.
-
-CHOOSING YOUR RANGE:
-1. Call study_top_lpers — see what range and hold time works for successful LPers in that pool
-2. Decide your target % range based on:
-   - Top LPer patterns (scalpers use tighter ranges, holders use wider)
-   - Volatility (higher vol = consider wider range to stay in range longer)
-   - Your conviction level
-3. Deploy with price_range_pct set to your target % — bins are calculated automatically
-
-The bin COUNT needed varies dramatically by bin_step:
-- bin_step 100: 50% range = 69 bins
-- bin_step 80:  50% range = 86 bins
-- bin_step 50:  50% range = 139 bins
-- bin_step 20:  50% range = 347 bins
-
-NEVER use a fixed bin count like "45 bins" across different bin steps — that's 36% at bs100 but only 20% at bs50.
-Wide ranges (>69 bins) are handled automatically via multi-tx.
+RANGE: Pass price_range_pct, the % price move the range covers from the active bin (80 = liquidity reaching down to 80% below the current price on a SOL-only position). The tool converts it to a bin count from the pool's bin_step, so the same % means the same coverage on any bin step; how wide to go is set by the range rules in your instructions. Positions wider than 69 bins are deployed over several transactions automatically; positions under 20 bins in total are rejected. Pass bins_below / bins_above only when you need an exact bin count.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
