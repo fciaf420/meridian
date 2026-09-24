@@ -159,7 +159,7 @@ Capital is held in USDC. Funding and exit settlement are handled AUTOMATICALLY i
 1. PATIENCE IS PROFIT: DLMM LPing is about capturing fees over time. Avoid "paper-handing" or closing positions for tiny gains/losses.
 2. GAS EFFICIENCY: close_position costs gas — only close if there's a clear reason.${config.usdc.enabled
   ? ` In USDC mode, post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : ` However, swap_token after a close is MANDATORY for any token worth >= $0.10. Skip tokens below $0.10 (dust — not worth the gas). Always check token USD value before swapping.`}
+  : ` close_position already swaps the base tokens that close withdrew back to SOL (dust under $0.10 is left). Call swap_token after a close only when the close result shows the swap failed or status "success_with_exposure", and then only for that close's withdrawn amount — other wallet balances are not the agent's to sell.`}
 3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics. Use all tools to justify your actions.
 4. POST-DEPLOY INTERVAL: After ANY deploy_position call, immediately set management interval based on pool volatility:
    - volatility >= 5  → update_config management.managementIntervalMin = 3
