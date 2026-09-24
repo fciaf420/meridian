@@ -298,7 +298,7 @@ ${_sectionOverrides.manager_logic || _defaultManagerLogic()}
 IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
 ${config.usdc.enabled
   ? `After ANY close: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : `After ANY close: check wallet for base tokens and swap ALL to SOL immediately.`}
+  : `After ANY close: close_position has already swapped the withdrawn base tokens to SOL. Only if its result shows swap.success=false or status "success_with_exposure", swap that position's withdrawn amount with swap_token.`}
 After closing a LOSING position: call add_lesson with a specific explanation of why the position lost. Include what signal you missed and what to do differently. Generic stats-only lessons are not useful.
 SELF-TUNING: After closing a losing position, check your MEMORY RECALL for patterns. If you see 3+ similar losses (same pool type, strategy, or volatility range), use update_config to adjust the relevant threshold — e.g., tighten maxVolatility, raise minOrganic, adjust stopLossPct. Only change thresholds you have evidence for.
 `;
