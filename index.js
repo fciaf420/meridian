@@ -10,7 +10,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
-import { registerCronRestarter } from "./tools/executor.js";
+import { registerCronRestarter, executeTool } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, isEnabled as telegramEnabled } from "./telegram.js";
 import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing } from "./briefing.js";
@@ -175,6 +175,21 @@ function stopCronJobs() {
   stopPnlWatcher();
 }
 
+// With no open positions, management relaxes to the idle cadence (10 min). This used
+// to be a MANDATORY prompt step after every close; it is a fixed rule, so run it here.
+const IDLE_MANAGEMENT_INTERVAL_MIN = 10;
+async function resetIdleManagementInterval() {
+  if (config.schedule.managementIntervalMin === IDLE_MANAGEMENT_INTERVAL_MIN) return;
+  // Re-read uncached so a stale positions cache can't relax cadence while a position is open.
+  const fresh = await getMyPositions({ force: true }).catch(() => null);
+  if (!fresh || fresh.error || fresh.positions?.length) return;
+  await executeTool("update_config", {
+    setting: "managementIntervalMin",
+    value: IDLE_MANAGEMENT_INTERVAL_MIN,
+    reason: "no open positions",
+  });
+}
+
 function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
 
@@ -201,6 +216,7 @@ function startCronJobs() {
       const preCheck = await getMyPositions();
       if (!preCheck?.positions?.length) {
         log("cron", "Management skipped — no open positions");
+        if (!preCheck?.error) await resetIdleManagementInterval().catch(() => {});
         timers.managementLastRun = Date.now();
         setManagementBusy(false);
         return;
@@ -372,10 +388,7 @@ STEPS:
 3. If closing: ${usdcModeEnabled()
     ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
     : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result reports a failed swap or status "success_with_exposure".`}
-4. After any close — recalibrate management interval (MANDATORY):
-   - No positions remaining → update_config setting=managementIntervalMin value=10
-   - Positions still open → keep current interval
-5. After closing a LOSING position — check MEMORY RECALL for patterns:
+4. After closing a LOSING position — check MEMORY RECALL for patterns:
    - If 3+ similar losses (same pool type, volatility range, or strategy) → use update_config to adjust the threshold that would have prevented it
    - Examples: tighten maxVolatility, raise minOrganic, adjust stopLossPct, raise minVolume
 
@@ -408,6 +421,7 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
             emit("out_of_range", { pair: p.pair, minutesOOR: p.minutes_out_of_range });
           }
         }
+        if (pos && !pos.error && !pos.positions?.length) await resetIdleManagementInterval();
       } catch { /* best-effort */ }
       // Promote high-hit nugget facts to MEMORY.md
       maybePromote();

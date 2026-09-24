@@ -87,8 +87,7 @@ function _defaultRangeSelectionText(deployAmount, currentBalanceSol) {
   * spot (two-sided): wider range helps BOTH directions since liquidity spans above and below.
   * NEVER generate a lesson saying "use wider range" for upside OOR on a single-sided-below strategy. That analysis is fundamentally wrong.
 - COMPOUNDING: Deploy amount is ${deployAmount} SOL (scaled from wallet: ${currentBalanceSol ?? "?"} SOL). Do NOT override with a smaller amount.
-- After deploy: update_config setting=managementIntervalMin based on volatility (>=5→3, 2-5→5, <2→10).
-- Report: strategy chosen + why, price_range_pct used + volatility basis, deploy amount, interval set.`;
+- Report: strategy chosen + why, price_range_pct used + volatility basis, deploy amount.`;
 }
 
 /** Build default section texts (without config interpolation for manager_logic) */
@@ -161,10 +160,7 @@ Capital is held in USDC. Funding and exit settlement are handled AUTOMATICALLY i
   ? ` In USDC mode, post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
   : ` close_position already swaps the base tokens that close withdrew back to SOL (dust under $0.10 is left). Call swap_token after a close only when the close result shows the swap failed or status "success_with_exposure", and then only for that close's withdrawn amount — other wallet balances are not the agent's to sell.`}
 3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics. Use all tools to justify your actions.
-4. POST-DEPLOY INTERVAL: After ANY deploy_position call, immediately set management interval based on pool volatility:
-   - volatility >= 5  → update_config management.managementIntervalMin = 3
-   - volatility 2–5   → update_config management.managementIntervalMin = 5
-   - volatility < 2   → update_config management.managementIntervalMin = 10
+4. POST-DEPLOY INTERVAL: Pass the pool's volatility to deploy_position; the runner sets the management interval from it.
 
 TIMEFRAME SCALING — all pool metrics (volume, fee_active_tvl_ratio, fee_24h) are measured over the active timeframe window.
 The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectations accordingly:

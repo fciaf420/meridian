@@ -363,6 +363,23 @@ export async function executeTool(name, args) {
     if (success) {
       if (name === "deploy_position") {
         emit("deploy", { pair: args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, amountUsd: usdcModeEnabled() ? (args.initial_value_usd ?? null) : null, position: result.position, tx: result.tx });
+        // Post-deploy management cadence is a fixed mapping from pool volatility.
+        // Falls back to the pool's current volatility when the model did not pass it.
+        // Best-effort: a failure here must never turn a landed deploy into an error.
+        try {
+          let vol = args.volatility == null ? NaN : Number(args.volatility);
+          if (!Number.isFinite(vol) && args.pool_address) {
+            const detail = await getPoolDetail({ pool_address: args.pool_address }).catch(() => null);
+            vol = detail?.volatility == null ? NaN : Number(detail.volatility);
+          }
+          if (Number.isFinite(vol)) {
+            const interval = vol >= 5 ? 3 : vol >= 2 ? 5 : 10;
+            const cadence = toolMap.update_config({ setting: "managementIntervalMin", value: interval, reason: `post-deploy cadence for volatility ${vol}` });
+            result.management_interval_min = cadence?.applied?.managementIntervalMin ?? null;
+          }
+        } catch (e) {
+          log("config", `Post-deploy cadence update failed: ${e.message}`);
+        }
       } else if (name === "close_position") {
         emit("close", { pair: args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? 0 });
         // USDC mode: auto-settle recovered base token + surplus SOL back to USDC.
