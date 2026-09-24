@@ -195,11 +195,13 @@ export function recallForPool(poolAddress) {
   const snaps = entry.snapshots || [];
   if (snaps.length >= 2) {
     const recent = snaps.slice(-6);
-    const first = recent[0];
-    const last = recent[recent.length - 1];
-    const drift = ((last.pnl_pct || 0) - (first.pnl_pct || 0)).toFixed(1);
+    // Skip snapshots whose PnL was unknown (null) so a failed fetch doesn't read as a 0% move
+    const withPnl = recent.filter(s => s.pnl_pct != null);
+    const drift = withPnl.length >= 2
+      ? `${(withPnl[withPnl.length - 1].pnl_pct - withPnl[0].pnl_pct).toFixed(1)}%`
+      : "unknown";
     const oorCount = recent.filter(s => !s.in_range).length;
-    lines.push(`Trend (${recent.length} checks): PnL drift ${drift}%, OOR ${oorCount}/${recent.length}`);
+    lines.push(`Trend (${recent.length} checks): PnL drift ${drift}, OOR ${oorCount}/${recent.length}`);
   }
 
   // Latest note

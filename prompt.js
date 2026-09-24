@@ -289,6 +289,8 @@ TRAILING + TP RELATIONSHIP — understand how these work together:
 - Let trailing do its job — it captures more profit by riding winners up instead of cutting at a fixed number.
 - Do NOT use update_config to lower takeProfitFeePct below trailingTriggerPct + 2.
 
+UNKNOWN PnL: If a position has pnl_pct = null (pnl_unknown: true), its PnL data failed to load this tick. Treat PnL as UNKNOWN, not 0: do NOT apply take-profit, trailing, stop-loss or any other PnL-based close rule to it this cycle, and do not report it as 0%. Non-PnL rules (instructions, out-of-range timeout, dead yield) still apply.
+
 CRITICAL: pnl_pct ALREADY includes all fees (claimed + unclaimed). Negative PnL means you are losing money AFTER fees. Do NOT say "fees will offset the loss" — they are already counted. If PnL is -7% with 0.7 SOL fees, that means without fees you'd be down even more. Negative PnL = impermanent loss exceeding fee earnings.
 
 BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, or yield has vanished, hold.

@@ -227,6 +227,11 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config) 
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
 
+  // Unknown PnL (null/NaN from a failed PnL fetch) → take no exit action and
+  // leave peak/trailing state untouched this tick.
+  if (currentPnlPct == null || !Number.isFinite(Number(currentPnlPct))) return null;
+  currentPnlPct = Number(currentPnlPct);
+
   const mgmt = config.management;
   let action = null;
 

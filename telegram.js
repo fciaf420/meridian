@@ -164,7 +164,7 @@ export async function notifyClose({ pair, pnlUsd, pnlSol, pnlPct }) {
   const label = unit === "sol" && pnlSol != null ? `${sign}${val.toFixed(4)} SOL` : `${sign}$${val.toFixed(2)}`;
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${label} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    (pnlPct == null ? `PnL: unknown (PnL data unavailable at close)` : `PnL: ${label} (${sign}${pnlPct.toFixed(2)}%)`)
   );
 }
 

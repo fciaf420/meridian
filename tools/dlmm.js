@@ -988,8 +988,8 @@ function normalizeLpAgentPosition(lpa) {
     poolActiveBinId: null, // LP Agent doesn't provide active bin
     isOutOfRange: lpa.inRange === false,
     pnlUsd: lpa.pnl?.value ?? 0,
-    pnlPctChange: lpa.pnl?.percent ?? 0,
-    pnlSolPctChange: lpa.pnl?.percentNative ?? 0,
+    pnlPctChange: lpa.pnl?.percent ?? null,
+    pnlSolPctChange: lpa.pnl?.percentNative ?? null,
     createdAt: lpa.createdAt
       ? (typeof lpa.createdAt === "number" ? lpa.createdAt : new Date(lpa.createdAt).getTime() / 1000)
       : null,
@@ -1015,6 +1015,19 @@ function normalizeLpAgentPosition(lpa) {
     _lpa_pairName: lpa.pairName,
     _lpa_source: "lpagent",
   };
+}
+
+/**
+ * PnL % from a PnL record (Meteora or normalized LP Agent), or null when it is
+ * unknown (no record, missing or non-numeric field). NEVER coerce missing data
+ * to 0: a fake 0% can fire a trailing TP on an API hiccup and hides stop-loss.
+ */
+function readPnlPct(p) {
+  if (!p) return null;
+  const raw = config.management.pnlUnit === "sol" ? p.pnlSolPctChange : p.pnlPctChange;
+  if (raw == null || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
 }
 
 // ─── Get Position PnL (LP Agent primary, Meteora fallback) ──────
@@ -1046,7 +1059,9 @@ export async function getPositionPnl({ pool_address, position_address }) {
 
     const unclaimedUsd    = parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0);
     const currentValueUsd = parseFloat(p.unrealizedPnl?.balances || 0);
-    const pnlUsdVal       = Math.round((p.pnlUsd ?? 0) * 100) / 100;
+    const pnlPct          = readPnlPct(p);
+    const pnlUnknown      = pnlPct == null;
+    const pnlUsdVal       = pnlUnknown ? null : Math.round(Number(p.pnlUsd ?? 0) * 100) / 100;
     const allTimeFeesUsd  = Math.round(parseFloat(p.allTimeFees?.total?.usd || 0) * 100) / 100;
 
     // Get accurate active bin from Meteora (LP Agent doesn't provide it)
@@ -1076,8 +1091,9 @@ export async function getPositionPnl({ pool_address, position_address }) {
 
     return {
       pnl_usd:           pnlUsdVal,
-      pnl_sol:           toSol(pnlUsdVal),
-      pnl_pct:           Math.round(((config.management.pnlUnit === "sol" ? p.pnlSolPctChange : p.pnlPctChange) ?? 0) * 100) / 100,
+      pnl_sol:           pnlUnknown ? null : toSol(pnlUsdVal),
+      pnl_pct:           pnlPct,
+      ...(pnlUnknown && { pnl_unknown: true, pnl_error: "PnL % missing from PnL API response" }),
       current_value_usd: Math.round(currentValueUsd * 100) / 100,
       current_value_sol: toSol(currentValueUsd),
       unclaimed_fee_usd: Math.round(unclaimedUsd * 100) / 100,
@@ -1241,8 +1257,14 @@ export async function getMyPositions({ force = false } = {}) {
       const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
       const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
       const collectedFees = p ? parseFloat(p.allTimeFees?.total?.usd || 0) : 0;
-      const pnlUsd        = p?.pnlUsd       ?? 0;
-      const pnlPct        = (config.management.pnlUnit === "sol" ? p?.pnlSolPctChange : p?.pnlPctChange) ?? 0;
+      // null = unknown (PnL APIs failed / not indexed yet). Consumers must take
+      // no PnL-based exit action on a null tick.
+      const pnlPct        = readPnlPct(p);
+      const pnlUnknown    = pnlPct == null;
+      const pnlUsd        = pnlUnknown ? null : Number(p?.pnlUsd ?? 0);
+      if (pnlUnknown) {
+        log("pnl_api", `PnL unknown for ${r.position.slice(0, 8)} (${p ? "no pnl % in response" : "no PnL data from LP Agent or Meteora"}) — reporting pnl_pct=null`);
+      }
 
       const tracked = getTrackedPosition(r.position);
 
@@ -1324,7 +1346,7 @@ export async function getMyPositions({ force = false } = {}) {
         : null;
       const ageMinutes = Math.max(ageFromPnlApi ?? 0, ageFromState ?? 0) || null;
 
-      const pnlUsdRounded = Math.round(pnlUsd * 100) / 100;
+      const pnlUsdRounded = pnlUnknown ? null : Math.round(pnlUsd * 100) / 100;
       const unclaimedRounded = Math.round(unclaimedFees * 100) / 100;
       const totalValRounded = Math.round(totalValue * 100) / 100;
       const collectedRounded = Math.round(collectedFees * 100) / 100;
@@ -1373,8 +1395,9 @@ export async function getMyPositions({ force = false } = {}) {
         collected_fees_usd: collectedRounded,
         collected_fees_sol: toSol(collectedRounded),
         pnl_usd: pnlUsdRounded,
-        pnl_sol: toSol(pnlUsdRounded),
-        pnl_pct: Math.round(pnlPct * 100) / 100,
+        pnl_sol: pnlUnknown ? null : toSol(pnlUsdRounded),
+        pnl_pct: pnlPct,
+        ...(pnlUnknown && { pnl_unknown: true, pnl_error: p ? "PnL % missing from PnL API response" : "PnL data unavailable (LP Agent + Meteora PnL API)" }),
         sol_price: solPrice,
         pnl_unit: config.management.pnlUnit,
         age_minutes: ageMinutes,
@@ -1444,8 +1467,9 @@ export async function getWalletPositions({ wallet_address }) {
         in_range:           inRange,
         unclaimed_fees_usd: Math.round((p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0) * 100) / 100,
         total_value_usd:    Math.round((p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0) * 100) / 100,
-        pnl_usd:            Math.round((p?.pnlUsd ?? 0) * 100) / 100,
-        pnl_pct:            Math.round(((config.management.pnlUnit === "sol" ? p?.pnlSolPctChange : p?.pnlPctChange) ?? 0) * 100) / 100,
+        pnl_usd:            readPnlPct(p) == null ? null : Math.round(Number(p.pnlUsd ?? 0) * 100) / 100,
+        pnl_pct:            readPnlPct(p),
+        ...(readPnlPct(p) == null && { pnl_unknown: true }),
         age_minutes:        p?.createdAt ? Math.floor((Date.now() - p.createdAt * 1000) / 60000) : null,
       };
     });
@@ -1567,8 +1591,9 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     // ─── Snapshot PnL BEFORE closing (position is still on-chain) ───
     // If PnL watcher provided an override (the value that triggered the close), trust it
     // over the cache which may have been refreshed with stale/wrong API data
-    let pnlUsd = _pnlOverride?.pnl_usd ?? 0;
-    let pnlPct = _pnlOverride?.pnl_pct ?? 0;
+    // pnlPct/pnlUsd stay null when PnL is unknown — never record a fake 0%.
+    let pnlUsd = _pnlOverride?.pnl_usd ?? null;
+    let pnlPct = _pnlOverride?.pnl_pct ?? null;
     let finalValueUsd = _pnlOverride?.total_value_usd ?? 0;
     let feesUsd = 0;
     const trackedPre = getTrackedPosition(position_address);
@@ -1582,17 +1607,18 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
       // No override — snapshot from cache or fresh API
       const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
       if (cachedPos) {
-        pnlUsd        = cachedPos.pnl_usd   ?? 0;
-        pnlPct        = cachedPos.pnl_pct   ?? 0;
+        pnlUsd        = cachedPos.pnl_usd   ?? null;
+        pnlPct        = cachedPos.pnl_pct   ?? null;
         finalValueUsd = cachedPos.total_value_usd ?? 0;
         feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
-      } else {
-      // No cache — fetch fresh from API while position is still open
+      }
+      if (pnlPct == null) {
+      // No cache, or cached PnL was unknown — fetch fresh from API while position is still open
       try {
         const freshPnl = await getPositionPnl({ pool_address: poolAddress, position_address });
-        if (freshPnl && !freshPnl.error) {
-          pnlUsd        = freshPnl.pnl_usd   ?? 0;
-          pnlPct        = freshPnl.pnl_pct   ?? 0;
+        if (freshPnl && !freshPnl.error && freshPnl.pnl_pct != null) {
+          pnlUsd        = freshPnl.pnl_usd   ?? null;
+          pnlPct        = freshPnl.pnl_pct;
           finalValueUsd = freshPnl.current_value_usd ?? 0;
           feesUsd       = (freshPnl.all_time_fees_usd || 0) + (freshPnl.unclaimed_fee_usd || 0);
         }
@@ -1746,6 +1772,15 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         log("close", `initial_value_usd missing for ${position_address}, using finalValueUsd ($${finalValueUsd}) as fallback`);
       }
 
+      // Unknown PnL: let recordPerformance derive it from final vs initial value
+      // when we have a real final value; otherwise record 0 but flag it, so the
+      // record isn't mistaken for a measured break-even (and never -100%).
+      const pnlUnknownAtClose = pnlPct == null;
+      const canDerivePnl = pnlUnknownAtClose && finalValueUsd > 0 && initialUsd > 0;
+      if (pnlUnknownAtClose) {
+        log("close_warn", `PnL unknown at close for ${position_address.slice(0, 8)} — ${canDerivePnl ? "deriving from final/initial value" : "recording 0 with pnl_unknown flag"}`);
+      }
+
       await recordPerformance({
         position: position_address,
         pool: poolAddress,
@@ -1762,8 +1797,9 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         fees_earned_usd: feesUsd,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
-        actual_pnl_usd: pnlUsd,
-        actual_pnl_pct: pnlPct,
+        actual_pnl_usd: pnlUnknownAtClose ? (canDerivePnl ? null : 0) : (pnlUsd ?? 0),
+        actual_pnl_pct: pnlUnknownAtClose ? (canDerivePnl ? null : 0) : pnlPct,
+        ...(pnlUnknownAtClose && { pnl_unknown: true }),
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: closeReason,

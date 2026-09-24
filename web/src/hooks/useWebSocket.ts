@@ -34,9 +34,10 @@ export interface PositionInfo {
   active_bin: number;
   lower_bin: number;
   upper_bin: number;
-  pnl_pct: number;
-  pnl_sol?: number;
-  pnl_usd?: number;
+  pnl_pct: number | null; // null = PnL unknown this tick (PnL API failed)
+  pnl_sol?: number | null;
+  pnl_usd?: number | null;
+  pnl_unknown?: boolean;
   unclaimed_fees_sol?: number;
   unclaimed_fees_usd?: number;
   age_minutes?: number;
