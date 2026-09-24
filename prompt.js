@@ -38,11 +38,23 @@ export function getPromptSectionText(section) {
 }
 
 /**
+ * Substitute `${name}` placeholders in override text. Autoresearch edits the
+ * default section TEMPLATE (see _getDefaultSections), so overrides carry
+ * literal `${deployAmount}` etc. Only names in `vars` are replaced; any other
+ * `${...}` is left as-is.
+ */
+export function fillSectionPlaceholders(text, vars) {
+  if (typeof text !== "string") return text;
+  return text.replace(/\$\{(\w+)\}/g, (match, name) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : match);
+}
+
+/**
  * Range selection text — used by index.js screening cycle.
- * Autoresearch can override this section.
+ * Autoresearch can override this section, but NOT the Evil Panda branch:
+ * an active strategy profile with its own fixed range rules takes precedence.
  */
 export function getRangeSelectionText(deployAmount, currentBalanceSol) {
-  if (_sectionOverrides.range_selection) return _sectionOverrides.range_selection;
   if (config.strategy.activeStrategy === "evil_panda") {
     return `- EVIL PANDA RANGE SIZING:
   Use single-sided SOL spot with price_range_pct=${config.strategy.evilPanda?.priceRangePct ?? 80}.
@@ -50,6 +62,13 @@ export function getRangeSelectionText(deployAmount, currentBalanceSol) {
   This creates an 80% downside range below the active bin. Do not substitute the volatility table for Evil Panda autonomous entries.
   Entry is only valid when token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend is green with price above Supertrend.
   If these entry checks are not satisfied, skip.`;
+  }
+  if (_sectionOverrides.range_selection) {
+    // Same placeholders the default template leaves literal in _getDefaultSections().
+    return fillSectionPlaceholders(_sectionOverrides.range_selection, {
+      deployAmount,
+      currentBalanceSol: currentBalanceSol ?? "?",
+    });
   }
   return _defaultRangeSelectionText(deployAmount, currentBalanceSol);
 }
