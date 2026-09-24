@@ -3,7 +3,7 @@ import {
   ComputeBudgetProgram,
   Keypair,
   PublicKey,
-  sendAndConfirmTransaction,
+  SendTransactionError,
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
@@ -144,8 +144,9 @@ async function applyPriorityFee(tx, feePayer, label) {
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports })
   );
 
-  const { blockhash } = await getConnection().getLatestBlockhash("confirmed");
+  const { blockhash, lastValidBlockHeight } = await getConnection().getLatestBlockhash("confirmed");
   tx.recentBlockhash = blockhash;
+  tx.lastValidBlockHeight = lastValidBlockHeight;
   tx.feePayer = feePayer;
   return tx;
 }
@@ -176,34 +177,52 @@ async function sendManagedTransaction(tx, signers, label) {
             log("tx_retry", `${label}: could not verify prior tx status (${statusErr?.message || statusErr}); resubmitting`);
           }
         } else {
-          // sendAndConfirmTransaction did not surface a signature on throw, so we
-          // cannot confirm whether the prior tx landed. Add a short delay before
-          // resubmit to reduce (not eliminate) the double-submit window.
+          // No signature was captured for the prior attempt (it failed before
+          // signing), so we cannot confirm whether it landed. Add a short delay
+          // before resubmit to reduce (not eliminate) the double-submit window.
           // LIMITATION: a silently-landed prior tx could still be resubmitted here.
           await new Promise((r) => setTimeout(r, 1500));
         }
 
-        const { blockhash } = await getConnection().getLatestBlockhash("confirmed");
-        tx.recentBlockhash = blockhash;
-        tx.feePayer ??= feePayer;
         lastSig = null;
       }
 
-      // Capture the signature for this attempt so a later expiry retry can check
-      // whether it landed before resubmitting. signTransaction is idempotent and
-      // does not broadcast; it just lets us derive the signature up-front.
-      try {
-        tx.partialSign?.(...signers);
-        const sig = tx.signature ? bs58.encode(tx.signature) : null;
-        if (sig) lastSig = sig;
-      } catch { /* best-effort sig capture; not fatal */ }
+      // Sign ONCE here and send the exact signed bytes. Do NOT use
+      // sendAndConfirmTransaction / connection.sendTransaction(tx, signers):
+      // for legacy txs web3.js overwrites recentBlockhash with its own cached
+      // blockhash and re-signs, so the signature that goes on the wire differs
+      // from one derived beforehand — and the double-submit guard above would
+      // check the wrong signature.
+      const connection = getConnection();
+      if (attempt > 0 || !tx.recentBlockhash || tx.lastValidBlockHeight == null) {
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+        tx.recentBlockhash = blockhash;
+        tx.lastValidBlockHeight = lastValidBlockHeight;
+      }
+      tx.feePayer ??= feePayer;
+      tx.sign(...signers);
+      if (!tx.signature) throw new Error(`${label}: transaction has no fee-payer signature after signing`);
+      const signature = bs58.encode(tx.signature);
+      lastSig = signature;
 
-      return await sendAndConfirmTransaction(getConnection(), tx, signers, {
+      await connection.sendRawTransaction(tx.serialize(), {
         skipPreflight: true,
         preflightCommitment: "confirmed",
-        commitment: "confirmed",
         maxRetries: 3,
       });
+      const status = (await connection.confirmTransaction({
+        signature,
+        blockhash: tx.recentBlockhash,
+        lastValidBlockHeight: tx.lastValidBlockHeight,
+      }, "confirmed")).value;
+      if (status?.err) {
+        throw new SendTransactionError({
+          action: "send",
+          signature,
+          transactionMessage: `Status: (${JSON.stringify(status)})`,
+        });
+      }
+      return signature;
     } catch (error) {
       lastError = error;
       const message = error?.message || String(error);
