@@ -193,6 +193,10 @@ on("deploy", (data) => { if (isEnabled()) notifyDeploy(data).catch(() => {}); })
 on("close", (data) => { if (isEnabled()) notifyClose(data).catch(() => {}); });
 on("out_of_range", (data) => { if (isEnabled()) notifyOutOfRange(data).catch(() => {}); });
 on("gas_low", (data) => { if (isEnabled()) notifyGasLow(data).catch(() => {}); });
+on("deploy_partial", (data) => {
+  if (!isEnabled()) return;
+  sendMessage(`⚠️ Partial deploy: ${data.pair}\nPosition ${data.position} is ${data.status} after a liquidity-add failure (${data.error}).\nX=${data.amountX ?? "?"} Y=${data.amountY ?? "?"}\nKept OPEN for management/close — check it.`).catch(() => {});
+});
 on("pnl_watcher_close", (data) => {
   if (!isEnabled()) return;
   const sign = (data.pnlPct || 0) >= 0 ? "+" : "";

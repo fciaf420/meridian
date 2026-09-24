@@ -9,12 +9,14 @@ import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { emit } from "../notifier.js";
 import {
   trackPosition,
   markOutOfRange,
   markInRange,
   recordClaim,
   recordClose,
+  updateTrackedPosition,
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
@@ -252,6 +254,30 @@ export async function getActiveBin({ pool_address }) {
     price: pool.fromPricePerLamport(Number(activeBin.price)),
     pricePerLamport: activeBin.price.toString(),
   };
+}
+
+/**
+ * Re-read a position's token amounts on-chain. Returns
+ * { rawX, rawY, empty } (raw base-unit strings), or null when the read fails
+ * (caller must treat null as "possibly funded").
+ */
+async function readPositionAmounts(pool, positionPubKey) {
+  try {
+    try { await pool.refetchStates(); } catch { /* best-effort */ }
+    const pd = (await pool.getPosition(positionPubKey))?.positionData;
+    if (!pd) return null;
+    const big = (v) => { try { return BigInt(String(v ?? "0").split(".")[0] || "0"); } catch { return null; } };
+    const rawX = big(pd.totalXAmount);
+    const rawY = big(pd.totalYAmount);
+    if (rawX == null || rawY == null) return null;
+    const binLiquidity = (pd.positionBinData || []).some(
+      (b) => Number(b.positionXAmount || 0) > 0 || Number(b.positionYAmount || 0) > 0,
+    );
+    return { rawX: rawX.toString(), rawY: rawY.toString(), empty: rawX === 0n && rawY === 0n && !binLiquidity };
+  } catch (e) {
+    log("deploy_warn", `Could not read position ${positionPubKey.toString().slice(0, 8)} on-chain: ${e.message}`);
+    return null;
+  }
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
@@ -806,14 +832,68 @@ export async function deployPosition({
           log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
         }
       } catch (liqErr) {
-        // Liquidity add failed — position exists on-chain but is empty.
-        // Mark it as closed so it doesn't count toward maxPositions or get managed.
+        // Liquidity add failed partway. Earlier chunks may already have landed
+        // real liquidity, so re-read the position on-chain before deciding.
+        // Only a VERIFIED-empty position is marked closed; a funded or
+        // unverifiable one stays tracked as open so management / close logic
+        // picks it up (a closed tracked entry is never auto-adopted, which
+        // would orphan the funds). No retry here: resending chunks could
+        // double-deploy.
         log("deploy_error", `Phase 2 (add liquidity) failed for ${posAddr.slice(0, 8)}: ${liqErr.message}`);
-        recordClose(posAddr, "deploy failed (liquidity add error)");
+        const onchain = await readPositionAmounts(pool, newPosition.publicKey);
+
+        if (onchain && onchain.empty) {
+          recordClose(posAddr, "deploy failed (liquidity add error, verified empty on-chain)");
+          return {
+            success: false,
+            error: `Position created on-chain but liquidity add failed: ${liqErr.message}. Position ${posAddr.slice(0, 8)} verified empty on-chain and marked closed.`,
+            position: posAddr,
+            txs: txHashes,
+          };
+        }
+
+        // Funded (partial) or unknown → keep it open with whatever landed.
+        let partialX = null;
+        let partialY = null;
+        if (onchain) {
+          try {
+            const [xDec, yDec] = await Promise.all([
+              getMintDecimals(pool.lbPair.tokenXMint),
+              getMintDecimals(pool.lbPair.tokenYMint),
+            ]);
+            if (xDec != null) partialX = Number(onchain.rawX) / 10 ** xDec;
+            if (yDec != null) partialY = Number(onchain.rawY) / 10 ** yDec;
+          } catch { /* amounts stay null — still keep the position open */ }
+        }
+        // Pro-rate the planned USD value by the share of the planned deposit that landed.
+        let partialUsd = null;
+        if (onchain && initial_value_usd > 0) {
+          const plannedY = Number(totalYLamports.toString());
+          const plannedX = Number(totalXLamports.toString());
+          const frac = plannedY > 0 ? Number(onchain.rawY) / plannedY
+            : plannedX > 0 ? Number(onchain.rawX) / plannedX : null;
+          if (frac != null && Number.isFinite(frac)) partialUsd = Math.round(initial_value_usd * Math.min(frac, 1) * 100) / 100;
+        }
+        const status = onchain ? "PARTIALLY FUNDED" : "UNVERIFIED (on-chain read failed)";
+        const note = `Deploy liquidity add failed after ${txHashes.length} tx(s): ${liqErr.message}. On-chain: ${status}` +
+          (onchain ? ` (X=${partialX ?? onchain.rawX}, Y=${partialY ?? onchain.rawY})` : "") +
+          ". Left OPEN for management/close.";
+        updateTrackedPosition(posAddr, {
+          ...(partialY != null && { amount_sol: partialY }),
+          ...(partialX != null && { amount_x: partialX }),
+          ...(partialUsd != null && { initial_value_usd: partialUsd }),
+          partial_deploy: true,
+        }, note);
+        _positionsCacheAt = 0;
+        log("deploy_warn", `Position ${posAddr.slice(0, 8)} is ${status} — kept open for management/close. ${note}`);
+        emit("deploy_partial", { pair: pool_name || pool_address.slice(0, 8), position: posAddr, status, amountX: partialX, amountY: partialY, error: liqErr.message });
         return {
           success: false,
-          error: `Position created on-chain but liquidity add failed: ${liqErr.message}. Empty position ${posAddr.slice(0, 8)} marked closed.`,
+          partial: true,
+          error: `Position created on-chain but liquidity add failed partway: ${liqErr.message}. Position ${posAddr.slice(0, 8)} is ${status} and has been kept OPEN — manage or close it; do NOT redeploy to "retry".`,
           position: posAddr,
+          amount_x: partialX,
+          amount_y: partialY,
           txs: txHashes,
         };
       }

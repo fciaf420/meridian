@@ -12,6 +12,7 @@ const emitter = new EventEmitter();
 //   deploy           — position deployed
 //   close            — position closed
 //   out_of_range     — position out of range
+//   deploy_partial   — wide-range deploy failed partway; position kept open
 //   briefing         — morning briefing HTML
 //   status           — busy state changes
 
