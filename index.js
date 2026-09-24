@@ -336,7 +336,7 @@ STEPS:
    - If no rule triggers: HOLD.
 3. If closing: ${usdcModeEnabled()
     ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
-    : `swap base tokens to SOL immediately after.`}
+    : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result reports a failed swap or status "success_with_exposure".`}
 4. After any close — recalibrate management interval (MANDATORY):
    - No positions remaining → update_config setting=managementIntervalMin value=10
    - Positions still open → keep current interval
