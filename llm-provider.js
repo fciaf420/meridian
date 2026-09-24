@@ -451,6 +451,7 @@ export function runClaudeCli(model, prompt, {
   timeoutMs = 180000,
   systemPrompt = null,
   effort = null,
+  jsonSchema = null,
 } = {}) {
   // Skip if rate limited — caller should fall back to DeepSeek
   if (isClaudeRateLimited()) {
@@ -470,6 +471,12 @@ export function runClaudeCli(model, prompt, {
 
     if (effort) {
       args.push("--effort", effort);
+    }
+
+    // The CLI validates the final answer against this schema and returns the object
+    // in the result's structured_output field.
+    if (jsonSchema) {
+      args.push("--json-schema", JSON.stringify(jsonSchema));
     }
 
     // Note: --system-prompt can't be used for large prompts (ENAMETOOLONG).
@@ -521,7 +528,8 @@ export function runClaudeCli(model, prompt, {
           }
           reject(new Error(msg || "Claude CLI returned an error"));
         } else if (parsed.type === "result") {
-          resolve(typeof parsed.result === "string" ? parsed.result.trim() : "");
+          if (jsonSchema && parsed.structured_output != null) resolve(parsed.structured_output);
+          else resolve(typeof parsed.result === "string" ? parsed.result.trim() : "");
         } else {
           reject(new Error(`Unexpected Claude CLI response: ${JSON.stringify(parsed).slice(0, 300)}`));
         }

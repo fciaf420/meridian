@@ -1,4 +1,7 @@
 import OpenAI from "openai";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
@@ -36,6 +39,38 @@ const TOOL_SUMMARIES = tools.map((tool) => ({
   parameters: tool.function.parameters || { type: "object", properties: {} },
 }));
 const TOOL_SUMMARIES_TEXT = JSON.stringify(TOOL_SUMMARIES, null, 2);
+// Enforced by the CLI (codex --output-schema / claude --json-schema) instead of prose + regex.
+// Tool arguments travel as a JSON string so the schema stays strict-mode compatible.
+const AGENT_PLAN_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["action", "response", "tool_calls"],
+  properties: {
+    action: { type: "string", enum: ["respond", "tool_calls"] },
+    response: { type: ["string", "null"] },
+    tool_calls: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "arguments_json"],
+        properties: {
+          name: { type: "string", enum: tools.map((tool) => tool.function.name) },
+          arguments_json: { type: "string" },
+        },
+      },
+    },
+  },
+};
+// codex exec takes the schema as a file path; write it once, on first Codex call.
+let _agentPlanSchemaPath = null;
+function getAgentPlanSchemaPath() {
+  if (_agentPlanSchemaPath) return _agentPlanSchemaPath;
+  const schemaPath = path.join(os.tmpdir(), `meridian-agent-plan-${process.pid}.schema.json`);
+  fs.writeFileSync(schemaPath, JSON.stringify(AGENT_PLAN_SCHEMA));
+  _agentPlanSchemaPath = schemaPath;
+  return schemaPath;
+}
 
 export function getScreenerModelLabel() {
   return config.llm.screeningModel;
@@ -147,15 +182,8 @@ function getClaudeSystemPrompt(agentType) {
   if (_systemPromptCache[agentType]) return _systemPromptCache[agentType];
   _systemPromptCache[agentType] = [
     `You are the ${agentType} reasoning engine for a JavaScript trading agent runner.`,
-    "Return raw JSON only. Do not wrap it in markdown fences or add any extra commentary.",
-    "Choose one of two actions only:",
-    '1. "respond" when you can fully answer the user with the information already available.',
-    '2. "tool_calls" when you need one or more listed tools to continue.',
-    "If you choose tool_calls, keep response null and provide exact JSON arguments for each tool call.",
-    "Never invent tool outputs, transaction results, or on-chain state.",
-    "Only use tool names from the available tools list.",
-    "Be conservative with write tools. Only call them when you intentionally want the runner to perform the real action.",
-    'Return exactly this shape: {"action":"respond","response":"...","tool_calls":[]} or {"action":"tool_calls","response":null,"tool_calls":[{"name":"tool_name","arguments":{}}]}',
+    'Set action to "respond" (with response) when you can answer from what is already available, or "tool_calls" (response null) when you need listed tools; arguments_json is the tool\'s arguments as a JSON object string.',
+    "The runner executes write tools for real on-chain, so only request them when you intend that action. Tool outputs and on-chain state come only from TOOL RESULT entries.",
     `AVAILABLE TOOLS:\n${TOOL_SUMMARIES_TEXT}`,
   ].join("\n\n");
   return _systemPromptCache[agentType];
@@ -166,31 +194,14 @@ function buildCodexAgentPrompt(messages, agentType) {
   const transcript = buildCodexTranscript(messages);
 
   return [
-    `You are the ${agentType} reasoning engine for a JavaScript trading agent runner.`,
-    "Return raw JSON only. Do not wrap it in markdown fences or add any extra commentary.",
-    "Choose one of two actions only:",
-    '1. "respond" when you can fully answer the user with the information already available.',
-    '2. "tool_calls" when you need one or more listed tools to continue.',
-    "If you choose tool_calls, keep response null and provide exact JSON arguments for each tool call.",
-    "Never invent tool outputs, transaction results, or on-chain state.",
-    "Only use tool names from the available tools list.",
-    "Be conservative with write tools. Only call them when you intentionally want the runner to perform the real action.",
-    'Return exactly this shape: {"action":"respond","response":"...","tool_calls":[]} or {"action":"tool_calls","response":null,"tool_calls":[{"name":"tool_name","arguments":{}}]}',
-    `AVAILABLE TOOLS:\n${TOOL_SUMMARIES_TEXT}`,
+    getClaudeSystemPrompt(agentType),
     `CONVERSATION TRANSCRIPT:\n${transcript}`,
   ].join("\n\n");
 }
 
 function parseCodexJson(content) {
-  try {
-    return JSON.parse(content);
-  } catch {
-    const fencedMatch = content.match(/```json\s*([\s\S]*?)```/i) || content.match(/(\{[\s\S]*\})/);
-    if (!fencedMatch) {
-      throw new Error("Codex CLI returned non-JSON output");
-    }
-    return JSON.parse(fencedMatch[1]);
-  }
+  // Output is schema-constrained by the CLI; a parse failure is a real error, not something to regex around.
+  return typeof content === "string" ? JSON.parse(content) : content;
 }
 
 function normalizeCodexToolCalls(toolCalls, step) {
@@ -200,16 +211,23 @@ function normalizeCodexToolCalls(toolCalls, step) {
       throw new Error("Codex CLI returned a tool call without a name");
     }
 
-    const args = toolCall.arguments && typeof toolCall.arguments === "object" && !Array.isArray(toolCall.arguments)
-      ? toolCall.arguments
-      : {};
+    // Passed through as a string: agentLoop's strict write-tool parse rejects malformed
+    // JSON (read tools fall back to {}). Valid JSON that is not an object is treated as
+    // malformed too, so a write tool never runs with null / array arguments.
+    let argsJson = typeof toolCall.arguments_json === "string" ? toolCall.arguments_json : "{}";
+    try {
+      const parsed = JSON.parse(argsJson);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        argsJson = `<non-object arguments: ${argsJson.slice(0, 80)}>`;
+      }
+    } catch { /* left as-is; rejected downstream */ }
 
     return {
       id: `codex-tool-${step + 1}-${index + 1}`,
       type: "function",
       function: {
         name,
-        arguments: JSON.stringify(args),
+        arguments: argsJson,
       },
     };
   });
@@ -221,6 +239,7 @@ async function createCodexMessage(messages, model, agentType, step) {
     cwd: process.cwd(),
     sandbox: "read-only",
     skipGitRepoCheck: true,
+    outputSchemaPath: getAgentPlanSchemaPath(),
     config: {
       suppress_unstable_features_warning: "true",
       model_reasoning_effort: agentType === "MANAGER" ? "high" : "medium",
@@ -268,7 +287,7 @@ async function createClaudeMessage(messages, model, agentType, step) {
   const transcript = buildCodexTranscript(messages);
   const systemPrompt = getClaudeSystemPrompt(agentType);
   const effort = CLAUDE_EFFORT_BY_ROLE[agentType] || "medium";
-  const content = await runClaudeCli(model, `CONVERSATION TRANSCRIPT:\n${transcript}`, { effort, systemPrompt });
+  const content = await runClaudeCli(model, `CONVERSATION TRANSCRIPT:\n${transcript}`, { effort, systemPrompt, jsonSchema: AGENT_PLAN_SCHEMA });
 
   if (!content) {
     throw new Error("Empty response from Claude CLI");
