@@ -24,6 +24,7 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { calculateBinsForPriceRange, splitRangeBins } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
+import { studyTopLPers } from "./study.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -529,8 +530,10 @@ export async function deployPosition({
   let hasBaseToken = (amount_x ?? 0) > 0;
   const hasSol = totalSolAmount > 0;
 
+  // Hoisted: the auto-swap fallback below reverts to this full SOL-only range.
+  let totalRangeBins;
   if (activeStrategy === "spot" && bins_below && !bins_above) {
-    const totalRangeBins = bins_below;
+    totalRangeBins = bins_below;
 
     if (needsAutoSwap || (hasBaseToken && hasSol)) {
       // TWO-SIDED: split bins between SOL (below) and token (above)

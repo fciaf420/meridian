@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import path from "path";
 import OpenAI from "openai";
+import { log } from "./logger.js";
 
 const DEFAULT_PROVIDER = "codex";
 
