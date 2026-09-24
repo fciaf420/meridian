@@ -7,7 +7,7 @@ import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./age
 import { log } from "./logger.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates, rankCandidatesByDarwin } from "./tools/screening.js";
+import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
@@ -17,7 +17,7 @@ import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot, maybePromote, checkCapacity } from "./memory.js";
-import { updatePnlAndCheckExits } from "./state.js";
+import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
 import { emit } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
@@ -213,6 +213,9 @@ function startCronJobs() {
       // Targeted recall + trailing TP / stop loss pre-check
       let memoryHints = "";
       let exitAlerts = "";
+      // Set only when the exit pre-check below ran to completion; the code-side
+      // HOLD gate further down requires it so a partial pre-check never skips the LLM.
+      let precheckedPositions = null;
       try {
         const pos = await getMyPositions();
         const recalls = [];
@@ -290,6 +293,7 @@ function startCronJobs() {
             memoryHints += `\n\nDYNAMIC FEES (current):\n${feeLines.join("\n")}\n`;
           }
         } catch { /* best-effort */ }
+        precheckedPositions = pos.positions || [];
       } catch { /* best-effort */ }
 
       // Inject recent auto-closes from PnL watcher so LLM knows what happened
@@ -312,6 +316,37 @@ function startCronJobs() {
         const kbHints = kbRecallForManagement(pos?.positions || []);
         if (kbHints) kbContext = `\n\n${kbHints}`;
       } catch { /* best-effort */ }
+
+      // Hard-close rules 2-6 are threshold checks on data already in hand. Evaluate them
+      // here and start a model session only when a position carries a free-text
+      // instruction, a rule fired, a rule could not be evaluated, or there are exit
+      // alerts. All-HOLD cycles skip the LLM call. This only gates the LLM: nothing is
+      // closed in code here, and the PnL watcher's own exits are unaffected.
+      if (precheckedPositions?.length && !exitAlerts) {
+        const m = config.management;
+        const ruleHits = [];
+        for (const p of precheckedPositions) {
+          if (getTrackedPosition(p.position)?.instruction) ruleHits.push(`${p.pair}: instruction`);
+          else if (p.pnl_pct == null) ruleHits.push(`${p.pair}: pnl unknown`);
+          else if (p.pnl_pct >= m.takeProfitFeePct) ruleHits.push(`${p.pair}: rule 3`);
+          else if ((p.minutes_out_of_range ?? 0) >= m.outOfRangeWaitMinutes) ruleHits.push(`${p.pair}: rule 4`);
+          else if (p.pnl_pct <= m.emergencyPriceDropPct) ruleHits.push(`${p.pair}: rule 6`);
+          else if (!p.pool) ruleHits.push(`${p.pair}: pool unknown`);
+          else {
+            const d = await getPoolDetail({ pool_address: p.pool, timeframe: config.screening.timeframe || "5m" }).catch(() => null);
+            if (!d || !Number.isFinite(d.fee_active_tvl_ratio) || !Number.isFinite(d.volume)) ruleHits.push(`${p.pair}: rule 5 unverified`);
+            else if (d.fee_active_tvl_ratio < config.screening.minFeeActiveTvlRatio && d.volume < config.screening.minVolume) {
+              ruleHits.push(`${p.pair}: rule 5`);
+            }
+          }
+        }
+        if (ruleHits.length === 0) {
+          log("cron", `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD (LLM skipped)`);
+          mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD.`;
+          return; // finally{} still releases the lock and emits the report
+        }
+        log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
+      }
 
       const pnlUnit = config.management.pnlUnit?.toUpperCase() || "SOL";
       const { content } = await agentLoop(`
