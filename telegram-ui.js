@@ -711,10 +711,13 @@ export function renderCandidates(list, { page = 0, refs, source = "meteora", fet
   const keyboard = [];
   for (const i of pages[pg]) {
     const c = candidates[i];
-    keyboard.push([
+    const mint = c.base_mint || c.base?.mint;
+    const row = [
       btn(`🚀 Deploy ${i + 1}`, `dp:${refs.put(c, `cand:${c.pool}`)}`),
       urlBtn("Meteora ↗", meteoraPoolUrl(c.pool)),
-    ]);
+    ];
+    if (mint) row.push(urlBtn("GMGN ↗", gmgnTokenUrl(mint)));
+    keyboard.push(row);
   }
   const pager = pagerRow("ca", pg, pages.length);
   if (pager) keyboard.push(pager);
