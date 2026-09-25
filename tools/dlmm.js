@@ -25,7 +25,8 @@ import {
 import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
-import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
+import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
+import { swapBackWithdrawnBase, expectedBaseWithdrawRaw } from "./close-swap.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
 import {
@@ -2093,18 +2094,22 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     // or other open positions' tokens). Capture the pre-close balance so we can
     // compute the positive delta after close. If we cannot determine it, we will
     // skip the auto-swap rather than risk dumping the whole balance.
+    // Read on-chain (raw units, `confirmed`), not from the Helius indexed
+    // balances API: that one lags, and on error returns tokens: [], which read
+    // as a zero balance.
     const SOL_MINT = "So11111111111111111111111111111111111111112";
     const baseMintPre = getTrackedPosition(position_address)?.base_mint || null;
-    let preCloseBaseBalance = null; // null => unknown (do NOT swap whole balance)
+    let preCloseBaseRaw = null; // bigint; null => unknown (do NOT swap whole balance)
+    let expectedBaseRaw = null; // bigint; null => unknown
     if (baseMintPre && baseMintPre !== SOL_MINT) {
       try {
-        const preBals = await getWalletBalances();
-        const preTok = preBals.tokens?.find((t) => t.mint === baseMintPre);
-        preCloseBaseBalance = preTok?.balance ?? 0;
+        preCloseBaseRaw = (await getOnchainTokenBalance(baseMintPre)).raw;
       } catch (preErr) {
         log("close_warn", `Could not snapshot pre-close base balance for ${baseMintPre}: ${preErr.message}`);
-        preCloseBaseBalance = null;
+        preCloseBaseRaw = null;
       }
+      // Position X liquidity + claimable X fees: what the remove txs should return.
+      expectedBaseRaw = expectedBaseWithdrawRaw(pool, positionData, baseMintPre);
     }
 
     // ─── Snapshot PnL BEFORE closing (position is still on-chain) ───
@@ -2351,107 +2356,23 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
       });
 
       // ─── Hard rule: swap ONLY the withdrawn base token back to SOL ───
-      // Sell only the DELTA this close added to the wallet (post - pre), never
-      // the entire base-token balance. Retries up to MAX_ATTEMPTS with backoff;
-      // re-fetches wallet balance between attempts so a silently-landed first tx
-      // doesn't cause a false insufficient-funds failure on retry. On each
-      // attempt the swap amount is re-clamped to (current - pre) so retries can't
-      // eat into a pre-existing balance.
-      const SOL = SOL_MINT;
+      // Sells only the delta this close added (on-chain post - pre, polled
+      // until it shows up), clamped to the expected withdrawal when known.
+      // Rules and retries live in tools/close-swap.js.
       const baseMint = tracked.base_mint;
       let swapOutcome = null;     // { success, mint, attempts, error? } when a swap was attempted
-      let exposureFlag = false;   // true when we skipped the swap to avoid dumping whole balance
+      let exposureFlag = false;   // true when withdrawn base token may remain unsold
 
-      if (baseMint && baseMint !== SOL) {
-        if (preCloseBaseBalance == null) {
-          // Pre-balance unknown — do NOT swap the whole balance. Flag leftover exposure.
-          exposureFlag = true;
-          swapOutcome = {
-            success: false,
-            mint: baseMint,
-            attempts: 0,
-            error: "pre-close base balance unknown; auto-swap skipped to avoid selling whole wallet balance",
-          };
-          log("close_warn", `Post-close swap skipped: pre-close balance for ${baseMint} unknown — leftover base token exposure, swap manually.`);
-        } else {
-          const MAX_ATTEMPTS = 3;
-          const BACKOFF_MS = [0, 1500, 3000]; // delay BEFORE attempt N
-          let lastError = null;
-          let attempts = 0;
-          let succeeded = false;
-
-          for (let i = 0; i < MAX_ATTEMPTS; i++) {
-            if (BACKOFF_MS[i]) await new Promise((r) => setTimeout(r, BACKOFF_MS[i]));
-
-            let baseToken;
-            try {
-              const walletBals = await getWalletBalances();
-              baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
-            } catch (balErr) {
-              lastError = `balance fetch failed: ${balErr.message}`;
-              log("close_warn", `Post-close swap attempt ${i + 1}: ${lastError}`);
-              attempts = i + 1;
-              continue;
-            }
-
-            // Only the amount withdrawn by THIS close: current - pre (clamped >= 0).
-            const currentBal = baseToken?.balance ?? 0;
-            const swapAmount = Math.max(0, currentBal - preCloseBaseBalance);
-
-            // Per-unit USD value to gate dust on the delta (not the whole balance).
-            const unitUsd = (baseToken && currentBal > 0) ? (baseToken.usd ?? 0) / currentBal : 0;
-            const deltaUsd = unitUsd * swapAmount;
-
-            // Nothing meaningful to swap — fully swapped by a prior attempt, or dust delta.
-            if (swapAmount <= 0 || deltaUsd < 0.10) {
-              if (attempts > 0) succeeded = true; // prior attempt effectively cleared it
-              break;
-            }
-
-            attempts = i + 1;
-            log("close", `Auto-swapping ${swapAmount} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (withdrawn delta, worth ~$${deltaUsd.toFixed(2)}) [attempt ${attempts}/${MAX_ATTEMPTS}]`);
-
-            let swapResult;
-            try {
-              swapResult = await swapToken({
-                input_mint: baseMint,
-                output_mint: SOL,
-                amount: swapAmount,
-              });
-            } catch (swapErr) {
-              lastError = swapErr.message;
-              log("close_warn", `Post-close swap attempt ${attempts} threw: ${lastError}`);
-              continue;
-            }
-
-            if (swapResult?.success) {
-              log("close", `Post-close swap OK on attempt ${attempts}: tx ${swapResult.tx}`);
-              txHashes.push(swapResult.tx);
-              succeeded = true;
-              break;
-            }
-
-            lastError = swapResult?.error || "unknown";
-            log("close_warn", `Post-close swap attempt ${attempts} failed: ${lastError}`);
-
-            // Terminal errors — no point retrying
-            const terminal = /no route|route not found|unsupported|invalid mint|mint not found/i.test(lastError);
-            if (terminal) {
-              log("close_warn", `Post-close swap terminal error, not retrying: ${lastError}`);
-              break;
-            }
-          }
-
-          if (attempts > 0) {
-            swapOutcome = succeeded
-              ? { success: true, mint: baseMint, attempts }
-              : { success: false, mint: baseMint, attempts, error: lastError };
-            if (!succeeded) {
-              exposureFlag = true;
-              log("close_warn", `Post-close swap failed after ${attempts} attempt(s); withdrawn base token remains in wallet: ${baseMint}`);
-            }
-          }
-        }
+      if (baseMint && baseMint !== SOL_MINT) {
+        const sb = await swapBackWithdrawnBase({
+          baseMint,
+          symbol: tracked.pool_name?.split("-")[0] || null,
+          preRaw: preCloseBaseRaw,
+          expectedRaw: expectedBaseRaw,
+        });
+        txHashes.push(...sb.txs);
+        swapOutcome = sb.swapOutcome;
+        exposureFlag = sb.exposureFlag;
       }
 
       return {
