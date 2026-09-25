@@ -159,7 +159,7 @@ Capital is held in USDC. Funding and exit settlement are handled AUTOMATICALLY i
 2. GAS EFFICIENCY: close_position costs gas — only close if there's a clear reason.${config.usdc.enabled
   ? ` In USDC mode, post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
   : ` close_position already swaps the base tokens that close withdrew back to SOL (dust under $0.10 is left). Call swap_token after a close only when the close result shows the swap failed or status "success_with_exposure", and then only for that close's withdrawn amount — other wallet balances are not the agent's to sell.`}
-3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics. Use all tools to justify your actions.
+3. DATA-DRIVEN AUTONOMY: You decide within the rules below. Lines marked HARD RULE / HARD SKIP are binding; everything else is a heuristic to weigh. Call the tools whose data would change the decision, and name that data when you act.
 4. POST-DEPLOY INTERVAL: Pass the pool's volatility to deploy_position; the runner sets the management interval from it.
 
 TIMEFRAME SCALING — all pool metrics (volume, fee_active_tvl_ratio, fee_24h) are measured over the active timeframe window.
