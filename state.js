@@ -66,6 +66,9 @@ export function trackPosition({
   signal_snapshot = null,
   experiment_id = null,   // autoresearch A/B: set when deployed inside an experiment arm
   experiment_arm = null,  // "control" | "candidate"
+  range_depth_mode = null,   // strategy.rangeDepthMode at deploy
+  ohlcv_buffer_mult = null,  // strategy.ohlcvBufferMult at deploy (ohlcv mode only)
+  ohlcv_depth_pct = null,    // candle depth deploy_position saw, when it had one
 }) {
   const state = load();
   state.positions[position] = {
@@ -91,6 +94,10 @@ export function trackPosition({
     study_avg_hold_hours: study_avg_hold_hours || null,
     signal_snapshot: signal_snapshot || null,
     ...(experiment_id && { experiment_id, experiment_arm }),
+    range_depth_mode: range_depth_mode || null,
+    ohlcv_buffer_mult: ohlcv_buffer_mult ?? null,
+    ohlcv_depth_pct: ohlcv_depth_pct ?? null,
+    min_active_bin: null,   // lowest active bin seen while open (recordActiveBin)
     out_of_range_since: null,
     last_claim_at: null,
     total_fees_claimed_usd: 0,
@@ -120,6 +127,61 @@ export function markOutOfRange(position_address, direction = null) {
     save(state);
     log("state", `Position ${position_address} marked out of range (${direction || "unknown"})`);
   }
+}
+
+/**
+ * Remember the lowest active bin seen while the position is open, so the close
+ * record can say how deep into the range price actually went. Writes only when
+ * a new low is seen.
+ */
+export function recordActiveBin(position_address, activeBin) {
+  if (!Number.isFinite(Number(activeBin))) return;
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return;
+  const bin = Number(activeBin);
+  if (pos.min_active_bin == null || bin < pos.min_active_bin) {
+    pos.min_active_bin = bin;
+    save(state);
+  }
+}
+
+/**
+ * How far into its downside range (0–100%) price went while a position was
+ * open: from the deploy-time active bin down to the lowest active bin seen,
+ * as a share of the range depth (price terms when bin_step is known). Below
+ * the range = 100. null when the bins are unknown.
+ */
+export function deepestBinReachedPct(pos) {
+  const entry = Number(pos?.active_bin_at_deploy ?? pos?.bin_range?.max);
+  const lower = Number(pos?.bin_range?.min);
+  const low = Number(pos?.min_active_bin);
+  if (![entry, lower, low].every(Number.isFinite) || !(entry > lower)) return null;
+  const binsDown = Math.max(0, entry - low);
+  const binsDeep = entry - lower;
+  const step = Number(pos?.bin_step) / 10000;
+  const frac = step > 0
+    ? (1 - Math.pow(1 + step, -Math.min(binsDown, binsDeep))) / (1 - Math.pow(1 + step, -binsDeep))
+    : Math.min(binsDown, binsDeep) / binsDeep;
+  return Math.round(Math.min(1, Math.max(0, frac)) * 1000) / 10;
+}
+
+/**
+ * Depth-use fields for a close record (performance history): how deep price
+ * went, the OOR side at close, whether it was a stop loss, and the buffer the
+ * deploy used. Fed to the ohlcvBufferMult evolution (lessons.js).
+ */
+export function depthUseAtClose(pos, closeReason = "") {
+  if (!pos) return {};
+  const notes = Array.isArray(pos.notes) ? pos.notes : [];
+  return {
+    deepest_bin_reached_pct: deepestBinReachedPct(pos),
+    oor_direction_at_close: pos.out_of_range_since ? (pos.oor_direction || null) : null,
+    stop_loss_close: /stop[_ ]?loss/i.test(String(closeReason || "")) || notes.some((n) => /^STOP_LOSS:/.test(String(n))),
+    range_depth_mode: pos.range_depth_mode ?? null,
+    ohlcv_buffer_mult: pos.ohlcv_buffer_mult ?? null,
+    ohlcv_depth_pct: pos.ohlcv_depth_pct ?? null,
+  };
 }
 
 /**
@@ -497,6 +559,7 @@ export async function syncOpenPositions(active_addresses) {
           close_reason: pos.oor_direction
             ? `external close (detected during sync, OOR ${pos.oor_direction})`
             : "external close (detected during sync)",
+          ...depthUseAtClose(pos),
           signal_snapshot: pos.signal_snapshot || null,
           ...(pos.experiment_id && { experiment_id: pos.experiment_id, experiment_arm: pos.experiment_arm }),
         });

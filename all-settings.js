@@ -68,7 +68,7 @@ const BOUNDS = {
   deployAmountUsd: [1, 100_000], maxDeployUsd: [1, 100_000], minUsdcToOpen: [0, 1_000_000],
   maxDeployAmount: [0.1, 100], temperature: [0, 2], maxTokens: [256, 200_000], maxSteps: [1, 100],
   emergencyPriceDropPct: [-100, -1], webPort: [1, 65_535], twapWindowMinutes: [5, 1440],
-  ohlcvBufferMult: [1, 3], solanaTrackerDailyCap: [0, 2500],
+  ohlcvBufferMult: [1, 1.8], solanaTrackerDailyCap: [0, 2500],
 };
 
 /**

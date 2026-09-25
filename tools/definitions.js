@@ -415,6 +415,7 @@ Examples:
 - { trailingTakeProfit: true }           — enable/disable trailing take profit
 - { trailingTriggerPct: 5 }             — activate trailing TP when PnL hits +5%
 - { trailingDropPct: 2 }                — close when PnL drops 2% from peak
+- { ohlcvBufferMult: 1.4 }             — deeper candle-based ranges (1.0–1.8; raise after downside OOR / stop losses, lower when the deep part of ranges goes unused)
 
 Entry-safety filters (blockTransferFeeAbovePct, blockTransferHook, blockPermanentDelegate,
 blockFreezeAuthority, blockMintAuthority, blockPausable, blockNonTransferable, solFeePoolsOnly,

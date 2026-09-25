@@ -253,6 +253,7 @@ const RISK_CONFIG_BOUNDS = {
   managementIntervalMin: { min: 1, max: 1440, integer: true },
   screeningIntervalMin: { min: 1, max: 1440, integer: true },
   pnlWatcherIntervalSec: { min: 5, max: 86400, integer: true },
+  ohlcvBufferMult: { min: 1.0, max: 1.8, hint: "candle range-depth buffer; evolution also moves it by 0.1 steps" },
 };
 
 /**

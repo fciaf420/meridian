@@ -14,6 +14,8 @@ import {
   trackPosition,
   markOutOfRange,
   markInRange,
+  recordActiveBin,
+  depthUseAtClose,
   recordClaim,
   recordClose,
   updateTrackedPosition,
@@ -745,6 +747,7 @@ export async function deployPosition({
     log("deploy", `Auto-calculated bins_below=${bins_below} from price_range_pct=${price_range_pct}% at bin_step=${resolvedBinStep}`);
   }
 
+  let ohlcvDepthPct = null; // candle depth seen below (recorded on the position for buffer evolution)
   // ─── Hard guard: validate actual range % — always check, even when price_range_pct is set ───
   // Models sometimes pass bins_below AND price_range_pct but the bins don't match the %.
   // Always verify the actual range and correct if too narrow.
@@ -768,6 +771,7 @@ export async function deployPosition({
     if (config.strategy?.rangeDepthMode === "ohlcv") {
       const currentPct = (1 - Math.pow(1 + stepPct, -bins_below)) * 100;
       const od = await getDepthForDeploy({ pool: pool_address, mint: base_mint || null }).catch(() => null);
+      ohlcvDepthPct = od?.depthPct > 0 ? od.depthPct : null;
       if (od?.depthPct > 0) {
         const maxPctCap = Number(config.strategy?.maxRangePct) || 80;
         const targetPct = Math.max(MIN_RANGE_PCT, Math.min(od.depthPct, maxPctCap, 99));
@@ -800,6 +804,13 @@ export async function deployPosition({
       bins_below = cappedBins;
     }
   }
+
+  // Range-depth context stored on the tracked position (ohlcvBufferMult evolution).
+  const depthTrackFields = () => ({
+    range_depth_mode: config.strategy?.rangeDepthMode ?? null,
+    ohlcv_buffer_mult: config.strategy?.rangeDepthMode === "ohlcv" ? (config.strategy?.ohlcvBufferMult ?? null) : null,
+    ohlcv_depth_pct: ohlcvDepthPct,
+  });
 
   // ─── Detect auto-swap need ────────────────────────────────────
   // When the model wants two-sided spot but only has SOL:
@@ -1134,6 +1145,7 @@ export async function deployPosition({
         active_bin: activeBin.binId,
         initial_value_usd: 0,
         study_avg_hold_hours,
+        ...depthTrackFields(),
         ...getExperimentTag(),
       });
       log("deploy", `Pre-tracked position ${posAddr.slice(0, 8)} (wide-range: liquidity pending)`);
@@ -1309,6 +1321,7 @@ export async function deployPosition({
       initial_value_usd,
       study_avg_hold_hours,
       signal_snapshot,
+      ...depthTrackFields(),
       ...getExperimentTag(), // autoresearch A/B arm, when deployed inside one
     });
 
@@ -1796,6 +1809,7 @@ export async function getMyPositions({ force = false } = {}) {
       }
       if (inRange) markInRange(r.position);
       else markOutOfRange(r.position, oorDirection);
+      if (activeBin != null) recordActiveBin(r.position, activeBin);
 
       const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
       const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
@@ -2390,6 +2404,7 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: closeReason,
+        ...depthUseAtClose(tracked, closeReason),
         deployed_at: tracked.deployed_at,
         signal_snapshot: tracked.signal_snapshot || null,
         ...(tracked.experiment_id && { experiment_id: tracked.experiment_id, experiment_arm: tracked.experiment_arm }),

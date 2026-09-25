@@ -39,6 +39,7 @@ export const CONFIG_KEY_MAP = {
   screeningModel: ["llm", "screeningModel"],
   generalModel: ["llm", "generalModel"],
   binsBelow: ["strategy", "binsBelow"],
+  ohlcvBufferMult: ["strategy", "ohlcvBufferMult"], // candle range-depth buffer; bounded 1.0–1.8 in executor
   // usdc mode
   usdcMode: ["usdc", "enabled"],
   deployAmountUsd: ["usdc", "deployAmountUsd"],
