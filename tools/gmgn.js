@@ -330,6 +330,11 @@ async function fetchTokenInfo(mint) {
   return info || null;
 }
 
+/** `token info` for one mint (cached 60s), or null. Read-only; used by tools/token-age.js. */
+export function fetchGmgnTokenInfo(mint) {
+  return mint ? fetchTokenInfo(mint) : Promise.resolve(null);
+}
+
 /* ============================== PRICE / CANDLES ============================== */
 
 /**

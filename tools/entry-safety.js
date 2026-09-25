@@ -622,11 +622,16 @@ export async function screenEntryCandidates(pools, opts = {}) {
     }
     live.push(p);
   }
+  // Token-age window (config.screening.min/maxTokenAgeHours), every source.
+  // Unknown age is kept and tagged token_age_unknown; deployPosition re-checks.
+  const { screenTokenAge } = await import("./token-age.js");
+  const age = await screenTokenAge(live, opts.tokenAge || {});
+  dropped.push(...age.dropped);
   // Fee mode from the API row; solFeePoolsOnly drops known non-SOL-fee pools
   // (unknown mode is kept and tagged — deployPosition checks on-chain).
   const filters = { ...ENTRY_FILTER_DEFAULTS, ...(opts.filters || currentEntryFilters()) };
   const feeOk = [];
-  for (const p of live) {
+  for (const p of age.kept) {
     const fm = p.fee_mode?.mode ? p.fee_mode : feeModeFromApi(p.collect_fee_mode, p.quote?.mint ?? WSOL_MINT);
     const tagged = { ...p, fee_mode: fm };
     if (filters.solFeePoolsOnly && fm.mode !== "unknown" && !fm.solFees) {
