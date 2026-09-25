@@ -201,8 +201,8 @@ NOTE: 5m windows are inherently noisy. A pool doing $100k+/hour can show $0 volu
 
 IMPORTANT: fee_active_tvl_ratio values are ALREADY in percentage form. 0.29 = 0.29%. Do NOT multiply by 100. A value of 1.0 = 1.0%, a value of 22 = 22%. Never convert.
 
-base_fee: The pool's static fee rate set at creation.
-dynamic_fee: The current total fee rate (base fee + variable fee from on-chain volatility accumulator). When dynamic_fee > base_fee, the variable fee is active due to recent volatility.
+base_fee: The pool's base fee rate (derived from base factor x bin step). It is configured per pool and is normally stable, but it is NOT guaranteed static — the pool operator can update it after creation.
+dynamic_fee: The current VARIABLE (volatility) fee component ONLY — i.e. total fee minus base fee, from the on-chain volatility accumulator. It is NOT the total. Total fee paid by swaps = base_fee + dynamic_fee, capped at 10%. dynamic_fee > 0 means the variable fee is active due to recent volatility; dynamic_fee = 0 means swaps pay just the base fee.
 
 `;
 
