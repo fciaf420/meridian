@@ -25,7 +25,6 @@
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "node-cron": "^3.0.3",
-    "nuggets": "file:./packages/nuggets",
     "openai": "^4.73.0",
     "ws": "^8.19.0"
   },

@@ -11,7 +11,6 @@ import { log } from "./logger.js";
 import { config } from "./config.js";
 import { getStateSummary } from "./state.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
-import { getMemoryContext } from "./memory.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { getLpOverviewSummary } from "./tools/lp-overview.js";
 import { buildUnifiedMemoryBrief } from "./unified-memory.js";
@@ -609,7 +608,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 }
 
 /**
- * Lightweight chat - uses nuggets-cached context instead of fetching from chain.
+ * Lightweight chat - uses cached state + the unified memory brief instead of fetching from chain.
  * First attempts a single LLM call with no tools. If the LLM says it needs tools
  * (by including "[NEED_TOOLS]" in its response), escalates to full agentLoop.
  *
@@ -617,7 +616,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
  */
 export async function lightChat(goal, sessionHistory = [], model = null) {
   const stateSummary = getStateSummary();
-  const memoryContext = getMemoryContext();
+  const memoryContext = buildUnifiedMemoryBrief("GENERAL");
   const perfSummary = getPerformanceSummary();
 
   const contextParts = [
@@ -627,7 +626,7 @@ export async function lightChat(goal, sessionHistory = [], model = null) {
   ];
 
   if (stateSummary) contextParts.push(`\nCURRENT STATE:\n${stateSummary}`);
-  if (memoryContext) contextParts.push(`\nMEMORY (from nuggets):\n${memoryContext}`);
+  if (memoryContext) contextParts.push(`\nMEMORY (lessons + KB):\n${memoryContext}`);
   if (perfSummary) {
     contextParts.push(`\nPERFORMANCE: ${perfSummary.total_positions_closed} closed, win rate ${perfSummary.win_rate_pct}%, avg PnL ${perfSummary.avg_pnl_pct}%`);
   }

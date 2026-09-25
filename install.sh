@@ -3,19 +3,6 @@ set -e
 
 echo "Installing Meridian DLMM Agent..."
 
-# Check if nuggets exists alongside meridian
-if [ ! -d "../nuggets" ]; then
-  echo "Cloning nuggets (holographic memory)..."
-  git clone https://github.com/NeoVertex1/nuggets.git ../nuggets
-fi
-
-# Build nuggets
-echo "Building nuggets..."
-cd ../nuggets
-npm install
-npm run build
-cd - > /dev/null
-
 # Install meridian
 echo "Installing meridian..."
 npm install
