@@ -745,9 +745,14 @@ export async function deployPosition({
     return dryRunResult;
   }
 
-  const { StrategyType } = await getDLMM();
+  const { DLMM, StrategyType } = await getDLMM();
   const wallet = getWallet();
-  const pool = await getPool(pool_address);
+  // A private, freshly loaded instance rather than the shared poolCache entry:
+  // the SDK builds the deposit from pool.lbPair.activeId, and a cached instance
+  // is up to 5 min stale — and could be refetched by another flow between our
+  // range computation and the build.
+  const pool = await DLMM.create(getConnection(), new PublicKey(pool_address));
+  const activeIdAtLoad = pool.lbPair.activeId;
   // Deploys fund the Y side with SOL (both SOL and USDC mode swap to SOL first),
   // so a pool whose token Y isn't wrapped SOL would be funded with the wrong token.
   const tokenYMint = pool.lbPair?.tokenYMint?.toBase58?.() ?? String(pool.lbPair?.tokenYMint ?? "");
@@ -755,7 +760,6 @@ export async function deployPosition({
     log("deploy", `Refusing deploy into ${pool_address}: token Y is ${tokenYMint}, not SOL`);
     return { success: false, error: `Pool ${pool_address} is not SOL-quoted (token Y ${tokenYMint}); only SOL pools are supported.` };
   }
-  const activeBin = await pool.getActiveBin();
   resolvedBinStep ||= pool.lbPair?.binStep ?? pool.lbPair?.bin_step ?? null;
 
   // ─── Auto-swap SOL → base token for two-sided spot ────────────
@@ -825,6 +829,18 @@ export async function deployPosition({
         };
       }
     }
+  }
+
+  // ─── Fresh active bin, one snapshot for range AND build ────────
+  // initializePositionAndAddLiquidityByStrategy (≤69 bins) anchors the deposit
+  // and its bin-slippage check to this.lbPair.activeId, which getActiveBin()
+  // does NOT refresh. Refetch right before computing the range (this is also
+  // after any auto-swap, which can move this very pool) and derive the range
+  // from pool.lbPair.activeId, so the range and the SDK build share one state.
+  await pool.refetchStates();
+  const activeBin = { binId: pool.lbPair.activeId };
+  if (activeBin.binId !== activeIdAtLoad) {
+    log("deploy", `Active bin moved ${activeIdAtLoad} → ${activeBin.binId} since pool load${needsAutoSwap ? " (after auto-swap)" : ""}; using the fresh bin`);
   }
 
   // Range calculation
