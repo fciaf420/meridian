@@ -936,7 +936,7 @@ async function fetchLpAgentOpenPositions(walletAddress) {
 
   try {
     const res = await fetch(
-      `${LPAGENT_API}/lp-positions/opening?owner=${walletAddress}`,
+      `${LPAGENT_API}/lp-positions/opening?owner=${walletAddress}&platform=meteora`,
       { headers: { "x-api-key": apiKey } }
     );
 

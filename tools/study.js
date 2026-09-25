@@ -227,9 +227,10 @@ export async function getPoolInfo({ pool_address }) {
   const d = raw.data;
   if (!d) return { error: "No data returned for this pool." };
 
-  const tokens = d.tokenInfo?.[0]?.data || [];
-  const tokenX = tokens[0] || {};
-  const tokenY = tokens[1] || {};
+  // Docs: tokenInfo is a tuple [tokenX result, tokenY result], each { status, data: [token] }.
+  // The old tokenInfo[0].data[1] lookup is kept only as a fallback.
+  const tokenX = d.tokenInfo?.[0]?.data?.[0] || {};
+  const tokenY = d.tokenInfo?.[1]?.data?.[0] || d.tokenInfo?.[0]?.data?.[1] || {};
   const feeInfo = d.feeInfo || {};
 
   const result = {
