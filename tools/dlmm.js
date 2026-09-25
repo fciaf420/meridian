@@ -981,7 +981,7 @@ let _positionsInflight = null; // deduplicates concurrent calls
 
 // ─── Fetch DLMM PnL API for all positions in a pool ────────────
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
-  const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
+  const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&page_size=100&page=1`; // snake_case: `pageSize` is ignored (API default 20)
   try {
     const res = await fetch(url);
     if (!res.ok) {
@@ -991,6 +991,9 @@ async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
     }
     const data = await res.json();
     const positions = data.positions || data.data || [];
+    if (data.hasNext) {
+      log("pnl_api", `Pool ${poolAddress.slice(0, 8)} has more than ${positions.length} open positions for this wallet — only the first page was read`);
+    }
     if (positions.length === 0) {
       log("pnl_api", `No positions returned for pool ${poolAddress.slice(0, 8)} — keys: ${Object.keys(data).join(", ")}`);
     }
@@ -1582,23 +1585,30 @@ export async function getWalletPositions({ wallet_address }) {
 
 // ─── Search Pools by Query ─────────────────────────────────────
 export async function searchPools({ query, limit = 10 }) {
-  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(query)}`;
+  const pageSize = Math.min(Math.max(1, Math.floor(Number(limit) || 10)), 1000);
+  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(query)}&page_size=${pageSize}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Pool search API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
-  const pools = (Array.isArray(data) ? data : data.data || []).slice(0, limit);
+  const pools = (Array.isArray(data) ? data : data.data || []).slice(0, pageSize);
+  const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+  // Field names per the Data API PoolResponse schema (dlmm.datapi.meteora.ag
+  // OpenAPI): pool_config.{bin_step,base_fee_pct}, tvl, volume["24h"], and
+  // token_x/token_y objects. The legacy names (bin_step, liquidity,
+  // trade_volume_24h, mint_x...) no longer exist and came back null.
   return {
     query,
-    total: pools.length,
+    total: data.total ?? pools.length,
     pools: pools.map((p) => ({
-      pool: p.address || p.pool_address,
+      pool: p.address,
       name: p.name,
-      bin_step: p.bin_step ?? p.dlmm_params?.bin_step,
-      fee_pct: p.base_fee_percentage ?? p.fee_pct,
-      tvl: p.liquidity,
-      volume_24h: p.trade_volume_24h,
-      token_x: { symbol: p.mint_x_symbol ?? p.token_x?.symbol, mint: p.mint_x ?? p.token_x?.address },
-      token_y: { symbol: p.mint_y_symbol ?? p.token_y?.symbol, mint: p.mint_y ?? p.token_y?.address },
+      bin_step: num(p.pool_config?.bin_step),
+      fee_pct: num(p.pool_config?.base_fee_pct),
+      tvl: num(p.tvl),
+      volume_24h: num(p.volume?.["24h"]),
+      fee_tvl_ratio_24h: num(p.fee_tvl_ratio?.["24h"]), // % of TVL, already net of protocol fee
+      token_x: { symbol: p.token_x?.symbol ?? null, mint: p.token_x?.address ?? null },
+      token_y: { symbol: p.token_y?.symbol ?? null, mint: p.token_y?.address ?? null },
     })),
   };
 }
