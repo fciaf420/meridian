@@ -4,6 +4,7 @@ import {
   Keypair,
   PublicKey,
   SendTransactionError,
+  SystemProgram,
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
@@ -134,8 +135,81 @@ async function estimatePriorityFeeMicroLamports(tx, feePayer, label = "tx") {
   }
 }
 
+// ─── Helius Sender ──────────────────────────────────────────────
+// Plain RPC sendTransaction is 1 tx/s on the Free plan, so sends and
+// rebroadcasts were being throttled and txs expired. Sender (0 credits,
+// 50 tx/s on every plan, staked/SWQoS routing) requires a SOL tip transfer to
+// one of these accounts plus a compute-unit price in every tx.
+// https://www.helius.dev/docs/sending-transactions/sender
+const HELIUS_SENDER_TIP_ACCOUNTS = [
+  "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+  "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
+  "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+  "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
+  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
+  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+  "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+  "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
+];
+
+function heliusSenderEnabled() {
+  return config.management.heliusSender !== false;
+}
+
+function heliusSenderUrl() {
+  // SWQoS-only route: 0.000005 SOL minimum tip (Sender Max needs 0.001 SOL).
+  return config.management.heliusSenderUrl || "https://sender.helius-rpc.com/fast?swqos_only=true";
+}
+
+function addSenderTip(tx, feePayer) {
+  const lamports = config.management.heliusSenderTipLamports ?? 5_000; // 0.000005 SOL
+  const to = HELIUS_SENDER_TIP_ACCOUNTS[Math.floor(Math.random() * HELIUS_SENDER_TIP_ACCOUNTS.length)];
+  tx.instructions.push(SystemProgram.transfer({ fromPubkey: feePayer, toPubkey: new PublicKey(to), lamports }));
+}
+
+/** POST signed bytes to Helius Sender. Resolves true on accept, false otherwise (never throws). */
+async function sendViaHeliusSender(wire, label) {
+  try {
+    const res = await fetch(heliusSenderUrl(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: `meridian-${Date.now()}`,
+        method: "sendTransaction",
+        params: [Buffer.from(wire).toString("base64"), { encoding: "base64", skipPreflight: true, maxRetries: 0 }],
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || data?.error) {
+      log("tx_sender_warn", `${label}: Helius Sender rejected (${res.status}${data?.error ? ` ${data.error.message || JSON.stringify(data.error)}` : ""})`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    log("tx_sender_warn", `${label}: Helius Sender unreachable (${error.message})`);
+    return false;
+  }
+}
+
+/** Broadcast signed bytes: Sender first (fast path), RPC as a redundant path. */
+async function broadcastSigned(connection, wire, sendOpts, label, { rpc = true } = {}) {
+  const viaSender = heliusSenderEnabled() ? sendViaHeliusSender(wire, label) : Promise.resolve(false);
+  const viaRpc = rpc
+    ? connection.sendRawTransaction(wire, sendOpts).then(() => true, (e) => {
+        log("tx_rpc_warn", `${label}: RPC send failed (${e.message})`);
+        return false;
+      })
+    : Promise.resolve(false);
+  const [s, r] = await Promise.all([viaSender, viaRpc]);
+  if (!s && !r) throw new Error(`${label}: transaction was not accepted by Helius Sender or the RPC`);
+}
+
 async function applyPriorityFee(tx, feePayer, label) {
   if (!tx?.instructions?.length) return tx;
+  if (heliusSenderEnabled()) addSenderTip(tx, feePayer);
 
   const estimated = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
   // Fall back to a sane default rather than sending with no priority fee, and
@@ -268,14 +342,18 @@ async function sendManagedTransaction(tx, signers, label) {
 
       const wire = tx.serialize();
       const sendOpts = { skipPreflight: true, preflightCommitment: "confirmed", maxRetries: 0 };
-      await connection.sendRawTransaction(wire, sendOpts);
+      await broadcastSigned(connection, wire, sendOpts, label);
       // Rebroadcast the SAME signed bytes every 2s until confirmed or expired.
       // A single send is often dropped under load and nothing re-sent it before
       // the blockhash expired ("block height exceeded"). Identical bytes = same
-      // signature, so a rebroadcast can never double-execute.
+      // signature, so a rebroadcast can never double-execute. Rebroadcasts go to
+      // Sender only (RPC sendTransaction is rate-limited to 1/s on the Free plan).
       const rebroadcastMs = config.management.txRebroadcastMs ?? 2_000;
       const rebroadcast = setInterval(() => {
-        connection.sendRawTransaction(wire, sendOpts).catch(() => { /* best-effort; confirm decides */ });
+        (heliusSenderEnabled()
+          ? sendViaHeliusSender(wire, label)
+          : connection.sendRawTransaction(wire, sendOpts)
+        ).catch(() => { /* best-effort; confirm decides */ });
       }, rebroadcastMs);
       let status;
       try {
@@ -2178,3 +2256,4 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 
 // Exposed for read-only verification scripts/tests (never sends anything).
 export { applyPriorityFee as _applyPriorityFeeForTest };
+export { sendManagedTransaction as _sendManagedTransactionForTest };
