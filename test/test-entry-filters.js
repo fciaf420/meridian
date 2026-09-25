@@ -200,7 +200,9 @@ function mockPool(over = {}) {
     tokenX: over.tokenX || reserve({ tlv: [metadataPointerTlv()] }),
     tokenY: { mint: { decimals: 9 } },
     isSwapDisabled: () => false,
-    // The first call after the entry checks: stop the deploy here with a sentinel.
+    // The first call after the entry checks (the fresh-bin refetch before the
+    // range is computed): stop the deploy here with a sentinel.
+    refetchStates: async () => { calls.push("refetchStates"); throw new Error("PAST_ENTRY_CHECKS"); },
     getActiveBin: async () => { calls.push("getActiveBin"); throw new Error("PAST_ENTRY_CHECKS"); },
     getOracle: async () => { calls.push("getOracle"); return over.oracle ?? null; },
     initializePositionAndAddLiquidityByStrategy: async () => { calls.push("tx"); throw new Error("must not build a tx"); },
@@ -237,7 +239,7 @@ test("deploy: token guards refuse before any tx, swap or active-bin read; the re
   config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockPermanentDelegate: false };
   const okPool = mockPool({ tokenX: reserve({ tlv: [delegateTlv()] }) });
   await assert.rejects(deployInto(okPool), /PAST_ENTRY_CHECKS/);
-  assert.deepEqual(okPool.calls, ["getOracle", "getActiveBin"]);
+  assert.deepEqual(okPool.calls, ["getOracle", "refetchStates"]);
   config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
 });
 
