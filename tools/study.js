@@ -11,16 +11,44 @@ const MERIDIAN_API = "https://api.agentmeridian.xyz/api";
 const MERIDIAN_PUBLIC_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
 
 /**
+ * GET with short backoff for transient failures of the shared study proxy.
+ * The proxy fronts LPAgent and answers 500 {"error":"LPAgent circuit open"} while
+ * LPAgent throttles it — observed to clear within ~20s — so retry that, 429/502/503/504,
+ * and network errors. Other statuses (401, 404, plain 500) return immediately.
+ */
+export async function fetchStudyWithRetry(url, opts, { delaysMs = [2000, 5000, 10000] } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    let reason;
+    try {
+      res = await fetch(url, opts);
+      if (res.ok) return res;
+      const body = await res.clone().text().catch(() => "");
+      const circuitOpen = res.status === 500 && /circuit open/i.test(body);
+      if (!circuitOpen && ![429, 502, 503, 504].includes(res.status)) return res;
+      reason = circuitOpen ? "circuit open" : `HTTP ${res.status}`;
+    } catch (err) {
+      if (attempt >= delaysMs.length) throw err;
+      reason = err.message;
+    }
+    if (attempt >= delaysMs.length) return res;
+    log("study", `study-top-lp ${reason}; retry ${attempt + 1}/${delaysMs.length} in ${delaysMs[attempt]}ms`);
+    await new Promise((r) => setTimeout(r, delaysMs[attempt]));
+  }
+}
+
+/**
  * Fetch interpreted LP study data from Meridian and normalize it for the agent.
  */
 export async function studyTopLPers({ pool_address, limit = 4 }) {
-  const res = await fetch(
+  const res = await fetchStudyWithRetry(
     `${MERIDIAN_API}/study-top-lp/${pool_address}`,
     { headers: { "x-api-key": MERIDIAN_PUBLIC_KEY } }
   );
 
   if (!res.ok) {
-    throw new Error(`study-top-lp API error: ${res.status}`);
+    const detail = await res.text().catch(() => "");
+    throw new Error(`study-top-lp API error: ${res.status}${detail ? ` ${detail.slice(0, 120)}` : ""}`);
   }
 
   const data = await res.json();
