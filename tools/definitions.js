@@ -891,7 +891,7 @@ Parse the text and extract structured criteria, then call this tool to store it.
     type: "function",
     function: {
       name: "set_active_strategy",
-      description: "Set which strategy to use for the next screening/deployment cycle.",
+      description: "Mark a saved strategy-library entry as the active reference. Screening cycles show it to the screener as a non-binding note (\"SAVED STRATEGY (reference, not mandatory)\"). It does not change the configured trading strategy (config.strategy.activeStrategy, e.g. evil_panda), the deploy defaults, or the exit rules; tell the user that when they ask to switch strategies. Use when the user asks to activate a saved strategy by id from list_strategies.",
       parameters: {
         type: "object",
         properties: { id: { type: "string", description: "Strategy ID to activate" } },
