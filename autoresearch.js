@@ -7,6 +7,7 @@
  */
 
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
@@ -571,16 +572,40 @@ ${failureDesc}
 
 Generate exactly ONE small, targeted modification. Change only one instruction or threshold. Do not rewrite the whole section.
 
-Reply with:
-HYPOTHESIS: [one sentence explaining what you're changing and why]
-MODIFIED_TEXT:
-[full section text with your single change applied]`;
+Return a JSON object: {"hypothesis": one sentence on what you changed and why, "modified_text": the full section text with your single change applied, without the --- delimiters}.`;
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["hypothesis", "modified_text"],
+    properties: { hypothesis: { type: "string" }, modified_text: { type: "string" } },
+  };
+  // The CLI providers enforce the schema; HTTP providers only get JSON mode (or nothing),
+  // so a non-JSON reply falls back to the previous HYPOTHESIS / MODIFIED_TEXT format.
+  // Either way the result has the same { hypothesis, modifiedText } shape the experiment
+  // record (hypothesis / modified_text) has always stored.
+  const toResult = (raw) => {
+    let obj = raw;
+    if (typeof raw === "string") {
+      try {
+        obj = JSON.parse(raw);
+      } catch {
+        const hypothesisMatch = raw.match(/HYPOTHESIS:\s*(.+?)(?:\n|$)/i);
+        const modifiedMatch = raw.match(/MODIFIED_TEXT:\s*\n([\s\S]+)/i);
+        obj = { hypothesis: hypothesisMatch?.[1], modified_text: modifiedMatch?.[1] };
+      }
+    }
+    if (typeof obj?.modified_text !== "string" || !obj.modified_text.trim()) throw new Error("autoresearch LLM returned no modified_text");
+    return { hypothesis: String(obj.hypothesis || "").trim() || "Targeted modification", modifiedText: obj.modified_text.trim() };
+  };
 
   if (provider === "codex") {
+    const schemaPath = path.join(os.tmpdir(), `meridian-autoresearch-${process.pid}.schema.json`);
+    fs.writeFileSync(schemaPath, JSON.stringify(schema));
     const content = await runCodexExec(model, `${systemMsg}\n\n${userMsg}`, {
       cwd: process.cwd(),
       sandbox: "read-only",
       skipGitRepoCheck: true,
+      outputSchemaPath: schemaPath,
       config: {
         "suppress_unstable_features_warning": "true",
         "model_reasoning_effort": config.autoresearch?.reasoningEffort ?? "medium",
@@ -588,32 +613,20 @@ MODIFIED_TEXT:
     });
 
     if (!content) throw new Error("Empty response from Codex CLI");
-
-    const hypothesisMatch = content.match(/HYPOTHESIS:\s*(.+?)(?:\n|$)/i);
-    const modifiedMatch = content.match(/MODIFIED_TEXT:\s*\n([\s\S]+)/i);
-
-    return {
-      hypothesis: hypothesisMatch?.[1]?.trim() || "Targeted modification",
-      modifiedText: modifiedMatch?.[1]?.trim() || null,
-    };
+    return toResult(content);
   }
 
   if (provider === "claude") {
     const { runClaudeCli } = await import("./llm-provider.js");
 
-    const content = await runClaudeCli(model, `${systemMsg}\n\n${userMsg}`, {
+    const content = await runClaudeCli(model, userMsg, {
       effort: "high",
+      systemPrompt: systemMsg,
+      jsonSchema: schema,
     });
 
     if (!content) throw new Error("Empty response from Claude CLI");
-
-    const hypothesisMatch = content.match(/HYPOTHESIS:\s*(.+?)(?:\n|$)/i);
-    const modifiedMatch = content.match(/MODIFIED_TEXT:\s*\n([\s\S]+)/i);
-
-    return {
-      hypothesis: hypothesisMatch?.[1]?.trim() || "Targeted modification",
-      modifiedText: modifiedMatch?.[1]?.trim() || null,
-    };
+    return toResult(content);
   }
 
   const baseURL = getChatCompletionsEndpoint();
@@ -629,6 +642,9 @@ MODIFIED_TEXT:
     temperature: 0.4,
     max_tokens: 4096,
   };
+  // JSON mode for DeepSeek / OpenRouter. MiniMax (reasoning_split) is left on plain text;
+  // toResult accepts the legacy format as a fallback.
+  if (provider !== "minimax") body.response_format = { type: "json_object" };
 
   if (provider === "minimax") {
     body.reasoning_split = true;
@@ -653,14 +669,7 @@ MODIFIED_TEXT:
   const content = message?.content;
   if (!content) throw new Error("Empty response from LLM");
 
-  // Parse response
-  const hypothesisMatch = content.match(/HYPOTHESIS:\s*(.+?)(?:\n|$)/i);
-  const modifiedMatch = content.match(/MODIFIED_TEXT:\s*\n([\s\S]+)/i);
-
-  return {
-    hypothesis: hypothesisMatch?.[1]?.trim() || "Targeted modification",
-    modifiedText: modifiedMatch?.[1]?.trim() || null,
-  };
+  return toResult(content);
 }
 
 // ─── Public Accessors ────────────────────────────────────────
