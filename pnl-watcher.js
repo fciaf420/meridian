@@ -11,6 +11,7 @@ import { config } from "./config.js";
 import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
 import { getMyPositions, closePosition } from "./tools/dlmm.js";
 import { emit } from "./notifier.js";
+import { getPositionBins, withTimeout } from "./tools/bin-visual.js";
 import { isBusy, isManagementBusy, isScreeningBusy } from "./session.js";
 import fs from "fs";
 
@@ -81,6 +82,8 @@ export async function runPnlWatcher() {
 
         log("pnl_watcher", `EXIT TRIGGERED for ${p.pair || p.position.slice(0, 8)}: ${reason}`);
 
+        // Read-only bin snapshot for the alert, started alongside the close; never fails it.
+        const preCloseBins = getPositionBins(p).catch(() => null);
         const closeResult = await closePosition({
           position_address: p.position,
           _pnlOverride: {
@@ -125,6 +128,7 @@ export async function runPnlWatcher() {
           pnlUsd: p.pnl_usd,
           autoClose: true,
           reason,
+          bins: await withTimeout(preCloseBins, 1_500),
         });
       } catch (posErr) {
         log("pnl_watcher_error", `Error processing position ${p.position.slice(0, 8)}: ${posErr.message}`);
