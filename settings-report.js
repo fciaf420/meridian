@@ -155,6 +155,7 @@ export function buildSettingsReport({ color = false } = {}) {
   row("pausable", onOff(ef.blockPausable), "blockPausable");
   row("non-transferable", onOff(ef.blockNonTransferable), "blockNonTransferable");
   row("SOL-fee pools only", ef.solFeePoolsOnly ? C.green("on") : "off", "solFeePoolsOnly (CollectFeeMode OnlyY)");
+  row("TWAP spike (bid_ask)", ef.twapSpikeMaxPct == null ? C.yellow("off") : `> +${ef.twapSpikeMaxPct}% vs ${ef.twapWindowMinutes}-min TWAP → block`, "twapSpikeMaxPct / twapWindowMinutes");
 
   // ── screening (active source(s) only) ──
   if (srcSource === "both") {

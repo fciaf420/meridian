@@ -47,6 +47,8 @@ export const ENTRY_FILTER_DEFAULTS = Object.freeze({
   blockPausable: true,
   blockNonTransferable: true,
   solFeePoolsOnly: false,
+  twapSpikeMaxPct: 15, // null = off
+  twapWindowMinutes: 60,
 });
 
 export const TOKEN_GUARD_BOOL_KEYS = [
@@ -384,6 +386,64 @@ export function feeModeTag(fm) {
   return fm.solFees ? "fees SOL" : fm.mode === "OnlyY" ? "fees Y" : "fees token";
 }
 
+/* ============================== TWAP ============================== */
+
+/**
+ * Price deviation from the on-chain oracle TWAP over the last `windowMinutes`.
+ * The TWAP is geometric (it averages bin ids): devPct = (1 + binStep/1e4)^(active − twapBin) − 1.
+ * `oracle` is pool.getOracle() (SDK IDynamicOracle); getActiveIdByTime returns
+ * null when the oracle's samples don't cover the window → known: false.
+ */
+export async function computeTwapDeviation({ oracle, activeId = null, binStep, nowSec = Math.floor(Date.now() / 1000), windowMinutes = 60 }) {
+  const BN = (await import("bn.js")).default;
+  const windowSec = Math.max(60, Math.round(Number(windowMinutes) * 60));
+  const out = { known: false, windowMinutes: windowSec / 60, twapBin: null, activeId: null, devBins: null, devPct: null, coveredMinutes: null };
+  if (!oracle) return { ...out, note: "oracle unavailable" };
+  try {
+    const cov = oracle.getMaxDuration?.(new BN(nowSec));
+    if (cov != null) out.coveredMinutes = Math.floor(Number(cov.toString()) / 60);
+  } catch { /* informational */ }
+  const res = oracle.getActiveIdByTime(new BN(nowSec - windowSec), new BN(nowSec));
+  // getOracle() decodes a fresh lbPair and keeps its activeId on the wrapper.
+  const active = num(oracle.currentActiveBinId) ?? num(activeId);
+  if (!res || active == null || !(binStep > 0)) {
+    return { ...out, note: `oracle covers ${out.coveredMinutes ?? "?"} min of the ${out.windowMinutes}-min window` };
+  }
+  const twapBin = num(res.value);
+  const devBins = active - twapBin;
+  const devPct = (Math.pow(1 + binStep / 10_000, devBins) - 1) * 100;
+  return { ...out, known: true, twapBin, activeId: active, devBins, devPct: Math.round(devPct * 100) / 100 };
+}
+
+/**
+ * TWAP spike guard: refuse a bid_ask entry when price is more than
+ * twapSpikeMaxPct above the TWAP. Unknown TWAP (window not covered) allows with a note.
+ */
+export function evaluateTwapGuard(twap, { maxPct = 15, strategy = "bid_ask" } = {}) {
+  if (maxPct == null) return { pass: true, note: "TWAP spike guard off" };
+  if (strategy !== "bid_ask") return { pass: true, note: `TWAP spike guard applies to bid_ask only (strategy ${strategy})` };
+  if (!twap?.known) return { pass: true, unknown: true, note: `TWAP unknown (${twap?.note ?? "no data"}) — allowed` };
+  if (twap.devPct > Number(maxPct)) {
+    return {
+      pass: false,
+      reason: `price is ${fmtSigned(twap.devPct)}% vs the ${twap.windowMinutes}-min on-chain TWAP (${twap.devBins > 0 ? "+" : ""}${twap.devBins} bins), above the ${maxPct}% limit (twapSpikeMaxPct)`,
+    };
+  }
+  return { pass: true, note: `price ${fmtSigned(twap.devPct)}% vs ${twap.windowMinutes}-min TWAP (limit ${maxPct}%)` };
+}
+
+const fmtSigned = (v) => `${v >= 0 ? "+" : ""}${Number(v).toFixed(1)}`;
+
+/** pool.getOracle() + computeTwapDeviation, never throwing (errors → unknown). */
+export async function readTwap(pool, { windowMinutes = 60, nowSec = Math.floor(Date.now() / 1000) } = {}) {
+  try {
+    const oracle = await pool.getOracle();
+    return await computeTwapDeviation({ oracle, activeId: pool?.lbPair?.activeId, binStep: num(pool?.lbPair?.binStep), nowSec, windowMinutes });
+  } catch (e) {
+    return { known: false, windowMinutes, note: `oracle read failed: ${e.message}` };
+  }
+}
+
 /* ============================== pool status ============================== */
 
 /**
@@ -453,10 +513,14 @@ export async function fetchPoolApiRow(poolAddress, { timeoutMs = 5000 } = {}) {
  * Entry state of a loaded DLMM pool for display (lookup / confirm cards) and
  * the re-center shadow log. Read-only.
  */
-export async function describePoolEntryState(pool, { apiBlacklisted = null, nowSec = Math.floor(Date.now() / 1000) } = {}) {
+export async function describePoolEntryState(pool, { apiBlacklisted = null, nowSec = Math.floor(Date.now() / 1000), strategy = "bid_ask", filters = currentEntryFilters(), twap: withTwap = true } = {}) {
   const status = evaluatePoolStatus({ lbPair: pool?.lbPair, clock: pool?.clock, nowSec, apiBlacklisted });
   const feeMode = feeModeFromLbPair(pool?.lbPair);
-  return { status, feeMode };
+  const twap = withTwap && typeof pool?.getOracle === "function"
+    ? await readTwap(pool, { windowMinutes: filters.twapWindowMinutes ?? 60, nowSec })
+    : null;
+  const twapGuard = evaluateTwapGuard(twap, { maxPct: filters.twapSpikeMaxPct, strategy });
+  return { status, feeMode, twap, twapGuard };
 }
 
 let _stateConn = null;
@@ -584,6 +648,7 @@ export async function runDeployEntryChecks({
   pool,
   pool_address = null,
   wallet = null,
+  strategy = "bid_ask",
   filters = currentEntryFilters(),
   apiRow = undefined, // injectable; undefined = fetch the pool-discovery row
   nowSec = Math.floor(Date.now() / 1000),
@@ -614,5 +679,14 @@ export async function runDeployEntryChecks({
   }
   notes.push(feeMode.label);
 
-  return { pass: true, reason: null, notes, token, status, feeMode };
+  // TWAP spike guard (bid_ask only; unknown TWAP allows with a note).
+  let twap = null;
+  if (filters.twapSpikeMaxPct != null && strategy === "bid_ask") {
+    twap = await readTwap(pool, { windowMinutes: filters.twapWindowMinutes ?? 60, nowSec });
+  }
+  const tg = evaluateTwapGuard(twap, { maxPct: filters.twapSpikeMaxPct, strategy });
+  if (!tg.pass) return { pass: false, reason: `TWAP spike: ${tg.reason}`, notes, token, status, feeMode, twap };
+  if (tg.note) notes.push(tg.note);
+
+  return { pass: true, reason: null, notes, token, status, feeMode, twap };
 }

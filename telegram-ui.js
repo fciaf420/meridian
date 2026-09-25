@@ -607,6 +607,15 @@ export function entryStateLines(c, filters = null) {
   if (st?.status) out.push(`${st.status.pass ? "✅" : "⛔"} Pool status: ${st.status.pass ? st.status.text : st.status.reasons.join("; ")}`);
   else if (c?.is_blacklisted === true) out.push("⛔ Pool status: Meteora API flags the pool as blacklisted");
   else if (st?.error) out.push(`❔ Pool status: unknown (${clipText(String(st.error), 60)})`);
+  const tw = st?.twap;
+  if (tw) {
+    const g = st.twapGuard;
+    const head = tw.known
+      ? `price ${tw.devPct >= 0 ? "+" : ""}${Number(tw.devPct).toFixed(1)}% vs ${tw.windowMinutes}-min on-chain TWAP (${tw.devBins > 0 ? "+" : ""}${tw.devBins} bins)`
+      : `unknown (${tw.note ?? "no oracle data"})`;
+    const tail = g?.pass === false ? ` — ⛔ above the ${filters?.twapSpikeMaxPct ?? "?"}% limit for bid_ask` : !tw.known ? " — allowed" : "";
+    out.push(`${g?.pass === false ? "⛔" : tw.known ? "📈" : "❔"} TWAP: ${head}${tail}`);
+  }
   const fm = feeModeOf(c);
   out.push(`💸 Fee mode: ${fm ? FEE_MODE_TEXT[fm.mode] ?? "unknown" : "unknown"}${fm && !fm.solFees && filters?.solFeePoolsOnly ? " — ⛔ solFeePoolsOnly is on" : ""}`);
   return out;

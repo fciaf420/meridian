@@ -237,7 +237,7 @@ test("deploy: token guards refuse before any tx, swap or active-bin read; the re
   config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockPermanentDelegate: false };
   const okPool = mockPool({ tokenX: reserve({ tlv: [delegateTlv()] }) });
   await assert.rejects(deployInto(okPool), /PAST_ENTRY_CHECKS/);
-  assert.deepEqual(okPool.calls, ["getActiveBin"]);
+  assert.deepEqual(okPool.calls, ["getOracle", "getActiveBin"]);
   config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
 });
 
@@ -415,4 +415,65 @@ test("cards: fee mode on candidate, lookup and confirm cards", async () => {
   const text = card.text;
   assert.match(text, /✅ Pool status: enabled/);
   assert.match(text, /💸 Fee mode: LP fees paid in the input token \(InputOnly\).*⛔ solFeePoolsOnly is on/);
+});
+
+// ─── 4. TWAP spike guard ─────────────────────────────────────────
+function mockOracle({ twapBin = 1000, active = 1000, coveredSec = 7200 } = {}) {
+  return {
+    currentActiveBinId: new BN(active),
+    getMaxDuration: () => new BN(coveredSec),
+    getActiveIdByTime: (t0, t1) => (t1.sub(t0).toNumber() > coveredSec ? null : { value: new BN(twapBin), duration: t1.sub(t0) }),
+  };
+}
+
+test("TWAP: deviation is geometric in bins; above the limit blocks bid_ask only; null disables", async () => {
+  const tw = await es.computeTwapDeviation({ oracle: mockOracle({ twapBin: 980, active: 1000 }), binStep: 100, windowMinutes: 60 });
+  assert.equal(tw.known, true);
+  assert.equal(tw.devBins, 20);
+  assert.equal(tw.devPct, Math.round((Math.pow(1.01, 20) - 1) * 10000) / 100); // ≈ +22.02%
+  const g = es.evaluateTwapGuard(tw, { maxPct: 15, strategy: "bid_ask" });
+  assert.equal(g.pass, false);
+  assert.match(g.reason, /price is \+22\.0% vs the 60-min on-chain TWAP \(\+20 bins\), above the 15% limit \(twapSpikeMaxPct\)/);
+  assert.equal(es.evaluateTwapGuard(tw, { maxPct: 25, strategy: "bid_ask" }).pass, true);
+  assert.equal(es.evaluateTwapGuard(tw, { maxPct: 15, strategy: "spot" }).pass, true, "spot is not gated");
+  assert.equal(es.evaluateTwapGuard(tw, { maxPct: null, strategy: "bid_ask" }).pass, true);
+  const below = await es.computeTwapDeviation({ oracle: mockOracle({ twapBin: 1030, active: 1000 }), binStep: 100 });
+  assert.ok(below.devPct < 0);
+  assert.equal(es.evaluateTwapGuard(below, { maxPct: 15 }).pass, true, "price below TWAP never blocks");
+});
+
+test("TWAP: an oracle that can't cover the window is unknown → allowed with a note (never blocks)", async () => {
+  const tw = await es.computeTwapDeviation({ oracle: mockOracle({ twapBin: 900, active: 1000, coveredSec: 1800 }), binStep: 100, windowMinutes: 60 });
+  assert.equal(tw.known, false);
+  assert.match(tw.note, /oracle covers 30 min of the 60-min window/);
+  const g = es.evaluateTwapGuard(tw, { maxPct: 15, strategy: "bid_ask" });
+  assert.equal(g.pass, true);
+  assert.equal(g.unknown, true);
+  assert.match(g.note, /TWAP unknown .* — allowed/);
+  const failed = await es.readTwap({ getOracle: async () => { throw new Error("rpc down"); }, lbPair: { binStep: 100 } });
+  assert.equal(failed.known, false);
+  assert.equal(es.evaluateTwapGuard(failed, { maxPct: 15 }).pass, true);
+});
+
+test("deploy: TWAP spike refuses bid_ask before any tx; spot and unknown TWAP pass", async () => {
+  const spike = mockPool({ oracle: mockOracle({ twapBin: 975, active: 1000 }) });
+  const r = await deployInto(spike);
+  assert.equal(r.blocked_by, "entry_filter");
+  assert.match(r.error, /^TWAP spike: price is \+28\.2% vs the 60-min on-chain TWAP/);
+  assert.deepEqual(spike.calls, ["getOracle"], "no active-bin read, no tx");
+  await assert.rejects(deployInto(mockPool({ oracle: mockOracle({ twapBin: 900, coveredSec: 600 }) })), /PAST_ENTRY_CHECKS/);
+  const spot = mockPool({ oracle: mockOracle({ twapBin: 975, active: 1000 }) });
+  await assert.rejects(deployInto(spot, { strategy: "spot" }), /PAST_ENTRY_CHECKS/);
+  assert.ok(!spot.calls.includes("getOracle"), "spot skips the oracle read");
+});
+
+test("cards: TWAP line on lookup and confirm cards (known, blocked and unknown)", async () => {
+  const filters = { ...es.ENTRY_FILTER_DEFAULTS };
+  const st = await es.describePoolEntryState(mockPool({ oracle: mockOracle({ twapBin: 975, active: 1000 }) }), { apiBlacklisted: false, filters });
+  const lines = ui.entryStateLines({ pool: "P", entry_state: st }, filters).join("\n");
+  assert.match(lines, /⛔ TWAP: price \+28\.2% vs 60-min on-chain TWAP \(\+25 bins\) — ⛔ above the 15% limit for bid_ask/);
+  const unk = await es.describePoolEntryState(mockPool({ oracle: mockOracle({ coveredSec: 600 }) }), { apiBlacklisted: false, filters });
+  assert.match(ui.entryStateLines({ pool: "P", entry_state: unk }, filters).join("\n"), /❔ TWAP: unknown \(oracle covers 10 min of the 60-min window\) — allowed/);
+  const card = ui.renderDeployConfirm({ pool: "P", name: "X", bin_step: 100 }, { args: { strategy: "bid_ask" }, range: ui.rangeInfo(50, 100), amountLabel: "1 SOL" }, "n", { entryState: st, entryFilters: filters }).text;
+  assert.match(card, /TWAP: price \+28\.2%/);
 });

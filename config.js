@@ -179,6 +179,9 @@ export const config = {
     blockNonTransferable:     u.blockNonTransferable     ?? true,
     // Only enter pools whose CollectFeeMode pays LP fees in SOL (OnlyY, SOL = token Y).
     solFeePoolsOnly:          u.solFeePoolsOnly          ?? false,
+    // Don't open bid_ask when price is > N% above the on-chain oracle TWAP; null = off.
+    twapSpikeMaxPct:          nullable("twapSpikeMaxPct", 15),
+    twapWindowMinutes:        u.twapWindowMinutes        ?? 60,
   },
 
   // ─── Strategy Mapping ───────────────────
