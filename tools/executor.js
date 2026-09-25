@@ -26,6 +26,7 @@ import { execSync, spawn } from "child_process";
 import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } from "../runtime-helpers.js";
 
 import { log, logAction } from "../logger.js";
+import { getPositionBins, withTimeout } from "./bin-visual.js";
 import { emit } from "../notifier.js";
 import { kbRead, kbWrite, kbSearch, kbList, kbDelete, kbMigrate, kbGetStats, kbRebuildIndexes } from "./knowledge-base-tools.js";
 
@@ -297,6 +298,19 @@ function validateConfigUpdate(args) {
   return { pass: true };
 }
 
+const CLOSE_BINS_WAIT_MS = 1_500;
+
+/** Read-only bins of a tracked position for the close alert; null (never a throw) when unknown or failing. */
+function startCloseBinsSnapshot(positionAddress) {
+  try {
+    const t = positionAddress ? getTrackedPosition(positionAddress) : null;
+    if (!t?.pool) return null;
+    return getPositionBins({ position: positionAddress, pool: t.pool, pair: t.pool_name || null }).catch(() => null);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Execute a tool call with safety checks and logging.
  */
@@ -352,6 +366,9 @@ export async function executeTool(name, args) {
 
   // ─── Execute ──────────────────────────────
   try {
+    // Close alert chart: a read-only bin snapshot started alongside the close.
+    // It is never awaited before the close and can never fail it.
+    const preCloseBins = name === "close_position" ? startCloseBinsSnapshot(args.position_address) : null;
     const result = await fn(args);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
@@ -386,7 +403,8 @@ export async function executeTool(name, args) {
         }
       } else if (name === "close_position") {
         const closedTracked = getTrackedPosition(args.position_address);
-        emit("close", { pair: closedTracked?.pool_name || args.position_address?.slice(0, 8), position: args.position_address, pool: result.pool ?? closedTracked?.pool ?? null, txs: result.txs ?? null, pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? null });
+        const bins = await withTimeout(preCloseBins, CLOSE_BINS_WAIT_MS);
+        emit("close", { pair: closedTracked?.pool_name || args.position_address?.slice(0, 8), position: args.position_address, pool: result.pool ?? closedTracked?.pool ?? null, txs: result.txs ?? null, pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? null, bins });
         // USDC mode: auto-settle recovered base token + surplus SOL back to USDC.
         if (usdcModeEnabled()) {
           try {
