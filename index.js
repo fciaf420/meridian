@@ -400,12 +400,7 @@ REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values)
 **Decision:** [STAY/CLOSE]
 **Reason:** [1 short sentence — if PnL is negative, say IL exceeds fees]
 
-FAILURE ANALYSIS: When closing a LOSING position (negative PnL), you MUST call add_lesson with a specific, actionable lesson that explains:
-- What went wrong (entered during pump reversal? too volatile for the range? held too long for a scalper pool?)
-- What signal you missed or should have weighted differently
-- What you would do differently next time
-Do NOT write generic "FAILED: pool X with stats Y" — explain the WHY.
-Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is high. Top LPers hold 0.2h in this pool but we held 3.8h. Next time: match scalper cadence or skip pumping tokens."
+FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesson with one lesson that names what went wrong, the signal that was missed or under-weighted, and what to do differently next time. The runner already records the raw stats of every close, so the lesson is only useful for the why.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel);
       mgmtReport = content;
     } catch (error) {
