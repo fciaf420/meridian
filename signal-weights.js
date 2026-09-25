@@ -57,6 +57,9 @@ const HIGHER_IS_BETTER = new Set([
 
 // Boolean signals — compared by win rate when present vs absent
 const BOOLEAN_SIGNALS = new Set(["smart_wallets_present", "gmgn_signal_present", "gmgn_buy_pressure", "gmgn_spike"]);
+// Booleans whose prior is "absent=better" until closes teach otherwise. Price spikes
+// usually precede upside OOR for single-sided bid_ask, so a spike starts as a penalty.
+const ABSENT_BETTER_PRIOR = new Set(["gmgn_spike"]);
 
 // Categorical signals — compared by win rate across categories
 const CATEGORICAL_SIGNALS = new Set(["narrative_quality", "volume_trend"]);
@@ -66,7 +69,7 @@ const CATEGORICAL_SIGNALS = new Set(["narrative_quality", "volume_trend"]);
 const DEFAULT_DIRECTIONS = Object.fromEntries(
   SIGNAL_NAMES.map((s) => {
     if (HIGHER_IS_BETTER.has(s)) return [s, "higher"];
-    if (BOOLEAN_SIGNALS.has(s)) return [s, "present=better"];
+    if (BOOLEAN_SIGNALS.has(s)) return [s, ABSENT_BETTER_PRIOR.has(s) ? "absent=better" : "present=better"];
     return [s, "unknown"];
   })
 );
@@ -102,7 +105,7 @@ export function loadWeights() {
       for (const name of SIGNAL_NAMES) {
         if (data.directions[name] == null) {
           if (HIGHER_IS_BETTER.has(name)) data.directions[name] = "higher";
-          else if (BOOLEAN_SIGNALS.has(name)) data.directions[name] = "present=better";
+          else if (BOOLEAN_SIGNALS.has(name)) data.directions[name] = ABSENT_BETTER_PRIOR.has(name) ? "absent=better" : "present=better";
           else data.directions[name] = "unknown";
         }
       }

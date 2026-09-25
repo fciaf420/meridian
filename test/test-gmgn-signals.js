@@ -283,7 +283,8 @@ test("rankCandidatesByDarwin scores the new signals like the existing booleans",
   assert.equal(c.direction, "present=better");
   assert.equal(c.score, 1);
   const s = score.contributions.find((x) => x.signal === "gmgn_spike");
-  assert.equal(s.score, 0);
+  assert.equal(s.direction, "absent=better", "spikes start as a penalty for bid_ask");
+  assert.equal(s.score, 1, "no spike scores full marks under absent=better");
 });
 
 test("weights migration: a persisted file without the new keys gets them at the neutral weight", () => {
@@ -302,7 +303,7 @@ test("weights migration: a persisted file without the new keys gets them at the 
   assert.equal(data.weights.fee_tvl_ratio, 0.7);
   assert.equal(data.directions.smart_wallets_present, "absent=better", "learned directions kept");
   assert.equal(data.directions.gmgn_buy_pressure, "present=better");
-  assert.equal(data.directions.gmgn_spike, "present=better");
+  assert.equal(data.directions.gmgn_spike, "absent=better", "spike prior: absent=better");
   assert.match(weights.getWeightsSummary(), /gmgn_buy_pressure/);
   // Loading does not rewrite the file; the next recalc persists.
   assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).weights.gmgn_spike, undefined);
@@ -332,4 +333,12 @@ test("gmgnSignalsEnabled defaults on and is listed for Telegram All settings", (
   const src = fs.readFileSync(path.join(REPO, "config.js"), "utf8");
   const entry = parseConfigKeys(src).find((e) => e.key === "gmgnSignalsEnabled");
   assert.deepEqual(entry, { key: "gmgnSignalsEnabled", file: "user", path: ["screening", "gmgnSignalsEnabled"] });
+});
+
+test("gmgn_spike starts as absent=better (spikes precede upside OOR for bid_ask)", async () => {
+  const sw = await import("../signal-weights.js");
+  const weightData = { weights: {}, directions: { gmgn_spike: "absent=better", gmgn_buy_pressure: "present=better" } };
+  const withSpike = sw.scoreSignalSnapshot({ gmgn_spike: true }, { weightData, calibration: {} });
+  const noSpike = sw.scoreSignalSnapshot({ gmgn_spike: false }, { weightData, calibration: {} });
+  assert.ok(noSpike.score > withSpike.score, `no spike ${noSpike.score} should beat spike ${withSpike.score}`);
 });
