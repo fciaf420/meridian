@@ -6,6 +6,7 @@ import readline from "readline";
 import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions } from "./tools/dlmm.js";
+import { getPositionBins } from "./tools/bin-visual.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV } from "./config.js";
@@ -969,6 +970,7 @@ const tgUI = createTelegramUI({
   computeDeployAmount,
   usdcModeEnabled,
   getMyPositions,
+  getPositionBins, // read-only bin charts (📊 Bins, Positions strips); never throws
   getWalletBalances,
   getTopCandidates,
   lookupToken: (mint) => lookupToken(mint), // read-only; deploys still go through the picker + executeTool

@@ -22,6 +22,7 @@ import {
   encodePresetValue, decodePreset, planTradingChange, riskIncreases, describeChanges,
   parseCustomDeploySize, stopLossOff,
 } from "./trading-settings.js";
+import { renderBinStrip, renderBinChart, withTimeout } from "./tools/bin-visual.js";
 
 export const MENU_BUTTON_TEXT = "🏠 Menu";
 export const CONFIRM_TTL_MS = 60_000;
@@ -29,6 +30,8 @@ export const PAGE_CHAR_BUDGET = 3500; // leaves headroom under Telegram's 4096 c
 export const POSITIONS_PER_PAGE = 5;
 export const CANDIDATES_PER_PAGE = 5;
 export const ENTRY_PREVIEW_TIMEOUT_MS = 8_000;
+export const BINS_STRIP_TIMEOUT_MS = 4_000; // Positions list: show it without strips rather than wait
+export const BINS_VIEW_TIMEOUT_MS = 8_000;
 
 export const BOT_COMMANDS = [
   { command: "menu", description: "Main menu" },
@@ -609,31 +612,38 @@ export function renderWallet(wallet, { config, usdcMode, positions = null } = {}
   return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard, totals: t };
 }
 
-function positionBlock(p, i, unit) {
+function positionBlock(p, i, unit, strip = null) {
   const range = p.in_range
     ? "✅ in range"
     : `⚠️ OOR${p.oor_direction ? ` ${escapeHtml(p.oor_direction)}` : ""}${p.minutes_out_of_range ? ` ${p.minutes_out_of_range}m` : ""}`;
   return [
     `<b>${i + 1}. ${escapeHtml(p.pair ?? shortAddr(p.position))}</b> · ${range}`,
+    ...(strip ? [strip] : []),
     `PnL: ${escapeHtml(fmtPnl(p, unit))} · Value: ${fmtValue(p, unit)}`,
     `Fees: ${fmtFees(p, unit)} unclaimed · Age: ${fmtAge(p.age_minutes)}`,
     `<code>${escapeHtml(shortAddr(p.position))}</code>`,
   ].join("\n");
 }
 
-export function renderPositions(result, { page = 0, refs, unit = "sol" } = {}) {
+/**
+ * `strips` (optional): position address → bin strip HTML (tools/bin-visual.js).
+ * A position without one renders exactly as before. `bins` adds a 📊 Bins button.
+ */
+export function renderPositions(result, { page = 0, refs, unit = "sol", strips = null, bins = false } = {}) {
   if (!result || result.error) {
     return { text: `📊 <b>Positions</b>\n⚠️ ${escapeHtml(result?.error ?? "Could not load positions")}`, keyboard: [backRow("po:0")] };
   }
   const positions = result.positions || [];
   if (!positions.length) return { text: "📊 <b>Positions</b>\nNo open positions.", keyboard: [backRow("po:0")] };
-  const blocks = positions.map((p, i) => positionBlock(p, i, unit));
+  const blocks = positions.map((p, i) => positionBlock(p, i, unit, strips?.get?.(p.position) ?? null));
   const pages = paginate(blocks, { perPage: POSITIONS_PER_PAGE });
   const pg = Math.min(Math.max(0, page), pages.length - 1);
   const keyboard = [];
   for (const i of pages[pg]) {
     const p = positions[i];
-    const row = [btn(`🔒 Close ${i + 1}`, `pc:${refs.put(p.position, `pos:${p.position}`)}`)];
+    const ref = refs.put(p.position, `pos:${p.position}`);
+    const row = [btn(`🔒 Close ${i + 1}`, `pc:${ref}`)];
+    if (bins && p.pool) row.push(btn(`📊 Bins ${i + 1}`, `bv:${ref}:${pg}`));
     if (p.pool) row.push(urlBtn("Meteora ↗", meteoraPoolUrl(p.pool)));
     row.push(urlBtn("Solscan ↗", solscanAccountUrl(p.position)));
     keyboard.push(row);
@@ -643,6 +653,19 @@ export function renderPositions(result, { page = 0, refs, unit = "sol" } = {}) {
   keyboard.push(backRow(`po:${pg}`));
   const text = `📊 <b>Positions</b> (${positions.length} open)\n\n${pages[pg].map((i) => blocks[i]).join("\n\n")}`;
   return { text, keyboard, page: pg, pages: pages.length };
+}
+
+/**
+ * 📊 Bins view: the 4-row chart for one position. `chart` is renderBinChart()
+ * output, or null when the fetch failed. Refresh edits in place; Back returns
+ * to the Positions page it came from.
+ */
+export function renderBinsView(p, chart, ref, { page = 0 } = {}) {
+  const title = `📊 <b>Bins</b> · ${escapeHtml(p.pair ?? shortAddr(p.position))}`;
+  const body = chart ?? "⚠️ Could not load the bin chart right now. Try Refresh.";
+  const keyboard = [[btn("🔄 Refresh", `bv:${ref}:${page}:r`), btn("⬅ Back", `po:${page}`)]];
+  if (p.pool) keyboard.push([urlBtn("Meteora ↗", meteoraPoolUrl(p.pool))]);
+  return { text: clipText(`${title}\n\n${body}`, PAGE_CHAR_BUDGET), keyboard };
 }
 
 /** Fee mode of a candidate: on-chain entry state, else the screening tag, else the API string. */
@@ -1178,6 +1201,27 @@ export function createTelegramUI(deps) {
       if (ok) return { message_id: ctx.messageId, edited: true };
     }
     return deps.tg.sendHTML(view.text, extra);
+  }
+
+  /** Bin strips for the Positions list, fetched in parallel; any failure or timeout just drops that strip. */
+  async function loadStrips(positions) {
+    if (!deps.getPositionBins || !positions?.length) return null;
+    const list = positions.filter((p) => p?.position && p?.pool);
+    const got = await withTimeout(
+      Promise.all(list.map((p) => Promise.resolve().then(() => deps.getPositionBins(p)).catch(() => null))),
+      deps.binsStripTimeoutMs ?? BINS_STRIP_TIMEOUT_MS,
+      null,
+    );
+    const strips = new Map();
+    (got || []).forEach((data, i) => {
+      try {
+        const strip = data ? renderBinStrip(data) : null;
+        if (strip) strips.set(list[i].position, strip);
+      } catch (e) {
+        logf("telegram_warn", `Bin strip render failed: ${e.message}`);
+      }
+    });
+    return strips;
   }
 
   async function statusInfo() {
@@ -1760,7 +1804,28 @@ export function createTelegramUI(deps) {
         case "po": {
           await answer();
           const res = await deps.getMyPositions({}).catch((e) => ({ error: e.message }));
-          await show(ctx, renderPositions(res, { page: Number(arg) || 0, refs, unit: unit() }), opts);
+          const strips = await loadStrips(res?.positions);
+          await show(ctx, renderPositions(res, { page: Number(arg) || 0, refs, unit: unit(), strips, bins: !!deps.getPositionBins }), opts);
+          return;
+        }
+        case "bv": {
+          // Read-only 📊 Bins chart. bv:<ref>:<page>[:r] — r = Refresh (skips the 60s cache).
+          const addr = refs.get(arg);
+          if (!addr || !deps.getPositionBins) {
+            await answer("That button is stale — reopen Positions.", true);
+            return;
+          }
+          const refresh = d.split(":")[3] === "r";
+          await answer(refresh ? "Refreshing…" : "");
+          const res = await deps.getMyPositions({}).catch((e) => ({ error: e.message }));
+          const p = (res?.positions || []).find((x) => x.position === addr);
+          if (!p) {
+            await show(ctx, { text: `Position <code>${escapeHtml(shortAddr(addr))}</code> is no longer open.`, keyboard: [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]] }, opts);
+            return;
+          }
+          const data = await withTimeout(deps.getPositionBins(p, { force: refresh }), deps.binsViewTimeoutMs ?? BINS_VIEW_TIMEOUT_MS);
+          const chart = data ? renderBinChart(data, { header: false }) : null;
+          await show(ctx, renderBinsView(p, chart, arg, { page: Number(sub) || 0 }), opts);
           return;
         }
         case "ca":
@@ -2099,6 +2164,18 @@ export function createTelegramUI(deps) {
     return `PnL: ${abs} (${fmtSigned(d.pnlPct, 2)}%)`;
   }
 
+  /** Bins just before the close (snapshot taken by the closer); omitted when it failed. */
+  function closeChart(d) {
+    if (!d.bins) return null;
+    try {
+      const chart = renderBinChart(d.bins, { header: false });
+      return chart ? `\nBins before close:\n${chart}` : null;
+    } catch (e) {
+      logf("telegram_warn", `Close chart render failed: ${e.message}`);
+      return null;
+    }
+  }
+
   const handlers = {
     deploy: (d) => {
       const amount = d.amountUsd != null ? `$${fmtNum(d.amountUsd, 2)} (${fmtNum(d.amountSol, 4)} SOL)` : `${fmtNum(d.amountSol, 4)} SOL`;
@@ -2115,12 +2192,14 @@ export function createTelegramUI(deps) {
       `🔒 <b>Closed</b> ${escapeHtml(d.pair)}`,
       fmtAlertPnl(d),
       txLinks(d.txs) || null,
+      closeChart(d),
     ].filter(Boolean).join("\n"), [[positionsBtn()]]),
     pnl_watcher_close: (d) => alert("pnl_watcher_close", d.position, 0, [
       `⚡ <b>${/stop|loss/i.test(d.reason || "") ? "Stop-loss" : /tp|profit|trail/i.test(d.reason || "") ? "Take-profit" : "Exit"} hit — auto-closed</b> ${escapeHtml(d.pair)}`,
       escapeHtml(d.reason ?? ""),
       fmtAlertPnl(d),
       txLinks(d.txs) || null,
+      closeChart(d),
     ].filter(Boolean).join("\n"), [[positionsBtn()]]),
     deploy_partial: (d) => alert("deploy_partial", d.position, 0, [
       `⚠️ <b>Partial deploy</b> ${escapeHtml(d.pair)}`,
