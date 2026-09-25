@@ -772,12 +772,7 @@ fee trend over last 24 hours, liquidity amounts.`,
       description: `Store a fact in holographic memory for cross-session learning.
 Use this to remember patterns, outcomes, or strategies that should persist across restarts.
 Nuggets: "pools" (pool outcomes), "strategies" (what strategies work), "lessons" (general rules), "patterns" (market patterns).
-Or create a new nugget name for a new category.
-
-Examples:
-- remember_fact("pools", "BONK-SOL", "high volume but unstable, close within 30min")
-- remember_fact("strategies", "bid_ask_bs100", "works well for volatile tokens, 70%+ win rate")
-- remember_fact("lessons", "evening_volatility", "volume drops after 8pm UTC, avoid new deploys")`,
+Or create a new nugget name for a new category. Writing an existing nugget+key replaces its value.`,
       parameters: {
         type: "object",
         properties: {
@@ -796,12 +791,7 @@ Examples:
       name: "recall_memory",
       description: `Query holographic memory for relevant facts from past sessions.
 Use this before making decisions to check if you've learned something relevant.
-Supports fuzzy matching — you don't need an exact key, just a related query.
-
-Examples:
-- recall_memory("BONK") → might recall "BONK-SOL: high volume but unstable"
-- recall_memory("bid_ask strategy") → might recall strategy effectiveness data
-- recall_memory("evening trading") → might recall timing-based lessons`,
+Supports fuzzy matching — you don't need an exact key, just a related query (a token symbol, strategy name, or topic).`,
       parameters: {
         type: "object",
         properties: {
@@ -818,11 +808,7 @@ Examples:
       name: "forget_fact",
       description: `Remove a fact from holographic memory.
 Use this to clean up stale, incorrect, or outdated facts.
-Specify the nugget name and the exact key of the fact to forget.
-
-Examples:
-- forget_fact("pools", "BONK-SOL") — remove an outdated pool outcome
-- forget_fact("strategies", "old_pattern") — remove an obsolete strategy note`,
+Specify the nugget name and the exact key of the fact to forget (recall_memory shows keys).`,
       parameters: {
         type: "object",
         properties: {
@@ -1092,11 +1078,7 @@ TIP: Always read INDEX.md first to find what you need, then drill into specific 
       name: "kb_write",
       description: `Write or update a markdown article in the knowledge base. Use this to file observations, compile analysis, or update existing articles.
 Articles should be concise, interlinked using [[concept]] syntax, and organized into categories: pools/, strategies/, patterns/, lessons/, performance/.
-The INDEX.md is auto-updated when you write an article.
-
-Examples:
-- kb_write("pools/bonk-sol.md", "# Pool: BONK-SOL\\n\\n3 deploys, avg +4.2%...")
-- kb_write("patterns/evening-volume.md", "# Evening Volume Dropoff\\n\\nObserved [[volume]] drops after 8pm UTC...")`,
+The INDEX.md is auto-updated when you write an article. Writing an existing path overwrites the whole article.`,
       parameters: {
         type: "object",
         properties: {
@@ -1113,11 +1095,7 @@ Examples:
     function: {
       name: "kb_search",
       description: `Full-text search across all knowledge base articles. Returns matching file paths with context lines.
-Use this to find articles related to a topic before reading them in full.
-
-Examples:
-- kb_search("BONK") → finds all articles mentioning BONK
-- kb_search("trailing take profit") → finds strategy articles about trailing TP`,
+Use this to find articles related to a topic before reading them in full.`,
       parameters: {
         type: "object",
         properties: {
