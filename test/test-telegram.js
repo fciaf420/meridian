@@ -299,12 +299,30 @@ test("close: cancel, expired nonce, wrong chat and wrong message all refuse", as
   assert.equal(exec.filter((e) => e.name === "close_position").length, 1);
 });
 
-test("close: a busy agent refuses and the nonce is not reusable", async () => {
-  const { u, t, exec } = makeUI({ runExclusive: async () => ({ busy: true }) });
+test("close: a busy agent refuses, says it did NOT run, and offers a single-use Retry", async () => {
+  let busy = true;
+  const exec = [];
+  const { u, t } = makeUI({
+    runExclusive: async (fn) => (busy ? { busy: true } : { busy: false, value: await fn() }),
+    executeTool: async (name, args) => { exec.push({ name, args }); return { success: true }; },
+  });
   const { yes } = await openCloseCard(u, t);
   await u.handleCallback(yes, ctxFor(42));
-  assert.ok(t.edits().some((e) => /busy — nothing was closed/.test(e.text)));
+  const busyCard = t.edits().find((e) => /Not closed/.test(e.text));
+  assert.ok(busyCard, "busy card shown");
+  assert.match(busyCard.text, /did <b>NOT<\/b> run/);
   assert.equal(exec.length, 0);
+  // original nonce is spent
+  await u.handleCallback(yes, ctxFor(42));
+  assert.equal(exec.length, 0);
+  // Retry is a fresh nonce on the same card; it runs once when the bot is free
+  const retry = JSON.stringify(busyCard.keyboard ?? busyCard.reply_markup ?? busyCard).match(/y:([A-Za-z0-9_-]+)/)?.[0];
+  assert.ok(retry, "retry button present");
+  busy = false;
+  await u.handleCallback(retry, ctxFor(42));
+  assert.equal(exec.filter((e) => e.name === "close_position").length, 1);
+  await u.handleCallback(retry, ctxFor(42)); // replay refused
+  assert.equal(exec.filter((e) => e.name === "close_position").length, 1);
 });
 
 // ─── Deploy confirmation ─────────────────────────────────────────

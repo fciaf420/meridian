@@ -1029,17 +1029,34 @@ export function createTelegramUI(deps) {
       show(ctx, { text, keyboard });
     const { action, params } = entry;
 
+    // The bot runs one trade/cycle at a time. When it's busy, say plainly that
+    // nothing happened and offer a Retry — a fresh single-use confirm with the
+    // exact same parameters (still a deliberate tap; the deploy/close guards,
+    // e.g. no duplicate pool, run again on retry).
+    const busyRetry = async (kind, p, verb) => {
+      const retryNonce = nonces.put(kind, p, { chatId: ctx?.chatId ?? null });
+      const msg = await show(ctx, {
+        text:
+          `⏳ <b>Not ${verb}</b> — the bot is busy with another cycle or trade (e.g. a screening cycle that may itself be deploying).\n` +
+          `Your ${kind} of <b>${escapeHtml(p.label)}</b> did <b>NOT</b> run. Check Positions, then Retry if you still want it (expires in ${Math.round(CONFIRM_TTL_MS / 1000)}s).`,
+        keyboard: [[btn(`🔁 Retry ${kind}`, `y:${retryNonce}`), btn("📊 Positions", "po:0")], [btn("⬅ Menu", "m")]],
+      });
+      // Bind to this chat + message like every confirm card.
+      nonces.bind(retryNonce, msg?.message_id ?? ctx?.messageId ?? null, ctx?.chatId ?? msg?.chat?.id ?? null);
+      return msg;
+    };
+
     if (action === "close") {
       await edit(`⏳ Closing ${escapeHtml(params.label)}…`, []);
       const r = await deps.runExclusive(() => deps.executeTool("close_position", { position_address: params.position_address }));
-      if (r.busy) return edit(`⏳ Agent is busy — nothing was closed. Open Positions and try again.`);
+      if (r.busy) return busyRetry("close", params, "closed");
       return edit(renderExecResult("close", params.label, r.value));
     }
 
     if (action === "deploy") {
       await edit(`⏳ Deploying into ${escapeHtml(params.label)}…`, []);
       const r = await deps.runExclusive(() => deps.executeTool("deploy_position", { ...params.args }), { screening: true });
-      if (r.busy) return edit(`⏳ Agent is busy — nothing was deployed. Try again in a moment.`);
+      if (r.busy) return busyRetry("deploy", params, "deployed");
       try { await deps.afterDeploy?.(); } catch { /* best-effort */ }
       return edit(renderExecResult("deploy", params.label, r.value));
     }
