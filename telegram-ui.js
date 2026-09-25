@@ -471,22 +471,142 @@ export function renderStatus(info, now = Date.now()) {
   return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard: [backRow("st")] };
 }
 
-export function renderWallet(wallet, { config, usdcMode }) {
-  if (!wallet || wallet.error) {
-    return { text: `💰 <b>Wallet</b>\n⚠️ Could not read balances: ${escapeHtml(wallet?.error ?? "unknown error")}`, keyboard: [backRow("wa")] };
+// ─── Wallet: true total (wallet + DLMM positions) ────────────────
+export const WALLET_DUST_USD = 0.10;
+export const WALLET_MAX_TOKENS = 12;
+export const WALLET_MAX_POSITIONS = 15;
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+const finitePos = (v) => { const n = Number(v); return v != null && Number.isFinite(n) && n > 0 ? n : null; };
+
+/**
+ * Read-only totals from data the bot already has: getWalletBalances() (Helius
+ * balances with per-token USD) and getMyPositions() (LP Agent / Meteora
+ * position value, composition and unclaimed fees). A position whose value is
+ * unknown (missing or 0) is excluded from the subtotal and flagged, never
+ * counted as 0. Returns plain numbers; renderWallet formats them.
+ *
+ * Fees are added on top of total_value_usd because both sources exclude them:
+ * LP Agent `value` reconciles as value + collectedFee + unCollectedFee −
+ * inputValue = pnl.value, and Meteora's UnrealizedPnL.balances is the token X +
+ * Y balance with unclaimed fees reported separately (dlmm.datapi OpenAPI).
+ */
+export function computeWalletTotals(wallet, positionsResult = null) {
+  const posList = Array.isArray(positionsResult?.positions) ? positionsResult.positions : [];
+  const price = finitePos(wallet?.sol_price) ?? finitePos(posList.find((p) => finitePos(p.sol_price))?.sol_price);
+  const toSol = (usd) => (price && usd != null ? usd / price : null);
+
+  // ── In wallet ──
+  const walletItems = [];
+  const sol = Number(wallet?.sol) || 0;
+  const solUsd = Number.isFinite(Number(wallet?.sol_usd)) && Number(wallet.sol_usd) > 0 ? Number(wallet.sol_usd) : (price ? sol * price : 0);
+  walletItems.push({ symbol: "SOL", amount: sol, usd: solUsd, kind: "sol" });
+  const tokens = Array.isArray(wallet?.tokens) ? wallet.tokens : [];
+  const isSol = (t) => t.mint === SOL_MINT || t.symbol === "SOL";
+  const isUsdc = (t) => t.mint === USDC_MINT || t.symbol === "USDC";
+  const usdcAmt = Number(wallet?.usdc) || 0;
+  if (usdcAmt > 0) {
+    const entry = tokens.find(isUsdc);
+    walletItems.push({ symbol: "USDC", amount: usdcAmt, usd: finitePos(entry?.usd) ?? usdcAmt, kind: "usdc" });
   }
+  const others = [];
+  let dustUsd = 0;
+  let dustCount = 0;
+  let unpriced = 0;
+  for (const t of tokens) {
+    if (isSol(t) || isUsdc(t)) continue;
+    const usd = t.usd == null ? null : Number(t.usd);
+    if (usd == null || !Number.isFinite(usd)) { if (Number(t.balance) > 0) unpriced++; continue; }
+    if (usd > WALLET_DUST_USD) others.push({ symbol: t.symbol || shortAddr(t.mint), amount: Number(t.balance), usd, kind: "token" });
+    else if (usd > 0) { dustUsd += usd; dustCount++; }
+  }
+  others.sort((a, b) => b.usd - a.usd);
+  walletItems.push(...others);
+  const walletUsd = walletItems.reduce((a, x) => a + x.usd, 0) + dustUsd;
+
+  // ── In DLMM positions ──
+  const positions = posList.map((p) => {
+    const valueUsd = finitePos(p.total_value_usd) ?? (price && finitePos(p.total_value_sol) ? finitePos(p.total_value_sol) * price : null);
+    const feesUsd = Number.isFinite(Number(p.unclaimed_fees_usd)) && Number(p.unclaimed_fees_usd) > 0 ? Number(p.unclaimed_fees_usd) : 0;
+    const c = p.composition || null;
+    return {
+      position: p.position,
+      pair: p.pair ?? shortAddr(p.position),
+      known: valueUsd != null,
+      valueUsd,
+      feesUsd,
+      totalUsd: valueUsd != null ? valueUsd + feesUsd : null,
+      solSide: c && Number.isFinite(Number(c.sol_amount)) ? { sol: Number(c.sol_amount), usd: Number(c.sol_usd) || (price ? Number(c.sol_amount) * price : null) } : null,
+      tokenSide: c && Number.isFinite(Number(c.token_usd)) ? { amount: Number(c.token_amount), usd: Number(c.token_usd), sol: toSol(Number(c.token_usd)) } : null,
+    };
+  });
+  const dlmmUsd = positions.reduce((a, x) => a + (x.known ? x.totalUsd : 0), 0);
+  const unknownCount = positions.filter((x) => !x.known).length;
+  const totalUsd = walletUsd + dlmmUsd;
+  return {
+    price,
+    walletItems, dustUsd, dustCount, unpriced, walletUsd, walletSol: toSol(walletUsd),
+    positions, positionsError: positionsResult?.error ?? (positionsResult ? null : "not loaded"),
+    dlmmUsd, dlmmSol: toSol(dlmmUsd), unknownCount,
+    totalUsd, totalSol: toSol(totalUsd),
+  };
+}
+
+const usdStr = (v) => (v == null ? "?" : `$${Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+const solStr = (v) => (v == null ? "? SOL" : `${fmtNum(v, 4)} SOL`);
+const amtStr = (v) => (Number(v) >= 1000 ? Math.round(Number(v)).toLocaleString("en-US") : fmtNum(v, 4));
+
+export function renderWallet(wallet, { config, usdcMode, positions = null } = {}) {
+  const keyboard = [[btn("🔄 Refresh", "wa:r"), btn("⬅ Menu", "m")]];
+  if (!wallet || wallet.error) {
+    return { text: `💰 <b>Wallet</b>\n⚠️ Could not read balances: ${escapeHtml(wallet?.error ?? "unknown error")}`, keyboard };
+  }
+  const t = computeWalletTotals(wallet, positions);
   const reserve = usdcMode ? config.usdc?.gasReserveSol : (config.management?.gasReserve ?? 0.2);
-  const lines = [
-    `💰 <b>Wallet</b> <code>${escapeHtml(shortAddr(wallet.wallet))}</code>`,
-    `SOL: <b>${fmtNum(wallet.sol, 4)}</b> ($${fmtNum(wallet.sol_usd, 2)}) @ $${fmtNum(wallet.sol_price, 2)}`,
-    `USDC: <b>$${fmtNum(wallet.usdc, 2)}</b>`,
-    `Gas reserve: ${fmtNum(reserve, 4)} SOL${usdcMode ? " (USDC mode, warn-only)" : ""}`,
-    `Total: $${fmtNum(wallet.total_usd, 2)}`,
-  ];
+  const lines = [`💰 <b>Wallet</b> <code>${escapeHtml(shortAddr(wallet.wallet))}</code>`];
+
+  // Total first so it survives any clipping.
+  lines.push(`<b>Total: ${solStr(t.totalSol)} (${usdStr(t.totalUsd)})</b>`);
+  lines.push(`= wallet ${usdStr(t.walletUsd)} + DLMM ${usdStr(t.dlmmUsd)}${t.price ? ` · SOL price used: $${fmtNum(t.price, 2)}` : " · ⚠️ SOL price unknown, SOL totals not shown"}`);
+  if (t.positionsError) lines.push(`⚠️ DLMM positions not included: ${escapeHtml(clipText(String(t.positionsError), 120))}`);
+  if (t.unknownCount) lines.push(`⚠️ ${t.unknownCount} position${t.unknownCount === 1 ? "" : "s"} with unknown value not included.`);
+
+  lines.push("", `<b>In wallet</b> (${usdStr(t.walletUsd)})`);
+  const shown = t.walletItems.slice(0, WALLET_MAX_TOKENS);
+  for (const x of shown) {
+    if (x.kind === "sol") lines.push(`SOL: <b>${fmtNum(x.amount, 4)}</b> (${usdStr(x.usd)})`);
+    else if (x.kind === "usdc") lines.push(`USDC: <b>$${fmtNum(x.amount, 2)}</b>${Math.abs(x.usd - x.amount) > 0.01 ? ` (${usdStr(x.usd)})` : ""}`);
+    else lines.push(`${escapeHtml(clipText(String(x.symbol), 16))}: ${amtStr(x.amount)} (${usdStr(x.usd)})`);
+  }
+  const hidden = t.walletItems.slice(WALLET_MAX_TOKENS);
+  if (hidden.length) lines.push(`+ ${hidden.length} more token${hidden.length === 1 ? "" : "s"} (${usdStr(hidden.reduce((a, x) => a + x.usd, 0))})`);
+  if (t.dustCount) lines.push(`+ ${t.dustCount} balance${t.dustCount === 1 ? "" : "s"} under $${WALLET_DUST_USD.toFixed(2)} (${usdStr(t.dustUsd)})`);
+  if (t.unpriced) lines.push(`${t.unpriced} unpriced token${t.unpriced === 1 ? "" : "s"} not counted.`);
+  lines.push(`Gas reserve: ${fmtNum(reserve, 4)} SOL${usdcMode ? " (USDC mode, warn-only)" : ""}`);
   if (Number(wallet.sol) < Number(reserve)) lines.push("⚠️ SOL is below the gas reserve.");
-  const keyboard = [backRow("wa")];
+
+  if (!t.positionsError) {
+    lines.push("", `<b>In DLMM positions</b> (${usdStr(t.dlmmUsd)}${t.dlmmSol != null ? ` · ${solStr(t.dlmmSol)}` : ""}; value + unclaimed fees)`);
+    if (!t.positions.length) lines.push("No open positions.");
+    t.positions.slice(0, WALLET_MAX_POSITIONS).forEach((x, i) => {
+      const head = `${i + 1}. <b>${escapeHtml(clipText(String(x.pair), 24))}</b>`;
+      if (!x.known) {
+        lines.push(`${head}: value unknown (not counted)`);
+        return;
+      }
+      const parts = [`${solStr(t.price ? x.totalUsd / t.price : null)} (${usdStr(x.totalUsd)})`];
+      if (x.solSide) parts.push(`SOL side ${solStr(x.solSide.sol)}`);
+      if (x.tokenSide) parts.push(`token side ${solStr(x.tokenSide.sol)} (${usdStr(x.tokenSide.usd)})`);
+      parts.push(`fees ${solStr(t.price ? x.feesUsd / t.price : null)} (${usdStr(x.feesUsd)})`);
+      lines.push(`${head}: ${parts.join(" · ")}`);
+    });
+    const more = t.positions.slice(WALLET_MAX_POSITIONS);
+    if (more.length) lines.push(`+ ${more.length} more position${more.length === 1 ? "" : "s"} (${usdStr(more.reduce((a, x) => a + (x.known ? x.totalUsd : 0), 0))})`);
+    if (t.positions.length) lines.push("Excludes position rent (refunded on close).");
+  }
   if (wallet.wallet) keyboard.unshift([urlBtn("Solscan ↗", solscanAccountUrl(wallet.wallet))]);
-  return { text: lines.join("\n"), keyboard };
+  return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard, totals: t };
 }
 
 function positionBlock(p, i, unit) {
@@ -824,6 +944,79 @@ export function renderTradingSettings(config, { note = null, usdcMode = false, c
   return { text: lines.join("\n"), keyboard };
 }
 
+// ─── All settings (Settings → 🧾 All settings) ──────────────────
+// Callback data: as (groups), ag:<group>:<page>, ak:<id> (key card),
+// av:<id>:<choice> (On/Off or enum index), ai:<id> (send a value), ax (cancel
+// input). <id> is the base-36 index of the key in the all-settings registry.
+export const ALL_SETTINGS_PER_PAGE = 8;
+
+const settingValueHtml = (v, svcFmt) => escapeHtml(clipText(svcFmt(v), 60));
+
+export function renderAllSettingsGroups(svc, { dryRun = false, note = null } = {}) {
+  const groups = svc.groups();
+  const lines = [
+    "🧾 <b>All settings</b>",
+    `Mode: <b>${dryRun ? "DRY RUN" : "LIVE"}</b>`,
+    "Every key user-config.json / gmgn-config.json can hold (secrets, keys and endpoints are never shown). Tap a group, then a key.",
+    "Changes save to the file and apply to the running bot where it supports it. Risk-raising changes and dryRun ask for a second tap.",
+  ];
+  if (note) lines.push("", note);
+  const keyboard = [];
+  const gb = groups.map((g) => btn(`${g.label} (${g.entries.length})`, `ag:${g.id}:0`));
+  for (let i = 0; i < gb.length; i += 2) keyboard.push(gb.slice(i, i + 2));
+  keyboard.push([btn("🛡 Entry filters", "ef"), btn("⚙️ Trading settings", "ts")]);
+  keyboard.push([btn("⚙️ Settings", "se:0"), btn("⬅ Menu", "m")]);
+  return { text: lines.join("\n"), keyboard };
+}
+
+export function renderAllSettingsGroup(svc, groupId, page = 0, { fmt }) {
+  const g = svc.groups().find((x) => x.id === groupId);
+  if (!g) return { text: "Unknown group.", keyboard: [[btn("🧾 All settings", "as")]] };
+  const pages = Math.max(1, Math.ceil(g.entries.length / ALL_SETTINGS_PER_PAGE));
+  const pg = Math.min(Math.max(0, Number(page) || 0), pages - 1);
+  const slice = g.entries.slice(pg * ALL_SETTINGS_PER_PAGE, (pg + 1) * ALL_SETTINGS_PER_PAGE);
+  const lines = [`🧾 <b>${escapeHtml(g.label)}</b>${pages > 1 ? ` (${pg + 1}/${pages})` : ""}`, ""];
+  for (const e of slice) lines.push(`<code>${escapeHtml(e.key)}</code> = <b>${settingValueHtml(svc.current(e), fmt)}</b>${e.restart ? " ⟳" : ""}`);
+  if (slice.some((e) => e.restart)) lines.push("", "⟳ = applies after a restart");
+  const keyboard = [];
+  const kb = slice.map((e) => btn(clipText(e.key, 30), `ak:${e.id}`));
+  for (let i = 0; i < kb.length; i += 2) keyboard.push(kb.slice(i, i + 2));
+  const pager = pagerRow(`ag:${g.id}`, pg, pages);
+  if (pager) keyboard.push(pager);
+  keyboard.push([btn("⬅ All settings", "as"), btn("⬅ Menu", "m")]);
+  return { text: lines.join("\n"), keyboard };
+}
+
+export function renderSettingCard(svc, e, { fmt, dryRun = false, note = null, awaitingInput = false, ttlMs = CONFIRM_TTL_MS } = {}) {
+  const cur = svc.current(e);
+  const lines = [
+    `🧾 <code>${escapeHtml(e.key)}</code>`,
+    `Current: <b>${settingValueHtml(cur, fmt)}</b>`,
+    `Type: ${escapeHtml(svc.describe(e))}`,
+    `File: ${e.file === "gmgn" ? "gmgn-config.json" : "user-config.json"}${e.restart ? " · applies after a restart (no restart button: the bot has no safe in-place restart)" : ""}`,
+  ];
+  if (e.special === "dryRun") {
+    lines.push("", dryRun
+      ? "🧪 Now <b>DRY RUN</b>: no transactions are sent. Turning it off makes the bot trade with <b>real funds</b>."
+      : "🔴 Now <b>LIVE</b>: the bot signs real transactions. Turning dryRun on stops sending them.");
+    if (svc.dryRunInEnv) lines.push("⚠️ .env sets DRY_RUN: the change applies now, but after a restart .env wins over user-config.json.");
+  }
+  if (awaitingInput) lines.push("", `✏️ <b>Send the new value</b> as your next message (${Math.round(ttlMs / 1000)}s). /cancel aborts.`);
+  if (note) lines.push("", note);
+  const keyboard = [];
+  if (e.type === "boolean") {
+    keyboard.push([btn(`${cur === true ? "✅ " : ""}On`, `av:${e.id}:1`), btn(`${cur === false ? "✅ " : ""}Off`, `av:${e.id}:0`)]);
+  } else if (e.type === "enum") {
+    const opts = e.enum.map((v, i) => btn(`${v === cur ? "✅ " : ""}${v === null ? "default" : v}`, `av:${e.id}:${i}`));
+    for (let i = 0; i < opts.length; i += 3) keyboard.push(opts.slice(i, i + 3));
+  } else if (!awaitingInput) {
+    keyboard.push([btn("✏️ Send a new value", `ai:${e.id}`)]);
+  }
+  if (awaitingInput) keyboard.push([btn("✖ Cancel input", "ax")]);
+  keyboard.push([btn(`⬅ ${clipText(e.groupLabel ?? "Group", 30)}`, `ag:${e.group}:0`), btn("🧾 All settings", "as")]);
+  return { text: lines.join("\n"), keyboard };
+}
+
 export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = {}) {
   return {
     text: [
@@ -954,6 +1147,7 @@ export function renderExecResult(action, label, result) {
  *   buildSettingsReport(), handleAutoresearchCommand(args), readRecentErrors()
  *   setEntryFilter(key, value)            — → { ok, text, loosened } | { ok: false, error } (entry-safety.js)
  *   applyTradingSettings(changes)         — → { ok, text, changes, rescheduled } | { ok: false, error } (trading-settings.js)
+ *   allSettings                           — all-settings.js createAllSettings() service (registry, validate, risk, apply)
  *   entryPreview(candidate, { strategy }) — read-only pool status / fee mode / TWAP for the confirm card
  *   log(category, msg), now(), ttlMs
  */
@@ -971,6 +1165,7 @@ export function createTelegramUI(deps) {
     lastManagement: null,
     lastScreening: null,
     customDeploy: null, // { chatId, expiresAt } while waiting for a "Custom…" deploy size
+    cfgInput: null, // { chatId, id, expiresAt } while waiting for an All-settings value
   };
   const isDryRun = () => process.env.DRY_RUN === "true";
   const unit = () => deps.config.management?.pnlUnit || "sol";
@@ -1272,6 +1467,75 @@ export function createTelegramUI(deps) {
     return show(ctx, tradingView({ note: r.note }), opts);
   }
 
+  // ── all settings ──
+  const svc = () => deps.allSettings || null;
+  const fmtSetting = (v) => {
+    if (v === null || v === undefined) return "unset";
+    if (typeof v === "boolean") return v ? "on" : "off";
+    if (Array.isArray(v)) return v.length ? v.join(", ") : "(empty)";
+    return String(v);
+  };
+  const withGroupLabel = (e) => ({ ...e, groupLabel: svc().groups().find((g) => g.id === e.group)?.label });
+  const settingCard = (e, extra = {}) => renderSettingCard(svc(), withGroupLabel(e), { fmt: fmtSetting, dryRun: isDryRun(), ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, ...extra });
+
+  function cfgPending(chatId = null) {
+    const c = state.cfgInput;
+    if (!c) return null;
+    if (c.expiresAt <= now()) { state.cfgInput = null; return null; }
+    if (chatId != null && c.chatId != null && String(chatId) !== c.chatId) return null;
+    return c;
+  }
+
+  function applySetting(e, value) {
+    const r = svc().apply(e, value);
+    if (!r?.ok) {
+      logf("telegram_warn", `Setting ${e.key} change failed: ${r?.error}`);
+      return { ok: false, note: `⚠️ Not changed: ${escapeHtml(r?.error ?? "error")}` };
+    }
+    logf("telegram", `Setting changed from Telegram: ${r.text}`);
+    return { ok: true, text: r.text, note: `✅ Saved: ${escapeHtml(r.text)}${r.restart ? "\n⟳ Applies after a restart." : ""}` };
+  }
+
+  /** Validate, then apply (one tap) or show a nonce confirm (risk-raising / dryRun). */
+  async function settingChange(e, raw, ctx, answer, opts = {}) {
+    const v = svc().validate(e, raw);
+    if (v.error) {
+      logf("telegram_warn", `Setting ${e.key} refused: ${v.error}`);
+      await answer(`Not changed: ${v.error}`.slice(0, 180), true);
+      return show(ctx, settingCard(e, { note: `⚠️ Not changed: ${escapeHtml(v.error)}` }), opts);
+    }
+    const before = svc().current(e);
+    if (JSON.stringify(before) === JSON.stringify(v.value)) {
+      await answer("Already set.");
+      return show(ctx, settingCard(e), opts);
+    }
+    const reasons = svc().risk(e, v.value);
+    const line = `${e.key}: ${fmtSetting(before)} → ${fmtSetting(v.value)}`;
+    if (reasons.length) {
+      await answer();
+      const nonce = nonces.put("cfg_set", { id: e.id, key: e.key, value: v.value, label: line });
+      logf("telegram", `Setting confirm requested: ${line} (${reasons.join(", ")})`);
+      const live = e.special === "dryRun" && v.value === false;
+      const text = [
+        e.special === "dryRun" ? (live ? "🔴 <b>Switch to LIVE trading?</b>" : "🧪 <b>Switch to DRY RUN?</b>") : "⚠️ <b>Raise risk?</b>",
+        `<b>${escapeHtml(clipText(line, 300))}</b>`,
+        "",
+        `This ${escapeHtml(reasons.join(" and "))}.`,
+        live ? "The bot will sign and send REAL transactions with real funds from the next action on." : null,
+        e.special === "dryRun" && svc().dryRunInEnv ? "⚠️ .env sets DRY_RUN: after a restart .env wins over this setting." : null,
+        "",
+        `Saves to ${e.file === "gmgn" ? "gmgn-config.json" : "user-config.json"}${e.restart ? " (applies after a restart)" : " and applies to the running bot"}. Expires in ${Math.round((deps.ttlMs ?? CONFIRM_TTL_MS) / 1000)}s.`,
+      ].filter((l) => l != null).join("\n");
+      return presentConfirm(ctx, {
+        nonce,
+        view: { text, keyboard: [[btn(live ? "🔴 Confirm LIVE" : "✅ Confirm change", `y:${nonce}`), btn("✖ Cancel", `n:${nonce}`)]] },
+      }, opts);
+    }
+    const r = applySetting(e, v.value);
+    await answer(r.ok ? `Saved: ${r.text}`.slice(0, 180) : "Not changed", !r.ok);
+    return show(ctx, settingCard(e, { note: r.note }), opts);
+  }
+
   // ── execution (Confirm tap) ──
   async function execute(entry, ctx) {
     const edit = (text, keyboard = [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]]) =>
@@ -1326,6 +1590,13 @@ export function createTelegramUI(deps) {
       return edit(`🔍 <b>Screening cycle finished</b>\n${escapeHtml(clipText(String(report ?? "no report"), 1500))}`, [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]]);
     }
 
+    if (action === "cfg_set") {
+      const e = svc()?.get(params.id);
+      if (!e || e.key !== params.key) return edit("Unknown setting — nothing was changed.", [[btn("🧾 All settings", "as")]]);
+      const r = applySetting(e, params.value);
+      return show(ctx, settingCard(e, { note: r.note }));
+    }
+
     if (action === "trade_set") {
       const r = applyTrading(params.changes, params);
       return show(ctx, tradingView({ note: r.note }));
@@ -1366,6 +1637,30 @@ export function createTelegramUI(deps) {
         return true;
       }
       await show(null, candidatesView(0), { fresh: true });
+      return true;
+    }
+
+    // All settings: the owner's next message is the value (commands pass through).
+    const pendingCfg = svc() ? cfgPending(ctx.chatId) : null;
+    if (/^\/cancel(@\w+)?$/i.test(text) && (pendingCfg || customPending(ctx.chatId))) {
+      state.cfgInput = null;
+      state.customDeploy = null;
+      logf("telegram", "Pending settings input cancelled (/cancel)");
+      await deps.tg.sendHTML("✖ Cancelled. Nothing was changed.", { reply_markup: { inline_keyboard: [[btn("🧾 All settings", "as"), btn("⬅ Menu", "m")]] } });
+      return true;
+    }
+    if (pendingCfg && !text.startsWith("/")) {
+      const e = svc().get(pendingCfg.id);
+      const v = e ? svc().validate(e, text) : { error: "unknown setting" };
+      if (v.error) {
+        logf("telegram_warn", `Setting ${e?.key ?? "?"} input refused: ${v.error}`);
+        await deps.tg.sendHTML(`⚠️ Not changed: ${escapeHtml(v.error)}. Send another value, or /cancel.`, {
+          reply_markup: { inline_keyboard: [[btn("✖ Cancel input", "ax")]] },
+        });
+        return true;
+      }
+      state.cfgInput = null; // single use
+      await settingChange(e, v.value, { chatId: ctx.chatId }, async () => {}, { fresh: true });
       return true;
     }
 
@@ -1452,9 +1747,14 @@ export function createTelegramUI(deps) {
           await show(ctx, renderStatus(await statusInfo(), now()), opts);
           return;
         case "wa": {
-          await answer();
-          const wallet = await deps.getWalletBalances().catch((e) => ({ error: e.message }));
-          await show(ctx, renderWallet(wallet, { config: deps.config, usdcMode: !!deps.usdcModeEnabled?.() }), opts);
+          // Read-only. Refresh (wa:r) forces a fresh position scan; the first
+          // open reuses the positions cache.
+          await answer(arg === "r" ? "Refreshing…" : "");
+          const [wallet, positions] = await Promise.all([
+            deps.getWalletBalances().catch((e) => ({ error: e.message })),
+            deps.getMyPositions ? deps.getMyPositions(arg === "r" ? { force: true } : {}).catch((e) => ({ error: e.message })) : null,
+          ]);
+          await show(ctx, renderWallet(wallet, { config: deps.config, usdcMode: !!deps.usdcModeEnabled?.(), positions }), opts);
           return;
         }
         case "po": {
@@ -1485,6 +1785,7 @@ export function createTelegramUI(deps) {
           const extraRow = [btn("⚙️ Trading settings", "ts")];
           if (deps.setEntryFilter) extraRow.unshift(btn("🛡 Entry filters", "ef"));
           view.keyboard.push(extraRow);
+          if (deps.allSettings) view.keyboard.push([btn("🧾 All settings", "as")]);
           view.keyboard.push(backRow(`se:${view.page}`));
           await show(ctx, view, opts);
           return;
@@ -1535,6 +1836,64 @@ export function createTelegramUI(deps) {
           await answer();
           await show(ctx, tradingView(), opts);
           return;
+        case "as":
+        case "ag":
+        case "ak":
+        case "av":
+        case "ai":
+        case "ax": {
+          // Owner-only (transport), edited in place. Secrets are never in the registry.
+          if (!svc()) {
+            await answer("All settings isn't available here.", true);
+            return;
+          }
+          if (head === "as") {
+            await answer();
+            await show(ctx, renderAllSettingsGroups(svc(), { dryRun: isDryRun() }), opts);
+            return;
+          }
+          if (head === "ag") {
+            await answer();
+            await show(ctx, renderAllSettingsGroup(svc(), arg, sub, { fmt: fmtSetting }), opts);
+            return;
+          }
+          if (head === "ax") {
+            state.cfgInput = null;
+            await answer("Cancelled");
+            await show(ctx, renderAllSettingsGroups(svc(), { dryRun: isDryRun(), note: "✖ Input cancelled. Nothing was changed." }), opts);
+            return;
+          }
+          const e = svc().get(arg);
+          if (!e) {
+            await answer("Unknown setting.", true);
+            return;
+          }
+          if (head === "ak") {
+            await answer();
+            await show(ctx, settingCard(e), opts);
+            return;
+          }
+          if (head === "ai") {
+            if (e.type === "boolean" || e.type === "enum") {
+              await answer("Use the buttons.", true);
+              return;
+            }
+            state.cfgInput = { chatId: ctx.chatId != null ? String(ctx.chatId) : null, id: e.id, expiresAt: now() + (deps.ttlMs ?? CONFIRM_TTL_MS) };
+            await answer("Send the new value");
+            await show(ctx, settingCard(e, { awaitingInput: true }), opts);
+            return;
+          }
+          // av: On/Off or enum index
+          let raw;
+          if (e.type === "boolean" && (sub === "1" || sub === "0")) raw = sub === "1";
+          else if (e.type === "enum" && /^\d+$/.test(sub ?? "") && Number(sub) < e.enum.length) raw = e.enum[Number(sub)] ?? "off";
+          if (raw === undefined) {
+            await answer("Unknown choice.", true);
+            return;
+          }
+          await settingChange(e, raw, ctx, answer, opts);
+          return;
+        }
         case "tv": {
           // Owner-only (transport), edited in place. Risk-raising presets go
           // through the nonce confirm; the rest apply in one tap. All logged.
@@ -1701,7 +2060,10 @@ export function createTelegramUI(deps) {
           const r = nonces.take(arg);
           await answer(r.entry ? "Cancelled" : "Nothing to cancel");
           if (r.entry?.action === "trade_set") logf("telegram", `Trading settings change cancelled: ${r.entry.params.label}`);
-          const back = r.entry?.action === "trade_set" ? [[btn("⚙️ Trading settings", "ts"), btn("⬅ Menu", "m")]] : [[btn("⬅ Menu", "m")]];
+          if (r.entry?.action === "cfg_set") logf("telegram", `Setting change cancelled: ${r.entry.params.label}`);
+          const back = r.entry?.action === "trade_set" ? [[btn("⚙️ Trading settings", "ts"), btn("⬅ Menu", "m")]]
+            : r.entry?.action === "cfg_set" ? [[btn("🧾 All settings", "as"), btn("⬅ Menu", "m")]]
+              : [[btn("⬅ Menu", "m")]];
           await show(ctx, { text: "✖ Cancelled. Nothing was done.", keyboard: back });
           return;
         }

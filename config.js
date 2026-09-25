@@ -7,7 +7,8 @@ import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // MERIDIAN_USER_CONFIG_PATH lets tests point every reader/writer at a temp file.
 export const USER_CONFIG_PATH = process.env.MERIDIAN_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
-const GMGN_CONFIG_PATH = path.join(__dirname, "gmgn-config.json");
+// MERIDIAN_GMGN_CONFIG_PATH lets tests point the gmgn-config.json reader/writer at a temp file.
+export const GMGN_CONFIG_PATH = process.env.MERIDIAN_GMGN_CONFIG_PATH || path.join(__dirname, "gmgn-config.json");
 
 function readJsonIfExists(filePath) {
   return fs.existsSync(filePath)
@@ -23,6 +24,8 @@ if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
 if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
 if (u.llmProvider) process.env.LLM_PROVIDER     ||= u.llmProvider;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
+// True when DRY_RUN came from the environment (.env), which wins over user-config dryRun at startup.
+export const DRY_RUN_SET_IN_ENV = process.env.DRY_RUN !== undefined;
 if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
 if (u.usdcMode !== undefined) process.env.USDC_MODE ||= String(u.usdcMode);
 if (gmgnUserConfig.apiKey || u.gmgnApiKey) {
@@ -317,7 +320,7 @@ const SECTION_MAP = {
 };
 
 // Keys that no caller may change
-const LOCKED_KEYS = new Set(["walletKey", "rpcUrl", "llmModel"]);
+export const LOCKED_KEYS = new Set(["walletKey", "rpcUrl", "llmModel"]);
 
 // Keys that atlas_autotune may NOT change (cadence / owner-level)
 const ATLAS_DISALLOWED = new Set([
@@ -327,7 +330,7 @@ const ATLAS_DISALLOWED = new Set([
 ]);
 
 // Keys whose values should be rounded to the nearest integer
-const INTEGER_KEYS = new Set([
+export const INTEGER_KEYS = new Set([
   "minTvl", "maxTvl", "minVolume", "minOrganic", "minHolders",
   "minMcap", "maxMcap", "minBinStep", "maxBinStep", "maxVolatility",
   "maxPriceChangePct", "minTokenFeesSol", "athTopThresholdPct",
@@ -360,6 +363,22 @@ export function persistUserConfig(changes, extra = {}) {
   Object.assign(userConfig, changes, extra);
   fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
   return userConfig;
+}
+
+/**
+ * Merge `changes` into gmgn-config.json (same read / Object.assign / 2-space
+ * JSON write as persistUserConfig), keeping every other key. Throws on failure,
+ * including an unparsable existing file.
+ */
+export function persistGmgnConfig(changes) {
+  let gmgnConfig = {};
+  if (fs.existsSync(GMGN_CONFIG_PATH)) {
+    // An unreadable file is an error, not {}: rewriting it would drop the API key.
+    gmgnConfig = JSON.parse(fs.readFileSync(GMGN_CONFIG_PATH, "utf8"));
+  }
+  Object.assign(gmgnConfig, changes);
+  fs.writeFileSync(GMGN_CONFIG_PATH, JSON.stringify(gmgnConfig, null, 2));
+  return gmgnConfig;
 }
 
 /**
