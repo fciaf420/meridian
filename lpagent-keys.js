@@ -4,7 +4,15 @@
  * rate-limit state is shared across modules (no double-spending keys).
  */
 
-// Support multiple API keys (comma-separated) for rate limit rotation
+// Support multiple API keys (comma-separated) for rate limit rotation.
+//
+// WARNING: LPAgent's Terms of Service §7 prohibits creating multiple accounts
+// to circumvent restrictions (https://docs.lpagent.io/terms-of-service.md).
+// Rotating keys from several accounts to beat the per-key rate limit falls
+// under that clause and risks account termination (which silently degrades
+// PnL to the Meteora fallback). Recommended: one key, and upgrade the plan
+// (Premium 10 RPM, Enterprise 20 RPM) with LPAGENT_RPM set to match.
+// Multi-key support is kept for keys that legitimately belong to one account.
 const LPAGENT_KEYS = (process.env.LPAGENT_API_KEY || "")
   .split(",")
   .map((k) => k.trim())
@@ -12,8 +20,14 @@ const LPAGENT_KEYS = (process.env.LPAGENT_API_KEY || "")
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ─── Per-key rate limiter (5 RPM per key) ───────────────────
-const RATE_LIMIT_PER_KEY = 5;
+// ─── Per-key rate limiter ───────────────────────────────────
+// Requests per minute per key. Plan limits (docs.lpagent.io api-key-dashboard):
+// Basic 5, Premium 10, Enterprise 20. Configure with LPAGENT_RPM (default 5).
+const DEFAULT_RPM = 5;
+function rateLimitPerKey() {
+  const n = Number.parseInt(process.env.LPAGENT_RPM ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RPM;
+}
 const RATE_WINDOW_MS = 60_000;
 const _keyCallTimes = new Map(); // key → [timestamps]
 
@@ -25,6 +39,7 @@ function acquireKey() {
   if (LPAGENT_KEYS.length === 0) return { key: null, waitMs: 0 };
 
   const now = Date.now();
+  const limit = rateLimitPerKey();
   let bestKey = null;
   let bestRemaining = -1;
   let shortestWait = Infinity;
@@ -35,7 +50,7 @@ function acquireKey() {
     const recent = calls.filter(t => now - t < RATE_WINDOW_MS);
     _keyCallTimes.set(key, recent);
 
-    const remaining = RATE_LIMIT_PER_KEY - recent.length;
+    const remaining = limit - recent.length;
     if (remaining > bestRemaining) {
       bestRemaining = remaining;
       bestKey = key;
@@ -67,11 +82,17 @@ let _lastRequestAt = 0;
  * Get a key, waiting if all keys are rate-limited.
  * Also enforces a minimum gap between requests to avoid burst 429s.
  * Returns the API key string, or null if no keys configured.
+ *
+ * With { wait: false } it never waits for the per-minute budget: it returns
+ * null when every key is exhausted, so time-sensitive callers (the PnL
+ * watcher, the close path) fall back to Meteora immediately instead of
+ * sleeping for up to 60s. The anti-burst gap (at most 2s) still applies.
  */
-async function getKey() {
+async function getKey({ wait = true } = {}) {
   const { key, waitMs } = acquireKey();
   if (!key) return null;
   if (waitMs > 0) {
+    if (!wait) return null;
     await sleep(waitMs);
     // After waiting, record the call for the key we'll use
     const now = Date.now();

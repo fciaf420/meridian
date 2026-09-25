@@ -24,9 +24,9 @@ import {
 import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
-import { calculateBinsForPriceRange, splitRangeBins } from "../runtime-helpers.js";
+import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
-import { studyTopLPers } from "./study.js";
+import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -435,18 +435,19 @@ export async function deployPosition({
     try {
       const { checkSmartWalletsOnPool } = await import("../smart-wallets.js");
       const swResult = await checkSmartWalletsOnPool({ pool_address });
-      hasSmartWallets = swResult?.found?.length > 0;
+      // checkSmartWalletsOnPool returns `in_pool`; a degraded result (some
+      // wallet lookups failed) is not a confirmed signal, so it fails.
+      hasSmartWallets = (swResult?.in_pool?.length ?? 0) > 0 && !swResult?.degraded;
     } catch { /* default to false */ }
     if (!hasSmartWallets) failures.push("no smart wallets on pool");
 
-    // Condition 2: Top LPers >= 80% win rate using spot
+    // Condition 2: Top LPers >= 80% win rate (LPAgent top-lpers, Premium key).
+    // fetchTopLpersStats returns [] without a key / on 401 / on error → fails closed.
     let studyPasses = false;
     try {
-      const studyResult = await studyTopLPers({ pool_address, limit: 4 });
-      const credible = (studyResult?.lpers || []).filter(lp => lp.total_lp >= 3 && lp.win_rate >= 0.6 && lp.total_inflow >= 1000);
-      const avgWR = credible.length > 0 ? credible.reduce((s, lp) => s + lp.win_rate, 0) / credible.length : 0;
-      studyPasses = avgWR >= 0.80;
-    } catch { /* default to false */ }
+      const lpers = await fetchTopLpersStats({ pool_address, limit: 20 });
+      studyPasses = evaluateTopLpersGate(lpers).passes;
+    } catch (e) { log("deploy", `top-lpers gate error: ${e.message}`); }
     if (!studyPasses) failures.push("top LPers < 80% win rate");
 
     // Condition 3: Price must be stabilizing (not pumping >10% in 1h)
@@ -1021,7 +1022,8 @@ const LPA_CACHE_TTL = 10_000; // 10 seconds
 /**
  * Fetch ALL open positions from LP Agent for the given wallet.
  * Returns a Map keyed by position address → raw LP Agent position object.
- * Returns null on 429, fetch error, or no API keys configured (triggers Meteora fallback).
+ * Returns null on 429, fetch error, no API keys configured, or an exhausted
+ * per-minute key budget (triggers Meteora fallback).
  */
 async function fetchLpAgentOpenPositions(walletAddress) {
   // Return cached result if fresh
@@ -1029,12 +1031,14 @@ async function fetchLpAgentOpenPositions(walletAddress) {
     return _lpaCache;
   }
 
-  const apiKey = await getLpaKey();
+  // Non-blocking: when the LPAgent per-minute budget is spent, return null so
+  // the caller (PnL watcher, close snapshot) uses Meteora instead of sleeping.
+  const apiKey = await getLpaKey({ wait: false });
   if (!apiKey) return null;
 
   try {
     const res = await fetch(
-      `${LPAGENT_API}/lp-positions/opening?owner=${walletAddress}`,
+      `${LPAGENT_API}/lp-positions/opening?owner=${walletAddress}&platform=meteora`,
       { headers: { "x-api-key": apiKey } }
     );
 
@@ -1099,14 +1103,19 @@ function normalizeLpAgentPosition(lpa) {
       // LP Agent returns token amounts, not USD — convert using prices
       unclaimedFeeTokenX: { usd: parseFloat(lpa.unCollectedFee0 || 0) * (lpa.price0 || 0) },
       unclaimedFeeTokenY: { usd: parseFloat(lpa.unCollectedFee1 || 0) * (lpa.price1 || 0) },
-      balances: lpa.currentValue ?? lpa.value ?? 0,
+      // `value` (number) is the live position value in USD and reconciles with
+      // pnl.value; `currentValue` (string) does not. Fall back to it only.
+      balances: lpaCurrentValueUsd(lpa),
     },
     allTimeFees: {
       total: { usd: lpa.collectedFee ?? 0 },
     },
     allTimeDeposits: {
       total: { usd: lpa.inputValue ?? 0 },
-      tokenX: { amount: lpa.current?.amount0 ?? 0 },
+      // current.amount0 is a RAW base-unit string; amount0Adjusted is UI units,
+      // matching the Meteora path. Note it is the current X holding, not the
+      // original deposit (LPAgent only exposes that via /lp-positions/position).
+      tokenX: { amount: lpa.current?.amount0Adjusted ?? 0 },
       tokenY: { amountSol: lpa.inputNative ?? 0 },
     },
     // Extra fields from LP Agent not in Meteora
@@ -1286,7 +1295,7 @@ export async function getMyPositions({ force = false } = {}) {
     const [walletBalResult, lpAgentHistMap] = await Promise.all([
       getWalletBalances().catch(() => ({ sol_price: 0 })),
       hasUntracked
-        ? import("./lp-overview.js").then((m) => m.fetchHistoricalPositionMap()).catch(() => new Map())
+        ? import("./lp-overview.js").then((m) => m.fetchHistoricalPositionMap({ wait: false })).catch(() => new Map())
         : Promise.resolve(new Map()),
     ]);
 

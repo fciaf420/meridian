@@ -222,7 +222,7 @@ ${config.strategy.activeStrategy === "evil_panda"
    If any Evil Panda entry condition fails, skip the pool.
 
    You may ONLY use two-sided spot (with sol_split_pct) when ALL of these conditions are met:
-   1. study_top_lpers shows >= 80% win rate AND top LPers are using two-sided/spot
+   1. Top LPers on this pool win >= 80% of their positions AND are using two-sided/spot. The deploy tool checks the win rate itself (LPAgent top-lpers, needs a Premium key, otherwise the deploy is blocked). study_top_lpers patterns.pct_top_winners is the share of owners in the top-winners list, NOT a win rate; only use study_top_lpers to see which strategy top LPers prefer
    2. Pool has smart_wallets_present = true (institutional conviction)
    3. Price trend is STABILIZING or RANGING (NOT mid-pump, NOT fading)
    4. Pool memory shows prior spot deploys were profitable (if any exist)
@@ -250,7 +250,7 @@ WHY EVIL PANDA IS DEFAULT:
    bid_ask is the proven strategy: 55% win rate, 8% loss rate, consistent returns.
 
    You may ONLY use two-sided spot (with sol_split_pct) when ALL of these conditions are met:
-   1. study_top_lpers shows >= 80% win rate AND top LPers are using two-sided/spot
+   1. Top LPers on this pool win >= 80% of their positions AND are using two-sided/spot. The deploy tool checks the win rate itself (LPAgent top-lpers, needs a Premium key, otherwise the deploy is blocked). study_top_lpers patterns.pct_top_winners is the share of owners in the top-winners list, NOT a win rate; only use study_top_lpers to see which strategy top LPers prefer
    2. Pool has smart_wallets_present = true (institutional conviction)
    3. Price trend is STABILIZING or RANGING (NOT mid-pump, NOT fading)
    4. Pool memory shows prior spot deploys were profitable (if any exist)

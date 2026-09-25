@@ -126,3 +126,10 @@ export function normalizeCandidatesPayload(payload) {
     total_screened: Number(payload?.total_screened ?? candidates.length),
   };
 }
+
+/** Current USD value of an LP Agent open position: `value`, else parsed `currentValue`, else 0. */
+export function lpaCurrentValueUsd(lpa) {
+  if (typeof lpa?.value === "number" && Number.isFinite(lpa.value)) return lpa.value;
+  const parsed = parseFloat(lpa?.currentValue);
+  return Number.isFinite(parsed) ? parsed : 0;
+}

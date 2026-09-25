@@ -597,7 +597,9 @@ function captureToolSignals(name, args, result) {
     case "get_top_lpers": {
       const pool = args.pool_address;
       if (!pool) break;
-      const winRate = result.patterns?.avg_win_rate;
+      // pct_top_winners (0-100) is the share of owners in the top-winners list,
+      // not a true win rate. The signal keeps its historical name and value.
+      const winRate = result.patterns?.pct_top_winners ?? result.patterns?.avg_win_rate;
       if (winRate != null) {
         updateStagedSignals(pool, {
           study_win_rate: winRate,
