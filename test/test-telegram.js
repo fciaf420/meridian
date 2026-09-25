@@ -1049,3 +1049,14 @@ test("positions: each position gets a links row with GMGN for its token mint", (
   assert.equal(gmgn[0].url, `https://gmgn.ai/sol/token/${MINT}`);
   assert.ok(keyboard.every((row) => row.length <= 3), "no row wider than 3 buttons");
 });
+
+test("positions: each block shows the range depth %", () => {
+  // OP-SOL shape: bins -598..-436 at step 100 → 80% deep.
+  const p = { position: "Pos11111111111111111111111111111111111111111", pool: "Pool1", pair: "OP-SOL", in_range: true,
+    lower_bin: -598, upper_bin: -436, active_bin: -450, bin_step: 100 };
+  assert.equal(ui.fmtRangeDepth(p), "Range: 80% deep · 162 bins · step 100 · price 13% below top");
+  assert.equal(ui.fmtRangeDepth({ ...p, in_range: false }), "Range: 80% deep · 162 bins · step 100");
+  assert.equal(ui.fmtRangeDepth({ ...p, bin_step: null }), null);
+  const { text } = ui.renderPositions({ positions: [p] }, { refs: ui.createRefMap() });
+  assert.match(text, /Range: 80% deep · 162 bins/);
+});
