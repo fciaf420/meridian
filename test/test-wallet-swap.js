@@ -51,9 +51,13 @@ test.afterEach(() => {
   process.env.DRY_RUN = "false";
 });
 
-/** Stub connection recording every call. `statuses` feeds getSignatureStatuses. */
-function stubConnection({ statuses = [null] } = {}) {
-  const calls = { getSignatureStatuses: [], sendRawTransaction: 0, other: [] };
+/**
+ * Stub connection recording every call. `statuses` feeds getSignatureStatuses;
+ * `confirm` is the swap/v1 confirmTransaction behaviour (a status value, or a
+ * function that may throw).
+ */
+function stubConnection({ statuses = [null], confirm = { err: null } } = {}) {
+  const calls = { getSignatureStatuses: [], sendRawTransaction: 0, other: [], confirmed: [] };
   let i = 0;
   return {
     calls,
@@ -68,7 +72,11 @@ function stubConnection({ statuses = [null] } = {}) {
       return { value: [st] };
     },
     sendRawTransaction: async () => { calls.sendRawTransaction++; return "v1FallbackSig"; },
-    confirmTransaction: async () => ({ value: { err: null } }),
+    getLatestBlockhash: async () => { calls.other.push("getLatestBlockhash"); return { blockhash: "x", lastValidBlockHeight: 1000 }; },
+    confirmTransaction: async (strategy) => {
+      calls.confirmed.push(strategy);
+      return { value: typeof confirm === "function" ? confirm() : confirm };
+    },
   };
 }
 
@@ -89,7 +97,7 @@ function routes({ order = () => jsonResponse(orderOk()), execute, quote, swap } 
     if (url.includes("/swap/v2/order")) return order(url, opts);
     if (url.includes("/swap/v2/execute")) return execute(url, opts);
     if (url.includes("/swap/v1/quote")) return (quote ?? (() => jsonResponse({ inAmount: "1000000", outAmount: "5000000" })))(url, opts);
-    if (url.includes("/swap/v1/swap")) return (swap ?? (() => jsonResponse({ swapTransaction: unsignedTxBase64() })))(url, opts);
+    if (url.includes("/swap/v1/swap")) return (swap ?? (() => jsonResponse({ swapTransaction: unsignedTxBase64(), lastValidBlockHeight: 12345 })))(url, opts);
     throw new Error(`unexpected fetch ${url}`);
   });
 }
@@ -141,7 +149,7 @@ test("DRY_RUN short-circuits before any fetch, RPC call or signing", async () =>
   assert.equal(r.dry_run, true);
   assert.deepEqual(r.would_swap, { input_mint: USDC, output_mint: SOL, amount: 1 });
   assert.equal(calls.length, 0);
-  assert.deepEqual(connection.calls, { getSignatureStatuses: [], sendRawTransaction: 0, other: [] });
+  assert.deepEqual(connection.calls, { getSignatureStatuses: [], sendRawTransaction: 0, other: [], confirmed: [] });
 });
 
 test("happy path: v2 order without slippageBps, signed execute, Success", async () => {
@@ -179,7 +187,8 @@ test("order with empty transaction + errorCode falls back to swap/v1 (slippageBp
   const connection = stubConnection();
   const r = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(connection));
   assert.equal(r.success, true);
-  assert.equal(r.tx, "v1FallbackSig");
+  assert.equal(r.tx, connection.calls.confirmed[0].signature);
+  assert.equal(connection.calls.confirmed[0].lastValidBlockHeight, 12345);
   assert.equal(execCalls(calls).length, 0);
   assert.ok(v1Calls(calls)[0].url.includes("slippageBps=300"));
   assert.equal(connection.calls.sendRawTransaction, 1);
@@ -253,7 +262,7 @@ test("execute pre-send rejection without signature falls back to swap/v1", async
   const connection = stubConnection();
   const r = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(connection));
   assert.equal(r.success, true);
-  assert.equal(r.tx, "v1FallbackSig");
+  assert.equal(r.tx, connection.calls.confirmed[0].signature);
   assert.equal(connection.calls.getSignatureStatuses.length, 0);
   assert.equal(v1Calls(calls).length, 2);
 });
@@ -266,4 +275,53 @@ test("execute plain 4xx without code or signature fails without fallback", async
   assert.match(r.error, /Swap v2 execute failed/);
   assert.equal(v1Calls(calls).length, 0);
   assert.equal(connection.calls.getSignatureStatuses.length, 0);
+});
+
+// ─── swap/v1 fallback: on-chain result, priority fee, confirm errors ──────
+
+const v1FallbackRoutes = (extra = {}) => routes({
+  order: () => jsonResponse({ transaction: "", requestId: "r", errorCode: 1, errorMessage: "no tx" }),
+  execute: () => { throw new Error("execute must not be called"); },
+  ...extra,
+});
+
+test("swap/v1 fallback: tx landed but FAILED on-chain → success:false (not a false SUCCESS)", async () => {
+  v1FallbackRoutes();
+  const connection = stubConnection({ confirm: { err: { InstructionError: [3, { Custom: 6001 }] } } });
+  const r = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(connection));
+  assert.equal(r.success, false);
+  assert.match(r.error, /failed on-chain/);
+  assert.match(r.error, /6001/);
+  assert.equal(r.tx, connection.calls.confirmed[0].signature);
+});
+
+test("swap/v1 fallback: /swap body asks for dynamic CU limit and the floor CU price", async () => {
+  const calls = v1FallbackRoutes();
+  const r = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(stubConnection()));
+  assert.equal(r.success, true);
+  const body = JSON.parse(calls.find((c) => c.url.includes("/swap/v1/swap")).opts.body);
+  assert.equal(body.dynamicComputeUnitLimit, true);
+  assert.ok(body.computeUnitPriceMicroLamports >= 50_000, `price ${body.computeUnitPriceMicroLamports}`);
+  // price × 1.4M CU must stay within maxPriorityFeeLamports (default 0.001 SOL)
+  assert.ok(body.computeUnitPriceMicroLamports * 1.4 <= 1_000_000);
+});
+
+test("swap/v1 fallback: expiry with no landing → failure; expiry but landed OK → success", async () => {
+  v1FallbackRoutes();
+  const expire = () => { throw new Error("block height exceeded"); };
+  const notLanded = stubConnection({ confirm: expire, statuses: [null] });
+  const r1 = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(notLanded));
+  assert.equal(r1.success, false);
+  assert.match(r1.error, /did not confirm/);
+
+  v1FallbackRoutes();
+  const landed = stubConnection({ confirm: expire, statuses: [{ err: null, confirmationStatus: "confirmed" }] });
+  const r2 = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(landed));
+  assert.equal(r2.success, true);
+
+  v1FallbackRoutes();
+  const landedFailed = stubConnection({ confirm: expire, statuses: [{ err: { InstructionError: [0, "x"] }, confirmationStatus: "confirmed" }] });
+  const r3 = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(landedFailed));
+  assert.equal(r3.success, false);
+  assert.match(r3.error, /failed on-chain/);
 });
