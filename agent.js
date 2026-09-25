@@ -261,7 +261,7 @@ async function createCodexMessage(messages, model, agentType, step) {
     outputSchemaPath: getAgentPlanSchemaPath(agentType),
     config: {
       suppress_unstable_features_warning: "true",
-      model_reasoning_effort: agentType === "MANAGER" ? "high" : "medium",
+      model_reasoning_effort: config.llm.reasoningEffort ?? (agentType === "MANAGER" ? "high" : "medium"),
     },
   });
 
