@@ -147,11 +147,12 @@ function _defaultRangeSelectionText(deployAmount, currentBalanceSol) {
 
   Pool Volatility  │ bid_ask range │ spot range  │ Reasoning
   ─────────────────┼───────────────┼─────────────┼─────────────────────────────
-  >= 8  (extreme)  │ 55–75%        │ 65–85%      │ Wild swings, need maximum room
+  >= 8  (extreme)  │ 60–80%        │ 65–80%      │ Wild swings, need maximum room
   5–8   (high)     │ 45–60%        │ 55–70%      │ Active memecoin territory
   2–5   (moderate) │ 40–55%        │ 50–65%      │ Normal volatile pool — stay wide
   < 2   (low)      │ 35–45%        │ 40–50%      │ Ranging/stable, still need buffer
   BIAS: Always pick the UPPER HALF of the range band. Wider is safer — tighter only if 3+ recent lessons confirm in-range stability for this exact pool.
+  HARD MAX: never exceed ${config.strategy.maxRangePct ?? 80}% depth — deploy_position caps anything deeper.
 
   Adjust from the table using your MEMORY and LESSONS:
   - If LESSONS show repeated OOR downside on similar pools → go wider within the band

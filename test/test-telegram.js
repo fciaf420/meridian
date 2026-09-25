@@ -364,10 +364,11 @@ test("deploy plan: USDC mode uses amount_usd; unreadable wallet refuses; volatil
   assert.equal(usdc.args.amount_usd, 50);
   assert.equal(usdc.args.amount_y, undefined);
   assert.equal(usdc.args.strategy, "bid_ask");
-  assert.equal(usdc.args.price_range_pct, 75, "volatility 9 → widest bid_ask band");
+  assert.equal(usdc.args.price_range_pct, 80, "volatility 9 → widest bid_ask band (the 80% max)");
   assert.match(ui.buildDeployPlan(c, { wallet: { error: "rpc down" }, config: cfg, computeDeployAmount: () => 1 }).error, /wallet/);
   assert.equal(ui.rangeForVolatility(1, "bid_ask"), 45);
-  assert.equal(ui.rangeForVolatility(null, "spot"), 85);
+  assert.equal(ui.rangeForVolatility(null, "spot"), 80);
+  assert.equal(ui.rangeForVolatility(9, "bid_ask"), 80);
 });
 
 test("legacy number reply goes through the same confirmation", async () => {
@@ -798,7 +799,7 @@ test("picker: the number reply after /candidates goes through the picker", async
   await u.handleCallback(`ds:${id}:s`, ctxFor(msgId + 1)); // different message: refused
   assert.ok(t.answers().some((a) => /different message/.test(a.text)));
   await u.handleCallback(`ds:${id}:s`, ctxFor(msgId));
-  assert.ok(buttonByText(t.edits().at(-1), /^Auto \(85%\)$/), "volatility 9 → spot auto 85%");
+  assert.ok(buttonByText(t.edits().at(-1), /^Auto \(80%\)$/), "volatility 9 → spot auto 80% (the max)");
   await u.handleCallback(`dr:${id}:a`, ctxFor(msgId));
   const card = t.edits().at(-1);
   assert.equal(card.messageId, msgId);
@@ -806,7 +807,7 @@ test("picker: the number reply after /candidates goes through the picker", async
   const d = exec.find((e) => e.name === "deploy_position");
   assert.equal(d.args.pool_address, "CandPool2222222222222222222222222222222222222");
   assert.equal(d.args.strategy, "spot");
-  assert.equal(d.args.price_range_pct, 85);
+  assert.equal(d.args.price_range_pct, 80);
   assert.equal(d.args.bins_above, 0);
 });
 
