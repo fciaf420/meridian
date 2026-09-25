@@ -15,6 +15,7 @@ const emitter = new EventEmitter();
 //   deploy_partial   — wide-range deploy failed partway; position kept open
 //   briefing         — morning briefing HTML
 //   status           — busy state changes
+//   llm_unavailable  — LLM provider + fallback both failed (deduped in llm-health.js)
 
 export function emit(event, data) {
   emitter.emit(event, data);

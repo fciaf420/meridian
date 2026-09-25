@@ -21,6 +21,7 @@ import {
   runCodexExec,
   runClaudeCli,
 } from "./llm-provider.js";
+import { classifyLlmError, LlmUnavailableError, llmHealth } from "./llm-health.js";
 
 const PROVIDER = getLlmProvider();
 const CLI_PROVIDERS = new Set(["codex", "claude"]);
@@ -446,6 +447,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const fallbackModel = getRoleFallbackModel(agentType, activeModel);
       let msg;
       let usedModel = activeModel;
+      let primaryError = null; // last primary-provider error, for the outage report
 
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -453,9 +455,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           break;
         } catch (apiErr) {
           const errMsg = apiErr.message || "";
-          // Claude rate limit — skip retries, go straight to DeepSeek
-          if (errMsg.includes("rate limited") || errMsg.includes("hit your limit") || errMsg.includes("resets")) {
-            log("agent", `Claude rate limited — skipping retries, falling back to DeepSeek`);
+          primaryError = apiErr;
+          // Usage limit / quota / rate limit / bad credentials: retrying (or another
+          // model on the same account) cannot help. Fail fast to the fallback.
+          const cls = classifyLlmError(apiErr);
+          if (cls.nonRetryable || errMsg.includes("resets")) {
+            log("agent", `${PROVIDER} ${cls.kind === "auth" ? "auth failed" : "usage/rate limit reached"} — not retrying: ${errMsg.slice(0, 300)}${cls.resetText ? ` (resets ${cls.resetText})` : ""}`);
             msg = null;
             break;
           }
@@ -487,10 +492,13 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         const dsModel = DEEPSEEK_FALLBACK_MODELS[agentType] || "deepseek-chat";
 
         const fallbackKey = process.env.DEEPSEEK_API_KEY;
+        let fallbackNote = null;
+        if (PROVIDER === "deepseek") fallbackNote = "no fallback (primary is DeepSeek)";
+        else if (!fallbackKey) fallbackNote = "no DeepSeek fallback (DEEPSEEK_API_KEY not set)";
         // Same API as the primary when PROVIDER is deepseek: a pinned older model is not a fallback.
         if (fallbackKey && PROVIDER !== "deepseek") {
           try {
-            log("agent", `All ${PROVIDER} retries exhausted — falling back to ${dsModel} via DeepSeek API`);
+            log("agent", `${PROVIDER} unavailable — falling back to ${dsModel} via DeepSeek API`);
             const fallbackClient = new OpenAI({
               baseURL: "https://api.deepseek.com/v1",
               apiKey: fallbackKey,
@@ -509,14 +517,32 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               log("agent", `DeepSeek fallback succeeded (model: ${dsModel})`);
             }
           } catch (dsErr) {
-            log("agent", `DeepSeek fallback also failed: ${dsErr.message}`);
+            if (classifyLlmError(dsErr).kind === "auth") {
+              fallbackNote = "DeepSeek fallback key is invalid (401) — fix DEEPSEEK_API_KEY";
+              log("agent", `DeepSeek fallback failed: API key rejected (401). Fix DEEPSEEK_API_KEY in .env to re-enable the fallback.`);
+            } else {
+              fallbackNote = `DeepSeek fallback failed: ${String(dsErr.message).slice(0, 200)}`;
+              log("agent", `DeepSeek fallback also failed: ${dsErr.message}`);
+            }
           }
+          if (!msg && !fallbackNote) fallbackNote = "DeepSeek fallback returned no choices";
+        }
+
+        if (!msg) {
+          const cls = classifyLlmError(primaryError || "");
+          const primaryText = primaryError?.message ? String(primaryError.message).slice(0, 300) : "no assistant message";
+          const reason = `${PROVIDER}: ${primaryText}${fallbackNote ? `; ${fallbackNote}` : ""}`;
+          llmHealth.reportFailure({ provider: PROVIDER, reason, resetAt: cls.resetAt, resetText: cls.resetText });
+          throw new LlmUnavailableError(`LLM unavailable — ${reason}`, {
+            provider: PROVIDER, reason, resetAt: cls.resetAt, resetText: cls.resetText,
+          });
         }
       }
 
       if (!msg) {
         throw new Error("Provider returned no assistant message");
       }
+      llmHealth.reportSuccess();
 
       messages.push(msg);
 
