@@ -56,33 +56,11 @@ type AutoresearchPayload = {
   recentLessons: LessonItem[];
 };
 
-type MemoryFact = {
-  key: string;
-  value: string;
-  hits: number;
-};
-
-type MemoryNugget = {
-  name: string;
-  fact_count: number;
-  capacity_used_pct?: number | null;
-  facts: MemoryFact[];
-};
-
-type MemoryPayload = {
-  total_nuggets: number;
-  total_facts: number;
-  recalled_facts: number;
-  context: string | null;
-  nuggets: MemoryNugget[];
-};
-
 type InsightsPayload = {
   lessons: {
     total: number;
     lessons: LessonItem[];
   };
-  memory: MemoryPayload | null;
   darwin: DarwinPayload;
   autoresearch: AutoresearchPayload;
 };
@@ -244,63 +222,6 @@ export default function IntelTab() {
               </div>
             ) : (
               <div className="text-sm text-ash/46">No lessons recorded yet.</div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="mb-3">
-              <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-amber-200/66">Memory</div>
-              <div className="mt-1 text-base font-medium tracking-tight text-cream">Prompt-injected nuggets</div>
-            </div>
-
-            {data?.memory ? (
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-wrap gap-2 text-xs text-ash/60">
-                  <Badge variant="outline">{data.memory.total_nuggets} nuggets</Badge>
-                  <Badge variant="secondary">{data.memory.total_facts} facts</Badge>
-                  <Badge variant="secondary">{data.memory.recalled_facts} recalled</Badge>
-                </div>
-
-                {data.memory.context ? (
-                  <pre className="whitespace-pre-wrap break-words rounded-2xl border border-white/8 bg-white/4 px-4 py-3 font-mono text-[11px] leading-relaxed text-cream/85">
-                    {data.memory.context}
-                  </pre>
-                ) : null}
-
-                <div className="grid gap-3 lg:grid-cols-2">
-                  {data.memory.nuggets.map((nugget) => (
-                    <div key={nugget.name} className="rounded-2xl border border-white/8 bg-white/4 px-4 py-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-ash/60">{nugget.name}</div>
-                          <div className="mt-1 text-sm text-cream/86">{nugget.fact_count} facts</div>
-                        </div>
-                        {nugget.capacity_used_pct != null ? (
-                          <Badge variant="outline">{fmtPct(nugget.capacity_used_pct)}</Badge>
-                        ) : null}
-                      </div>
-
-                      <div className="mt-3 flex flex-col gap-2">
-                        {nugget.facts.length ? (
-                          nugget.facts.map((fact) => (
-                            <div key={`${nugget.name}-${fact.key}`} className="rounded-xl border border-white/6 bg-black/10 px-3 py-2">
-                              <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-ash/56">{fact.key}</div>
-                              <div className="mt-1 text-sm text-cream/84">{fact.value}</div>
-                              <div className="mt-1 text-[10px] text-ash/52">hits: {fact.hits}</div>
-                            </div>
-                          ))
-                        ) : (
-                          <div className="text-sm text-ash/46">No facts stored.</div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <div className="text-sm text-ash/46">No promoted memory facts yet.</div>
             )}
           </CardContent>
         </Card>

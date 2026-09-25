@@ -208,10 +208,6 @@ export const config = {
     generalFallbackModel:    u.generalFallbackModel    ?? null,
   },
 
-  memory: {
-    nuggetsFirst: u.memoryNuggetsFirst ?? true,
-  },
-
   // ─── Web UI ───────────────────────────
   web: {
     port: parseInt(u.webPort || process.env.WEB_PORT || "3737", 10),
@@ -289,7 +285,6 @@ const SECTION_MAP = {
   schedule: new Set(Object.keys(config.schedule)),
   strategy: new Set(Object.keys(config.strategy)),
   llm: new Set(Object.keys(config.llm)),
-  memory: new Set(Object.keys(config.memory)),
   knowledgeBase: new Set(Object.keys(config.knowledgeBase)),
   research: config.research ? new Set(Object.keys(config.research)) : new Set(),
 };

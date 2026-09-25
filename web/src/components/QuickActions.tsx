@@ -201,7 +201,7 @@ function renderMemory(data: unknown) {
   const text = typeof data === "string"
     ? data
     : data == null
-      ? "No memory facts promoted yet."
+      ? "No memory recorded yet."
       : JSON.stringify(data, null, 2);
   return (
     <pre className="whitespace-pre-wrap break-words rounded-xl border border-white/8 bg-white/4 px-4 py-3 font-mono text-[11px] leading-relaxed text-cream/85">

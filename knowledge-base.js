@@ -5,7 +5,7 @@
  * strategies, market regimes, and pool behaviors. Auto-maintained INDEX.md
  * and CONCEPTS.md replace the need for RAG at this scale.
  *
- * Existing JSON systems (lessons.json, pool-memory.json, nuggets) remain
+ * Existing JSON systems (lessons.json, pool-memory.json) remain
  * the structured data sources. The KB is a synthesis layer on top.
  */
 
@@ -550,41 +550,7 @@ export async function migrateFromJson() {
     log("kb", `Pool memory migration error: ${e.message}`);
   }
 
-  // 3. Migrate nuggets facts → knowledge/strategies/ and knowledge/patterns/
-  try {
-    const { getShelf } = await import("./memory.js");
-    const shelf = getShelf();
-
-    for (const nuggetName of ["strategies", "patterns"]) {
-      try {
-        const nugget = shelf.get(nuggetName);
-        if (!nugget) continue;
-        const facts = nugget.facts();
-        if (facts.length === 0) continue;
-
-        const articlePath = `${nuggetName}/compiled-from-nuggets.md`;
-        const fullPath = path.join(kbDir, articlePath);
-
-        if (fs.existsSync(fullPath)) { skipped++; continue; }
-
-        let content = `# ${nuggetName.charAt(0).toUpperCase() + nuggetName.slice(1)}: Compiled from Memory\n\n`;
-        content += `*Migrated from Nuggets holographic memory — ${facts.length} facts*\n\n`;
-
-        for (const f of facts) {
-          content += `- **${f.key}**: ${f.value}`;
-          if (f.hits > 1) content += ` *(recalled ${f.hits}x)*`;
-          content += `\n`;
-        }
-
-        const nuggetResult = writeArticle(articlePath, content);
-        if (nuggetResult.success) created++; else skipped++;
-      } catch { /* nugget may not exist */ }
-    }
-  } catch (e) {
-    log("kb", `Nuggets migration error: ${e.message}`);
-  }
-
-  // 4. Rebuild indexes
+  // 3. Rebuild indexes
   rebuildIndex();
   rebuildConcepts();
 

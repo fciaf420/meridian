@@ -30,7 +30,6 @@ import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } fro
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 import { log, logAction } from "../logger.js";
-import { rememberFact, recallMemory, forgetFact } from "../memory.js";
 import { emit } from "../notifier.js";
 import { kbRead, kbWrite, kbSearch, kbList, kbDelete, kbMigrate, kbGetStats, kbRebuildIndexes } from "./knowledge-base-tools.js";
 
@@ -127,9 +126,6 @@ const toolMap = {
     addLesson(rule, tags || [], { pinned: !!pinned, role: role || null });
     return { saved: true, rule, pinned: !!pinned, role: role || "all" };
   },
-  remember_fact: ({ nugget, key, value }) => rememberFact(nugget, key, value),
-  recall_memory: ({ query, nugget }) => recallMemory(query, nugget),
-  forget_fact: ({ nugget, key }) => forgetFact(nugget, key),
   kb_read: kbRead,
   kb_write: kbWrite,
   kb_search: kbSearch,

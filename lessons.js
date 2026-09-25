@@ -12,7 +12,6 @@ import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { config, reloadScreeningThresholds } from "./config.js";
 import { recordPoolDeploy } from "./pool-memory.js";
-import { rememberPoolOutcome, rememberStrategy } from "./memory.js";
 import { recalculateWeights } from "./signal-weights.js";
 import { filePositionClose } from "./knowledge-base.js";
 
@@ -179,32 +178,6 @@ export async function recordPerformance(perf) {
     }
   }
 
-  // Store in holographic memory (nuggets)
-  try {
-    const outcome = pnl_pct >= 0 ? "profitable" : "unprofitable";
-    const oorInfo = perf.close_reason?.match(/OOR (upside|downside)/)?.[1];
-    const oorTag = oorInfo ? `, OOR_direction=${oorInfo}` : "";
-    const splitTag = (perf.sol_split_pct != null && perf.sol_split_pct < 100)
-      ? `, sol_split=${perf.sol_split_pct}%, two-sided` : "";
-    rememberPoolOutcome(
-      perf.pool_name || perf.pool,
-      `${outcome}, PnL ${pnl_pct.toFixed(1)}%, range_eff ${range_efficiency.toFixed(0)}%, strategy=${perf.strategy}, bin_step=${perf.bin_step}${oorTag}${splitTag}, vol=${perf.volatility}`
-    );
-    if (perf.strategy && perf.bin_step) {
-      const isTwoSided = perf.sol_split_pct != null && perf.sol_split_pct < 100;
-      const strategyLabel = isTwoSided
-        ? `${perf.strategy}_2sided_bs${perf.bin_step}`
-        : `${perf.strategy}_bs${perf.bin_step}`;
-      const splitInfo = isTwoSided ? `, sol_split=${perf.sol_split_pct}%` : "";
-      rememberStrategy(
-        strategyLabel,
-        `${outcome}, PnL ${pnl_pct.toFixed(1)}%, vol=${perf.volatility}, fee_tvl=${perf.fee_tvl_ratio}${splitInfo}`
-      );
-    }
-  } catch (e) {
-    log("memory", `Failed to store in nuggets: ${e.message}`);
-  }
-
   // File position close to knowledge base (direct write, no LLM)
   try {
     filePositionClose({ ...perf, pnl_pct, minutes_in_range: perf.minutes_in_range });
@@ -224,7 +197,7 @@ export async function recordPerformance(perf) {
         userConfig = result.userConfig; // carry forward mutations
         log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
       }
-      // Also evolve from lessons/nuggets (reuses same userConfig + data)
+      // Also evolve from lessons (reuses same userConfig + data)
       const lessonResult = evolveFromLessons(data.lessons || [], config, { userConfig, lessonsData: data });
       if (lessonResult?.changes && Object.keys(lessonResult.changes).length > 0) {
         userConfig = lessonResult.userConfig;

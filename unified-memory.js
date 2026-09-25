@@ -1,7 +1,5 @@
 import { getLessonRecordsForPrompt } from "./lessons.js";
-import { getMemoryFactsForPrompt } from "./memory.js";
 import { getKbArticlesForPrompt } from "./knowledge-base.js";
-import { config } from "./config.js";
 
 function normalizeText(value) {
   return String(value || "")
@@ -23,10 +21,6 @@ function formatLessonLine(lesson, label) {
   return `- [${priority}${outcome}] ${trimSentence(lesson.rule, 240)}`;
 }
 
-function formatFactLine(fact) {
-  return `- [${fact.nugget} | hits=${fact.hits}] ${fact.key}: ${trimSentence(fact.value, 180)}`;
-}
-
 function formatKbLine(article) {
   const updated = article.updated ? article.updated.slice(0, 10) : "unknown";
   return `- [${article.category} | ${updated}] ${article.title}: ${trimSentence(article.summary, 180)}`;
@@ -34,7 +28,6 @@ function formatKbLine(article) {
 
 export function buildUnifiedMemoryBrief(agentType = "GENERAL") {
   const lessonRecords = getLessonRecordsForPrompt({ agentType, maxLessons: 20 });
-  const facts = getMemoryFactsForPrompt(agentType, 12);
   const kbArticles = getKbArticlesForPrompt(agentType, 4);
 
   const dedupe = new Set();
@@ -50,15 +43,12 @@ export function buildUnifiedMemoryBrief(agentType = "GENERAL") {
   };
 
   const pinnedLessons = addUnique(lessonRecords.pinned, (lesson) => formatLessonLine(lesson, "PINNED"), "lesson");
-  const roleLessons = addUnique(lessonRecords.roleMatched.slice(0, facts.length > 0 && config.memory.nuggetsFirst ? 6 : 10), (lesson) => formatLessonLine(lesson, agentType), "lesson");
-  const recentLessons = facts.length === 0
-    ? addUnique(lessonRecords.recent.slice(0, 4), (lesson) => formatLessonLine(lesson, "RECENT"), "lesson")
-    : [];
-  const factLines = addUnique(facts, formatFactLine, "fact");
+  const roleLessons = addUnique(lessonRecords.roleMatched.slice(0, 10), (lesson) => formatLessonLine(lesson, agentType), "lesson");
+  const recentLessons = addUnique(lessonRecords.recent.slice(0, 4), (lesson) => formatLessonLine(lesson, "RECENT"), "lesson");
   const kbLines = addUnique(kbArticles, formatKbLine, "kb");
 
   const sections = [
-    "Use this memory in order of precedence: 1) pinned/rule lessons, 2) recalled facts, 3) KB synthesis, 4) recent lessons. If sources conflict, prefer the higher-precedence source and the more specific pool/strategy evidence.",
+    "Use this memory in order of precedence: 1) pinned/rule lessons, 2) KB synthesis, 3) recent lessons. If sources conflict, prefer the higher-precedence source and the more specific pool/strategy evidence.",
   ];
 
   if (pinnedLessons.length || roleLessons.length || recentLessons.length) {
@@ -67,13 +57,6 @@ export function buildUnifiedMemoryBrief(agentType = "GENERAL") {
       ...pinnedLessons,
       ...roleLessons,
       ...recentLessons,
-    ].join("\n"));
-  }
-
-  if (factLines.length) {
-    sections.push([
-      "RECALLED FACTS",
-      ...factLines,
     ].join("\n"));
   }
 

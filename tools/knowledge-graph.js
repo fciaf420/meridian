@@ -50,11 +50,6 @@ export async function buildKnowledgeGraph() {
   const lessonsData = readJSON(path.join(BASE, "lessons.json"));
   const userConfig = readJSON(path.join(BASE, "user-config.json"));
 
-  const strategiesNugget = readJSON(path.join(BASE, "data", "nuggets", "strategies.nugget.json"));
-  const patternsNugget = readJSON(path.join(BASE, "data", "nuggets", "patterns.nugget.json"));
-  const lessonsNugget = readJSON(path.join(BASE, "data", "nuggets", "lessons.nugget.json"));
-  const poolsNugget = readJSON(path.join(BASE, "data", "nuggets", "pools.nugget.json"));
-
   // ── 2. Fetch live data in parallel ───────────────────────────
 
   const [livePositionsResult, walletResult] = await Promise.allSettled([
@@ -220,29 +215,26 @@ export async function buildKnowledgeGraph() {
     }
   }
 
-  // ── 7. Strategy nodes (from nuggets) ─────────────────────────
+  // ── 7. Strategy nodes (from pool-memory deploy history) ──────
 
-  const strategyFacts = strategiesNugget?.facts || [];
+  const strategyDeployCounts = new Map();
+  for (const poolData of Object.values(pools)) {
+    for (const d of poolData.deploys || []) {
+      if (d.strategy) strategyDeployCounts.set(d.strategy, (strategyDeployCounts.get(d.strategy) || 0) + 1);
+    }
+  }
   const strategyNodeIds = new Set();
 
-  for (const fact of strategyFacts) {
-    const id = `strategy_${fact.key}`;
-    const size = Math.max(5, Math.min((fact.hits || 1) * 2 + 3, 14));
-
+  for (const [strategy, deploys] of strategyDeployCounts) {
     nodes.push({
-      id,
+      id: `strategy_${strategy}`,
       type: "strategy",
-      label: fact.key,
-      size,
+      label: strategy,
+      size: Math.max(5, Math.min(deploys * 2 + 3, 14)),
       color: "#60a5fa",
-      data: {
-        key: fact.key,
-        value: fact.value,
-        hits: fact.hits,
-        last_hit_session: fact.last_hit_session,
-      },
+      data: { key: strategy, deploys },
     });
-    strategyNodeIds.add(fact.key);
+    strategyNodeIds.add(strategy);
   }
 
   // Edge: position → strategy (match position strategy to strategy node)
@@ -314,45 +306,7 @@ export async function buildKnowledgeGraph() {
     }
   }
 
-  // ── 9. Pattern nodes (from nuggets) ──────────────────────────
-
-  const patternFacts = patternsNugget?.facts || [];
-  const PATTERN_COLORS = ["#a78bfa", "#818cf8", "#c084fc", "#e879f9", "#f472b6"];
-
-  for (let i = 0; i < patternFacts.length; i++) {
-    const fact = patternFacts[i];
-    const id = `pattern_${fact.key}`;
-    const size = Math.max(5, Math.min((fact.hits || 1) * 2 + 3, 14));
-    const color = PATTERN_COLORS[i % PATTERN_COLORS.length];
-
-    nodes.push({
-      id,
-      type: "pattern",
-      label: fact.key,
-      size,
-      color,
-      data: {
-        key: fact.key,
-        value: fact.value,
-        hits: fact.hits,
-        last_hit_session: fact.last_hit_session,
-      },
-    });
-
-    // Edge: pattern → pool (scan value text for pool names)
-    const valLC = (fact.value || "").toLowerCase();
-    for (const [poolNameLC, poolKey] of Object.entries(poolNameMap)) {
-      if (valLC.includes(poolNameLC) && poolNodeIds.has(poolKey)) {
-        edges.push({
-          source: id,
-          target: poolKey,
-          style: "dashed",
-        });
-      }
-    }
-  }
-
-  // ── 10. Compute insights ─────────────────────────────────────
+  // ── 9. Compute insights ─────────────────────────────────────
 
   const now = Date.now();
   const ONE_DAY = 24 * 60 * 60 * 1000;
@@ -548,7 +502,7 @@ export async function buildKnowledgeGraph() {
     });
   }
 
-  // ── 11. Build meta ───────────────────────────────────────────
+  // ── 10. Build meta ───────────────────────────────────────────
 
   const nodeCounts = {};
   for (const node of nodes) {
