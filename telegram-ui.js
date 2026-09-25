@@ -337,7 +337,7 @@ export function readRecentErrors({ n = 15, repoDir = process.cwd(), maxBytes = 5
 export function rangeForVolatility(volatility, strategy) {
   const v = volatility == null || volatility === "" ? NaN : Number(volatility);
   const spot = strategy === "spot";
-  if (!Number.isFinite(v) || v >= 8) return spot ? 85 : 75;
+  if (!Number.isFinite(v) || v >= 8) return 80; // = strategy.maxRangePct default; deploy_position caps deeper ranges
   if (v >= 5) return spot ? 70 : 60;
   if (v >= 2) return spot ? 65 : 55;
   return spot ? 50 : 45;
