@@ -102,9 +102,10 @@ async function estimatePriorityFeeMicroLamports(tx, feePayer, label = "tx") {
         method: "getPriorityFeeEstimate",
         params: [{
           transaction: serializedTx,
+          // Helius rejects `recommended` combined with `priorityLevel`
+          // ("recommended cannot be used with priority_level") — send the level only.
           options: {
             priorityLevel: config.management.priorityFeeLevel || "Medium",
-            recommended: true,
           },
         }],
       }),
@@ -115,8 +116,16 @@ async function estimatePriorityFeeMicroLamports(tx, feePayer, label = "tx") {
     }
 
     const data = await res.json();
+    // JSON-RPC errors come back with HTTP 200 — surface them instead of silently
+    // falling back to the default price.
+    if (data?.error) {
+      throw new Error(`Helius fee estimate error: ${data.error.message || JSON.stringify(data.error)}`);
+    }
     const estimate = Math.ceil(Number(data?.result?.priorityFeeEstimate || 0));
-    if (!Number.isFinite(estimate) || estimate <= 0) return null;
+    if (!Number.isFinite(estimate) || estimate <= 0) {
+      log("priority_fee_warn", `${label}: no usable estimate in Helius response`);
+      return null;
+    }
     log("priority_fee", `${label}: estimated ${estimate} microlamports/CU (${config.management.priorityFeeLevel})`);
     return estimate;
   } catch (error) {
@@ -129,42 +138,77 @@ async function applyPriorityFee(tx, feePayer, label) {
   if (!tx?.instructions?.length) return tx;
 
   const estimated = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
-  // Fall back to a sane default rather than sending with no priority fee.
-  let microLamports = estimated || (config.management.fallbackPriorityFeeMicroLamports || 50_000);
-  // Cap the total priority fee per tx (price × CU limit), so a fee-estimate spike
-  // can't make one tx expensive now that the CU limit defaults to 1.4M.
-  const cuLimitForCap = config.management.computeUnitLimit || 1_400_000;
-  const maxFeeLamports = config.management.maxPriorityFeeLamports ?? 1_000_000; // 0.001 SOL
-  const maxMicroLamports = Math.floor((maxFeeLamports * 1_000_000) / cuLimitForCap);
-  if (microLamports > maxMicroLamports) {
-    log("priority_fee", `${label}: estimate ${microLamports} µL/CU capped to ${maxMicroLamports} (max ${maxFeeLamports} lamports/tx)`);
-    microLamports = maxMicroLamports;
-  }
-
-  // Raise the compute-unit limit: position/bin-array init and extended
-  // add-liquidity are compute-heavy and exceed the 200k default, failing AFTER
-  // fees are paid. Each InitializeBinArray costs ~200k CU, so an add-liquidity tx
-  // that creates two bin arrays exhausted the old 400k default before the ATA and
-  // deposit instructions ran. Default to the 1.4M per-tx maximum; the priority fee
-  // scales with the limit but stays tiny at typical micro-lamport prices.
-  // Skip if the SDK tx already set its own CU limit (discriminator 2).
-  const hasCuLimit = tx.instructions.some(
-    (ix) => ix.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 2,
-  );
-  if (!hasCuLimit) {
-    tx.instructions.unshift(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: config.management.computeUnitLimit || 1_400_000 })
-    );
-  }
-  tx.instructions.unshift(
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports })
+  // Fall back to a sane default rather than sending with no priority fee, and
+  // floor at Helius's recommended landing price so a quiet-market "Medium"
+  // reading (~1k µL/CU) doesn't produce a tx that never lands.
+  const floor = config.management.minPriorityFeeMicroLamports ?? 10_000;
+  let microLamports = Math.max(
+    estimated || (config.management.fallbackPriorityFeeMicroLamports || 50_000),
+    floor,
   );
 
   const { blockhash, lastValidBlockHeight } = await getConnection().getLatestBlockhash("confirmed");
   tx.recentBlockhash = blockhash;
   tx.lastValidBlockHeight = lastValidBlockHeight;
   tx.feePayer = feePayer;
+
+  // Compute-unit limit. Each InitializeBinArray costs ~200k CU, so the old 400k
+  // default could run out mid-tx; a blanket 1.4M fixed that but hurt landing
+  // (a tx reserving 1.4M CU is hard to pack next to a busy pool's per-account CU
+  // budget — live txs used ~29k of 1.4M and add-liquidity chunks kept expiring).
+  // Simulate at the max to measure, then request 1.2× what it used. Skip if the
+  // SDK tx already set its own CU limit (discriminator 2).
+  const hasCuLimit = tx.instructions.some(
+    (ix) => ix.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 2,
+  );
+  let cuLimit = null;
+  if (!hasCuLimit) {
+    const maxCu = config.management.computeUnitLimit || 1_400_000;
+    cuLimit = maxCu;
+    const limitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: maxCu });
+    tx.instructions.unshift(limitIx);
+    const measured = await simulateComputeUnits(tx, label);
+    if (measured) {
+      cuLimit = Math.min(maxCu, Math.max(50_000, Math.ceil(measured * 1.2)));
+      tx.instructions[0] = ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit });
+      log("priority_fee", `${label}: simulated ${measured} CU → limit ${cuLimit}`);
+    }
+  }
+
+  // Cap the total priority fee per tx (price × CU limit) so an estimate spike
+  // can't make one tx expensive.
+  const cuLimitForCap = cuLimit || config.management.computeUnitLimit || 1_400_000;
+  const maxFeeLamports = config.management.maxPriorityFeeLamports ?? 1_000_000; // 0.001 SOL
+  const maxMicroLamports = Math.floor((maxFeeLamports * 1_000_000) / cuLimitForCap);
+  if (microLamports > maxMicroLamports) {
+    log("priority_fee", `${label}: price ${microLamports} µL/CU capped to ${maxMicroLamports} (max ${maxFeeLamports} lamports/tx)`);
+    microLamports = maxMicroLamports;
+  }
+  tx.instructions.unshift(
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports })
+  );
   return tx;
+}
+
+/**
+ * Simulate a (not yet signed) legacy tx and return the compute units it used,
+ * or null if simulation isn't possible — callers then keep the max limit.
+ * A simulation error (e.g. a program failure) also returns null: sizing is
+ * only an optimisation and must never block or alter what gets sent.
+ */
+async function simulateComputeUnits(tx, label) {
+  try {
+    const sim = await getConnection().simulateTransaction(tx);
+    const used = sim?.value?.unitsConsumed;
+    if (sim?.value?.err) {
+      log("priority_fee_warn", `${label}: simulation error ${JSON.stringify(sim.value.err)} — keeping max CU limit`);
+      return null;
+    }
+    return Number.isFinite(used) && used > 0 ? used : null;
+  } catch (error) {
+    log("priority_fee_warn", `${label}: simulation failed (${error.message}) — keeping max CU limit`);
+    return null;
+  }
 }
 
 async function sendManagedTransaction(tx, signers, label) {
@@ -2119,3 +2163,6 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 
   throw new Error(`Position ${position_address} not found in open positions`);
 }
+
+// Exposed for read-only verification scripts/tests (never sends anything).
+export { applyPriorityFee as _applyPriorityFeeForTest };
