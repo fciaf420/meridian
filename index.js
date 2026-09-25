@@ -5,7 +5,9 @@ import cron from "node-cron";
 import readline from "readline";
 import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions } from "./tools/dlmm.js";
+import { getMyPositions, isCloseInflight } from "./tools/dlmm.js";
+import { llmHealth, isLlmUnavailableError } from "./llm-health.js";
+import { runManagementWithOorFallback, formatOorFallbackReport } from "./oor-fallback.js";
 import { getPositionBins } from "./tools/bin-visual.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
@@ -228,8 +230,18 @@ function runScreeningCycle({ manual = false } = {}) {
 async function screeningCycleBody() {
   let screenReport = null;
   let screenFailed = false;
+  let screenRoutine = false;
   const fundEventsBefore = _fundEvents;
   try {
+    // No deploys without the LLM. While a recent call failed, skip with one line
+    // instead of pre-loading candidates only to hit the same provider error.
+    // llmHealth lets a cycle probe again after LLM_PROBE_INTERVAL_MS.
+    if (llmHealth.isUnavailable()) {
+      const outage = llmHealth.getOutage();
+      log("cron", `Screening skipped — LLM unavailable (${String(outage?.reason || "").slice(0, 200)}${outage?.resetText ? `; resets ${outage.resetText}` : ""})`);
+      return;
+    }
+
     // Hard guards — don't even run the agent if preconditions aren't met
     let preCheckPositions;
     try {
@@ -489,14 +501,21 @@ ${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
     `, config.llm.maxSteps, []);
     screenReport = content;
   } catch (error) {
-    log("cron_error", `Screening cycle failed: ${error.message}`);
-    screenReport = `Screening cycle failed: ${error.message}`;
-    screenFailed = true;
+    if (isLlmUnavailableError(error)) {
+      // The llm_unavailable alert (deduped) already tells the operator; this is a skip, not a failure.
+      log("cron", `Screening skipped — ${error.message}`);
+      screenReport = `Screening skipped — ${error.message}`;
+      screenRoutine = true;
+    } else {
+      log("cron_error", `Screening cycle failed: ${error.message}`);
+      screenReport = `Screening cycle failed: ${error.message}`;
+      screenFailed = true;
+    }
   } finally {
     setScreeningBusy(false);
     if (screenReport) {
       // A screening cycle that deployed nothing is routine: no Telegram message.
-      emit("cycle:screening", { report: screenReport, routine: !screenFailed && _fundEvents === fundEventsBefore });
+      emit("cycle:screening", { report: screenReport, routine: screenRoutine || (!screenFailed && _fundEvents === fundEventsBefore) });
       // File screening deploy to KB (direct write, no LLM)
       try { fileScreeningResult(screenReport); } catch { /* best-effort */ }
     }
@@ -541,6 +560,7 @@ function startCronJobs() {
     let mgmtReport = null;
     let mgmtFailed = false;
     let mgmtRuleFired = false; // a hard close rule or exit alert fired this cycle
+    let fallbackSummary = null; // set when the LLM failed and the rule-4 fallback ran
     const fundEventsBefore = _fundEvents;
     try {
       // Pool context + trailing TP / stop loss pre-check
@@ -679,7 +699,7 @@ function startCronJobs() {
 
       if (exitAlerts) mgmtRuleFired = true;
       const pnlUnit = config.management.pnlUnit?.toUpperCase() || "SOL";
-      const { content } = await agentLoop(`
+      const managementGoal = `
 MANAGEMENT CYCLE${memoryHints}${exitAlerts}${autoCloseInfo}${kbContext}
 
 HARD CLOSE RULES (check in order — close immediately on first match, no further analysis):
@@ -717,8 +737,36 @@ REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values)
 **Reason:** [1 short sentence — if PnL is negative, say IL exceeds fees]
 
 FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesson with one lesson that names what went wrong, the signal that was missed or under-weighted, and what to do differently next time. The runner already records the raw stats of every close, so the lesson is only useful for the why.
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel);
-      mgmtReport = content;
+      `;
+      // If the LLM path fails (provider down, or no assistant message), rule 4
+      // (OOR timeout) is a pure threshold, so those positions are closed in code
+      // through the same close_position path; every other rule waits for the LLM.
+      // The management lock is still held, so the PnL watcher, Telegram actions
+      // and screening cannot race these closes.
+      const mgmtRun = await runManagementWithOorFallback({
+        runLlm: () => agentLoop(managementGoal, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel),
+        onLlmError: (llmError) => {
+          const outage = isLlmUnavailableError(llmError);
+          log(outage ? "cron" : "cron_error", `Management LLM call failed (${llmError.message}) — running the rule-4 OOR fallback in code`);
+          // A provider outage is reported once by the deduped llm_unavailable alert;
+          // anything else is a real cycle failure and keeps the cycle_error alert.
+          if (!outage) emit("cycle_error", { cycle: "Management", error: llmError.message });
+        },
+        fallbackDeps: {
+          getPositions: () => getMyPositions({ force: true }),
+          executeTool,
+          getTrackedPosition,
+          isBusy,
+          isCloseInflight,
+          management: config.management,
+          log,
+          dryRun: process.env.DRY_RUN === "true",
+        },
+      });
+      fallbackSummary = mgmtRun.fallbackSummary;
+      mgmtReport = fallbackSummary
+        ? formatOorFallbackReport(fallbackSummary, mgmtRun.error?.message)
+        : mgmtRun.content;
     } catch (error) {
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
@@ -728,8 +776,11 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
       setManagementBusy(false);
       // Routine = nothing happened (code-only HOLD, or the LLM ran and changed
       // nothing without a close rule firing). Routine reports aren't pushed to Telegram.
+      // An LLM-down cycle is routine unless the OOR fallback tried to close something.
       if (mgmtReport) {
-        const routine = !mgmtFailed && !mgmtRuleFired && _fundEvents === fundEventsBefore;
+        const routine = fallbackSummary
+          ? fallbackSummary.attempted.length === 0
+          : !mgmtFailed && !mgmtRuleFired && _fundEvents === fundEventsBefore;
         emit("cycle:management", { report: mgmtReport, routine });
       }
       try {
@@ -744,7 +795,7 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
       // Pattern synthesis to knowledge base (throttled, max once/hour, only when recent closes exist)
       try {
         const kbGoal = shouldFileObservations();
-        if (kbGoal && !isBusy() && !isScreeningBusy()) {
+        if (kbGoal && !isBusy() && !isScreeningBusy() && !llmHealth.isUnavailable()) {
           log("kb", "Running KB pattern synthesis...");
           await agentLoop(kbGoal, 3, [], "GENERAL", config.llm.generalModel)
             .catch(e => log("kb", `Synthesis skipped: ${e.message}`));
