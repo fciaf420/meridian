@@ -1935,12 +1935,14 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     let pnlPct = _pnlOverride?.pnl_pct ?? null;
     let finalValueUsd = _pnlOverride?.total_value_usd ?? 0;
     let feesUsd = 0;
+    let unclaimedFeesUsd = null; // USD value of the fees the remove txs will claim (null = unknown)
     const trackedPre = getTrackedPosition(position_address);
     feesUsd = trackedPre?.total_fees_claimed_usd || 0;
 
     if (_pnlOverride) {
       // PnL watcher already gave us accurate numbers at the moment it decided to close
       feesUsd = (_pnlOverride.collected_fees_usd || 0) + (_pnlOverride.unclaimed_fees_usd || 0) || feesUsd;
+      unclaimedFeesUsd = _pnlOverride.unclaimed_fees_usd ?? null;
       log("close", `Using PnL override from watcher: ${pnlPct}% ($${pnlUsd})`);
     } else {
       // No override — snapshot from cache or fresh API
@@ -1950,6 +1952,7 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         pnlPct        = cachedPos.pnl_pct   ?? null;
         finalValueUsd = cachedPos.total_value_usd ?? 0;
         feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
+        unclaimedFeesUsd = cachedPos.unclaimed_fees_usd ?? null;
       }
       if (pnlPct == null) {
       // No cache, or cached PnL was unknown — fetch fresh from API while position is still open
@@ -1960,6 +1963,7 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
           pnlPct        = freshPnl.pnl_pct;
           finalValueUsd = freshPnl.current_value_usd ?? 0;
           feesUsd       = (freshPnl.all_time_fees_usd || 0) + (freshPnl.unclaimed_fee_usd || 0);
+          unclaimedFeesUsd = freshPnl.unclaimed_fee_usd ?? null;
         }
       } catch (e) {
         log("close_warn", `Could not snapshot PnL before close: ${e.message}`);
@@ -1969,28 +1973,22 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
 
     const txHashes = [];
 
-    // ─── Step 1: Claim Fees (to clear account state) ───────────
-    try {
-      log("close", `Step 1: Claiming fees for ${position_address}`);
-      const claimTxs = await pool.claimSwapFee({
-        owner: wallet.publicKey,
-        position: positionData,
-      });
-      for (const tx of Array.isArray(claimTxs) ? claimTxs : [claimTxs]) {
-        const claimHash = await sendManagedTransaction(tx, [wallet], "close claim fees");
-        txHashes.push(claimHash);
-      }
-      log("close", `Step 1 OK: ${txHashes.join(", ")}`);
-    } catch (e) {
-      log("close_warn", `Step 1 (Claim) failed or nothing to claim: ${e.message}`);
+    // ─── Unclaimed fees, read BEFORE removal ───────────────────
+    // There is no separate claim pass: removeLiquidity({ shouldClaimAndClose })
+    // puts claimFee2 (+ claimReward2 per farm reward) and closePositionIfEmpty
+    // in every chunk, so a claim tx first only duplicated work (one extra tx
+    // per 70 bins, each paying fees and able to expire). The amounts the remove
+    // txs claim are read from the position data now, while it still holds them.
+    // PnL / fees_earned_usd come from the snapshot above (taken before any tx)
+    // and the post-close swap uses the pre-close balance delta, which includes
+    // the claimed X fees, so neither depended on the old claim pass.
+    const claimedAtClose = readUnclaimedFees(pool, positionData);
+    if (claimedAtClose) {
+      log("close", `Unclaimed fees claimed by the remove txs: X=${claimedAtClose.x} Y=${claimedAtClose.y}${unclaimedFeesUsd != null ? ` (~$${Number(unclaimedFeesUsd).toFixed(2)})` : ""}`);
     }
 
-    // Refresh pool state after the claim txs so removeLiquidity (Step 2) operates
-    // on fresh on-chain state rather than the pre-claim snapshot.
-    try { await pool.refetchStates(); } catch { /* best-effort */ }
-
-    // ─── Step 2: Remove Liquidity & Close ──────────────────────
-    log("close", `Step 2: Removing liquidity and closing account`);
+    // ─── Remove Liquidity, claim fees & rewards, close ─────────
+    log("close", `Removing liquidity, claiming fees and closing account`);
     try {
       const closeTx = await pool.removeLiquidity({
         user: wallet.publicKey,
@@ -2019,30 +2017,39 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
       // a still-funded account would strand or burn the funds. Best-effort: if the
       // verification itself cannot run, fall back to the prior (error-text) behavior.
       let verifiedEmpty = null; // null => could not verify
+      let feesOnly = false;     // no liquidity left, but unclaimed fees/rewards remain
       let freshPositionData = positionData;
-      try {
+      const readZombieState = async () => {
         try { await pool.refetchStates(); } catch { /* best-effort */ }
         freshPositionData = await pool.getPosition(positionPubKey);
         const pd = freshPositionData?.positionData || {};
         const binData = pd.positionBinData || [];
         const num = (v) => { const n = Number(v ?? 0); return Number.isFinite(n) ? n : 0; };
-        const totalX = num(pd.totalXAmount);
-        const totalY = num(pd.totalYAmount);
-        const feeX = num(pd.feeX);
-        const feeY = num(pd.feeY);
-        const rwd1 = num(pd.rewardOne);
-        const rwd2 = num(pd.rewardTwo);
-        const binLiquidity = binData.some(
-          (b) => num(b.positionXAmount) > 0 || num(b.positionYAmount) > 0,
-        );
-        verifiedEmpty =
-          totalX === 0 && totalY === 0 &&
-          feeX === 0 && feeY === 0 &&
-          rwd1 === 0 && rwd2 === 0 &&
-          !binLiquidity;
+        const liquidity = num(pd.totalXAmount) > 0 || num(pd.totalYAmount) > 0 ||
+          binData.some((b) => num(b.positionXAmount) > 0 || num(b.positionYAmount) > 0);
+        const feesOrRewards = num(pd.feeX) > 0 || num(pd.feeY) > 0 || num(pd.rewardOne) > 0 || num(pd.rewardTwo) > 0;
+        return { liquidity, feesOrRewards };
+      };
+      try {
+        const st = await readZombieState();
+        verifiedEmpty = !st.liquidity && !st.feesOrRewards;
+        feesOnly = !st.liquidity && st.feesOrRewards;
       } catch (verifyErr) {
         verifiedEmpty = null; // verification unavailable — keep prior behavior
         log("close_warn", `Zombie-empty verification could not run: ${verifyErr.message}`);
+      }
+
+      if (feesOnly) {
+        // No liquidity left but fees/rewards still owed: closePositionIfEmpty
+        // would be a no-op. Claim them (the only case that still needs a
+        // separate claim), then re-verify before closing.
+        log("close", `Zombie position has no liquidity but unclaimed fees/rewards — claiming before close`);
+        const claimTxs = await pool.claimAllRewardsByPosition({ owner: wallet.publicKey, position: freshPositionData });
+        for (const tx of Array.isArray(claimTxs) ? claimTxs : [claimTxs]) {
+          txHashes.push(await sendManagedTransaction(tx, [wallet], "close zombie claim"));
+        }
+        const st = await readZombieState();
+        verifiedEmpty = !st.liquidity && !st.feesOrRewards;
       }
 
       if (verifiedEmpty === false) {
@@ -2092,6 +2099,7 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     const tracked = getTrackedPosition(position_address);
     const oorDir = tracked?.oor_direction || null;
     const closeReason = oorDir ? `agent decision (OOR ${oorDir})` : "agent decision";
+    if (claimedAtClose) recordClaim(position_address, unclaimedFeesUsd ?? undefined);
     recordClose(position_address, closeReason);
     if (tracked) {
       const deployedAt = new Date(tracked.deployed_at).getTime();
@@ -2259,6 +2267,7 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         txs: txHashes,
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
+        ...(claimedAtClose && { claimed_fees: { ...claimedAtClose, usd: unclaimedFeesUsd } }),
         ...(swapOutcome && { swap: swapOutcome }),
       };
     }
@@ -2277,6 +2286,32 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────
+/**
+ * Unclaimed fees (UI units) and raw LM rewards held by a position, from the
+ * SDK's LbPosition data. Returns null when there is nothing to claim or the
+ * amounts can't be read.
+ */
+function readUnclaimedFees(pool, position) {
+  try {
+    const pd = position?.positionData;
+    if (!pd) return null;
+    const ui = (v, dec) => {
+      const n = Number(String(v ?? 0));
+      return Number.isFinite(n) && Number.isInteger(dec) ? n / 10 ** dec : null;
+    };
+    const x = ui(pd.feeX, pool?.tokenX?.mint?.decimals);
+    const y = ui(pd.feeY, pool?.tokenY?.mint?.decimals);
+    if (x == null || y == null) return null;
+    const r1 = String(pd.rewardOne ?? 0);
+    const r2 = String(pd.rewardTwo ?? 0);
+    const hasRewards = r1 !== "0" || r2 !== "0";
+    if (x === 0 && y === 0 && !hasRewards) return null;
+    return { x, y, ...(hasRewards && { reward_one_raw: r1, reward_two_raw: r2 }) };
+  } catch {
+    return null;
+  }
+}
+
 async function lookupPoolForPosition(position_address, walletAddress) {
   // Check state registry first (fast path)
   const tracked = getTrackedPosition(position_address);
