@@ -1379,6 +1379,8 @@ export async function deployPosition({
 }
 
 const POSITIONS_CACHE_TTL = 5 * 60_000; // 5 minutes
+const RECENT_DEPLOY_MS = 5 * 60_000;   // a deploy this recent may not be on the RPC scan yet
+const SHORT_CACHE_MS = 10_000;         // cache an incomplete scan only this long
 
 let _positionsCache = null;
 let _positionsCacheAt = 0;
@@ -2003,6 +2005,16 @@ export async function getMyPositions({ force = false } = {}) {
     await syncOpenPositions(positions.map((p) => p.position));
     _positionsCache = result;
     _positionsCacheAt = Date.now();
+    // A position deployed in the last few minutes can be missing from the RPC
+    // scan (it lags the confirmed tx). Don't pin that incomplete result for the
+    // full TTL: expire it in ~10s so the next read picks the new position up.
+    const seen = new Set(positions.map((p) => p.position));
+    const lagging = getTrackedPositions(true).filter((t) =>
+      t?.position && !seen.has(t.position) && Date.now() - Date.parse(t.deployed_at || 0) < RECENT_DEPLOY_MS);
+    if (lagging.length) {
+      _positionsCacheAt = Date.now() - POSITIONS_CACHE_TTL + SHORT_CACHE_MS;
+      log("positions", `${lagging.length} just-deployed position(s) not visible on RPC yet (${lagging.map((t) => t.position.slice(0, 8)).join(", ")}) — rescanning in ${SHORT_CACHE_MS / 1000}s`);
+    }
     return result;
   } catch (error) {
     log("positions_error", `SDK scan failed: ${error.stack || error.message}`);
