@@ -248,7 +248,9 @@ const WRITE_TOOLS = new Set([
 const RISK_CONFIG_BOUNDS = {
   maxDeployAmount: { min: 0, max: 100 },        // SOL per position
   maxPositions: { min: 1, max: 50, integer: true },
-  stopLossPct: { min: 0, max: 100 },            // percent loss
+  // Stop loss is a PnL threshold, so it is negative (state.js closes when pnl <= stopLossPct;
+  // 0 disables it). A positive value would close every position below that profit.
+  stopLossPct: { min: -100, max: 0, hint: "use a negative PnL percent, e.g. -20" },
   trailingTriggerPct: { min: 0, max: 1000 },    // percent gain to arm trailing
   trailingDropPct: { min: 0, max: 100 },        // percent drop from peak to exit
   managementIntervalMin: { min: 1, max: 1440, integer: true },
@@ -287,7 +289,7 @@ function validateConfigUpdate(args) {
       return { pass: false, reason: `update_config rejected: ${key} must be an integer, got ${val}.` };
     }
     if (val < bounds.min || val > bounds.max) {
-      return { pass: false, reason: `update_config rejected: ${key}=${val} is outside the allowed range [${bounds.min}-${bounds.max}].` };
+      return { pass: false, reason: `update_config rejected: ${key}=${val} is outside the allowed range [${bounds.min}, ${bounds.max}]${bounds.hint ? ` (${bounds.hint})` : ""}.` };
     }
   }
   return { pass: true };
