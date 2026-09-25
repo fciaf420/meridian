@@ -277,6 +277,27 @@ async function applyPriorityFee(tx, feePayer, label) {
   return tx;
 }
 
+/**
+ * Expiry retry N (1-based) pays base × priorityFeeRetryMultiplier^N µL/CU
+ * (×2 per retry by default), still capped so price × CU limit stays within
+ * maxPriorityFeeLamports. The price instruction is replaced in place (same
+ * size). No-op for a tx applyPriorityFee didn't prepare.
+ */
+function escalatePriorityFee(tx, attempt, label) {
+  const st = feeState.get(tx);
+  if (!st || attempt <= 0) return;
+  const factor = config.management.priorityFeeRetryMultiplier ?? 2;
+  const wanted = Math.ceil(st.baseMicroLamports * Math.pow(factor, attempt));
+  const priced = cappedPriorityPrice({ microLamports: wanted, cuLimit: st.cuLimit });
+  if (priced.microLamports === st.microLamports) {
+    if (priced.capped) log("tx_retry", `${label}: CU price stays ${st.microLamports} µL/CU (at the ${config.management.maxPriorityFeeLamports ?? 1_000_000}-lamport cap)`);
+    return;
+  }
+  log("tx_retry", `${label}: CU price ${st.microLamports} → ${priced.microLamports} µL/CU for retry ${attempt + 1}/3${priced.capped ? " (capped)" : ""}`);
+  setComputeBudgetIx(tx, isCuPriceIx, ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priced.microLamports }));
+  st.microLamports = priced.microLamports;
+}
+
 /** Replace the (single) compute-budget instruction matching `match` in place. */
 function setComputeBudgetIx(tx, match, ix) {
   const i = tx.instructions.findIndex(match);
@@ -367,6 +388,7 @@ async function sendManagedTransaction(tx, signers, label, { beforeResend } = {})
       // from one derived beforehand — and the double-submit guard above would
       // check the wrong signature.
       const connection = getConnection();
+      if (attempt > 0) escalatePriorityFee(tx, attempt, label);
       if (attempt > 0 || !tx.recentBlockhash || tx.lastValidBlockHeight == null) {
         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
         tx.recentBlockhash = blockhash;

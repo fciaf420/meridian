@@ -70,9 +70,22 @@ function mockSender() {
 }
 
 const savedMgmt = { ...config.management };
+// Pin the fee/send settings the assertions assume, whatever user-config says.
+test.beforeEach(() => {
+  Object.assign(config.management, {
+    heliusSender: true,
+    minPriorityFeeMicroLamports: 50_000,
+    fallbackPriorityFeeMicroLamports: 50_000,
+    maxPriorityFeeLamports: 1_000_000,
+    computeUnitLimit: 1_400_000,
+    priorityFeeRetryMultiplier: 2,
+    txRebroadcastMs: 2_000,
+  });
+});
 test.afterEach(() => {
   globalThis.fetch = realFetch;
   setDeps({ connection: null, wallet: null });
+  for (const k of Object.keys(config.management)) if (!(k in savedMgmt)) delete config.management[k];
   Object.assign(config.management, savedMgmt);
 });
 
@@ -438,4 +451,48 @@ test("a known position that closed is dropped and not checked again", async () =
   assert.deepEqual(await listPositionAccounts(wallet.publicKey, { trackedOpen: [] }), []);
   assert.deepEqual(await listPositionAccounts(wallet.publicKey, { trackedOpen: [] }), []);
   assert.equal(rpc.calls.gma.length, 1);
+});
+
+// ─── 9. Priority fee escalation on expiry retry ────────────────
+
+const wirePrice = (wire) => {
+  const tx = Transaction.from(wire);
+  return Number(tx.instructions.find(isPrice).data.readBigUInt64LE(1));
+};
+const expireTwice = (n) => { if (n <= 2) throw new Error("block height exceeded"); return { err: null }; };
+
+test("each expiry retry doubles the CU price (fresh blockhash, new signature)", async () => {
+  const conn = mockConnection({ unitsConsumed: 100_000, confirm: expireTwice, statuses: [null, null] });
+  setDeps({ connection: conn, wallet });
+  mockSender();
+  await sendManagedTransaction(makeTx(40), [wallet], "esc");
+  assert.equal(conn.calls.sendRaw, 3);
+  const prices = conn.calls.sentWires.map(wirePrice);
+  assert.deepEqual(prices, [50_000, 100_000, 200_000]);
+  const sigs = conn.calls.sentWires.map((w) => Transaction.from(w).signature.toString("hex"));
+  assert.equal(new Set(sigs).size, 3);
+});
+
+test("escalation stays within maxPriorityFeeLamports", async () => {
+  config.management.maxPriorityFeeLamports = 15_000; // 15k lamports / 120k CU → 125,000 µL/CU cap
+  const conn = mockConnection({ unitsConsumed: 100_000, confirm: expireTwice, statuses: [null, null] });
+  setDeps({ connection: conn, wallet });
+  mockSender();
+  await sendManagedTransaction(makeTx(40), [wallet], "esc-cap");
+  const prices = conn.calls.sentWires.map(wirePrice);
+  assert.deepEqual(prices, [50_000, 100_000, 125_000]);
+  for (const p of prices) assert.ok(p * 120_000 / 1e6 <= 15_000);
+});
+
+test("escalation replaces the price in place: still one CU price instruction per send", async () => {
+  const conn = mockConnection({ confirm: expireTwice, statuses: [null, null] });
+  setDeps({ connection: conn, wallet });
+  mockSender();
+  await sendManagedTransaction(makeTx(40), [wallet], "esc-one");
+  for (const w of conn.calls.sentWires) {
+    const tx = Transaction.from(w);
+    assert.equal(count(tx, isPrice), 1);
+    assert.equal(count(tx, isLimit), 1);
+    assert.equal(count(tx, isSenderTipIx), 1);
+  }
 });
