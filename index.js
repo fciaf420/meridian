@@ -325,6 +325,8 @@ HARD CLOSE RULES (check in order — close immediately on first match, no furthe
 5. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio}% AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
 6. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (emergency stop)
 
+If a position's pnl_pct is null (pnl_unknown: true), its PnL is UNKNOWN this tick (data fetch failed), NOT 0 — skip rules 3 and 6 for it and do not close it on PnL grounds this cycle.
+
 These rules come from user-config. They are not suggestions. Do not override them.
 If NO rule triggers → HOLD. Do not close for any other reason.
 
@@ -897,8 +899,8 @@ async function handleTelegramCommand(rawText) {
       for (const p of positions.positions) {
         const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
-        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
-        lines.push(`• ${p.pair}  ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
+        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
+        lines.push(`• ${p.pair}  ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
       }
       await tgSend(lines.join("\n"));
     });
@@ -1122,8 +1124,8 @@ if (runtimeMode.interactive) {
       for (const p of positions.positions) {
         const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
-        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
-        console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
+        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
+        console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
       }
       console.log();
     }
@@ -1223,8 +1225,8 @@ Commands:
         for (const p of positions.positions) {
           const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
           const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
-          const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
-          console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
+          const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
+          console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
         }
         console.log();
       });

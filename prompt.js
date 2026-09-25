@@ -38,11 +38,23 @@ export function getPromptSectionText(section) {
 }
 
 /**
+ * Substitute `${name}` placeholders in override text. Autoresearch edits the
+ * default section TEMPLATE (see _getDefaultSections), so overrides carry
+ * literal `${deployAmount}` etc. Only names in `vars` are replaced; any other
+ * `${...}` is left as-is.
+ */
+export function fillSectionPlaceholders(text, vars) {
+  if (typeof text !== "string") return text;
+  return text.replace(/\$\{(\w+)\}/g, (match, name) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : match);
+}
+
+/**
  * Range selection text — used by index.js screening cycle.
- * Autoresearch can override this section.
+ * Autoresearch can override this section, but NOT the Evil Panda branch:
+ * an active strategy profile with its own fixed range rules takes precedence.
  */
 export function getRangeSelectionText(deployAmount, currentBalanceSol) {
-  if (_sectionOverrides.range_selection) return _sectionOverrides.range_selection;
   if (config.strategy.activeStrategy === "evil_panda") {
     return `- EVIL PANDA RANGE SIZING:
   Use single-sided SOL spot with price_range_pct=${config.strategy.evilPanda?.priceRangePct ?? 80}.
@@ -50,6 +62,13 @@ export function getRangeSelectionText(deployAmount, currentBalanceSol) {
   This creates an 80% downside range below the active bin. Do not substitute the volatility table for Evil Panda autonomous entries.
   Entry is only valid when token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend is green with price above Supertrend.
   If these entry checks are not satisfied, skip.`;
+  }
+  if (_sectionOverrides.range_selection) {
+    // Same placeholders the default template leaves literal in _getDefaultSections().
+    return fillSectionPlaceholders(_sectionOverrides.range_selection, {
+      deployAmount,
+      currentBalanceSol: currentBalanceSol ?? "?",
+    });
   }
   return _defaultRangeSelectionText(deployAmount, currentBalanceSol);
 }
@@ -182,8 +201,8 @@ NOTE: 5m windows are inherently noisy. A pool doing $100k+/hour can show $0 volu
 
 IMPORTANT: fee_active_tvl_ratio values are ALREADY in percentage form. 0.29 = 0.29%. Do NOT multiply by 100. A value of 1.0 = 1.0%, a value of 22 = 22%. Never convert.
 
-base_fee: The pool's static fee rate set at creation.
-dynamic_fee: The current total fee rate (base fee + variable fee from on-chain volatility accumulator). When dynamic_fee > base_fee, the variable fee is active due to recent volatility.
+base_fee: The pool's base fee rate (derived from base factor x bin step). It is configured per pool and is normally stable, but it is NOT guaranteed static — the pool operator can update it after creation.
+dynamic_fee: The current VARIABLE (volatility) fee component ONLY — i.e. total fee minus base fee, from the on-chain volatility accumulator. It is NOT the total. Total fee paid by swaps = base_fee + dynamic_fee, capped at 10%. dynamic_fee > 0 means the variable fee is active due to recent volatility; dynamic_fee = 0 means swaps pay just the base fee.
 
 `;
 
@@ -288,6 +307,8 @@ TRAILING + TP RELATIONSHIP — understand how these work together:
 - takeProfitFeePct MUST be higher than trailingTriggerPct. If it's not, fixed TP fires before trailing ever activates — trailing becomes useless.
 - Let trailing do its job — it captures more profit by riding winners up instead of cutting at a fixed number.
 - Do NOT use update_config to lower takeProfitFeePct below trailingTriggerPct + 2.
+
+UNKNOWN PnL: If a position has pnl_pct = null (pnl_unknown: true), its PnL data failed to load this tick. Treat PnL as UNKNOWN, not 0: do NOT apply take-profit, trailing, stop-loss or any other PnL-based close rule to it this cycle, and do not report it as 0%. Non-PnL rules (instructions, out-of-range timeout, dead yield) still apply.
 
 CRITICAL: pnl_pct ALREADY includes all fees (claimed + unclaimed). Negative PnL means you are losing money AFTER fees. Do NOT say "fees will offset the loss" — they are already counted. If PnL is -7% with 0.7 SOL fees, that means without fees you'd be down even more. Negative PnL = impermanent loss exceeding fee earnings.
 
