@@ -214,12 +214,15 @@ console.log("\n── Screening Source ─────────────�
 const sourceChoice = await askChoice("Where do pool candidates come from?", [
   { label: `GMGN     — advanced token screening (filters live in gmgn-config.json)${e("screeningSource") === "gmgn" ? " (current)" : ""}`, key: "gmgn" },
   { label: `Meteora  — Meteora pool API + thresholds below${e("screeningSource", "meteora") === "meteora" ? " (current)" : ""}`, key: "meteora" },
+  { label: `Both     — Meteora + GMGN in parallel, deduped; picks found by both rank first${e("screeningSource") === "both" ? " (current)" : ""}`, key: "both" },
 ]);
 const screeningSource = sourceChoice.key;
 
-// Meteora-specific filters only matter when source = meteora.
+// Meteora-specific filters matter when source = meteora or both (in "both",
+// bin step / TVL / max volatility also gate GMGN-only picks).
+const usesMeteoraFilters = screeningSource === "meteora" || screeningSource === "both";
 let timeframe, maxVolatility, maxPriceChangePct, minOrganic, minHolders, maxMcap;
-if (screeningSource === "meteora") {
+if (usesMeteoraFilters) {
   console.log("\n── Meteora Filters ───────────────────────────");
   timeframe         = await ask("Pool discovery timeframe (30m / 1h / 4h / 12h / 24h)", p("timeframe", "4h"));
   maxVolatility     = await askNum("Max pool volatility", p("maxVolatility", 8.0), { min: 0.5, max: 20 });
@@ -227,7 +230,8 @@ if (screeningSource === "meteora") {
   minOrganic        = await askNum("Min organic score (0-100)", p("minOrganic", 65), { min: 0, max: 100 });
   minHolders        = await askNum("Min token holders", p("minHolders", 500), { min: 1 });
   maxMcap           = await askNum("Max token market cap USD", p("maxMcap", 10_000_000), { min: 100_000 });
-} else {
+}
+if (screeningSource !== "meteora") {
   console.log("\n  ✓ GMGN screening — edit token filters (mcap, holders, KOL, snipers, indicators)");
   console.log("    in gmgn-config.json. Copy gmgn-config.example.json if it doesn't exist yet.");
 }
@@ -309,7 +313,7 @@ const changes = {
   usdcMode,
   ...(usdcMode ? { deployAmountUsd, maxDeployUsd, minUsdcToOpen, gasReserveSol } : {}),
   screeningSource,
-  ...(screeningSource === "meteora"
+  ...(usesMeteoraFilters
     ? { timeframe, maxVolatility, maxPriceChangePct, minOrganic, minHolders, maxMcap }
     : {}),
   activeStrategy,
@@ -346,7 +350,7 @@ console.log(`
 ╚═══════════════════════════════════════════╝
 
 Preset:        ${presetName}
-Screening:     ${screeningSource}${screeningSource === "gmgn" ? "  (filters in gmgn-config.json)" : `  (timeframe ${timeframe})`}
+Screening:     ${screeningSource}${screeningSource === "gmgn" ? "  (filters in gmgn-config.json)" : screeningSource === "both" ? `  (Meteora timeframe ${timeframe} + gmgn-config.json)` : `  (timeframe ${timeframe})`}
 Strategy:      ${activeStrategy} / ${strategyShape}${activeStrategy === "evil_panda" ? `  (range ${evilPandaPriceRangePct}%)` : ""}
 
   Deploy:      ${deployAmountSol} SOL/position  |  Max: ${maxPositions} positions
