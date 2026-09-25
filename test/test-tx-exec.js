@@ -28,6 +28,8 @@ const {
   _applyPriorityFeeForTest: applyPriorityFee,
   _sendManagedTransactionForTest: sendManagedTransaction,
   _setDlmmTestDeps: setDeps,
+  _listPositionAccountsForTest: listPositionAccounts,
+  _resetPositionDiscoveryForTest: resetDiscovery,
 } = dlmm;
 const { legacyTxSize, isSenderTipIx, MAX_TX_BYTES } = txSend;
 
@@ -344,4 +346,96 @@ test("fee cap uses the final (replaced) limit", async () => {
   await applyPriorityFee(tx, wallet.publicKey, "x");
   assert.equal(limitOf(tx), 120_000);
   assert.equal(priceOf(tx), Math.floor((100_000 * 1_000_000) / 120_000));
+});
+
+// ─── 8. PnL watcher: existence check instead of a full gPA every tick ──
+
+const DLMM_PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+const POSITION_V2 = Buffer.from("75b0d4c7f5b485b6", "hex");
+const LIMIT_ORDER = Buffer.from("89b7d45b731d8de3", "hex");
+const head = (disc, pool, owner) => Buffer.concat([disc, pool.toBuffer(), owner.toBuffer()]);
+
+function positionRpc(accounts) {
+  // accounts: Map<base58, { owner, data } | null>
+  const calls = { gpa: [], gma: [] };
+  return {
+    calls,
+    getProgramAccounts: async (programId, cfg) => {
+      calls.gpa.push(cfg);
+      return [...accounts].filter(([, a]) => a).map(([k, a]) => ({ pubkey: new PublicKey(k), account: { data: a.data, owner: a.owner } }));
+    },
+    getMultipleAccountsInfo: async (keys, cfg) => {
+      calls.gma.push({ keys: keys.map((k) => k.toBase58()), cfg });
+      return keys.map((k) => accounts.get(k.toBase58()) ?? null);
+    },
+  };
+}
+
+test("tracked positions: one getMultipleAccountsInfo (72-byte slice), closed and limit-order accounts excluded", async () => {
+  const owner = wallet.publicKey;
+  const pool = Keypair.generate().publicKey;
+  const open = Keypair.generate().publicKey.toBase58();
+  const closed = Keypair.generate().publicKey.toBase58();
+  const limitOrder = Keypair.generate().publicKey.toBase58();
+  const someoneElses = Keypair.generate().publicKey.toBase58();
+  const accounts = new Map([
+    [open, { owner: DLMM_PROGRAM, data: head(POSITION_V2, pool, owner) }],
+    [closed, null],
+    [limitOrder, { owner: DLMM_PROGRAM, data: head(LIMIT_ORDER, pool, owner) }],
+    [someoneElses, { owner: DLMM_PROGRAM, data: head(POSITION_V2, pool, Keypair.generate().publicKey) }],
+  ]);
+  const rpc = positionRpc(accounts);
+  setDeps({ connection: rpc });
+  resetDiscovery({ at: Date.now() }); // discovery just ran
+  const got = await listPositionAccounts(owner, { trackedOpen: [open, closed, limitOrder, someoneElses] });
+  assert.deepEqual(got, [{ position: open, pool: pool.toBase58() }]);
+  assert.equal(rpc.calls.gpa.length, 0);
+  assert.equal(rpc.calls.gma.length, 1);
+  assert.deepEqual(rpc.calls.gma[0].cfg, { dataSlice: { offset: 0, length: 72 } });
+});
+
+test("discovery scan runs at most every 5 min, filtered by PositionV2 discriminator + owner, sliced", async () => {
+  const owner = wallet.publicKey;
+  const pool = Keypair.generate().publicKey;
+  const untracked = Keypair.generate().publicKey.toBase58();
+  const rpc = positionRpc(new Map([[untracked, { owner: DLMM_PROGRAM, data: head(POSITION_V2, pool, owner) }]]));
+  setDeps({ connection: rpc });
+  resetDiscovery({ at: 0 });
+  const t0 = 10_000_000;
+  const first = await listPositionAccounts(owner, { trackedOpen: [], now: t0 });
+  assert.deepEqual(first, [{ position: untracked, pool: pool.toBase58() }]);
+  assert.equal(rpc.calls.gpa.length, 1);
+  const cfg = rpc.calls.gpa[0];
+  assert.deepEqual(cfg.dataSlice, { offset: 0, length: 72 });
+  assert.equal(cfg.filters[0].memcmp.offset, 0);
+  assert.equal(cfg.filters[1].memcmp.offset, 40);
+  assert.equal(cfg.filters[1].memcmp.bytes, owner.toBase58());
+
+  // 30s ticks for the next 5 min: no gPA; the discovered (untracked) one is still checked.
+  for (let t = t0 + 30_000; t < t0 + 300_000; t += 30_000) {
+    const got = await listPositionAccounts(owner, { trackedOpen: [], now: t });
+    assert.deepEqual(got.map((g) => g.position), [untracked]);
+  }
+  assert.equal(rpc.calls.gpa.length, 1);
+  assert.equal(rpc.calls.gma.length, 9);
+  await listPositionAccounts(owner, { trackedOpen: [], now: t0 + 300_000 });
+  assert.equal(rpc.calls.gpa.length, 2);
+});
+
+test("no tracked or known positions between scans → no RPC at all", async () => {
+  const rpc = positionRpc(new Map());
+  setDeps({ connection: rpc });
+  resetDiscovery({ at: Date.now() });
+  assert.deepEqual(await listPositionAccounts(wallet.publicKey, { trackedOpen: [] }), []);
+  assert.equal(rpc.calls.gma.length + rpc.calls.gpa.length, 0);
+});
+
+test("a known position that closed is dropped and not checked again", async () => {
+  const pos = Keypair.generate().publicKey.toBase58();
+  const rpc = positionRpc(new Map([[pos, null]]));
+  setDeps({ connection: rpc });
+  resetDiscovery({ at: Date.now(), known: [[pos, Keypair.generate().publicKey.toBase58()]] });
+  assert.deepEqual(await listPositionAccounts(wallet.publicKey, { trackedOpen: [] }), []);
+  assert.deepEqual(await listPositionAccounts(wallet.publicKey, { trackedOpen: [] }), []);
+  assert.equal(rpc.calls.gma.length, 1);
 });

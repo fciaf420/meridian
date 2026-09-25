@@ -18,6 +18,7 @@ import {
   recordClose,
   updateTrackedPosition,
   getTrackedPosition,
+  getTrackedPositions,
   minutesOutOfRange,
   syncOpenPositions,
 } from "../state.js";
@@ -1505,6 +1506,92 @@ export async function getPositionPnl({ pool_address, position_address }) {
   }
 }
 
+// ─── Position account discovery ────────────────────────────────
+// The PnL watcher refreshes positions every 30s. A full getProgramAccounts
+// on the DLMM program (no discriminator filter, full ~8 KB+ PositionV2 data)
+// every tick was the bot's most expensive RPC call. Now each refresh is one
+// getMultipleAccountsInfo over the positions we already know (tracked open +
+// last scan), sliced to the 72-byte header, and the filtered scan that finds
+// untracked positions runs at most every 5 minutes.
+const DLMM_PROGRAM_ID = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+// Anchor discriminator of the PositionV2 account (IDL). LimitOrder accounts
+// share the lb_pair@8 / owner@40 layout but have a different discriminator.
+const POSITION_V2_DISCRIMINATOR = Buffer.from("75b0d4c7f5b485b6", "hex");
+const POSITION_HEAD_LEN = 72; // discriminator(8) + lb_pair(32) + owner(32)
+const POSITION_DISCOVERY_INTERVAL_MS = 5 * 60_000;
+let _knownPositionAccounts = new Map(); // position → lb_pair, from the last discovery scan
+let _lastPositionDiscoveryAt = 0;
+
+function positionAccountFilters(owner) {
+  return [
+    { memcmp: { offset: 0, bytes: bs58.encode(POSITION_V2_DISCRIMINATOR) } },
+    { memcmp: { offset: 40, bytes: owner.toBase58() } },
+  ];
+}
+
+/** lb_pair of a PositionV2 account owned by `owner`, or null (closed / not a position / not ours). */
+function positionHeadPool(info, owner) {
+  if (!info?.data || !info.owner?.equals?.(DLMM_PROGRAM_ID)) return null;
+  const d = Buffer.from(info.data);
+  if (d.length < POSITION_HEAD_LEN) return null;
+  if (!d.subarray(0, 8).equals(POSITION_V2_DISCRIMINATOR)) return null;
+  if (!d.subarray(40, 72).equals(owner.toBuffer())) return null;
+  return new PublicKey(d.subarray(8, 40)).toBase58();
+}
+
+/**
+ * The wallet's open DLMM position accounts → [{ position, pool }].
+ * @param {PublicKey} owner
+ * @param {object} [opts]
+ * @param {boolean} [opts.discover] force the filtered getProgramAccounts scan
+ * @param {string[]} [opts.trackedOpen] tracked open positions (default: state.json)
+ * @param {number} [opts.now]
+ */
+async function listPositionAccounts(owner, { discover = false, trackedOpen = null, now = Date.now() } = {}) {
+  const connection = getConnection();
+  if (discover || now - _lastPositionDiscoveryAt >= POSITION_DISCOVERY_INTERVAL_MS) {
+    const accs = await connection.getProgramAccounts(DLMM_PROGRAM_ID, {
+      filters: positionAccountFilters(owner),
+      dataSlice: { offset: 0, length: POSITION_HEAD_LEN },
+    });
+    const found = new Map();
+    for (const a of accs) {
+      const pool = positionHeadPool({ owner: DLMM_PROGRAM_ID, data: a.account.data }, owner);
+      if (pool) found.set(a.pubkey.toBase58(), pool);
+    }
+    _knownPositionAccounts = found;
+    _lastPositionDiscoveryAt = now;
+    return [...found].map(([position, pool]) => ({ position, pool }));
+  }
+
+  const tracked = trackedOpen ?? getTrackedPositions(true).map((p) => p.position);
+  const keys = [...new Set([...tracked, ..._knownPositionAccounts.keys()])];
+  if (keys.length === 0) return [];
+  const infos = [];
+  for (let i = 0; i < keys.length; i += 100) { // getMultipleAccounts takes ≤100 keys
+    const batch = keys.slice(i, i + 100).map((k) => new PublicKey(k));
+    infos.push(...await connection.getMultipleAccountsInfo(batch, { dataSlice: { offset: 0, length: POSITION_HEAD_LEN } }));
+  }
+  const out = [];
+  keys.forEach((position, i) => {
+    const pool = positionHeadPool(infos[i], owner);
+    if (pool) {
+      out.push({ position, pool });
+      _knownPositionAccounts.set(position, pool);
+    } else {
+      _knownPositionAccounts.delete(position); // closed, or not a position of ours
+    }
+  });
+  return out;
+}
+
+/** Test seam: forget discovery state so the next call scans (or not, with `at`). */
+export function _resetPositionDiscoveryForTest({ at = 0, known = [] } = {}) {
+  _lastPositionDiscoveryAt = at;
+  _knownPositionAccounts = new Map(known);
+}
+export { listPositionAccounts as _listPositionAccountsForTest };
+
 // ─── Get My Positions ──────────────────────────────────────────
 export async function getMyPositions({ force = false } = {}) {
   if (!force && _positionsCache && Date.now() - _positionsCacheAt < POSITIONS_CACHE_TTL) {
@@ -1521,22 +1608,13 @@ export async function getMyPositions({ force = false } = {}) {
   }
 
   _positionsInflight = (async () => { try {
-    log("positions", "Scanning positions via getProgramAccounts...");
-    const DLMM_PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
     const walletPubkey = new PublicKey(walletAddress);
-
-    // Owner field sits at offset 40 (8 discriminator + 32 lb_pair)
-    const accounts = await getConnection().getProgramAccounts(DLMM_PROGRAM, {
-      filters: [{ memcmp: { offset: 40, bytes: walletPubkey.toBase58() } }],
-    });
-
+    const accounts = await listPositionAccounts(walletPubkey);
     log("positions", `Found ${accounts.length} position account(s)`);
 
     // Collect raw (pool, position) pairs
     const raw = [];
-    for (const acc of accounts) {
-      const positionAddress = acc.pubkey.toBase58();
-      const lbPairKey = new PublicKey(acc.account.data.slice(8, 40)).toBase58();
+    for (const { position: positionAddress, pool: lbPairKey } of accounts) {
       // Pair name: use tracked state pool_name if available
       const tracked = getTrackedPosition(positionAddress);
       const pair = tracked?.pool_name || lbPairKey.slice(0, 8);
@@ -1817,7 +1895,8 @@ export async function getWalletPositions({ wallet_address }) {
     const DLMM_PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 
     const accounts = await getConnection().getProgramAccounts(DLMM_PROGRAM, {
-      filters: [{ memcmp: { offset: 40, bytes: new PublicKey(wallet_address).toBase58() } }],
+      filters: positionAccountFilters(new PublicKey(wallet_address)),
+      dataSlice: { offset: 0, length: POSITION_HEAD_LEN },
     });
 
     if (accounts.length === 0) {
