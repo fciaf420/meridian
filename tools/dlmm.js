@@ -30,9 +30,14 @@ import { fetchGmgnPriceInfo } from "./gmgn.js";
 import {
   heliusSenderEnabled,
   buildSenderTipIx,
+  isSenderTipIx,
   sendAndConfirmSigned,
   basePriorityPrice,
   cappedPriorityPrice,
+  legacyTxSize,
+  MAX_TX_BYTES,
+  MAX_CU_LIMIT,
+  MIN_CU_LIMIT,
 } from "./tx-send.js";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
@@ -141,10 +146,6 @@ async function estimatePriorityFeeMicroLamports(tx, feePayer, label = "tx") {
   }
 }
 
-function addSenderTip(tx, feePayer) {
-  tx.instructions.push(buildSenderTipIx(feePayer));
-}
-
 /**
  * Which bin arrays covering [minBinId, maxBinId] are already initialized?
  * Returns { missing: number[], min, max } where [min, max] is the contiguous
@@ -184,55 +185,99 @@ async function initializedBinArrayWindow(pool, minBinId, maxBinId, activeBinId) 
   };
 }
 
+const isCuLimitIx = (ix) => ix?.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 2;
+const isCuPriceIx = (ix) => ix?.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 3;
+
+// Per-tx fee state set by applyPriorityFee: { cuLimit, baseMicroLamports,
+// microLamports, sender }. Its presence makes applyPriorityFee idempotent.
+const feeState = new WeakMap();
+
+/**
+ * Prepare a legacy tx for sending: Sender tip, CU limit, CU price, fresh
+ * blockhash, and a size check. Idempotent: calling it again on the same tx
+ * object never adds a second tip or compute-budget instruction.
+ *
+ * Size guard: the tip (+49 bytes) is only needed for Helius Sender. If the tx
+ * would exceed 1232 bytes with it, the tip is dropped and the tx goes out via
+ * the RPC only; if it is still too large, this throws before anything is signed.
+ */
 async function applyPriorityFee(tx, feePayer, label) {
   if (!tx?.instructions?.length) return tx;
-  if (heliusSenderEnabled()) addSenderTip(tx, feePayer);
+  if (feeState.has(tx)) return tx; // already prepared: never add a second tip / CU ix
+
+  const connection = getConnection();
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash;
+  tx.lastValidBlockHeight = lastValidBlockHeight;
+  tx.feePayer = feePayer;
+
+  // Sender tip, once (a tip already present is reused, never duplicated).
+  let tipped = tx.instructions.some(isSenderTipIx);
+  if (heliusSenderEnabled() && !tipped) {
+    tx.instructions.push(buildSenderTipIx(feePayer));
+    tipped = true;
+  }
+
+  // Put the compute-budget instructions in place now (their values don't
+  // change the size), so the size check below sees the final shape. Never a
+  // second one: an existing limit / price instruction is updated in place.
+  const maxCu = config.management.computeUnitLimit || MAX_CU_LIMIT;
+  const sdkLimitIx = tx.instructions.find(isCuLimitIx);
+  const sdkLimit = sdkLimitIx ? sdkLimitIx.data.readUInt32LE(1) : null;
+  if (!sdkLimitIx) tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitLimit({ units: maxCu }));
+  if (!tx.instructions.some(isCuPriceIx)) tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 0 }));
+
+  // ─── Size guard ───
+  let size = legacyTxSize(tx);
+  if (size > MAX_TX_BYTES && tipped) {
+    const withTip = size;
+    tx.instructions = tx.instructions.filter((ix) => !isSenderTipIx(ix));
+    tipped = false;
+    size = legacyTxSize(tx);
+    log("tx_size", `${label}: ${withTip} bytes with the Sender tip exceeds ${MAX_TX_BYTES} — dropped the tip, sending via RPC only (${size} bytes)`);
+  }
+  if (size > MAX_TX_BYTES) {
+    throw new Error(`${label}: transaction is ${size} bytes, over the ${MAX_TX_BYTES}-byte limit even without the Sender tip — not signed or sent`);
+  }
 
   const estimated = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
   // Fall back to a sane default rather than sending with no priority fee, and
   // floor the price (see basePriorityPrice).
-  let microLamports = basePriorityPrice(estimated);
-
-  const { blockhash, lastValidBlockHeight } = await getConnection().getLatestBlockhash("confirmed");
-  tx.recentBlockhash = blockhash;
-  tx.lastValidBlockHeight = lastValidBlockHeight;
-  tx.feePayer = feePayer;
+  const baseMicroLamports = basePriorityPrice(estimated);
 
   // Compute-unit limit. Each InitializeBinArray costs ~200k CU, so the old 400k
   // default could run out mid-tx; a blanket 1.4M fixed that but hurt landing
   // (a tx reserving 1.4M CU is hard to pack next to a busy pool's per-account CU
   // budget — live txs used ~29k of 1.4M and add-liquidity chunks kept expiring).
   // Simulate at the max to measure, then request 1.2× what it used. Skip if the
-  // SDK tx already set its own CU limit (discriminator 2).
-  const hasCuLimit = tx.instructions.some(
-    (ix) => ix.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 2,
-  );
-  let cuLimit = null;
-  if (!hasCuLimit) {
-    const maxCu = config.management.computeUnitLimit || 1_400_000;
-    cuLimit = maxCu;
-    const limitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: maxCu });
-    tx.instructions.unshift(limitIx);
+  // SDK tx already set its own CU limit.
+  let cuLimit = sdkLimit ?? maxCu;
+  if (sdkLimit == null) {
     const measured = await simulateComputeUnits(tx, label);
     if (measured) {
-      cuLimit = Math.min(maxCu, Math.max(50_000, Math.ceil(measured * 1.2)));
-      tx.instructions[0] = ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit });
+      cuLimit = Math.min(maxCu, Math.max(MIN_CU_LIMIT, Math.ceil(measured * 1.2)));
       log("priority_fee", `${label}: simulated ${measured} CU → limit ${cuLimit}`);
     }
+    setComputeBudgetIx(tx, isCuLimitIx, ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
   }
 
   // Cap the total priority fee per tx (price × CU limit) so an estimate spike
   // can't make one tx expensive.
-  const cuLimitForCap = cuLimit || config.management.computeUnitLimit || 1_400_000;
-  const priced = cappedPriorityPrice({ microLamports, cuLimit: cuLimitForCap });
+  const priced = cappedPriorityPrice({ microLamports: baseMicroLamports, cuLimit });
   if (priced.capped) {
-    log("priority_fee", `${label}: price ${microLamports} µL/CU capped to ${priced.maxMicroLamports} (max ${config.management.maxPriorityFeeLamports ?? 1_000_000} lamports/tx)`);
+    log("priority_fee", `${label}: price ${baseMicroLamports} µL/CU capped to ${priced.maxMicroLamports} (max ${config.management.maxPriorityFeeLamports ?? 1_000_000} lamports/tx)`);
   }
-  microLamports = priced.microLamports;
-  tx.instructions.unshift(
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports })
-  );
+  setComputeBudgetIx(tx, isCuPriceIx, ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priced.microLamports }));
+
+  feeState.set(tx, { cuLimit, baseMicroLamports, microLamports: priced.microLamports, sender: tipped });
   return tx;
+}
+
+/** Replace the (single) compute-budget instruction matching `match` in place. */
+function setComputeBudgetIx(tx, match, ix) {
+  const i = tx.instructions.findIndex(match);
+  if (i >= 0) tx.instructions[i] = ix;
+  else tx.instructions.unshift(ix);
 }
 
 /**
@@ -319,6 +364,8 @@ async function sendManagedTransaction(tx, signers, label) {
         blockhash: tx.recentBlockhash,
         lastValidBlockHeight: tx.lastValidBlockHeight,
         label,
+        // No tip (dropped by the size guard, or Sender disabled) → RPC only.
+        sender: feeState.get(tx)?.sender ?? false,
       });
       if (status?.err) {
         throw new SendTransactionError({
@@ -365,7 +412,7 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+setInterval(() => poolCache.clear(), 5 * 60 * 1000).unref?.(); // unref: never keeps a process (or test) alive on its own
 
 // ─── Get Active Bin ────────────────────────────────────────────
 export async function getActiveBin({ pool_address }) {
@@ -2261,3 +2308,12 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 export { applyPriorityFee as _applyPriorityFeeForTest };
 export { sendManagedTransaction as _sendManagedTransactionForTest };
 export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
+
+/**
+ * Test seam only: swap in a mock connection / wallet (pass null to restore the
+ * lazy defaults). Production code never calls this.
+ */
+export function _setDlmmTestDeps({ connection, wallet } = {}) {
+  if (connection !== undefined) _connection = connection;
+  if (wallet !== undefined) _wallet = wallet;
+}

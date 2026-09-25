@@ -7,6 +7,7 @@
  * Every function takes the connection explicitly: no module-level RPC state.
  */
 import { PublicKey, SystemProgram } from "@solana/web3.js";
+import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 
@@ -34,6 +35,30 @@ const TIP_ACCOUNT_SET = new Set(HELIUS_SENDER_TIP_ACCOUNTS);
 export const MAX_TX_BYTES = 1232;
 export const MAX_CU_LIMIT = 1_400_000;
 export const MIN_CU_LIMIT = 50_000;
+
+const shortVecLen = (n) => (n < 0x80 ? 1 : n < 0x4000 ? 2 : 3);
+
+/**
+ * Wire size in bytes of a legacy Transaction (signatures included), computed
+ * from the compiled message. tx.serialize()/serializeMessage() cannot be used
+ * to measure: web3.js throws once a tx passes 1232 bytes. Needs feePayer and
+ * recentBlockhash set.
+ */
+export function legacyTxSize(tx) {
+  const msg = tx.compileMessage();
+  const nSig = msg.header.numRequiredSignatures;
+  const nKeys = msg.accountKeys.length;
+  let size = shortVecLen(nSig) + 64 * nSig // signatures
+    + 3                                     // header
+    + shortVecLen(nKeys) + 32 * nKeys       // account keys
+    + 32                                    // recent blockhash
+    + shortVecLen(msg.instructions.length);
+  for (const ix of msg.instructions) {
+    const dataLen = bs58.decode(ix.data).length;
+    size += 1 + shortVecLen(ix.accounts.length) + ix.accounts.length + shortVecLen(dataLen) + dataLen;
+  }
+  return size;
+}
 
 export function heliusSenderEnabled() {
   return config.management.heliusSender !== false;
