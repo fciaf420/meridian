@@ -13,10 +13,69 @@
  * @param {Object} perfSummary - Performance summary
  * @returns {string} - Complete system prompt
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { config } from "./config.js";
 
 // ─── Section Override System (used by autoresearch) ──────────
 const _sectionOverrides = {};
+
+// ─── Concurrent A/B arm (used by autoresearch) ───────────────
+// While an experiment is active, screener runs alternate between the control
+// text (current override or default) and the candidate text. The arm is held
+// in async-local storage for the whole screener loop, so the prompt build and
+// any deploy_position inside that loop see the same arm, and concurrent loops
+// (management, chat) never inherit it.
+let _experiment = null; // { id, section, text }
+let _armCounter = 0;
+const _armStore = new AsyncLocalStorage();
+
+export function setExperimentCandidate(experiment) {
+  _experiment = experiment?.id && experiment?.section && typeof experiment?.text === "string"
+    ? { id: experiment.id, section: experiment.section, text: experiment.text }
+    : null;
+}
+
+export function clearExperimentCandidate() {
+  _experiment = null;
+}
+
+export function getExperimentCandidate() {
+  return _experiment ? { ..._experiment } : null;
+}
+
+/** The arm the next screener run will get (alternates control/candidate). */
+export function peekNextExperimentArm() {
+  return _armCounter % 2 === 0 ? "control" : "candidate";
+}
+
+/**
+ * Run a screener loop inside the next experiment arm. Without an active
+ * experiment it just calls fn(). Must be entered synchronously right after the
+ * goal text is built: getRangeSelectionText peeks the same arm.
+ */
+export function runWithExperimentArm(fn) {
+  if (!_experiment) return fn();
+  const arm = peekNextExperimentArm();
+  _armCounter++;
+  return _armStore.run({ experiment_id: _experiment.id, section: _experiment.section, arm }, fn);
+}
+
+/** { experiment_id, experiment_arm } for a deploy inside an experiment arm, else null. */
+export function getExperimentTag() {
+  const store = _armStore.getStore();
+  if (!store || !_experiment || store.experiment_id !== _experiment.id) return null;
+  return { experiment_id: store.experiment_id, experiment_arm: store.arm };
+}
+
+function _useCandidate(section, arm) {
+  return Boolean(_experiment && _experiment.section === section && arm === "candidate");
+}
+
+function _sectionText(section, fallback) {
+  const store = _armStore.getStore();
+  if (store?.experiment_id === _experiment?.id && _useCandidate(section, store?.arm)) return _experiment.text;
+  return _sectionOverrides[section] || fallback();
+}
 
 export function setPromptSectionOverride(section, text) {
   _sectionOverrides[section] = text;
@@ -35,6 +94,11 @@ export function getPromptSectionText(section) {
   // Return default section text
   const defaults = _getDefaultSections();
   return defaults[section] || null;
+}
+
+/** The built-in (non-overridden) template for a section, or null. */
+export function getDefaultPromptSectionText(section) {
+  return _getDefaultSections()[section] || null;
 }
 
 /**
@@ -63,9 +127,13 @@ export function getRangeSelectionText(deployAmount, currentBalanceSol) {
   Entry is only valid when token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend is green with price above Supertrend.
   If these entry checks are not satisfied, skip.`;
   }
-  if (_sectionOverrides.range_selection) {
+  // The range text is built into the goal just before the screener loop starts,
+  // so it uses the arm that loop is about to get.
+  const arm = _armStore.getStore()?.arm ?? peekNextExperimentArm();
+  const rangeText = _useCandidate("range_selection", arm) ? _experiment.text : _sectionOverrides.range_selection;
+  if (rangeText) {
     // Same placeholders the default template leaves literal in _getDefaultSections().
-    return fillSectionPlaceholders(_sectionOverrides.range_selection, {
+    return fillSectionPlaceholders(rangeText, {
       deployAmount,
       currentBalanceSol: currentBalanceSol ?? "?",
     });
@@ -207,7 +275,7 @@ dynamic_fee: The current VARIABLE (volatility) fee component ONLY — i.e. total
   // ═══════════════════════════════════════════════════════════════
 
   if (agentType === "SCREENER") {
-    const screenerCriteria = _sectionOverrides.screener_criteria || _defaultScreenerCriteria();
+    const screenerCriteria = _sectionText("screener_criteria", _defaultScreenerCriteria);
     prompt += `Role: SCREENER
 
 Your goal: Find high-yield, high-volume pools and DEPLOY capital.

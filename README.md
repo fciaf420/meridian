@@ -435,9 +435,11 @@ Everything in `user-config.json` is optional, but these are the main knobs.
 | `autoresearch` | enable prompt experiments |
 | `autoresearchModel` | model used for prompt edits |
 | `autoresearchReasoningEffort` | Codex reasoning effort for autoresearch |
-| `autoresearchMinCloses` | closes required per trial |
-| `autoresearchImprovementPct` | keep threshold |
-| `autoresearchDeclinePct` | revert threshold |
+| `autoresearchMinClosesPerArm` | closes needed in each A/B arm before a verdict (default 100) |
+| `autoresearchMinEffectPct` | minimum size-weighted mean PnL gain, in pp, to pass (default 1.5) |
+| `autoresearchMaxExperimentDays` | time cap; at the cap the result is inconclusive and the candidate is discarded (default 14) |
+| `autoresearchAutoKeep` | keep a passing candidate without operator approval (default false) |
+| `autoresearchMaxDiffPct` | reject candidates that change more than this % of the section's lines (default 30) |
 | `autoresearchCooldownCloses` | cooldown between experiments |
 
 ### Darwinian Weighting
@@ -476,30 +478,21 @@ Meridian can evolve screening thresholds from real performance and lesson histor
 
 ### Autoresearch
 
-Autoresearch is prompt optimization driven by real closes.
+Autoresearch is prompt optimization driven by real closes, inspired by karpathy/autoresearch. Live PnL is a noisy, non-stationary metric, so it runs as a concurrent A/B test and a human approves any change.
 
 It:
 
-1. waits until there is enough close history
-2. identifies the weakest prompt section
-3. proposes one targeted prompt change
-4. runs that change over later closes
-5. keeps, reverts, or discards it based on trial performance
+1. waits until there is enough close history, off the close path (never blocks a close)
+2. attributes recent losses to a prompt section that is active for the current strategy
+3. asks the generator for one small change, steered by the human-edited `autoresearch-program.md`
+4. rejects candidates that touch HARD RULE / HARD SKIP / MUST / NEVER lines or change too much
+5. alternates screener runs between the control text and the candidate, tagging each deploy with its arm
+6. after `autoresearchMinClosesPerArm` closes per arm, passes only if the bootstrap 95% CI of the size-weighted mean PnL difference is above 0 and the gain is at least `autoresearchMinEffectPct`
+7. turns a pass into a pending proposal for the operator (`/autoresearch approve | reject`), unless `autoresearchAutoKeep` is on
 
-Current section targets:
+Section targets: `screener_criteria`, plus `range_selection` when the strategy isn't `evil_panda`. `manager_logic` can't be split into concurrent arms, so it isn't targeted.
 
-- `screener_criteria`
-- `manager_logic`
-- `range_selection`
-
-Important safeguards:
-
-- it requires a minimum data gate before starting
-- if the first 3 trial closes are all losses, it reverts early
-- keep / revert uses a composite score based on win rate and average PnL
-- kept overrides persist across restarts in `autoresearch.json`
-
-Autoresearch is experimental. Results can be confounded if other adaptive systems, such as Darwinian weighting, also change behavior during the same evaluation window.
+Kept overrides persist in `autoresearch.json` and are applied only while autoresearch is enabled. `/autoresearch list | show | revert | restore` manage them from Telegram or the REPL. The legacy overrides from the pre-A/B loop are quarantined there.
 
 ## LP Agent and External Data
 

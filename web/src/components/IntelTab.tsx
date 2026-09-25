@@ -47,11 +47,25 @@ type ExperimentSummary = {
   } | null;
 };
 
+type OverrideView = {
+  section: string;
+  status: string;
+  applied: boolean;
+  text: string;
+  summary: string;
+  added: string[];
+  removed: string[];
+  stale: string[];
+  experiment_id?: string | null;
+  reason?: string | null;
+};
+
 type AutoresearchPayload = {
   enabled: boolean;
   cooldownRemaining: number;
   active: ExperimentSummary | null;
   keptOverrideSections: string[];
+  overrides?: { kept: OverrideView[]; quarantined: OverrideView[]; pending?: OverrideView | null };
   recentExperiments: ExperimentSummary[];
   recentLessons: LessonItem[];
 };
@@ -279,6 +293,24 @@ export default function IntelTab() {
                 <div className="mt-3 space-y-2 text-sm text-cream/84">
                   <div>Cooldown remaining: {data?.autoresearch.cooldownRemaining ?? 0}</div>
                   <div>Kept overrides: {(data?.autoresearch.keptOverrideSections || []).join(", ") || "none"}</div>
+                  {[...(data?.autoresearch.overrides?.pending ? [data.autoresearch.overrides.pending] : []), ...(data?.autoresearch.overrides?.kept || []), ...(data?.autoresearch.overrides?.quarantined || [])].map((o) => (
+                    <details key={`${o.status}-${o.section}`} className="rounded-xl border border-white/6 bg-black/10 px-3 py-2">
+                      <summary className="cursor-pointer text-sm">
+                        <span className="font-medium text-cream">{o.section}</span>{" "}
+                        <span className="text-ash/60">
+                          {o.status}
+                          {o.status === "kept" ? (o.applied ? " (applied)" : " (inactive)") : ""} · {o.summary}
+                        </span>
+                      </summary>
+                      {o.stale.length ? <div className="mt-2 text-xs text-amber-200/80">Stale: {o.stale.join("; ")}</div> : null}
+                      {o.reason ? <div className="mt-2 text-xs text-ash/60">{o.reason}</div> : null}
+                      <div className="mt-2 font-mono text-[11px] leading-5">
+                        {o.removed.map((l, i) => <div key={`r${i}`} className="text-red-300/80">- {l}</div>)}
+                        {o.added.map((l, i) => <div key={`a${i}`} className="text-emerald-300/80">+ {l}</div>)}
+                      </div>
+                      <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-[11px] text-cream/70">{o.text}</pre>
+                    </details>
+                  ))}
                   {data?.autoresearch.active ? (
                     <>
                       <Separator className="my-3" />
