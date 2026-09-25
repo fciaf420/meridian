@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "os";
 import path from "path";
 import OpenAI from "openai";
 import { log } from "./logger.js";
+import { codexFailureMessage, extractCodexJsonError, isBenignCodexItemError } from "./llm-health.js";
 
 const DEFAULT_PROVIDER = "codex";
 
@@ -182,7 +183,8 @@ function extractCodexMessage(output) {
           ? event.content
           : event.content.map((c) => c.text || "").join("\n");
       }
-      if (!lastStructuredError && event.type === "item.completed" && event.item?.type === "error" && event.item?.message) {
+      if (!lastStructuredError && event.type === "item.completed" && event.item?.type === "error" && event.item?.message
+        && !isBenignCodexItemError(event.item.message)) {
         lastStructuredError = event.item.message;
       }
     } catch {
@@ -191,6 +193,37 @@ function extractCodexMessage(output) {
   }
 
   return lastStructuredError || output.trim();
+}
+
+function hasCodexAgentMessage(output) {
+  return output.split(/\r?\n/).some((line) => {
+    try {
+      const event = JSON.parse(line);
+      return Boolean((event.type === "item.completed" && event.item?.type === "agent_message" && event.item?.text)
+        || (event.type === "message" && event.role === "assistant" && event.content));
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * Settle a finished `codex exec --json` run: { ok: true, content } or
+ * { ok: false, error }. The real cause of a failure (usage limit, auth, ...)
+ * is in the JSON stream; stderr mostly carries unrelated MCP-server noise
+ * from the user's own Codex setup (rmcp::transport), which is filtered out.
+ */
+export function settleCodexRun({ code, stdout = "", stderr = "" }) {
+  if (code !== 0) {
+    return { ok: false, error: codexFailureMessage({ stdout, stderr, code }) };
+  }
+  // Exit 0 with a failed turn and no agent message: report the failure instead
+  // of handing the error text to the caller as if it were the answer.
+  const turnError = extractCodexJsonError(stdout);
+  if (turnError && !hasCodexAgentMessage(stdout)) {
+    return { ok: false, error: turnError };
+  }
+  return { ok: true, content: extractCodexMessage(stdout) };
 }
 
 function killChildProcess(child) {
@@ -273,14 +306,13 @@ export function runCodexExec(model, prompt, {
       clearTimeout(killTimer);
       if (killed) return;
 
-      const output = stdoutChunks.join("");
-      const stderr = stderrChunks.join("").trim();
-      if (code !== 0) {
-        reject(new Error(stderr || extractCodexMessage(output) || `Codex CLI exited with code ${code}`));
-        return;
-      }
-
-      resolve(extractCodexMessage(output));
+      const settled = settleCodexRun({
+        code,
+        stdout: stdoutChunks.join(""),
+        stderr: stderrChunks.join("").trim(),
+      });
+      if (settled.ok) resolve(settled.content);
+      else reject(new Error(settled.error));
     });
 
     child.on("error", (err) => reject(err));
