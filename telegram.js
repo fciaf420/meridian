@@ -202,6 +202,8 @@ on("pnl_watcher_close", (data) => {
   const sign = (data.pnlPct || 0) >= 0 ? "+" : "";
   sendMessage(`⚡ PnL Watcher Auto-Close: ${data.pair}\n${data.reason}\nPnL: ${sign}${data.pnlPct?.toFixed(1)}%`).catch(() => {});
 });
-on("cycle:management", ({ report }) => { if (isEnabled()) sendMessage(`🔄 Management Cycle\n\n${report}`).catch(() => {}); });
+// Routine all-HOLD cycles (checked in code, nothing to do) are not sent — every
+// 5 min that is just noise. Cycles where the LLM ran, a rule fired, or it failed still are.
+on("cycle:management", ({ report, routine }) => { if (isEnabled() && !routine) sendMessage(`🔄 Management Cycle\n\n${report}`).catch(() => {}); });
 on("cycle:screening", ({ report }) => { if (isEnabled()) sendMessage(`🔍 Screening Cycle\n\n${report}`).catch(() => {}); });
 on("briefing", ({ html }) => { if (isEnabled()) sendHTML(html).catch(() => {}); });
