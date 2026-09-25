@@ -1,9 +1,18 @@
 /**
- * Autoresearch — automated prompt optimization system inspired by ATLAS.
+ * Autoresearch — automated prompt optimization, inspired by karpathy/autoresearch
+ * (an agent edits one thing, a fixed budget scores it, keep or discard, and a
+ * human-written program.md sets the direction).
  *
- * Identifies the worst-performing prompt section, generates a targeted
- * modification via a cheap LLM, tests it over N real closes, and
- * keeps/reverts based on actual PnL improvement.
+ * How it differs: live PnL is a noisy, non-stationary metric, not a fixed
+ * validation score, so each candidate runs as a concurrent A/B test against
+ * the current text and a human approves any winner.
+ *
+ * Flow: attribute recent losses to a prompt section that is active for the
+ * current strategy, ask the generator (steered by autoresearch-program.md) for
+ * one small edit, reject edits that touch protected lines or change too much,
+ * alternate screener runs between control and candidate, and after enough
+ * closes per arm, propose the candidate only if the bootstrap CI of the
+ * size-weighted PnL difference clears zero and the minimum effect.
  */
 
 import fs from "fs";

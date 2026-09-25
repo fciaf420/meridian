@@ -233,7 +233,7 @@ export const config = {
     meanReversionRate: u.darwinianMeanReversionRate ?? 0.02,
   },
 
-  // ─── Autoresearch (ATLAS-inspired prompt optimization) ─────
+  // ─── Autoresearch (prompt A/B experiments, after karpathy/autoresearch) ─────
   autoresearch: {
     enabled: u.autoresearch ?? false,
     // Concurrent A/B verdict: control vs candidate arms, size-weighted mean PnL,
