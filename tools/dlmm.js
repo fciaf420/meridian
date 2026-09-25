@@ -4,7 +4,6 @@ import {
   Keypair,
   PublicKey,
   SendTransactionError,
-  SystemProgram,
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
@@ -19,6 +18,7 @@ import {
   recordClose,
   updateTrackedPosition,
   getTrackedPosition,
+  getTrackedPositions,
   minutesOutOfRange,
   syncOpenPositions,
 } from "../state.js";
@@ -28,6 +28,18 @@ import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
+import {
+  heliusSenderEnabled,
+  buildSenderTipIx,
+  isSenderTipIx,
+  sendAndConfirmSigned,
+  basePriorityPrice,
+  cappedPriorityPrice,
+  legacyTxSize,
+  MAX_TX_BYTES,
+  MAX_CU_LIMIT,
+  MIN_CU_LIMIT,
+} from "./tx-send.js";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
@@ -135,78 +147,6 @@ async function estimatePriorityFeeMicroLamports(tx, feePayer, label = "tx") {
   }
 }
 
-// ─── Helius Sender ──────────────────────────────────────────────
-// Plain RPC sendTransaction is 1 tx/s on the Free plan, so sends and
-// rebroadcasts were being throttled and txs expired. Sender (0 credits,
-// 50 tx/s on every plan, staked/SWQoS routing) requires a SOL tip transfer to
-// one of these accounts plus a compute-unit price in every tx.
-// https://www.helius.dev/docs/sending-transactions/sender
-const HELIUS_SENDER_TIP_ACCOUNTS = [
-  "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
-  "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
-  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
-  "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
-  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
-  "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
-  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
-  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
-  "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
-  "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
-];
-
-function heliusSenderEnabled() {
-  return config.management.heliusSender !== false;
-}
-
-function heliusSenderUrl() {
-  // SWQoS-only route: 0.000005 SOL minimum tip (Sender Max needs 0.001 SOL).
-  return config.management.heliusSenderUrl || "https://sender.helius-rpc.com/fast?swqos_only=true";
-}
-
-function addSenderTip(tx, feePayer) {
-  const lamports = config.management.heliusSenderTipLamports ?? 5_000; // 0.000005 SOL
-  const to = HELIUS_SENDER_TIP_ACCOUNTS[Math.floor(Math.random() * HELIUS_SENDER_TIP_ACCOUNTS.length)];
-  tx.instructions.push(SystemProgram.transfer({ fromPubkey: feePayer, toPubkey: new PublicKey(to), lamports }));
-}
-
-/** POST signed bytes to Helius Sender. Resolves true on accept, false otherwise (never throws). */
-async function sendViaHeliusSender(wire, label) {
-  try {
-    const res = await fetch(heliusSenderUrl(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: `meridian-${Date.now()}`,
-        method: "sendTransaction",
-        params: [Buffer.from(wire).toString("base64"), { encoding: "base64", skipPreflight: true, maxRetries: 0 }],
-      }),
-    });
-    const data = await res.json().catch(() => null);
-    if (!res.ok || data?.error) {
-      log("tx_sender_warn", `${label}: Helius Sender rejected (${res.status}${data?.error ? ` ${data.error.message || JSON.stringify(data.error)}` : ""})`);
-      return false;
-    }
-    return true;
-  } catch (error) {
-    log("tx_sender_warn", `${label}: Helius Sender unreachable (${error.message})`);
-    return false;
-  }
-}
-
-/** Broadcast signed bytes: Sender first (fast path), RPC as a redundant path. */
-async function broadcastSigned(connection, wire, sendOpts, label, { rpc = true } = {}) {
-  const viaSender = heliusSenderEnabled() ? sendViaHeliusSender(wire, label) : Promise.resolve(false);
-  const viaRpc = rpc
-    ? connection.sendRawTransaction(wire, sendOpts).then(() => true, (e) => {
-        log("tx_rpc_warn", `${label}: RPC send failed (${e.message})`);
-        return false;
-      })
-    : Promise.resolve(false);
-  const [s, r] = await Promise.all([viaSender, viaRpc]);
-  if (!s && !r) throw new Error(`${label}: transaction was not accepted by Helius Sender or the RPC`);
-}
-
 /**
  * Which bin arrays covering [minBinId, maxBinId] are already initialized?
  * Returns { missing: number[], min, max } where [min, max] is the contiguous
@@ -246,62 +186,123 @@ async function initializedBinArrayWindow(pool, minBinId, maxBinId, activeBinId) 
   };
 }
 
+const isCuLimitIx = (ix) => ix?.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 2;
+const isCuPriceIx = (ix) => ix?.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 3;
+
+// Per-tx fee state set by applyPriorityFee: { cuLimit, baseMicroLamports,
+// microLamports, sender }. Its presence makes applyPriorityFee idempotent.
+const feeState = new WeakMap();
+
+/**
+ * Prepare a legacy tx for sending: Sender tip, CU limit, CU price, fresh
+ * blockhash, and a size check. Idempotent: calling it again on the same tx
+ * object never adds a second tip or compute-budget instruction.
+ *
+ * Size guard: the tip (+49 bytes) is only needed for Helius Sender. If the tx
+ * would exceed 1232 bytes with it, the tip is dropped and the tx goes out via
+ * the RPC only; if it is still too large, this throws before anything is signed.
+ */
 async function applyPriorityFee(tx, feePayer, label) {
   if (!tx?.instructions?.length) return tx;
-  if (heliusSenderEnabled()) addSenderTip(tx, feePayer);
+  if (feeState.has(tx)) return tx; // already prepared: never add a second tip / CU ix
 
-  const estimated = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
-  // Fall back to a sane default rather than sending with no priority fee, and
-  // floor the price: at the 10k Helius-"recommended" level, live deploy creates
-  // expired 3× in a row, while earlier txs at 50k landed in ~1s. With the CU
-  // limit sized by simulation, 50k µL/CU is still cheap (≈0.00004 SOL at 800k CU).
-  const floor = config.management.minPriorityFeeMicroLamports ?? 50_000;
-  let microLamports = Math.max(
-    estimated || (config.management.fallbackPriorityFeeMicroLamports || 50_000),
-    floor,
-  );
-
-  const { blockhash, lastValidBlockHeight } = await getConnection().getLatestBlockhash("confirmed");
+  const connection = getConnection();
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
   tx.recentBlockhash = blockhash;
   tx.lastValidBlockHeight = lastValidBlockHeight;
   tx.feePayer = feePayer;
+
+  // Sender tip, once (a tip already present is reused, never duplicated).
+  let tipped = tx.instructions.some(isSenderTipIx);
+  if (heliusSenderEnabled() && !tipped) {
+    tx.instructions.push(buildSenderTipIx(feePayer));
+    tipped = true;
+  }
+
+  // Put the compute-budget instructions in place now (their values don't
+  // change the size), so the size check below sees the final shape. Never a
+  // second one: an existing limit / price instruction is updated in place.
+  const maxCu = config.management.computeUnitLimit || MAX_CU_LIMIT;
+  const sdkLimitIx = tx.instructions.find(isCuLimitIx);
+  const sdkLimit = sdkLimitIx ? sdkLimitIx.data.readUInt32LE(1) : null;
+  if (!sdkLimitIx) tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitLimit({ units: maxCu }));
+  if (!tx.instructions.some(isCuPriceIx)) tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 0 }));
+
+  // ─── Size guard ───
+  let size = legacyTxSize(tx);
+  if (size > MAX_TX_BYTES && tipped) {
+    const withTip = size;
+    tx.instructions = tx.instructions.filter((ix) => !isSenderTipIx(ix));
+    tipped = false;
+    size = legacyTxSize(tx);
+    log("tx_size", `${label}: ${withTip} bytes with the Sender tip exceeds ${MAX_TX_BYTES} — dropped the tip, sending via RPC only (${size} bytes)`);
+  }
+  if (size > MAX_TX_BYTES) {
+    throw new Error(`${label}: transaction is ${size} bytes, over the ${MAX_TX_BYTES}-byte limit even without the Sender tip — not signed or sent`);
+  }
+
+  const estimated = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
+  // Fall back to a sane default rather than sending with no priority fee, and
+  // floor the price (see basePriorityPrice).
+  const baseMicroLamports = basePriorityPrice(estimated);
 
   // Compute-unit limit. Each InitializeBinArray costs ~200k CU, so the old 400k
   // default could run out mid-tx; a blanket 1.4M fixed that but hurt landing
   // (a tx reserving 1.4M CU is hard to pack next to a busy pool's per-account CU
   // budget — live txs used ~29k of 1.4M and add-liquidity chunks kept expiring).
-  // Simulate at the max to measure, then request 1.2× what it used. Skip if the
-  // SDK tx already set its own CU limit (discriminator 2).
-  const hasCuLimit = tx.instructions.some(
-    (ix) => ix.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 2,
-  );
-  let cuLimit = null;
-  if (!hasCuLimit) {
-    const maxCu = config.management.computeUnitLimit || 1_400_000;
-    cuLimit = maxCu;
-    const limitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: maxCu });
-    tx.instructions.unshift(limitIx);
-    const measured = await simulateComputeUnits(tx, label);
-    if (measured) {
-      cuLimit = Math.min(maxCu, Math.max(50_000, Math.ceil(measured * 1.2)));
-      tx.instructions[0] = ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit });
-      log("priority_fee", `${label}: simulated ${measured} CU → limit ${cuLimit}`);
-    }
+  // ALWAYS simulate at the max to measure, then request 1.2× what it used,
+  // clamped to [50k, 1.4M]. When the SDK already set a limit, keep the lower
+  // of the two: createExtendedEmptyPosition reserves 30k × bins (1.4M for a
+  // wide range, ~29k used) and the SDK's own estimator falls back to 1.4M when
+  // its simulation throws, while e.g. removeLiquidity's sim+30% may be lower.
+  setComputeBudgetIx(tx, isCuLimitIx, ComputeBudgetProgram.setComputeUnitLimit({ units: maxCu }));
+  const measured = await simulateComputeUnits(tx, label);
+  let cuLimit = sdkLimit ?? maxCu;
+  if (measured) {
+    const sized = Math.min(maxCu, Math.max(MIN_CU_LIMIT, Math.ceil(measured * 1.2)));
+    cuLimit = sdkLimit != null ? Math.min(sdkLimit, sized) : sized;
+    log("priority_fee", `${label}: simulated ${measured} CU → limit ${cuLimit}${sdkLimit != null ? ` (SDK set ${sdkLimit}${cuLimit < sdkLimit ? ", replaced" : ", kept"})` : ""}`);
   }
+  setComputeBudgetIx(tx, isCuLimitIx, ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
 
   // Cap the total priority fee per tx (price × CU limit) so an estimate spike
   // can't make one tx expensive.
-  const cuLimitForCap = cuLimit || config.management.computeUnitLimit || 1_400_000;
-  const maxFeeLamports = config.management.maxPriorityFeeLamports ?? 1_000_000; // 0.001 SOL
-  const maxMicroLamports = Math.floor((maxFeeLamports * 1_000_000) / cuLimitForCap);
-  if (microLamports > maxMicroLamports) {
-    log("priority_fee", `${label}: price ${microLamports} µL/CU capped to ${maxMicroLamports} (max ${maxFeeLamports} lamports/tx)`);
-    microLamports = maxMicroLamports;
+  const priced = cappedPriorityPrice({ microLamports: baseMicroLamports, cuLimit });
+  if (priced.capped) {
+    log("priority_fee", `${label}: price ${baseMicroLamports} µL/CU capped to ${priced.maxMicroLamports} (max ${config.management.maxPriorityFeeLamports ?? 1_000_000} lamports/tx)`);
   }
-  tx.instructions.unshift(
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports })
-  );
+  setComputeBudgetIx(tx, isCuPriceIx, ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priced.microLamports }));
+
+  feeState.set(tx, { cuLimit, baseMicroLamports, microLamports: priced.microLamports, sender: tipped });
   return tx;
+}
+
+/**
+ * Expiry retry N (1-based) pays base × priorityFeeRetryMultiplier^N µL/CU
+ * (×2 per retry by default), still capped so price × CU limit stays within
+ * maxPriorityFeeLamports. The price instruction is replaced in place (same
+ * size). No-op for a tx applyPriorityFee didn't prepare.
+ */
+function escalatePriorityFee(tx, attempt, label) {
+  const st = feeState.get(tx);
+  if (!st || attempt <= 0) return;
+  const factor = config.management.priorityFeeRetryMultiplier ?? 2;
+  const wanted = Math.ceil(st.baseMicroLamports * Math.pow(factor, attempt));
+  const priced = cappedPriorityPrice({ microLamports: wanted, cuLimit: st.cuLimit });
+  if (priced.microLamports === st.microLamports) {
+    if (priced.capped) log("tx_retry", `${label}: CU price stays ${st.microLamports} µL/CU (at the ${config.management.maxPriorityFeeLamports ?? 1_000_000}-lamport cap)`);
+    return;
+  }
+  log("tx_retry", `${label}: CU price ${st.microLamports} → ${priced.microLamports} µL/CU for retry ${attempt + 1}/3${priced.capped ? " (capped)" : ""}`);
+  setComputeBudgetIx(tx, isCuPriceIx, ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priced.microLamports }));
+  st.microLamports = priced.microLamports;
+}
+
+/** Replace the (single) compute-budget instruction matching `match` in place. */
+function setComputeBudgetIx(tx, match, ix) {
+  const i = tx.instructions.findIndex(match);
+  if (i >= 0) tx.instructions[i] = ix;
+  else tx.instructions.unshift(ix);
 }
 
 /**
@@ -325,7 +326,14 @@ async function simulateComputeUnits(tx, label) {
   }
 }
 
-async function sendManagedTransaction(tx, signers, label) {
+/**
+ * @param {object} [opts]
+ * @param {() => Promise<boolean>} [opts.beforeResend] Called before any
+ *   re-sign/resend after an expiry, once the prior signature is known not to
+ *   have landed. Return true only when resending is verified safe (e.g. the
+ *   chunk's bins are still empty on-chain); anything else aborts the resend.
+ */
+async function sendManagedTransaction(tx, signers, label, { beforeResend } = {}) {
   const feePayer = signers?.[0]?.publicKey;
   await applyPriorityFee(tx, feePayer, label);
   let lastError = null;
@@ -358,6 +366,18 @@ async function sendManagedTransaction(tx, signers, label) {
           await new Promise((r) => setTimeout(r, 1500));
         }
 
+        if (beforeResend) {
+          let safe = false;
+          try { safe = (await beforeResend()) === true; } catch (checkErr) {
+            log("tx_retry", `${label}: resend check failed (${checkErr?.message || checkErr})`);
+          }
+          if (!safe) {
+            const abort = new Error(`${label}: not resending after expiry — could not verify on-chain that it is safe to resend (prior error: ${lastError?.message || "expired"})`);
+            abort.noRetry = true;
+            throw abort;
+          }
+        }
+
         lastSig = null;
       }
 
@@ -368,6 +388,7 @@ async function sendManagedTransaction(tx, signers, label) {
       // from one derived beforehand — and the double-submit guard above would
       // check the wrong signature.
       const connection = getConnection();
+      if (attempt > 0) escalatePriorityFee(tx, attempt, label);
       if (attempt > 0 || !tx.recentBlockhash || tx.lastValidBlockHeight == null) {
         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
         tx.recentBlockhash = blockhash;
@@ -379,31 +400,18 @@ async function sendManagedTransaction(tx, signers, label) {
       const signature = bs58.encode(tx.signature);
       lastSig = signature;
 
+      // Broadcast, then rebroadcast the SAME signed bytes every 2s until
+      // confirmed or expired (a single send is often dropped under load).
       const wire = tx.serialize();
-      const sendOpts = { skipPreflight: true, preflightCommitment: "confirmed", maxRetries: 0 };
-      await broadcastSigned(connection, wire, sendOpts, label);
-      // Rebroadcast the SAME signed bytes every 2s until confirmed or expired.
-      // A single send is often dropped under load and nothing re-sent it before
-      // the blockhash expired ("block height exceeded"). Identical bytes = same
-      // signature, so a rebroadcast can never double-execute. Rebroadcasts go to
-      // Sender only (RPC sendTransaction is rate-limited to 1/s on the Free plan).
-      const rebroadcastMs = config.management.txRebroadcastMs ?? 2_000;
-      const rebroadcast = setInterval(() => {
-        (heliusSenderEnabled()
-          ? sendViaHeliusSender(wire, label)
-          : connection.sendRawTransaction(wire, sendOpts)
-        ).catch(() => { /* best-effort; confirm decides */ });
-      }, rebroadcastMs);
-      let status;
-      try {
-        status = (await connection.confirmTransaction({
-          signature,
-          blockhash: tx.recentBlockhash,
-          lastValidBlockHeight: tx.lastValidBlockHeight,
-        }, "confirmed")).value;
-      } finally {
-        clearInterval(rebroadcast);
-      }
+      const status = await sendAndConfirmSigned(connection, {
+        wire,
+        signature,
+        blockhash: tx.recentBlockhash,
+        lastValidBlockHeight: tx.lastValidBlockHeight,
+        label,
+        // No tip (dropped by the size guard, or Sender disabled) → RPC only.
+        sender: feeState.get(tx)?.sender ?? false,
+      });
       if (status?.err) {
         throw new SendTransactionError({
           action: "send",
@@ -424,7 +432,7 @@ async function sendManagedTransaction(tx, signers, label) {
         /blockhash not found/i.test(message) ||
         /transaction expired/i.test(message);
 
-      if (!retryableExpiry || attempt === 2) {
+      if (error?.noRetry || !retryableExpiry || attempt === 2) {
         throw error;
       }
 
@@ -449,7 +457,7 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000).unref?.(); // unref: never keeps a test/CLI process alive
+setInterval(() => poolCache.clear(), 5 * 60 * 1000).unref?.(); // unref: never keeps a process (or test) alive on its own
 
 // ─── Get Active Bin ────────────────────────────────────────────
 export async function getActiveBin({ pool_address }) {
@@ -829,9 +837,14 @@ export async function deployPosition({
     return dryRunResult;
   }
 
-  const { StrategyType } = await getDLMM();
+  const { DLMM, StrategyType } = await getDLMM();
   const wallet = getWallet();
-  const pool = await getPool(pool_address);
+  // A private, freshly loaded instance rather than the shared poolCache entry:
+  // the SDK builds the deposit from pool.lbPair.activeId, and a cached instance
+  // is up to 5 min stale — and could be refetched by another flow between our
+  // range computation and the build.
+  const pool = await DLMM.create(getConnection(), new PublicKey(pool_address));
+  const activeIdAtLoad = pool.lbPair.activeId;
   // Deploys fund the Y side with SOL (both SOL and USDC mode swap to SOL first),
   // so a pool whose token Y isn't wrapped SOL would be funded with the wrong token.
   const tokenYMint = pool.lbPair?.tokenYMint?.toBase58?.() ?? String(pool.lbPair?.tokenYMint ?? "");
@@ -852,7 +865,6 @@ export async function deployPosition({
     }
     for (const note of entry.notes || []) log("deploy", `Entry check: ${note}`);
   }
-  const activeBin = await pool.getActiveBin();
   resolvedBinStep ||= pool.lbPair?.binStep ?? pool.lbPair?.bin_step ?? null;
 
   // ─── Auto-swap SOL → base token for two-sided spot ────────────
@@ -922,6 +934,18 @@ export async function deployPosition({
         };
       }
     }
+  }
+
+  // ─── Fresh active bin, one snapshot for range AND build ────────
+  // initializePositionAndAddLiquidityByStrategy (≤69 bins) anchors the deposit
+  // and its bin-slippage check to this.lbPair.activeId, which getActiveBin()
+  // does NOT refresh. Refetch right before computing the range (this is also
+  // after any auto-swap, which can move this very pool) and derive the range
+  // from pool.lbPair.activeId, so the range and the SDK build share one state.
+  await pool.refetchStates();
+  const activeBin = { binId: pool.lbPair.activeId };
+  if (activeBin.binId !== activeIdAtLoad) {
+    log("deploy", `Active bin moved ${activeIdAtLoad} → ${activeBin.binId} since pool load${needsAutoSwap ? " (after auto-swap)" : ""}; using the fresh bin`);
   }
 
   // Range calculation
@@ -1088,10 +1112,46 @@ export async function deployPosition({
           slippage: 10, // 10%
         });
         const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
-        for (let i = 0; i < addTxArray.length; i++) {
-          const txHash = await sendManagedTransaction(addTxArray[i], [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`);
-          txHashes.push(txHash);
-          log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+        const { chunkBinRange } = await import("@meteora-ag/dlmm");
+        const chunkRanges = chunkBinRange(minBinId, maxBinId);
+        if (chunkRanges.length !== addTxArray.length) {
+          // Unexpected SDK chunking: can't map txs to bins for reconcile, so
+          // keep the old one-at-a-time behaviour.
+          log("deploy_warn", `SDK returned ${addTxArray.length} add txs for ${chunkRanges.length} bin chunks — sending sequentially`);
+          for (let i = 0; i < addTxArray.length; i++) {
+            const txHash = await sendManagedTransaction(addTxArray[i], [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`);
+            txHashes.push(txHash);
+            log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+          }
+        } else {
+          // The chunkable builder makes self-contained txs for parallel use
+          // (NoShrink modes, own ATA/wrap, own bin-array inits). Read-only
+          // simulation confirmed they don't conflict: initialize_bin_array and
+          // the bitmap-extension init both succeed on an already-initialized
+          // account, and each chunk is valid in any order. So send them all at
+          // once (each signed once, with its own rebroadcast + confirm): one
+          // confirmation window instead of N, and every chunk is priced off
+          // the same activeId.
+          const readFunded = () => readChunkFunding(pool, newPosition.publicKey, chunkRanges);
+          const results = await Promise.allSettled(addTxArray.map((tx, i) =>
+            sendManagedTransaction(tx, [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`, {
+              // Resend only if this chunk's bins are verified still empty.
+              beforeResend: async () => (await readFunded())?.[i] === false,
+            })));
+          // Reconcile against the position on-chain, never against send
+          // results alone: a "failed" chunk may have landed.
+          const funded = await readFunded();
+          const rec = reconcileChunkResults(results, funded);
+          for (const i of rec.landed) {
+            const r = results[i];
+            if (r.status === "fulfilled") txHashes.push(r.value);
+            log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${r.status === "fulfilled" ? r.value : "confirm failed but its bins are funded on-chain"}`);
+          }
+          if (rec.failed.length || rec.unknown.length) {
+            const why = [...rec.failed, ...rec.unknown].sort((a, b) => a - b)
+              .map((i) => `chunk ${i + 1}/${addTxArray.length} (bins ${chunkRanges[i].lowerBinId}..${chunkRanges[i].upperBinId}) ${rec.failed.includes(i) ? "empty on-chain" : "unverified"}: ${results[i].reason?.message || results[i].reason}`);
+            throw new Error(`${rec.failed.length + rec.unknown.length}/${addTxArray.length} add-liquidity chunk(s) did not land — ${why.join("; ")}`);
+          }
         }
       } catch (liqErr) {
         // Liquidity add failed partway. Earlier chunks may already have landed
@@ -1481,6 +1541,92 @@ export async function getPositionPnl({ pool_address, position_address }) {
   }
 }
 
+// ─── Position account discovery ────────────────────────────────
+// The PnL watcher refreshes positions every 30s. A full getProgramAccounts
+// on the DLMM program (no discriminator filter, full ~8 KB+ PositionV2 data)
+// every tick was the bot's most expensive RPC call. Now each refresh is one
+// getMultipleAccountsInfo over the positions we already know (tracked open +
+// last scan), sliced to the 72-byte header, and the filtered scan that finds
+// untracked positions runs at most every 5 minutes.
+const DLMM_PROGRAM_ID = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+// Anchor discriminator of the PositionV2 account (IDL). LimitOrder accounts
+// share the lb_pair@8 / owner@40 layout but have a different discriminator.
+const POSITION_V2_DISCRIMINATOR = Buffer.from("75b0d4c7f5b485b6", "hex");
+const POSITION_HEAD_LEN = 72; // discriminator(8) + lb_pair(32) + owner(32)
+const POSITION_DISCOVERY_INTERVAL_MS = 5 * 60_000;
+let _knownPositionAccounts = new Map(); // position → lb_pair, from the last discovery scan
+let _lastPositionDiscoveryAt = 0;
+
+function positionAccountFilters(owner) {
+  return [
+    { memcmp: { offset: 0, bytes: bs58.encode(POSITION_V2_DISCRIMINATOR) } },
+    { memcmp: { offset: 40, bytes: owner.toBase58() } },
+  ];
+}
+
+/** lb_pair of a PositionV2 account owned by `owner`, or null (closed / not a position / not ours). */
+function positionHeadPool(info, owner) {
+  if (!info?.data || !info.owner?.equals?.(DLMM_PROGRAM_ID)) return null;
+  const d = Buffer.from(info.data);
+  if (d.length < POSITION_HEAD_LEN) return null;
+  if (!d.subarray(0, 8).equals(POSITION_V2_DISCRIMINATOR)) return null;
+  if (!d.subarray(40, 72).equals(owner.toBuffer())) return null;
+  return new PublicKey(d.subarray(8, 40)).toBase58();
+}
+
+/**
+ * The wallet's open DLMM position accounts → [{ position, pool }].
+ * @param {PublicKey} owner
+ * @param {object} [opts]
+ * @param {boolean} [opts.discover] force the filtered getProgramAccounts scan
+ * @param {string[]} [opts.trackedOpen] tracked open positions (default: state.json)
+ * @param {number} [opts.now]
+ */
+async function listPositionAccounts(owner, { discover = false, trackedOpen = null, now = Date.now() } = {}) {
+  const connection = getConnection();
+  if (discover || now - _lastPositionDiscoveryAt >= POSITION_DISCOVERY_INTERVAL_MS) {
+    const accs = await connection.getProgramAccounts(DLMM_PROGRAM_ID, {
+      filters: positionAccountFilters(owner),
+      dataSlice: { offset: 0, length: POSITION_HEAD_LEN },
+    });
+    const found = new Map();
+    for (const a of accs) {
+      const pool = positionHeadPool({ owner: DLMM_PROGRAM_ID, data: a.account.data }, owner);
+      if (pool) found.set(a.pubkey.toBase58(), pool);
+    }
+    _knownPositionAccounts = found;
+    _lastPositionDiscoveryAt = now;
+    return [...found].map(([position, pool]) => ({ position, pool }));
+  }
+
+  const tracked = trackedOpen ?? getTrackedPositions(true).map((p) => p.position);
+  const keys = [...new Set([...tracked, ..._knownPositionAccounts.keys()])];
+  if (keys.length === 0) return [];
+  const infos = [];
+  for (let i = 0; i < keys.length; i += 100) { // getMultipleAccounts takes ≤100 keys
+    const batch = keys.slice(i, i + 100).map((k) => new PublicKey(k));
+    infos.push(...await connection.getMultipleAccountsInfo(batch, { dataSlice: { offset: 0, length: POSITION_HEAD_LEN } }));
+  }
+  const out = [];
+  keys.forEach((position, i) => {
+    const pool = positionHeadPool(infos[i], owner);
+    if (pool) {
+      out.push({ position, pool });
+      _knownPositionAccounts.set(position, pool);
+    } else {
+      _knownPositionAccounts.delete(position); // closed, or not a position of ours
+    }
+  });
+  return out;
+}
+
+/** Test seam: forget discovery state so the next call scans (or not, with `at`). */
+export function _resetPositionDiscoveryForTest({ at = 0, known = [] } = {}) {
+  _lastPositionDiscoveryAt = at;
+  _knownPositionAccounts = new Map(known);
+}
+export { listPositionAccounts as _listPositionAccountsForTest };
+
 // ─── Get My Positions ──────────────────────────────────────────
 export async function getMyPositions({ force = false } = {}) {
   if (!force && _positionsCache && Date.now() - _positionsCacheAt < POSITIONS_CACHE_TTL) {
@@ -1497,22 +1643,13 @@ export async function getMyPositions({ force = false } = {}) {
   }
 
   _positionsInflight = (async () => { try {
-    log("positions", "Scanning positions via getProgramAccounts...");
-    const DLMM_PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
     const walletPubkey = new PublicKey(walletAddress);
-
-    // Owner field sits at offset 40 (8 discriminator + 32 lb_pair)
-    const accounts = await getConnection().getProgramAccounts(DLMM_PROGRAM, {
-      filters: [{ memcmp: { offset: 40, bytes: walletPubkey.toBase58() } }],
-    });
-
+    const accounts = await listPositionAccounts(walletPubkey);
     log("positions", `Found ${accounts.length} position account(s)`);
 
     // Collect raw (pool, position) pairs
     const raw = [];
-    for (const acc of accounts) {
-      const positionAddress = acc.pubkey.toBase58();
-      const lbPairKey = new PublicKey(acc.account.data.slice(8, 40)).toBase58();
+    for (const { position: positionAddress, pool: lbPairKey } of accounts) {
       // Pair name: use tracked state pool_name if available
       const tracked = getTrackedPosition(positionAddress);
       const pair = tracked?.pool_name || lbPairKey.slice(0, 8);
@@ -1793,7 +1930,8 @@ export async function getWalletPositions({ wallet_address }) {
     const DLMM_PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 
     const accounts = await getConnection().getProgramAccounts(DLMM_PROGRAM, {
-      filters: [{ memcmp: { offset: 40, bytes: new PublicKey(wallet_address).toBase58() } }],
+      filters: positionAccountFilters(new PublicKey(wallet_address)),
+      dataSlice: { offset: 0, length: POSITION_HEAD_LEN },
     });
 
     if (accounts.length === 0) {
@@ -1969,12 +2107,14 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     let pnlPct = _pnlOverride?.pnl_pct ?? null;
     let finalValueUsd = _pnlOverride?.total_value_usd ?? 0;
     let feesUsd = 0;
+    let unclaimedFeesUsd = null; // USD value of the fees the remove txs will claim (null = unknown)
     const trackedPre = getTrackedPosition(position_address);
     feesUsd = trackedPre?.total_fees_claimed_usd || 0;
 
     if (_pnlOverride) {
       // PnL watcher already gave us accurate numbers at the moment it decided to close
       feesUsd = (_pnlOverride.collected_fees_usd || 0) + (_pnlOverride.unclaimed_fees_usd || 0) || feesUsd;
+      unclaimedFeesUsd = _pnlOverride.unclaimed_fees_usd ?? null;
       log("close", `Using PnL override from watcher: ${pnlPct}% ($${pnlUsd})`);
     } else {
       // No override — snapshot from cache or fresh API
@@ -1984,6 +2124,7 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         pnlPct        = cachedPos.pnl_pct   ?? null;
         finalValueUsd = cachedPos.total_value_usd ?? 0;
         feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
+        unclaimedFeesUsd = cachedPos.unclaimed_fees_usd ?? null;
       }
       if (pnlPct == null) {
       // No cache, or cached PnL was unknown — fetch fresh from API while position is still open
@@ -1994,6 +2135,7 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
           pnlPct        = freshPnl.pnl_pct;
           finalValueUsd = freshPnl.current_value_usd ?? 0;
           feesUsd       = (freshPnl.all_time_fees_usd || 0) + (freshPnl.unclaimed_fee_usd || 0);
+          unclaimedFeesUsd = freshPnl.unclaimed_fee_usd ?? null;
         }
       } catch (e) {
         log("close_warn", `Could not snapshot PnL before close: ${e.message}`);
@@ -2003,28 +2145,22 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
 
     const txHashes = [];
 
-    // ─── Step 1: Claim Fees (to clear account state) ───────────
-    try {
-      log("close", `Step 1: Claiming fees for ${position_address}`);
-      const claimTxs = await pool.claimSwapFee({
-        owner: wallet.publicKey,
-        position: positionData,
-      });
-      for (const tx of Array.isArray(claimTxs) ? claimTxs : [claimTxs]) {
-        const claimHash = await sendManagedTransaction(tx, [wallet], "close claim fees");
-        txHashes.push(claimHash);
-      }
-      log("close", `Step 1 OK: ${txHashes.join(", ")}`);
-    } catch (e) {
-      log("close_warn", `Step 1 (Claim) failed or nothing to claim: ${e.message}`);
+    // ─── Unclaimed fees, read BEFORE removal ───────────────────
+    // There is no separate claim pass: removeLiquidity({ shouldClaimAndClose })
+    // puts claimFee2 (+ claimReward2 per farm reward) and closePositionIfEmpty
+    // in every chunk, so a claim tx first only duplicated work (one extra tx
+    // per 70 bins, each paying fees and able to expire). The amounts the remove
+    // txs claim are read from the position data now, while it still holds them.
+    // PnL / fees_earned_usd come from the snapshot above (taken before any tx)
+    // and the post-close swap uses the pre-close balance delta, which includes
+    // the claimed X fees, so neither depended on the old claim pass.
+    const claimedAtClose = readUnclaimedFees(pool, positionData);
+    if (claimedAtClose) {
+      log("close", `Unclaimed fees claimed by the remove txs: X=${claimedAtClose.x} Y=${claimedAtClose.y}${unclaimedFeesUsd != null ? ` (~$${Number(unclaimedFeesUsd).toFixed(2)})` : ""}`);
     }
 
-    // Refresh pool state after the claim txs so removeLiquidity (Step 2) operates
-    // on fresh on-chain state rather than the pre-claim snapshot.
-    try { await pool.refetchStates(); } catch { /* best-effort */ }
-
-    // ─── Step 2: Remove Liquidity & Close ──────────────────────
-    log("close", `Step 2: Removing liquidity and closing account`);
+    // ─── Remove Liquidity, claim fees & rewards, close ─────────
+    log("close", `Removing liquidity, claiming fees and closing account`);
     try {
       const closeTx = await pool.removeLiquidity({
         user: wallet.publicKey,
@@ -2035,9 +2171,24 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         shouldClaimAndClose: true,
       });
 
-      for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendManagedTransaction(tx, [wallet], "close remove liquidity");
-        txHashes.push(txHash);
+      // Remove chunks cover disjoint bin ranges and each ends with
+      // closePositionIfEmpty (a no-op until the position is empty), so the
+      // last one to land closes the account. Simulation confirmed each is
+      // valid in any order, so send them concurrently. The account-gone check
+      // below still decides success.
+      const removeTxs = Array.isArray(closeTx) ? closeTx : [closeTx];
+      const results = await Promise.allSettled(removeTxs.map((tx, i) =>
+        sendManagedTransaction(tx, [wallet], `close remove liquidity ${i + 1}/${removeTxs.length}`)));
+      for (const r of results) if (r.status === "fulfilled") txHashes.push(r.value);
+      const failed = results.filter((r) => r.status === "rejected");
+      if (failed.length) {
+        const gone = (await getConnection().getAccountInfo(positionPubKey).catch(() => undefined)) === null;
+        if (!gone) {
+          // Not closed: fail this attempt (no blind resend). The next close
+          // rebuilds from on-chain state, so it only removes what is left.
+          throw new Error(`${failed.length}/${removeTxs.length} remove-liquidity tx(s) failed: ${failed.map((r) => r.reason?.message || r.reason).join("; ")}`);
+        }
+        log("close_warn", `${failed.length}/${removeTxs.length} remove tx(s) reported failure but the position account is closed`);
       }
     } catch (removeErr) {
       // Zombie position: liquidity was already removed in a previous attempt
@@ -2053,30 +2204,39 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
       // a still-funded account would strand or burn the funds. Best-effort: if the
       // verification itself cannot run, fall back to the prior (error-text) behavior.
       let verifiedEmpty = null; // null => could not verify
+      let feesOnly = false;     // no liquidity left, but unclaimed fees/rewards remain
       let freshPositionData = positionData;
-      try {
+      const readZombieState = async () => {
         try { await pool.refetchStates(); } catch { /* best-effort */ }
         freshPositionData = await pool.getPosition(positionPubKey);
         const pd = freshPositionData?.positionData || {};
         const binData = pd.positionBinData || [];
         const num = (v) => { const n = Number(v ?? 0); return Number.isFinite(n) ? n : 0; };
-        const totalX = num(pd.totalXAmount);
-        const totalY = num(pd.totalYAmount);
-        const feeX = num(pd.feeX);
-        const feeY = num(pd.feeY);
-        const rwd1 = num(pd.rewardOne);
-        const rwd2 = num(pd.rewardTwo);
-        const binLiquidity = binData.some(
-          (b) => num(b.positionXAmount) > 0 || num(b.positionYAmount) > 0,
-        );
-        verifiedEmpty =
-          totalX === 0 && totalY === 0 &&
-          feeX === 0 && feeY === 0 &&
-          rwd1 === 0 && rwd2 === 0 &&
-          !binLiquidity;
+        const liquidity = num(pd.totalXAmount) > 0 || num(pd.totalYAmount) > 0 ||
+          binData.some((b) => num(b.positionXAmount) > 0 || num(b.positionYAmount) > 0);
+        const feesOrRewards = num(pd.feeX) > 0 || num(pd.feeY) > 0 || num(pd.rewardOne) > 0 || num(pd.rewardTwo) > 0;
+        return { liquidity, feesOrRewards };
+      };
+      try {
+        const st = await readZombieState();
+        verifiedEmpty = !st.liquidity && !st.feesOrRewards;
+        feesOnly = !st.liquidity && st.feesOrRewards;
       } catch (verifyErr) {
         verifiedEmpty = null; // verification unavailable — keep prior behavior
         log("close_warn", `Zombie-empty verification could not run: ${verifyErr.message}`);
+      }
+
+      if (feesOnly) {
+        // No liquidity left but fees/rewards still owed: closePositionIfEmpty
+        // would be a no-op. Claim them (the only case that still needs a
+        // separate claim), then re-verify before closing.
+        log("close", `Zombie position has no liquidity but unclaimed fees/rewards — claiming before close`);
+        const claimTxs = await pool.claimAllRewardsByPosition({ owner: wallet.publicKey, position: freshPositionData });
+        for (const tx of Array.isArray(claimTxs) ? claimTxs : [claimTxs]) {
+          txHashes.push(await sendManagedTransaction(tx, [wallet], "close zombie claim"));
+        }
+        const st = await readZombieState();
+        verifiedEmpty = !st.liquidity && !st.feesOrRewards;
       }
 
       if (verifiedEmpty === false) {
@@ -2126,6 +2286,7 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     const tracked = getTrackedPosition(position_address);
     const oorDir = tracked?.oor_direction || null;
     const closeReason = oorDir ? `agent decision (OOR ${oorDir})` : "agent decision";
+    if (claimedAtClose) recordClaim(position_address, unclaimedFeesUsd ?? undefined);
     recordClose(position_address, closeReason);
     if (tracked) {
       const deployedAt = new Date(tracked.deployed_at).getTime();
@@ -2293,6 +2454,7 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         txs: txHashes,
         pnl_usd: pnlUsd,
         pnl_pct: pnlPct,
+        ...(claimedAtClose && { claimed_fees: { ...claimedAtClose, usd: unclaimedFeesUsd } }),
         ...(swapOutcome && { swap: swapOutcome }),
       };
     }
@@ -2311,6 +2473,71 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────
+/**
+ * Per-chunk funding of a position, read on-chain in one call: for each
+ * { lowerBinId, upperBinId } range, true if any of its bins holds liquidity,
+ * false if all are empty. Returns null when the read fails (unknown).
+ */
+async function readChunkFunding(pool, positionPubKey, ranges) {
+  try {
+    const pd = (await pool.getPosition(positionPubKey))?.positionData;
+    if (!pd) return null;
+    const bins = pd.positionBinData || [];
+    const has = (b) => Number(b.positionXAmount || 0) > 0 || Number(b.positionYAmount || 0) > 0;
+    return ranges.map(({ lowerBinId, upperBinId }) =>
+      bins.some((b) => b.binId >= lowerBinId && b.binId <= upperBinId && has(b)));
+  } catch (e) {
+    log("deploy_warn", `Could not read chunk funding for ${positionPubKey.toString().slice(0, 8)}: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Reconcile concurrently sent chunks with the on-chain read.
+ * @param {PromiseSettledResult[]} results  one per chunk
+ * @param {boolean[]|null} funded  per chunk from readChunkFunding (null = read failed)
+ * @returns {{ landed: number[], failed: number[], unknown: number[] }}
+ *   landed  — confirmed, or rejected but its bins are funded (landed anyway);
+ *   failed  — rejected AND its bins verified empty (safe to report as not deployed);
+ *   unknown — rejected and the read failed (treat as possibly funded).
+ */
+export function reconcileChunkResults(results, funded) {
+  const out = { landed: [], failed: [], unknown: [] };
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") out.landed.push(i);
+    else if (funded?.[i] === true) out.landed.push(i);
+    else if (funded?.[i] === false) out.failed.push(i);
+    else out.unknown.push(i);
+  });
+  return out;
+}
+
+/**
+ * Unclaimed fees (UI units) and raw LM rewards held by a position, from the
+ * SDK's LbPosition data. Returns null when there is nothing to claim or the
+ * amounts can't be read.
+ */
+function readUnclaimedFees(pool, position) {
+  try {
+    const pd = position?.positionData;
+    if (!pd) return null;
+    const ui = (v, dec) => {
+      const n = Number(String(v ?? 0));
+      return Number.isFinite(n) && Number.isInteger(dec) ? n / 10 ** dec : null;
+    };
+    const x = ui(pd.feeX, pool?.tokenX?.mint?.decimals);
+    const y = ui(pd.feeY, pool?.tokenY?.mint?.decimals);
+    if (x == null || y == null) return null;
+    const r1 = String(pd.rewardOne ?? 0);
+    const r2 = String(pd.rewardTwo ?? 0);
+    const hasRewards = r1 !== "0" || r2 !== "0";
+    if (x === 0 && y === 0 && !hasRewards) return null;
+    return { x, y, ...(hasRewards && { reward_one_raw: r1, reward_two_raw: r2 }) };
+  } catch {
+    return null;
+  }
+}
+
 async function lookupPoolForPosition(position_address, walletAddress) {
   // Check state registry first (fast path)
   const tracked = getTrackedPosition(position_address);
@@ -2349,4 +2576,15 @@ export { getPool as getPoolForRead, initializedBinArrayWindow };
 export function _setPoolForTest(poolAddress, pool) {
   if (pool == null) poolCache.delete(String(poolAddress));
   else poolCache.set(String(poolAddress), pool);
+}
+
+export { readChunkFunding as _readChunkFundingForTest };
+
+/**
+ * Test seam only: swap in a mock connection / wallet (pass null to restore the
+ * lazy defaults). Production code never calls this.
+ */
+export function _setDlmmTestDeps({ connection, wallet } = {}) {
+  if (connection !== undefined) _connection = connection;
+  if (wallet !== undefined) _wallet = wallet;
 }

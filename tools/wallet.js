@@ -8,6 +8,7 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { basePriorityPrice, cappedPriorityPrice, sendAndConfirmSigned, MAX_CU_LIMIT } from "./tx-send.js";
 
 let _connection = null;
 let _wallet = null;
@@ -377,7 +378,7 @@ export async function swapToken({
       const body = await orderRes.text();
       if (orderRes.status === 500) {
         log("swap", `Swap v2 order failed for ${input_mint}, falling back to swap/v1 quote API`);
-        return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
+        return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals, deps });
       }
       throw new Error(`Swap v2 order failed: ${orderRes.status} ${body}`);
     }
@@ -392,7 +393,7 @@ export async function swapToken({
           `(router=${order.router ?? "?"} errorCode=${order.errorCode ?? "-"} ${order.errorMessage ?? ""}), ` +
           `falling back to swap/v1 quote API`
       );
-      return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
+      return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals, deps });
     }
 
     const impact = parsePriceImpactPercent(order);
@@ -450,7 +451,7 @@ export async function swapToken({
       // Jupiter rejected the tx before sending it and returned no signature:
       // nothing can land, so the swap/v1 route is safe to try.
       log("swap", `Swap v2 execute rejected before landing (${outcome.reason}), falling back to swap/v1 quote API`);
-      return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
+      return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals, deps });
     }
 
     if (outcome.kind === "failed") {
@@ -495,7 +496,7 @@ export async function swapToken({
   }
 }
 
-async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals = 9, outDecimals = 9 }) {
+async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals = 9, outDecimals = 9, deps = {} }) {
   // ─── Get quote ─────────────────────────────────────────────
   const quoteRes = await jupiterFetch(
     `${JUPITER_QUOTE_API}/quote?inputMint=${input_mint}&outputMint=${output_mint}&amount=${amountStr}&slippageBps=300`,
@@ -506,6 +507,11 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   if (quote.error) throw new Error(`Quote error: ${quote.error}`);
 
   // ─── Get swap tx ───────────────────────────────────────────
+  // Same CU price policy as the DLMM send path: the configured floor/fallback
+  // (no tx exists yet to ask Helius about), capped so price × the worst-case
+  // 1.4M CU stays within maxPriorityFeeLamports. Jupiter sizes the CU limit
+  // from its own simulation (dynamicComputeUnitLimit), so the real fee is lower.
+  const { microLamports } = cappedPriorityPrice({ microLamports: basePriorityPrice(null), cuLimit: MAX_CU_LIMIT });
   const swapRes = await jupiterFetch(`${JUPITER_QUOTE_API}/swap`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": JUPITER_API_KEY },
@@ -513,16 +519,59 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
       quoteResponse: quote,
       userPublicKey: wallet.publicKey.toString(),
       wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      computeUnitPriceMicroLamports: microLamports,
     }),
   });
   if (!swapRes.ok) throw new Error(`Swap tx failed: ${swapRes.status} ${await swapRes.text()}`);
-  const { swapTransaction } = await swapRes.json();
+  const { swapTransaction, lastValidBlockHeight: swapLvbh } = await swapRes.json();
 
-  // ─── Sign and send ─────────────────────────────────────────
+  // ─── Sign, send with rebroadcast, confirm ──────────────────
+  // Sign once; the same bytes are rebroadcast until confirmed or expired.
+  // Jupiter's tx carries no Helius Sender tip, so it goes through the RPC only.
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
   tx.sign([wallet]);
-  const txHash = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
-  await connection.confirmTransaction(txHash, "confirmed");
+  const txHash = firstSignature(tx);
+  if (!txHash) throw new Error("swap/v1 fallback: transaction has no signature after signing");
+  let lastValidBlockHeight = Number(swapLvbh);
+  if (!Number.isFinite(lastValidBlockHeight) || lastValidBlockHeight <= 0) {
+    lastValidBlockHeight = (await connection.getLatestBlockhash("confirmed")).lastValidBlockHeight;
+  }
+
+  let status;
+  try {
+    status = await sendAndConfirmSigned(connection, {
+      wire: tx.serialize(),
+      signature: txHash,
+      blockhash: tx.message.recentBlockhash,
+      lastValidBlockHeight,
+      label: "swap v1 fallback",
+      sender: false,
+    });
+  } catch (confirmErr) {
+    // Expiry or a confirm transport error. Before reporting, check whether the
+    // tx landed anyway — never report failure for a swap that executed.
+    const chain = await checkSignatureOnChain(connection, txHash, {
+      attempts: deps.statusPollAttempts ?? 3,
+      intervalMs: deps.statusPollMs ?? 2000,
+    });
+    if (!chain.landed) {
+      throw new Error(`swap/v1 fallback tx ${txHash} did not confirm: ${confirmErr.message}`, { cause: confirmErr });
+    }
+    status = { err: chain.ok ? null : chain.err };
+  }
+  if (status?.err) {
+    // Landed but FAILED on-chain: nothing was swapped. Report failure so the
+    // caller retries or flags exposure instead of assuming the tokens are sold.
+    log("swap_error", `swap/v1 fallback tx ${txHash} failed on-chain: ${JSON.stringify(status.err)}`);
+    return {
+      success: false,
+      tx: txHash,
+      input_mint,
+      output_mint,
+      error: `Swap failed on-chain (${txHash}): ${JSON.stringify(status.err)}`,
+    };
+  }
 
   log("swap", `SUCCESS (fallback) tx: ${txHash}`);
   const toUi = (raw, dec) => (raw != null && !isNaN(Number(raw)) ? Number(raw) / Math.pow(10, dec) : null);
