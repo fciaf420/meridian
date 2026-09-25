@@ -668,7 +668,7 @@ export function startServer(timersFn) {
             const currentBalance = await getWalletBalances().catch(() => null);
             const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
             const { content } = await screenerLoop(
-              `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${deployAmount} SOL. Execute now, don't ask.`,
+              `get_top_candidates, pick the best one, deploy_position with ${deployAmount} SOL. Execute now, don't ask.`,
               config.llm.maxSteps, [],
             );
             appendHistory("auto", content);
@@ -708,7 +708,7 @@ export function startServer(timersFn) {
               const currentBalance = await getWalletBalances().catch(() => null);
               const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
               const { content } = await screenerLoop(
-                `Deploy ${deployAmount} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+                `Deploy ${deployAmount} SOL into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
                 config.llm.maxSteps, [],
               );
               appendHistory(`deploy #${pick} ${pool.name}`, content);

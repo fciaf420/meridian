@@ -106,7 +106,7 @@ This is an on-chain call via the SDK. Returns:
 - price: human-readable price (token X per token Y)
 - pricePerLamport: raw price in lamports
 
-Always call this before deploying a position to get the freshest price.`,
+deploy_position reads the active bin itself, so this is not a prerequisite for deploying; use it when you need the current price or bin for analysis or a report.`,
       parameters: {
         type: "object",
         properties: {
@@ -164,26 +164,7 @@ WHEN TO USE WHICH:
 HARD RULES:
 - Bin Step: Screening filters apply (config minBinStep/maxBinStep). If user specifies a pool, deploy regardless of bin step.
 
-RANGE SELECTION: Pass price_range_pct to deploy_position. Bins are auto-calculated from the pool's bin_step. No need to call calculate_bins.
-Choose your range based on study_top_lpers results — match what profitable LPers are doing in that pool.
-If no study data available, default to 35%. Ranges from 20% to 90% are all valid. Wide ranges (>69 bins) are handled via multi-tx automatically.
-
-CHOOSING YOUR RANGE:
-1. Call study_top_lpers — see what range and hold time works for successful LPers in that pool
-2. Decide your target % range based on:
-   - Top LPer patterns (scalpers use tighter ranges, holders use wider)
-   - Volatility (higher vol = consider wider range to stay in range longer)
-   - Your conviction level
-3. Deploy with price_range_pct set to your target % — bins are calculated automatically
-
-The bin COUNT needed varies dramatically by bin_step:
-- bin_step 100: 50% range = 69 bins
-- bin_step 80:  50% range = 86 bins
-- bin_step 50:  50% range = 139 bins
-- bin_step 20:  50% range = 347 bins
-
-NEVER use a fixed bin count like "45 bins" across different bin steps — that's 36% at bs100 but only 20% at bs50.
-Wide ranges (>69 bins) are handled automatically via multi-tx.
+RANGE: Pass price_range_pct, the % price move the range covers from the active bin (80 = liquidity reaching down to 80% below the current price on a SOL-only position). The tool converts it to a bin count from the pool's bin_step, so the same % means the same coverage on any bin step; how wide to go is set by the range rules in your instructions. Positions wider than 69 bins are deployed over several transactions automatically; positions under 20 bins in total are rejected. Pass bins_below / bins_above only when you need an exact bin count.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -311,11 +292,8 @@ WARNING: This executes a real on-chain transaction.`,
       name: "close_position",
       description: `Remove all liquidity and close a position.
 This withdraws all tokens back to the wallet and closes the position account.
-Use when:
-- Position has been out of range for > 30 minutes
-- IL exceeds accumulated fees
-- Token shows danger signals (organic score drop, volume crash)
-- Rebalancing (close old + open new)
+When to close is decided by the management rules in your instructions, not by this tool.
+After withdrawing, it swaps the base tokens this close withdrew back to SOL (skipping dust under $0.10; in USDC mode the runner then settles the proceeds to USDC). The result includes pnl_usd, pnl_pct, txs, and a swap object; status "success_with_exposure" means the withdrawn tokens could not be swapped safely and remain in the wallet.
 
 WARNING: This executes a real on-chain transaction. Cannot be undone.`,
       parameters: {
@@ -498,7 +476,7 @@ Use when the user says "add smart wallet", "track this wallet", "add to smart wa
     type: "function",
     function: {
       name: "remove_smart_wallet",
-      description: "Remove a wallet from the smart wallet tracker.",
+      description: "Remove a wallet from the smart wallet tracker. It stops counting as a smart-wallet signal in screening immediately. Use only when the user asks to stop tracking that wallet.",
       parameters: {
         type: "object",
         properties: {
@@ -794,12 +772,7 @@ fee trend over last 24 hours, liquidity amounts.`,
       description: `Store a fact in holographic memory for cross-session learning.
 Use this to remember patterns, outcomes, or strategies that should persist across restarts.
 Nuggets: "pools" (pool outcomes), "strategies" (what strategies work), "lessons" (general rules), "patterns" (market patterns).
-Or create a new nugget name for a new category.
-
-Examples:
-- remember_fact("pools", "BONK-SOL", "high volume but unstable, close within 30min")
-- remember_fact("strategies", "bid_ask_bs100", "works well for volatile tokens, 70%+ win rate")
-- remember_fact("lessons", "evening_volatility", "volume drops after 8pm UTC, avoid new deploys")`,
+Or create a new nugget name for a new category. Writing an existing nugget+key replaces its value.`,
       parameters: {
         type: "object",
         properties: {
@@ -818,12 +791,7 @@ Examples:
       name: "recall_memory",
       description: `Query holographic memory for relevant facts from past sessions.
 Use this before making decisions to check if you've learned something relevant.
-Supports fuzzy matching — you don't need an exact key, just a related query.
-
-Examples:
-- recall_memory("BONK") → might recall "BONK-SOL: high volume but unstable"
-- recall_memory("bid_ask strategy") → might recall strategy effectiveness data
-- recall_memory("evening trading") → might recall timing-based lessons`,
+Supports fuzzy matching — you don't need an exact key, just a related query (a token symbol, strategy name, or topic).`,
       parameters: {
         type: "object",
         properties: {
@@ -840,11 +808,7 @@ Examples:
       name: "forget_fact",
       description: `Remove a fact from holographic memory.
 Use this to clean up stale, incorrect, or outdated facts.
-Specify the nugget name and the exact key of the fact to forget.
-
-Examples:
-- forget_fact("pools", "BONK-SOL") — remove an outdated pool outcome
-- forget_fact("strategies", "old_pattern") — remove an obsolete strategy note`,
+Specify the nugget name and the exact key of the fact to forget (recall_memory shows keys).`,
       parameters: {
         type: "object",
         properties: {
@@ -910,7 +874,7 @@ Parse the text and extract structured criteria, then call this tool to store it.
     type: "function",
     function: {
       name: "set_active_strategy",
-      description: "Set which strategy to use for the next screening/deployment cycle.",
+      description: "Mark a saved strategy-library entry as the active reference. Screening cycles show it to the screener as a non-binding note (\"SAVED STRATEGY (reference, not mandatory)\"). It does not change the configured trading strategy (config.strategy.activeStrategy, e.g. evil_panda), the deploy defaults, or the exit rules; tell the user that when they ask to switch strategies. Use when the user asks to activate a saved strategy by id from list_strategies.",
       parameters: {
         type: "object",
         properties: { id: { type: "string", description: "Strategy ID to activate" } },
@@ -923,7 +887,7 @@ Parse the text and extract structured criteria, then call this tool to store it.
     type: "function",
     function: {
       name: "remove_strategy",
-      description: "Remove a strategy from the library.",
+      description: "Permanently delete a saved strategy from the library. If it was the active reference, the next saved strategy becomes active. Use only when the user asks to delete it.",
       parameters: {
         type: "object",
         properties: { id: { type: "string", description: "Strategy ID to remove" } },
@@ -1053,7 +1017,7 @@ Call this tool before deploying to any pool — you may have been here before an
     type: "function",
     function: {
       name: "remove_from_blacklist",
-      description: "Remove a token mint from the blacklist.",
+      description: "Remove a token mint from the blacklist so screening and deploys can use it again. Use only when the user asks; a mint blacklisted for a scam or rug reason should stay listed.",
       parameters: {
         type: "object",
         properties: { mint: { type: "string", description: "The mint address to remove" } },
@@ -1114,11 +1078,7 @@ TIP: Always read INDEX.md first to find what you need, then drill into specific 
       name: "kb_write",
       description: `Write or update a markdown article in the knowledge base. Use this to file observations, compile analysis, or update existing articles.
 Articles should be concise, interlinked using [[concept]] syntax, and organized into categories: pools/, strategies/, patterns/, lessons/, performance/.
-The INDEX.md is auto-updated when you write an article.
-
-Examples:
-- kb_write("pools/bonk-sol.md", "# Pool: BONK-SOL\\n\\n3 deploys, avg +4.2%...")
-- kb_write("patterns/evening-volume.md", "# Evening Volume Dropoff\\n\\nObserved [[volume]] drops after 8pm UTC...")`,
+The INDEX.md is auto-updated when you write an article. Writing an existing path overwrites the whole article.`,
       parameters: {
         type: "object",
         properties: {
@@ -1135,11 +1095,7 @@ Examples:
     function: {
       name: "kb_search",
       description: `Full-text search across all knowledge base articles. Returns matching file paths with context lines.
-Use this to find articles related to a topic before reading them in full.
-
-Examples:
-- kb_search("BONK") → finds all articles mentioning BONK
-- kb_search("trailing take profit") → finds strategy articles about trailing TP`,
+Use this to find articles related to a topic before reading them in full.`,
       parameters: {
         type: "object",
         properties: {
@@ -1169,7 +1125,7 @@ Examples:
     type: "function",
     function: {
       name: "kb_delete",
-      description: "Delete an article from the knowledge base. Also removes its INDEX.md entry.",
+      description: "Permanently delete an article from the knowledge base and its INDEX.md entry. Use for articles that are wrong or merged into another; prefer kb_write to correct an article.",
       parameters: {
         type: "object",
         properties: {

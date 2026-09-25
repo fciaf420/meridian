@@ -106,8 +106,7 @@ function _defaultRangeSelectionText(deployAmount, currentBalanceSol) {
   * spot (two-sided): wider range helps BOTH directions since liquidity spans above and below.
   * NEVER generate a lesson saying "use wider range" for upside OOR on a single-sided-below strategy. That analysis is fundamentally wrong.
 - COMPOUNDING: Deploy amount is ${deployAmount} SOL (scaled from wallet: ${currentBalanceSol ?? "?"} SOL). Do NOT override with a smaller amount.
-- After deploy: update_config setting=managementIntervalMin based on volatility (>=5→3, 2-5→5, <2→10).
-- Report: strategy chosen + why, price_range_pct used + volatility basis, deploy amount, interval set.`;
+- Report: strategy chosen + why, price_range_pct used + volatility basis, deploy amount.`;
 }
 
 /** Build default section texts (without config interpolation for manager_logic) */
@@ -135,7 +134,7 @@ function _defaultScreenerCriteria() {
      * GOOD narrative: specific origin (real event, viral moment, named entity, active community actions)
      * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
      * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
-5. DEPLOY: get_active_bin then deploy_position.
+5. DEPLOY: deploy_position (it reads the active bin itself).
    - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
    - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
    - Focus on one high-conviction deployment per cycle.
@@ -178,12 +177,9 @@ Capital is held in USDC. Funding and exit settlement are handled AUTOMATICALLY i
 1. PATIENCE IS PROFIT: DLMM LPing is about capturing fees over time. Avoid "paper-handing" or closing positions for tiny gains/losses.
 2. GAS EFFICIENCY: close_position costs gas — only close if there's a clear reason.${config.usdc.enabled
   ? ` In USDC mode, post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : ` However, swap_token after a close is MANDATORY for any token worth >= $0.10. Skip tokens below $0.10 (dust — not worth the gas). Always check token USD value before swapping.`}
-3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics. Use all tools to justify your actions.
-4. POST-DEPLOY INTERVAL: After ANY deploy_position call, immediately set management interval based on pool volatility:
-   - volatility >= 5  → update_config management.managementIntervalMin = 3
-   - volatility 2–5   → update_config management.managementIntervalMin = 5
-   - volatility < 2   → update_config management.managementIntervalMin = 10
+  : ` close_position already swaps the base tokens that close withdrew back to SOL (dust under $0.10 is left). Call swap_token after a close only when the close result shows the swap failed or status "success_with_exposure", and then only for that close's withdrawn amount — other wallet balances are not the agent's to sell.`}
+3. DATA-DRIVEN AUTONOMY: You decide within the rules below. Lines marked HARD RULE / HARD SKIP are binding; everything else is a heuristic to weigh. Call the tools whose data would change the decision, and name that data when you act.
+4. POST-DEPLOY INTERVAL: Pass the pool's volatility to deploy_position; the runner sets the management interval from it.
 
 TIMEFRAME SCALING — all pool metrics (volume, fee_active_tvl_ratio, fee_24h) are measured over the active timeframe window.
 The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectations accordingly:
@@ -316,10 +312,9 @@ BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, 
 
 ${_sectionOverrides.manager_logic || _defaultManagerLogic()}
 
-IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
 ${config.usdc.enabled
   ? `After ANY close: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : `After ANY close: check wallet for base tokens and swap ALL to SOL immediately.`}
+  : `After ANY close: close_position has already swapped the withdrawn base tokens to SOL. Only if its result shows swap.success=false or status "success_with_exposure", swap that position's withdrawn amount with swap_token.`}
 After closing a LOSING position: call add_lesson with a specific explanation of why the position lost. Include what signal you missed and what to do differently. Generic stats-only lessons are not useful.
 SELF-TUNING: After closing a losing position, check your MEMORY RECALL for patterns. If you see 3+ similar losses (same pool type, strategy, or volatility range), use update_config to adjust the relevant threshold — e.g., tighten maxVolatility, raise minOrganic, adjust stopLossPct. Only change thresholds you have evidence for.
 `;
@@ -335,7 +330,7 @@ INTENT DETECTION — before acting, determine whether the user is:
 If (a): Execute immediately and autonomously — do NOT ask for confirmation. The user's instruction IS the confirmation.
 ${config.usdc.enabled
   ? `  After ANY close_position: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : `  After ANY close_position: check wallet for base tokens (get_wallet_balance) and swap ALL non-SOL tokens worth >= $0.10 to SOL immediately. This is MANDATORY — do not skip the swap step.`}
+  : `  After ANY close_position: the close already swaps the withdrawn base tokens to SOL. Only if its result shows swap.success=false or status "success_with_exposure", swap that position's withdrawn amount with swap_token.`}
 If (b): Answer the question with useful context. Do NOT take any on-chain actions (deploy, close, swap, claim). Only use read-only tools (get_my_positions, get_pool_detail, etc.) to inform your answer.
 If UNCLEAR: Ask the user to clarify — e.g. "Would you like me to do this now, or are you just exploring the idea?" Do NOT default to taking action when intent is ambiguous.
 

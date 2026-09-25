@@ -1,4 +1,7 @@
 import OpenAI from "openai";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
@@ -30,12 +33,63 @@ const RETRYABLE = new Set([402, 408, 429, 502, 503, 504, 529]);
 // run through the strict-parse write path (no {} fallback) and serially, not in the
 // lenient parallel read batch.
 const WRITE_TOOLS = new Set(["deploy_position", "close_position", "claim_fees", "swap_token", "update_config"]);
-const TOOL_SUMMARIES = tools.map((tool) => ({
-  name: tool.function.name,
-  description: tool.function.description,
-  parameters: tool.function.parameters || { type: "object", properties: {} },
-}));
-const TOOL_SUMMARIES_TEXT = JSON.stringify(TOOL_SUMMARIES, null, 2);
+// Tools a role never needs are not exposed to it (instead of prose telling it not to
+// call them). GENERAL (user chat, KB upkeep, studies) keeps the full set.
+const ADMIN_TOOLS = ["self_update", "kb_migrate", "kb_delete", "kb_rebuild_indexes", "clear_lessons",
+  "remove_smart_wallet", "remove_strategy", "remove_from_blacklist", "add_strategy", "set_active_strategy"];
+const ROLE_HIDDEN_TOOLS = {
+  SCREENER: new Set(ADMIN_TOOLS),
+  MANAGER: new Set([...ADMIN_TOOLS, "discover_pools", "get_top_candidates", "study_top_lpers"]),
+};
+export function toolsForRole(agentType) {
+  const hidden = ROLE_HIDDEN_TOOLS[agentType];
+  return hidden ? tools.filter((tool) => !hidden.has(tool.function.name)) : tools;
+}
+function toolSummariesText(agentType) {
+  return JSON.stringify(toolsForRole(agentType).map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters || { type: "object", properties: {} },
+  })), null, 2);
+}
+// Enforced by the CLI (codex --output-schema / claude --json-schema) instead of prose + regex.
+// Tool arguments travel as a JSON string so the schema stays strict-mode compatible.
+// The tool-name enum is the role's own tool set.
+const _agentPlanSchemaCache = {};
+function getAgentPlanSchema(agentType) {
+  if (_agentPlanSchemaCache[agentType]) return _agentPlanSchemaCache[agentType];
+  _agentPlanSchemaCache[agentType] = {
+    type: "object",
+    additionalProperties: false,
+    required: ["action", "response", "tool_calls"],
+    properties: {
+      action: { type: "string", enum: ["respond", "tool_calls"] },
+      response: { type: ["string", "null"] },
+      tool_calls: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "arguments_json"],
+          properties: {
+            name: { type: "string", enum: toolsForRole(agentType).map((tool) => tool.function.name) },
+            arguments_json: { type: "string" },
+          },
+        },
+      },
+    },
+  };
+  return _agentPlanSchemaCache[agentType];
+}
+// codex exec takes the schema as a file path; write it once per role, on first Codex call.
+const _agentPlanSchemaPaths = {};
+function getAgentPlanSchemaPath(agentType) {
+  if (_agentPlanSchemaPaths[agentType]) return _agentPlanSchemaPaths[agentType];
+  const schemaPath = path.join(os.tmpdir(), `meridian-agent-plan-${String(agentType).toLowerCase()}-${process.pid}.schema.json`);
+  fs.writeFileSync(schemaPath, JSON.stringify(getAgentPlanSchema(agentType)));
+  _agentPlanSchemaPaths[agentType] = schemaPath;
+  return schemaPath;
+}
 
 export function getScreenerModelLabel() {
   return config.llm.screeningModel;
@@ -147,16 +201,9 @@ function getClaudeSystemPrompt(agentType) {
   if (_systemPromptCache[agentType]) return _systemPromptCache[agentType];
   _systemPromptCache[agentType] = [
     `You are the ${agentType} reasoning engine for a JavaScript trading agent runner.`,
-    "Return raw JSON only. Do not wrap it in markdown fences or add any extra commentary.",
-    "Choose one of two actions only:",
-    '1. "respond" when you can fully answer the user with the information already available.',
-    '2. "tool_calls" when you need one or more listed tools to continue.',
-    "If you choose tool_calls, keep response null and provide exact JSON arguments for each tool call.",
-    "Never invent tool outputs, transaction results, or on-chain state.",
-    "Only use tool names from the available tools list.",
-    "Be conservative with write tools. Only call them when you intentionally want the runner to perform the real action.",
-    'Return exactly this shape: {"action":"respond","response":"...","tool_calls":[]} or {"action":"tool_calls","response":null,"tool_calls":[{"name":"tool_name","arguments":{}}]}',
-    `AVAILABLE TOOLS:\n${TOOL_SUMMARIES_TEXT}`,
+    'Set action to "respond" (with response) when you can answer from what is already available, or "tool_calls" (response null) when you need listed tools; arguments_json is the tool\'s arguments as a JSON object string.',
+    "The runner executes write tools for real on-chain, so only request them when you intend that action. Tool outputs and on-chain state come only from TOOL RESULT entries.",
+    `AVAILABLE TOOLS:\n${toolSummariesText(agentType)}`,
   ].join("\n\n");
   return _systemPromptCache[agentType];
 }
@@ -166,31 +213,14 @@ function buildCodexAgentPrompt(messages, agentType) {
   const transcript = buildCodexTranscript(messages);
 
   return [
-    `You are the ${agentType} reasoning engine for a JavaScript trading agent runner.`,
-    "Return raw JSON only. Do not wrap it in markdown fences or add any extra commentary.",
-    "Choose one of two actions only:",
-    '1. "respond" when you can fully answer the user with the information already available.',
-    '2. "tool_calls" when you need one or more listed tools to continue.',
-    "If you choose tool_calls, keep response null and provide exact JSON arguments for each tool call.",
-    "Never invent tool outputs, transaction results, or on-chain state.",
-    "Only use tool names from the available tools list.",
-    "Be conservative with write tools. Only call them when you intentionally want the runner to perform the real action.",
-    'Return exactly this shape: {"action":"respond","response":"...","tool_calls":[]} or {"action":"tool_calls","response":null,"tool_calls":[{"name":"tool_name","arguments":{}}]}',
-    `AVAILABLE TOOLS:\n${TOOL_SUMMARIES_TEXT}`,
+    getClaudeSystemPrompt(agentType),
     `CONVERSATION TRANSCRIPT:\n${transcript}`,
   ].join("\n\n");
 }
 
 function parseCodexJson(content) {
-  try {
-    return JSON.parse(content);
-  } catch {
-    const fencedMatch = content.match(/```json\s*([\s\S]*?)```/i) || content.match(/(\{[\s\S]*\})/);
-    if (!fencedMatch) {
-      throw new Error("Codex CLI returned non-JSON output");
-    }
-    return JSON.parse(fencedMatch[1]);
-  }
+  // Output is schema-constrained by the CLI; a parse failure is a real error, not something to regex around.
+  return typeof content === "string" ? JSON.parse(content) : content;
 }
 
 function normalizeCodexToolCalls(toolCalls, step) {
@@ -200,16 +230,23 @@ function normalizeCodexToolCalls(toolCalls, step) {
       throw new Error("Codex CLI returned a tool call without a name");
     }
 
-    const args = toolCall.arguments && typeof toolCall.arguments === "object" && !Array.isArray(toolCall.arguments)
-      ? toolCall.arguments
-      : {};
+    // Passed through as a string: agentLoop's strict write-tool parse rejects malformed
+    // JSON (read tools fall back to {}). Valid JSON that is not an object is treated as
+    // malformed too, so a write tool never runs with null / array arguments.
+    let argsJson = typeof toolCall.arguments_json === "string" ? toolCall.arguments_json : "{}";
+    try {
+      const parsed = JSON.parse(argsJson);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        argsJson = `<non-object arguments: ${argsJson.slice(0, 80)}>`;
+      }
+    } catch { /* left as-is; rejected downstream */ }
 
     return {
       id: `codex-tool-${step + 1}-${index + 1}`,
       type: "function",
       function: {
         name,
-        arguments: JSON.stringify(args),
+        arguments: argsJson,
       },
     };
   });
@@ -221,6 +258,7 @@ async function createCodexMessage(messages, model, agentType, step) {
     cwd: process.cwd(),
     sandbox: "read-only",
     skipGitRepoCheck: true,
+    outputSchemaPath: getAgentPlanSchemaPath(agentType),
     config: {
       suppress_unstable_features_warning: "true",
       model_reasoning_effort: agentType === "MANAGER" ? "high" : "medium",
@@ -268,7 +306,7 @@ async function createClaudeMessage(messages, model, agentType, step) {
   const transcript = buildCodexTranscript(messages);
   const systemPrompt = getClaudeSystemPrompt(agentType);
   const effort = CLAUDE_EFFORT_BY_ROLE[agentType] || "medium";
-  const content = await runClaudeCli(model, `CONVERSATION TRANSCRIPT:\n${transcript}`, { effort, systemPrompt });
+  const content = await runClaudeCli(model, `CONVERSATION TRANSCRIPT:\n${transcript}`, { effort, systemPrompt, jsonSchema: getAgentPlanSchema(agentType) });
 
   if (!content) {
     throw new Error("Empty response from Claude CLI");
@@ -310,7 +348,7 @@ async function createProviderMessage(messages, model, agentType, step) {
   const completionOptions = {
     model,
     messages,
-    tools,
+    tools: toolsForRole(agentType),
     tool_choice: "auto",
     temperature: config.llm.temperature,
     max_tokens: config.llm.maxTokens,
@@ -449,7 +487,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         const dsModel = DEEPSEEK_FALLBACK_MODELS[agentType] || "deepseek-chat";
 
         const fallbackKey = process.env.DEEPSEEK_API_KEY;
-        if (fallbackKey) {
+        // Same API as the primary when PROVIDER is deepseek: a pinned older model is not a fallback.
+        if (fallbackKey && PROVIDER !== "deepseek") {
           try {
             log("agent", `All ${PROVIDER} retries exhausted — falling back to ${dsModel} via DeepSeek API`);
             const fallbackClient = new OpenAI({
@@ -459,10 +498,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             const dsResponse = await fallbackClient.chat.completions.create({
               model: dsModel,
               messages,
-              tools,
+              tools: toolsForRole(agentType),
               tool_choice: "auto",
               temperature: config.llm.temperature,
-              max_tokens: config.llm.maxTokens,
+              // deepseek-reasoner counts its chain of thought toward max_tokens.
+              max_tokens: dsModel === "deepseek-reasoner" ? Math.max(config.llm.maxTokens, 32768) : config.llm.maxTokens,
             });
             if (dsResponse?.choices?.length) {
               msg = dsResponse.choices[0].message;
