@@ -615,8 +615,9 @@ Returns pool address, name, bin_step, fee %, TVL, volume, and token mints.`,
 Use this when the user asks "who are the top LPers in this pool?" or wants to
 know how others are performing in a specific pool without saving lessons.
 
-Returns: aggregate patterns (avg hold time, win rate, ROI) and per-LPer summaries.
-Requires LPAGENT_API_KEY to be set.`,
+Returns: aggregate patterns (avg hold time, pct_top_winners, ROI) and per-LPer summaries.
+pct_top_winners is the share of owners in the top-winners list (0-100), not a win rate.
+Data comes from the Meridian study API, not LPAgent.`,
       parameters: {
         type: "object",
         properties: {
@@ -639,12 +640,13 @@ Requires LPAGENT_API_KEY to be set.`,
     function: {
       name: "study_top_lpers",
       description: `Fetch and analyze top LPers for a pool to learn from their behaviour.
-Returns aggregate patterns (avg hold time, win rate, ROI) and historical samples.
+Returns aggregate patterns (avg hold time, pct_top_winners, ROI) and historical samples.
+pct_top_winners is the share of owners in the top-winners list (0-100), not a win rate.
 
 Use this before deploying into a new pool to:
 - See if top performers are scalpers (< 1h holds) or long-term holders.
 - Match your strategy and range to what is actually working for others.
-- Avoid pools where even the best performers have low win rates.`,
+- Avoid pools where even the best performers have poor ROI.`,
       parameters: {
         type: "object",
         properties: {

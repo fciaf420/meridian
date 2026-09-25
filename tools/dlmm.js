@@ -24,7 +24,7 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { calculateBinsForPriceRange, splitRangeBins } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
-import { studyTopLPers } from "./study.js";
+import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -390,18 +390,19 @@ export async function deployPosition({
     try {
       const { checkSmartWalletsOnPool } = await import("../smart-wallets.js");
       const swResult = await checkSmartWalletsOnPool({ pool_address });
-      hasSmartWallets = swResult?.found?.length > 0;
+      // checkSmartWalletsOnPool returns `in_pool`; a degraded result (some
+      // wallet lookups failed) is not a confirmed signal, so it fails.
+      hasSmartWallets = (swResult?.in_pool?.length ?? 0) > 0 && !swResult?.degraded;
     } catch { /* default to false */ }
     if (!hasSmartWallets) failures.push("no smart wallets on pool");
 
-    // Condition 2: Top LPers >= 80% win rate using spot
+    // Condition 2: Top LPers >= 80% win rate (LPAgent top-lpers, Premium key).
+    // fetchTopLpersStats returns [] without a key / on 401 / on error → fails closed.
     let studyPasses = false;
     try {
-      const studyResult = await studyTopLPers({ pool_address, limit: 4 });
-      const credible = (studyResult?.lpers || []).filter(lp => lp.total_lp >= 3 && lp.win_rate >= 0.6 && lp.total_inflow >= 1000);
-      const avgWR = credible.length > 0 ? credible.reduce((s, lp) => s + lp.win_rate, 0) / credible.length : 0;
-      studyPasses = avgWR >= 0.80;
-    } catch { /* default to false */ }
+      const lpers = await fetchTopLpersStats({ pool_address, limit: 20 });
+      studyPasses = evaluateTopLpersGate(lpers).passes;
+    } catch (e) { log("deploy", `top-lpers gate error: ${e.message}`); }
     if (!studyPasses) failures.push("top LPers < 80% win rate");
 
     // Condition 3: Price must be stabilizing (not pumping >10% in 1h)

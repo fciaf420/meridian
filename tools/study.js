@@ -4,6 +4,7 @@
  */
 
 import { getKey, fetchWithRetry } from "../lpagent-keys.js";
+import { log } from "../logger.js";
 
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
 const MERIDIAN_API = "https://api.agentmeridian.xyz/api";
@@ -73,13 +74,19 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
   }
 
   const numericRows = [...uniqueRows.values()];
+  const pctTopWinners = winnersByPct.length > 0 && ownerCount > 0
+    ? Math.round((winnersByPct.length / ownerCount) * 100)
+    : null;
   const patterns = {
     top_lper_count: ownerCount,
     active_position_count: Number(data.activePositionCount || 0),
     avg_hold_hours: avg(numericRows.map((row) => row.avgAgeHours).filter(isNum)),
-    avg_win_rate: winnersByPct.length > 0 && ownerCount > 0
-      ? Math.round((winnersByPct.length / ownerCount) * 100)
-      : null,
+    // Share of owners that appear in Meridian's top-winners-by-% list (0-100).
+    // This is NOT a win rate: it measures list size relative to owner count.
+    pct_top_winners: pctTopWinners,
+    // Deprecated alias kept for backward compatibility (signal-tracker weights
+    // were learned on this value). Same number as pct_top_winners.
+    avg_win_rate: pctTopWinners,
     avg_roi_pct: avg(numericRows.map((row) => row.pnlPct).filter(isNum)),
     avg_fee_pct_of_capital: avg(numericRows.map((row) => row.feePercent).filter(isNum)),
     best_roi: winnersByPct.length > 0 && isNum(winnersByPct[0]?.pnlPct)
@@ -102,6 +109,99 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
       suggestedStyle: data.suggestedStyle || null,
     },
   };
+}
+
+// ─── LPAgent top-lpers (Premium) for the two-sided spot deploy gate ───────
+// Docs: https://docs.lpagent.io/api-reference/pools/get-top-lpers-for-a-pool.md
+// Premium/Enterprise only; Basic (free) keys get 401.
+
+const _topLpersLogged = new Set();
+function logTopLpersOnce(reason) {
+  if (_topLpersLogged.has(reason)) return;
+  _topLpersLogged.add(reason);
+  log("study", `top-lpers unavailable (${reason}) — two-sided spot gate fails closed`);
+}
+
+function finiteOrNull(value) {
+  const n = Number(value);
+  return value != null && value !== "" && Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Map raw LPAgent top-lpers rows to the fields the deploy gate needs.
+ * win_rate is recomputed as win_lp / total_lp (0..1) because the docs do not
+ * state the unit of the API's own `win_rate` field. total_inflow is USD.
+ */
+export function mapTopLpersRows(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((r) => {
+    const total = finiteOrNull(r?.total_lp);
+    const wins = finiteOrNull(r?.win_lp);
+    return {
+      owner: r?.owner ?? null,
+      total_lp: total,
+      win_lp: wins,
+      win_rate: total != null && total > 0 && wins != null ? wins / total : null, // 0..1
+      total_inflow: finiteOrNull(r?.total_inflow), // USD
+      total_pnl: finiteOrNull(r?.total_pnl), // USD
+      total_pnl_native: finiteOrNull(r?.total_pnl_native), // SOL
+      avg_age_hour: finiteOrNull(r?.avg_age_hour),
+      api_win_rate: finiteOrNull(r?.win_rate), // unit undocumented, informational only
+    };
+  });
+}
+
+/**
+ * Condition 2 of the two-sided spot gate. Credible = at least 3 LPs, a win
+ * rate of at least 60% and at least $1,000 deposited. Passes only with at
+ * least 2 credible LPers whose average win rate is at least 80%.
+ */
+export function evaluateTopLpersGate(lpers) {
+  const credible = (Array.isArray(lpers) ? lpers : []).filter((lp) =>
+    lp && lp.total_lp != null && lp.total_lp >= 3
+    && lp.win_rate != null && lp.win_rate >= 0.6
+    && lp.total_inflow != null && lp.total_inflow >= 1000
+  );
+  const avgWR = credible.length > 0
+    ? credible.reduce((s, lp) => s + lp.win_rate, 0) / credible.length
+    : 0;
+  return { passes: credible.length >= 2 && avgWR >= 0.80, credible, avgWR };
+}
+
+/**
+ * Fetch top LPers for a pool from LPAgent (GET /pools/{id}/top-lpers).
+ * Returns [] with no key, on any error, or on 401 (Basic tier), so callers
+ * fail closed. The reason is logged once per process.
+ */
+export async function fetchTopLpersStats({ pool_address, limit = 20 }) {
+  const apiKey = await getKey();
+  if (!apiKey) {
+    logTopLpersOnce("LPAGENT_API_KEY not set");
+    return [];
+  }
+  const size = Math.min(100, Math.max(1, Math.floor(Number(limit) || 20)));
+  const url = `${LPAGENT_API}/pools/${pool_address}/top-lpers`
+    + `?chain=SOL&platform=meteora&order_by=total_pnl_native&sort_order=desc&page=1&limit=${size}`;
+  try {
+    const res = await fetchWithRetry(url, { headers: { "x-api-key": apiKey } });
+    if (res.status === 401) {
+      logTopLpersOnce("HTTP 401: Premium or Enterprise key required");
+      return [];
+    }
+    if (!res.ok) {
+      logTopLpersOnce(`HTTP ${res.status}`);
+      return [];
+    }
+    const json = await res.json();
+    if (json?.status !== "success" || !Array.isArray(json.data)) {
+      logTopLpersOnce("unexpected response shape");
+      return [];
+    }
+    return mapTopLpersRows(json.data);
+  } catch (e) {
+    logTopLpersOnce(`error: ${e.message}`);
+    return [];
+  }
 }
 
 /**
