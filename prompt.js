@@ -37,6 +37,11 @@ export function getPromptSectionText(section) {
   return defaults[section] || null;
 }
 
+/** The built-in (non-overridden) template for a section, or null. */
+export function getDefaultPromptSectionText(section) {
+  return _getDefaultSections()[section] || null;
+}
+
 /**
  * Substitute `${name}` placeholders in override text. Autoresearch edits the
  * default section TEMPLATE (see _getDefaultSections), so overrides carry

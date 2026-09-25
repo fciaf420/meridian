@@ -9,11 +9,13 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 import {
   getPromptSectionText,
+  getDefaultPromptSectionText,
   setPromptSectionOverride,
   clearPromptSectionOverride,
 } from "./prompt.js";
@@ -42,7 +44,12 @@ const DEFAULTS = {
   active: null,          // currently running experiment (or null)
   cooldownRemaining: 0,  // closes remaining before next experiment
   kept_overrides: {},    // section → text for permanently kept experiment overrides
+  kept_meta: {},         // section → { experiment_id, kept_at, strategy, default_hash }
+  quarantined_overrides: {}, // section → { text, reason, quarantined_at, strategy, ... } (never applied)
+  reverted_overrides: [],    // operator-reverted kept overrides, newest last
 };
+
+const freshDefaults = () => structuredClone(DEFAULTS);
 
 const MANAGEMENT_THRESHOLD_KEYS = ["stopLossPct", "takeProfitFeePct", "trailingTriggerPct", "trailingDropPct"];
 
@@ -119,13 +126,14 @@ let _autoresearchDegraded = false;
 export function loadAutoresearch() {
   if (!fs.existsSync(AUTORESEARCH_FILE)) {
     // File absent — safe to create fresh defaults.
-    saveAutoresearch(DEFAULTS);
-    return { ...DEFAULTS };
+    saveAutoresearch(freshDefaults());
+    return freshDefaults();
   }
   try {
     const data = JSON.parse(fs.readFileSync(AUTORESEARCH_FILE, "utf8"));
-    // Merge with DEFAULTS so existing files gain new fields (e.g. kept_overrides)
-    return { ...DEFAULTS, ...data };
+    // Merge with (fresh copies of) DEFAULTS so existing files gain new fields
+    // without later mutations leaking into the shared DEFAULTS object.
+    return { ...freshDefaults(), ...data };
   } catch (err) {
     // File PRESENT but corrupt: do NOT silently fall back to DEFAULTS (a later
     // save would wipe experiment history and kept overrides). Preserve the bad
@@ -151,31 +159,318 @@ export function saveAutoresearch(data) {
     log("autoresearch", "Skipping autoresearch.json save: file is in degraded (corrupt) state. Restore or remove the corrupt backup to re-enable saves.");
     return;
   }
-  fs.writeFileSync(AUTORESEARCH_FILE, JSON.stringify(data, null, 2));
+  fs.writeFileSync(AUTORESEARCH_FILE, serializeAutoresearch(data));
+}
+
+/**
+ * 2-space JSON with non-ASCII escaped as \uXXXX. That is the format the
+ * tracked file has always used, so rewriting it leaves the experiment history
+ * byte-identical.
+ */
+export function serializeAutoresearch(data) {
+  return JSON.stringify(data, null, 2)
+    .replace(/[\u007f-￿]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+// ─── Override provenance, staleness and migration ────────────
+
+const LEGACY_QUARANTINE_MIGRATION = "quarantine_legacy_kept_overrides_v1";
+const LEGACY_QUARANTINE_REASON =
+  "Kept by the pre-A/B loop: each verdict compared one 7-close window against a different 7-close window " +
+  "with no concurrent control (a placebo is 'kept' ~45% of the time), all 32 experiments ran 2026-03-27..04-04 " +
+  "under the bid_ask default, and the text was hand-edited after it was tested. Quarantined: inactive until an " +
+  "operator restores it (/autoresearch restore <section>).";
+
+export function hashText(text) {
+  return createHash("sha256").update(String(text ?? "")).digest("hex").slice(0, 16);
+}
+
+/** Current default-template fingerprint for a section (detects later prompt.js edits). */
+export function defaultSectionHash(section) {
+  const text = getDefaultPromptSectionText(section);
+  return text == null ? null : hashText(text);
+}
+
+/**
+ * One-time migration: move the legacy kept_overrides into quarantined_overrides
+ * and close any legacy (pre-A/B) active experiment. Mutates `state`; returns
+ * true when something changed. Idempotent: a marker in state.migrations
+ * makes every later call a no-op. Experiments are never rewritten.
+ */
+export function migrateAutoresearchState(state, now = new Date()) {
+  if (!state || typeof state !== "object") return false;
+  state.migrations = state.migrations || {};
+  if (state.migrations[LEGACY_QUARANTINE_MIGRATION]) return false;
+  const at = now.toISOString();
+  const kept = state.kept_overrides || {};
+  state.quarantined_overrides = state.quarantined_overrides || {};
+  const experiments = Array.isArray(state.experiments) ? state.experiments : [];
+  for (const [section, text] of Object.entries(kept)) {
+    state.quarantined_overrides[section] = {
+      text,
+      reason: LEGACY_QUARANTINE_REASON,
+      quarantined_at: at,
+      source: "kept_overrides",
+      strategy: "bid_ask",
+      default_hash: null,
+      experiment_ids: experiments.filter((e) => e?.section === section && e?.status === "kept").map((e) => e.id),
+    };
+  }
+  state.kept_overrides = {};
+  state.kept_meta = {};
+  state.migrations[LEGACY_QUARANTINE_MIGRATION] = at;
+  return true;
+}
+
+/**
+ * Reasons an override may no longer fit the running bot (empty = fresh).
+ * `meta` is the provenance recorded when it was kept: { strategy, default_hash }.
+ */
+export function overrideStaleness(section, meta, cfg = config) {
+  const reasons = [];
+  const current = cfg.strategy?.activeStrategy ?? null;
+  if (!meta) {
+    reasons.push("no provenance recorded (legacy override)");
+  } else {
+    if (meta.strategy && current && meta.strategy !== current) {
+      reasons.push(`generated under ${meta.strategy}, current strategy is ${current}`);
+    }
+    if (meta.default_hash && meta.default_hash !== defaultSectionHash(section)) {
+      reasons.push("the prompt.js default for this section changed after it was kept");
+    } else if (!meta.default_hash) {
+      reasons.push("no default fingerprint recorded, so later prompt.js edits can't be detected");
+    }
+  }
+  if (section === "range_selection" && current === "evil_panda") {
+    reasons.push("inert under evil_panda (the Evil Panda range text takes precedence)");
+  }
+  return reasons;
+}
+
+/** Set-based line diff: lines only in `before` (removed) and only in `after` (added). */
+export function lineDiff(before, after) {
+  const norm = (t) => String(t ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const a = norm(before);
+  const b = norm(after);
+  const aSet = new Set(a);
+  const bSet = new Set(b);
+  return {
+    removed: a.filter((l) => !bSet.has(l)),
+    added: b.filter((l) => !aSet.has(l)),
+    total: a.length,
+  };
+}
+
+function diffSummary(section, text) {
+  const d = lineDiff(getDefaultPromptSectionText(section), text);
+  return { added: d.added, removed: d.removed, summary: `+${d.added.length} / -${d.removed.length} lines vs default` };
 }
 
 // ─── Startup Restoration ─────────────────────────────────────
 
 /**
- * On module load, restore any active experiment's override into memory.
- * Without this, a restart would lose the in-memory override while
- * autoresearch.json still shows an active experiment.
+ * Apply persisted overrides to the in-memory prompt. Overrides are inert
+ * unless autoresearch is enabled: with it off, the bot runs on the prompt.js
+ * defaults and nothing in autoresearch.json reaches the agent.
  */
-try {
-  const state = loadAutoresearch();
-  // First restore all kept overrides so they survive restarts
-  if (state.kept_overrides) {
-    for (const [section, text] of Object.entries(state.kept_overrides)) {
-      setPromptSectionOverride(section, text);
-      log("autoresearch", `Restored kept override: ${section}`);
+export function applyStartupOverrides(state, cfg = config) {
+  const applied = [];
+  if (cfg?.autoresearch?.enabled !== true) {
+    const n = Object.keys(state?.kept_overrides || {}).length;
+    if (n || state?.active) {
+      log("autoresearch", `Autoresearch disabled — ${n} kept override(s)${state?.active ? " and the active experiment" : ""} left inactive`);
     }
+    return applied;
   }
-  // Then restore the active experiment (overrides the kept one for that section)
+  for (const [section, text] of Object.entries(state.kept_overrides || {})) {
+    setPromptSectionOverride(section, text);
+    applied.push(section);
+    const stale = overrideStaleness(section, state.kept_meta?.[section], cfg);
+    log("autoresearch", `Restored kept override: ${section}${stale.length ? ` — WARNING stale: ${stale.join("; ")}` : ""}`);
+  }
   if (state.active?.modified_text && state.active?.section) {
     setPromptSectionOverride(state.active.section, state.active.modified_text);
+    applied.push(`active:${state.active.section}`);
     log("autoresearch", `Restored active experiment override: ${state.active.id} (${state.active.section})`);
   }
+  return applied;
+}
+
+try {
+  const state = loadAutoresearch();
+  if (migrateAutoresearchState(state)) {
+    saveAutoresearch(state);
+    const q = Object.keys(state.quarantined_overrides || {});
+    log("autoresearch", `Migrated autoresearch.json: legacy kept overrides quarantined (${q.join(", ") || "none"})`);
+  }
+  applyStartupOverrides(state, config);
 } catch { /* ignore on first load if file doesn't exist yet */ }
+
+// ─── Operator commands (Telegram + REPL: /autoresearch …) ────
+
+const SECTIONS = ["screener_criteria", "manager_logic", "range_selection"];
+
+function fmtOverrideBlock(section, text, meta, cfg, { full = false } = {}) {
+  const d = diffSummary(section, text);
+  const stale = overrideStaleness(section, meta, cfg);
+  const lines = [`• ${section}: ${d.summary}${meta?.experiment_id ? ` (from ${meta.experiment_id})` : ""}`];
+  if (stale.length) lines.push(`  ⚠ stale: ${stale.join("; ")}`);
+  const cap = full ? Infinity : 6;
+  for (const l of d.removed.slice(0, cap)) lines.push(`  - ${l}`);
+  for (const l of d.added.slice(0, cap)) lines.push(`  + ${l}`);
+  if (!full && (d.removed.length > cap || d.added.length > cap)) lines.push(`  … /autoresearch show ${section} for the full text`);
+  if (full) lines.push("", "Full text:", text);
+  return lines.join("\n");
+}
+
+const AUTORESEARCH_HELP = [
+  "/autoresearch — status",
+  "/autoresearch list — kept and quarantined overrides with a diff vs the default",
+  "/autoresearch show <section> — full text + diff (kept, else quarantined)",
+  "/autoresearch revert <section> — deactivate a kept override (kept in reverted history)",
+  "/autoresearch restore <section> — re-keep the latest reverted or quarantined text",
+].join("\n");
+
+/**
+ * Operator path for overrides. Returns plain text (callers escape for
+ * Telegram HTML). Not exposed as an LLM tool on purpose.
+ */
+export function handleAutoresearchCommand(argString = "", cfg = config) {
+  const [sub = "status", sectionArg] = String(argString).trim().split(/\s+/).filter(Boolean);
+  const cmd = sub.toLowerCase();
+  let state;
+  try {
+    state = loadAutoresearch();
+  } catch (e) {
+    return `autoresearch.json is unreadable: ${e.message}`;
+  }
+  const enabled = cfg?.autoresearch?.enabled === true;
+  const kept = state.kept_overrides || {};
+  const quarantined = state.quarantined_overrides || {};
+  const needSection = () => (SECTIONS.includes(sectionArg) ? null : `Unknown or missing section. Use one of: ${SECTIONS.join(", ")}`);
+
+  if (cmd === "help") return AUTORESEARCH_HELP;
+
+  if (cmd === "status") {
+    const lines = [
+      `Autoresearch: ${enabled ? "enabled" : "disabled (overrides inactive)"} | strategy: ${cfg.strategy?.activeStrategy ?? "?"}`,
+      `Kept overrides: ${Object.keys(kept).join(", ") || "none"}`,
+      `Quarantined: ${Object.keys(quarantined).join(", ") || "none"}`,
+      `Active experiment: ${state.active ? `${state.active.id} (${state.active.section})` : "none"}`,
+      `Experiments recorded: ${(state.experiments || []).length}`,
+      "",
+      AUTORESEARCH_HELP,
+    ];
+    return lines.join("\n");
+  }
+
+  if (cmd === "list") {
+    const lines = [`Kept overrides (${enabled ? "applied" : "inactive while autoresearch is disabled"}):`];
+    if (!Object.keys(kept).length) lines.push("  none");
+    for (const [section, text] of Object.entries(kept)) lines.push(fmtOverrideBlock(section, text, state.kept_meta?.[section], cfg));
+    lines.push("", "Quarantined (never applied):");
+    if (!Object.keys(quarantined).length) lines.push("  none");
+    for (const [section, q] of Object.entries(quarantined)) {
+      lines.push(fmtOverrideBlock(section, q.text, q, cfg));
+      lines.push(`  quarantined ${q.quarantined_at}: ${q.reason}`);
+    }
+    return lines.join("\n");
+  }
+
+  if (cmd === "show") {
+    const bad = needSection();
+    if (bad) return bad;
+    if (kept[sectionArg]) return `Kept override\n${fmtOverrideBlock(sectionArg, kept[sectionArg], state.kept_meta?.[sectionArg], cfg, { full: true })}`;
+    if (quarantined[sectionArg]) return `Quarantined override\n${fmtOverrideBlock(sectionArg, quarantined[sectionArg].text, quarantined[sectionArg], cfg, { full: true })}`;
+    return `No kept or quarantined override for ${sectionArg}; the prompt.js default is in use.`;
+  }
+
+  if (cmd === "revert") {
+    const bad = needSection();
+    if (bad) return bad;
+    if (!kept[sectionArg]) return `No kept override for ${sectionArg}.`;
+    state.reverted_overrides = Array.isArray(state.reverted_overrides) ? state.reverted_overrides : [];
+    state.reverted_overrides.push({
+      section: sectionArg,
+      text: kept[sectionArg],
+      meta: state.kept_meta?.[sectionArg] ?? null,
+      reverted_at: new Date().toISOString(),
+    });
+    delete state.kept_overrides[sectionArg];
+    if (state.kept_meta) delete state.kept_meta[sectionArg];
+    saveAutoresearch(state);
+    clearPromptSectionOverride(sectionArg);
+    return `Reverted ${sectionArg}: the prompt.js default is live again. /autoresearch restore ${sectionArg} undoes this.`;
+  }
+
+  if (cmd === "restore") {
+    const bad = needSection();
+    if (bad) return bad;
+    if (kept[sectionArg]) return `${sectionArg} already has a kept override; /autoresearch revert ${sectionArg} first.`;
+    const reverted = (state.reverted_overrides || []).filter((r) => r.section === sectionArg);
+    let text, meta, from;
+    if (reverted.length) {
+      const last = reverted[reverted.length - 1];
+      text = last.text;
+      meta = last.meta;
+      from = "reverted history";
+      state.reverted_overrides = state.reverted_overrides.filter((r) => r !== last);
+    } else if (quarantined[sectionArg]) {
+      const q = quarantined[sectionArg];
+      text = q.text;
+      meta = { strategy: q.strategy ?? null, default_hash: q.default_hash ?? null, experiment_id: q.experiment_ids?.at(-1) ?? null, restored_from: "quarantine" };
+      from = "quarantine";
+      delete state.quarantined_overrides[sectionArg];
+    } else {
+      return `Nothing to restore for ${sectionArg}.`;
+    }
+    state.kept_overrides = { ...(state.kept_overrides || {}), [sectionArg]: text };
+    state.kept_meta = { ...(state.kept_meta || {}), [sectionArg]: { ...(meta || {}), restored_at: new Date().toISOString() } };
+    saveAutoresearch(state);
+    if (enabled) setPromptSectionOverride(sectionArg, text);
+    const stale = overrideStaleness(sectionArg, state.kept_meta[sectionArg], cfg);
+    return [
+      `Restored ${sectionArg} from ${from}. ${enabled ? "Applied now." : "Inactive until autoresearch is enabled."}`,
+      stale.length ? `⚠ stale: ${stale.join("; ")}` : null,
+    ].filter(Boolean).join("\n");
+  }
+
+  return `Unknown subcommand "${sub}".\n${AUTORESEARCH_HELP}`;
+}
+
+/** Dashboard view of kept/quarantined overrides: text, diff vs default, staleness. */
+export function describeOverrides(state, cfg = config) {
+  const enabled = cfg?.autoresearch?.enabled === true;
+  const describe = (section, text, meta, status) => {
+    const d = diffSummary(section, text);
+    return {
+      section,
+      status,
+      applied: status === "kept" && enabled,
+      text,
+      summary: d.summary,
+      added: d.added,
+      removed: d.removed,
+      stale: overrideStaleness(section, meta, cfg),
+      experiment_id: meta?.experiment_id ?? meta?.experiment_ids?.at?.(-1) ?? null,
+      reason: meta?.reason ?? null,
+    };
+  };
+  return {
+    kept: Object.entries(state?.kept_overrides || {}).map(([s, t]) => describe(s, t, state.kept_meta?.[s], "kept")),
+    quarantined: Object.entries(state?.quarantined_overrides || {}).map(([s, q]) => describe(s, q.text, q, "quarantined")),
+  };
+}
+
+/** Escape for Telegram's HTML parse mode and split under its 4096-char cap. */
+export function autoresearchTelegramChunks(text, size = 3500) {
+  const s = String(text ?? "");
+  const out = [];
+  for (let i = 0; i < s.length; i += size) {
+    out.push(s.slice(i, i + size).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  }
+  return out;
+}
 
 // ─── Main Entry Point ────────────────────────────────────────
 
@@ -535,6 +830,12 @@ async function evaluateExperiment(perfData, cfg, state) {
     // Persist the kept override so it survives restarts
     if (!state.kept_overrides) state.kept_overrides = {};
     state.kept_overrides[experiment.section] = experiment.modified_text;
+    state.kept_meta = { ...(state.kept_meta || {}), [experiment.section]: {
+      experiment_id: experiment.id,
+      kept_at: new Date().toISOString(),
+      strategy: cfg.strategy?.activeStrategy ?? null,
+      default_hash: defaultSectionHash(experiment.section),
+    } };
     // Log as lesson
     logExperimentLesson(experiment, "kept", compositeImprovement);
     state.experiments.push(experiment);
@@ -727,7 +1028,7 @@ Return a JSON object: {"hypothesis": one sentence on what you changed and why, "
 
     data = await response.json();
   } catch (e) {
-    if (controller.signal.aborted) throw new Error(`autoresearch LLM call timed out after ${AUTORESEARCH_LLM_TIMEOUT_MS / 1000}s`);
+    if (controller.signal.aborted) throw new Error(`autoresearch LLM call timed out after ${AUTORESEARCH_LLM_TIMEOUT_MS / 1000}s`, { cause: e });
     throw e;
   } finally {
     clearTimeout(timer);

@@ -133,3 +133,100 @@ test("D2: evolution counters alone never invalidate; a real threshold change doe
   // Legacy experiments only recorded the counters: never invalidate on them.
   assert.equal(ar.environmentChangedSince({ thresholds_last_evolved: "x", thresholds_positions_at_evolution: 3 }, cfg), false);
 });
+
+// "experiments": [...] exactly as serializeAutoresearch lays it out inside the top-level object.
+function experimentsBlock(experiments) {
+  return `"experiments": ${ar.serializeAutoresearch(experiments).replace(/\n/g, "\n  ")}`;
+}
+
+test("quarantine migration is idempotent and leaves experiments byte-identical", () => {
+  const legacy = {
+    enabled: false,
+    experiments: [
+      { id: "exp_1", section: "screener_criteria", hypothesis: "Tighten “1h” filter — ok", status: "kept" },
+      { id: "exp_2", section: "range_selection", hypothesis: "Widen 🚀", status: "reverted" },
+      { id: "exp_3", section: "range_selection", hypothesis: "Keep", status: "kept" },
+    ],
+    active: null,
+    cooldownRemaining: 0,
+    kept_overrides: { screener_criteria: "SCREEN TEXT", range_selection: "RANGE TEXT ${deployAmount}" },
+  };
+  const raw = ar.serializeAutoresearch(legacy);
+  const state = JSON.parse(raw);
+  const now = new Date("2026-09-24T00:00:00Z");
+
+  assert.equal(ar.migrateAutoresearchState(state, now), true);
+  assert.deepEqual(state.kept_overrides, {});
+  assert.equal(state.quarantined_overrides.screener_criteria.text, "SCREEN TEXT");
+  assert.equal(state.quarantined_overrides.range_selection.text, "RANGE TEXT ${deployAmount}");
+  assert.equal(state.quarantined_overrides.range_selection.quarantined_at, now.toISOString());
+  assert.match(state.quarantined_overrides.range_selection.reason, /7-close/);
+  assert.deepEqual(state.quarantined_overrides.range_selection.experiment_ids, ["exp_3"]);
+
+  const once = ar.serializeAutoresearch(state);
+  assert.equal(ar.migrateAutoresearchState(state, new Date("2027-01-01T00:00:00Z")), false, "second run is a no-op");
+  assert.equal(ar.serializeAutoresearch(state), once, "second run changes nothing");
+
+  // Experiments: same bytes in the file before and after (non-ASCII stays \u-escaped).
+  assert.ok(raw.includes(experimentsBlock(legacy.experiments)));
+  assert.ok(once.includes(experimentsBlock(legacy.experiments)));
+  assert.deepEqual(state.experiments, legacy.experiments);
+});
+
+test("the repo autoresearch.json keeps its experiment bytes through the migration", () => {
+  const raw = fs.readFileSync(path.join(REPO, "autoresearch.json"), "utf8");
+  const state = JSON.parse(raw);
+  const block = experimentsBlock(state.experiments);
+  assert.ok(raw.includes(block), "serializer reproduces the tracked file's experiment bytes");
+  ar.migrateAutoresearchState(state);
+  assert.ok(ar.serializeAutoresearch(state).includes(block));
+  assert.deepEqual(state.kept_overrides, {});
+});
+
+test("startup restore does nothing when autoresearch is disabled", async () => {
+  const { getPromptSectionText, getDefaultPromptSectionText } = await import("../prompt.js");
+  const state = {
+    kept_overrides: { screener_criteria: "KEPT OVERRIDE TEXT" },
+    active: { id: "exp_x", section: "manager_logic", modified_text: "ACTIVE TEXT" },
+  };
+  const applied = ar.applyStartupOverrides(state, { autoresearch: { enabled: false }, strategy: config.strategy });
+  assert.deepEqual(applied, []);
+  assert.equal(getPromptSectionText("screener_criteria"), getDefaultPromptSectionText("screener_criteria"));
+  assert.equal(getPromptSectionText("manager_logic"), getDefaultPromptSectionText("manager_logic"));
+});
+
+test("operator commands: revert and restore round-trip, quarantine restores with stale warning", async () => {
+  const { getPromptSectionText, getDefaultPromptSectionText } = await import("../prompt.js");
+  fs.writeFileSync(AR_FILE, ar.serializeAutoresearch({
+    experiments: [], active: null, cooldownRemaining: 0,
+    kept_overrides: {}, kept_meta: {},
+    quarantined_overrides: { screener_criteria: { text: "OLD SCREEN", reason: "test", quarantined_at: "t", strategy: "bid_ask", default_hash: null, experiment_ids: ["exp_9"] } },
+    reverted_overrides: [],
+    migrations: { quarantine_legacy_kept_overrides_v1: "t" },
+  }));
+  const cfgOff = { autoresearch: { enabled: false }, strategy: { activeStrategy: "evil_panda" } };
+
+  const list = ar.handleAutoresearchCommand("list", cfgOff);
+  assert.match(list, /Quarantined/);
+  assert.match(list, /generated under bid_ask, current strategy is evil_panda/);
+
+  const restored = ar.handleAutoresearchCommand("restore screener_criteria", cfgOff);
+  assert.match(restored, /Inactive until autoresearch is enabled/);
+  assert.match(restored, /stale/);
+  assert.equal(getPromptSectionText("screener_criteria"), getDefaultPromptSectionText("screener_criteria"), "disabled: not applied");
+  let st = ar.loadAutoresearch();
+  assert.equal(st.kept_overrides.screener_criteria, "OLD SCREEN");
+  assert.equal(st.quarantined_overrides.screener_criteria, undefined);
+
+  assert.match(ar.handleAutoresearchCommand("revert screener_criteria", cfgOff), /Reverted/);
+  st = ar.loadAutoresearch();
+  assert.equal(st.kept_overrides.screener_criteria, undefined);
+  assert.equal(st.reverted_overrides.at(-1).text, "OLD SCREEN");
+
+  assert.match(ar.handleAutoresearchCommand("restore screener_criteria", cfgOff), /from reverted history/);
+  assert.equal(ar.loadAutoresearch().kept_overrides.screener_criteria, "OLD SCREEN");
+  assert.match(ar.handleAutoresearchCommand("show bogus", cfgOff), /Unknown or missing section/);
+
+  const chunks = ar.autoresearchTelegramChunks("a < b & c > d");
+  assert.deepEqual(chunks, ["a &lt; b &amp; c &gt; d"]);
+});
