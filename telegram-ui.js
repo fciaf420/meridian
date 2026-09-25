@@ -645,9 +645,12 @@ export function renderPositions(result, { page = 0, refs, unit = "sol", strips =
     const ref = refs.put(p.position, `pos:${p.position}`);
     const row = [btn(`🔒 Close ${i + 1}`, `pc:${ref}`)];
     if (bins && p.pool) row.push(btn(`📊 Bins ${i + 1}`, `bv:${ref}:${pg}`));
-    if (p.pool) row.push(urlBtn("Meteora ↗", meteoraPoolUrl(p.pool)));
-    row.push(urlBtn("Solscan ↗", solscanAccountUrl(p.position)));
-    keyboard.push(row);
+    // Links on their own row so five buttons don't crowd a phone screen.
+    const links = [];
+    if (p.pool) links.push(urlBtn("Meteora ↗", meteoraPoolUrl(p.pool)));
+    if (p.base_mint) links.push(urlBtn("GMGN ↗", gmgnTokenUrl(p.base_mint)));
+    links.push(urlBtn("Solscan ↗", solscanAccountUrl(p.position)));
+    keyboard.push(row, links);
   }
   const pager = pagerRow("po", pg, pages.length);
   if (pager) keyboard.push(pager);
