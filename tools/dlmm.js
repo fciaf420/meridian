@@ -27,6 +27,8 @@ import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
+
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
@@ -644,6 +646,13 @@ export async function deployPosition({
   const { StrategyType } = await getDLMM();
   const wallet = getWallet();
   const pool = await getPool(pool_address);
+  // Deploys fund the Y side with SOL (both SOL and USDC mode swap to SOL first),
+  // so a pool whose token Y isn't wrapped SOL would be funded with the wrong token.
+  const tokenYMint = pool.lbPair?.tokenYMint?.toBase58?.() ?? String(pool.lbPair?.tokenYMint ?? "");
+  if (tokenYMint !== WSOL_MINT) {
+    log("deploy", `Refusing deploy into ${pool_address}: token Y is ${tokenYMint}, not SOL`);
+    return { success: false, error: `Pool ${pool_address} is not SOL-quoted (token Y ${tokenYMint}); only SOL pools are supported.` };
+  }
   const activeBin = await pool.getActiveBin();
   resolvedBinStep ||= pool.lbPair?.binStep ?? pool.lbPair?.bin_step ?? null;
 
