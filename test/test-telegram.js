@@ -1022,3 +1022,16 @@ test("token lookup: Refresh re-runs in place; wrong chat refused; callback_data 
   assert.ok(all.some((d) => d.startsWith("tp:")) && all.some((d) => d.startsWith("tr:")));
   for (const d of all) assert.ok(Buffer.byteLength(d, "utf8") <= 64, d);
 });
+
+test("candidates: each row links the token on GMGN when the mint is known", () => {
+  const MINT = "Mint111111111111111111111111111111111111111";
+  const { keyboard } = ui.renderCandidates([
+    { pool: "CandPool1111111111111111111111111111111111111", name: "AAA-SOL", base_mint: MINT },
+    { pool: "CandPool2222222222222222222222222222222222222", name: "BBB-SOL", base: { mint: MINT } },
+    { pool: "CandPool3333333333333333333333333333333333333", name: "CCC-SOL" },
+  ], { refs: ui.createRefMap() });
+  const gmgn = (row) => row.find((b) => b.text === "GMGN ↗");
+  assert.equal(gmgn(keyboard[0])?.url, `https://gmgn.ai/sol/token/${MINT}`);
+  assert.equal(gmgn(keyboard[1])?.url, `https://gmgn.ai/sol/token/${MINT}`);
+  assert.equal(gmgn(keyboard[2]), undefined);
+});
