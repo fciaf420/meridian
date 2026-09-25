@@ -38,3 +38,21 @@ test("classic prompts never state the Evil Panda entry gate", () => {
   const deploy = tools.find((t) => t.function.name === "deploy_position").function.description;
   assert.doesNotMatch(deploy, /Supertrend|entry checks/, "static tool text is shared by every strategy");
 });
+
+test("management goal: hard rules first, judgment closes need a stated reason, otherwise hold", () => {
+  const goal = prompt.buildManagementGoal("\n\nEXIT ALERTS (CLOSE THESE IMMEDIATELY):\nX", { usdcMode: false });
+  assert.ok(goal.includes("EXIT ALERTS (CLOSE THESE IMMEDIATELY):\nX"), "runner context is inserted as-is");
+  assert.ok(goal.indexOf("HARD CLOSE RULES") < goal.indexOf("JUDGMENT CLOSES"), "hard rules come first");
+  assert.match(goal, /JUDGMENT CLOSES: When no hard rule fires and no exit alert applies, you may still close/);
+  for (const factor of [/downside out of range with negative PnL/, /yield dying/, /opportunity cost/]) assert.match(goal, factor);
+  assert.match(goal, /A judgment close needs a stated reason/);
+  assert.match(goal, /Without a hard rule, an exit alert or a stated judgment reason → HOLD\./);
+  assert.doesNotMatch(goal, /Do not close for any other reason/);
+  assert.ok(goal.includes(`pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE`), "thresholds still come from config");
+  assert.ok(goal.includes('**Rule triggered:** [rule number or "none"]'), "report format unchanged");
+  assert.match(prompt.buildManagementGoal("", { usdcMode: true }), /auto-settles all recovered tokens/);
+  // The manager instructions describe the same judgment factors, so the two prompts agree.
+  const mgr = prompt.buildSystemPrompt("MANAGER", {}, {}, null, null, null, null);
+  assert.match(mgr, /needs the factor and its data named in the close reason/);
+  assert.match(mgr, /Opportunity Cost/);
+});

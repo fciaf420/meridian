@@ -238,7 +238,7 @@ function _defaultScreenerCriteria() {
 }
 
 function _defaultManagerLogic() {
-  return `Decision Factors for Closing (no exit rule triggered):
+  return `Decision Factors for Closing (no exit rule triggered; a close on one of these needs the factor and its data named in the close reason):
 - Yield Health: Call get_position_pnl. Is the current Fee/TVL still one of the best available?
 - Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back? (Only matters BEFORE the OOR timeout — see below.)
 - OOR Timeout (hard rule, BOTH directions): once minutes_out_of_range >= outOfRangeWaitMinutes, CLOSE — upside or downside, positive or negative PnL. Nothing below extends that wait.
@@ -258,6 +258,62 @@ const SPOT_BIN_DIRECTION = `SPOT STRATEGY BIN DIRECTION:
    - SOL-only spot: set bins_below = range, bins_above = 0 (same direction as bid_ask)
    - If depositing only SOL, keep bins_above = 0: bins above the active bin can only hold the base token, so they would sit empty and waste range
 `;
+
+/**
+ * The management cycle goal (user turn). `context` is the pre-loaded blocks the
+ * runner gathered (memory hints, EXIT ALERTS, auto-closes, KB), inserted as-is.
+ * Hard rules first; judgment closes on the manager_logic decision factors are
+ * allowed only with a stated reason; otherwise hold.
+ */
+export function buildManagementGoal(context = "", { usdcMode = false } = {}) {
+  const m = config.management;
+  const s = config.screening;
+  const pnlUnit = m.pnlUnit?.toUpperCase() || "SOL";
+  return `
+MANAGEMENT CYCLE${context}
+
+HARD CLOSE RULES (check in order — close immediately on first match, no further analysis):
+1. Position instruction condition met → CLOSE immediately (highest priority)
+2. Position instruction exists but condition NOT met → HOLD (skip all other rules)
+3. pnl_pct >= ${m.takeProfitFeePct}% → CLOSE (take profit)
+4. minutes_out_of_range >= ${m.outOfRangeWaitMinutes} → CLOSE (OOR timeout). Applies in both OOR directions and at any PnL.
+5. fee_active_tvl_ratio < ${s.minFeeActiveTvlRatio}% AND volume < $${s.minVolume} → CLOSE (yield dead)
+6. pnl_pct <= ${m.emergencyPriceDropPct}% → CLOSE (emergency stop)
+
+If a position's pnl_pct is null (pnl_unknown: true), its PnL is UNKNOWN this tick (data fetch failed), NOT 0 — skip rules 3 and 6 for it and do not close it on PnL grounds this cycle.
+
+These thresholds come from the user's config and are binding.
+Positions listed under EXIT ALERTS (stop loss, trailing take profit, strategy exit) were flagged by the runner's exit check: close them.
+
+JUDGMENT CLOSES: When no hard rule fires and no exit alert applies, you may still close a position on one of the decision factors in your instructions:
+- downside out of range with negative PnL, before the OOR timeout
+- yield dying: volume or fee/active-TVL collapsing on the 15m or 1h view, not a single 5m reading
+- opportunity cost: a clearly better pool that justifies the gas of exiting and re-entering
+A judgment close needs a stated reason: start its Reason line with "Judgment:" and name the factor and the data behind it. Rule 2 still wins, so a position whose instruction condition is not met stays open.
+Without a hard rule, an exit alert or a stated judgment reason → HOLD.
+
+STEPS:
+1. get_my_positions — check all open positions.
+2. For each position:
+   - Call get_position_pnl.
+   - Apply HARD CLOSE RULES above in order. First match → close, stop checking.
+   - If no rule triggers: HOLD, unless a judgment close applies (see JUDGMENT CLOSES).
+3. If closing: ${usdcMode
+    ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
+    : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result reports a failed swap or status "success_with_exposure".`}
+4. After closing a LOSING position — check POOL CONTEXT and the lessons in your memory brief for patterns:
+   - If 3+ similar losses (same pool type, volatility range, or strategy) → use update_config to adjust the threshold that would have prevented it
+   - Examples: tighten maxVolatility, raise minOrganic, adjust stopLossPct, raise minVolume
+
+REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values):
+**[PAIR]** | Age: [X]m | Fees: [X] ${pnlUnit} | PnL: [X]% | OOR: [direction or "in-range"]
+**Rule triggered:** [rule number or "none"]
+**Decision:** [STAY/CLOSE]
+**Reason:** [1 short sentence — if PnL is negative, say IL exceeds fees]
+
+FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesson with one lesson that names what went wrong, the signal that was missed or under-weighted, and what to do differently next time. The runner already records the raw stats of every close, so the lesson is only useful for the why.
+      `;
+}
 
 export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, unifiedMemory = null, perfSummary = null, signalWeights = null) {
 
@@ -390,7 +446,7 @@ UNKNOWN PnL: If a position has pnl_pct = null (pnl_unknown: true), its PnL data 
 
 pnl_pct already includes all fees (claimed + unclaimed), so negative PnL means the position is losing money after fees: impermanent loss exceeds fee earnings. Fees cannot offset a negative PnL later because they are already counted; if PnL is -7% with 0.7 SOL fees, the position would be down even more without them.
 
-BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
+BIAS TO HOLD: Unless an exit rule fires or one of the decision factors below clearly justifies a close (pool dying, volume collapsed, yield vanished, downside OOR at a loss, a clearly better opportunity), hold.
 
 ${_sectionOverrides.manager_logic || _defaultManagerLogic()}
 

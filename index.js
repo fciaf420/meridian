@@ -46,7 +46,7 @@ import { startServer } from "./server.js";
 import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
 import { getScreeningThresholdSummary, getStartupMode, screeningCronGate } from "./runtime-helpers.js";
-import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine } from "./prompt.js";
+import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
 log("startup", "DLMM LP Agent starting...");
@@ -714,45 +714,7 @@ function startCronJobs() {
       }
 
       if (exitAlerts) mgmtRuleFired = true;
-      const pnlUnit = config.management.pnlUnit?.toUpperCase() || "SOL";
-      const managementGoal = `
-MANAGEMENT CYCLE${memoryHints}${exitAlerts}${autoCloseInfo}${kbContext}
-
-HARD CLOSE RULES (check in order — close immediately on first match, no further analysis):
-1. Position instruction condition met → CLOSE immediately (highest priority)
-2. Position instruction exists but condition NOT met → HOLD (skip all other rules)
-3. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-4. minutes_out_of_range >= ${config.management.outOfRangeWaitMinutes} → CLOSE (OOR timeout). Applies in both OOR directions and at any PnL.
-5. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio}% AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
-6. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (emergency stop)
-
-If a position's pnl_pct is null (pnl_unknown: true), its PnL is UNKNOWN this tick (data fetch failed), NOT 0 — skip rules 3 and 6 for it and do not close it on PnL grounds this cycle.
-
-These thresholds come from the user's config and are binding.
-Positions listed under EXIT ALERTS (stop loss, trailing take profit, strategy exit) were flagged by the runner's exit check: close them.
-If no rule above and no exit alert applies → HOLD. Do not close for any other reason.
-
-STEPS:
-1. get_my_positions — check all open positions.
-2. For each position:
-   - Call get_position_pnl.
-   - Apply HARD CLOSE RULES above in order. First match → close, stop checking.
-   - If no rule triggers: HOLD.
-3. If closing: ${usdcModeEnabled()
-    ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
-    : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result reports a failed swap or status "success_with_exposure".`}
-4. After closing a LOSING position — check POOL CONTEXT and the lessons in your memory brief for patterns:
-   - If 3+ similar losses (same pool type, volatility range, or strategy) → use update_config to adjust the threshold that would have prevented it
-   - Examples: tighten maxVolatility, raise minOrganic, adjust stopLossPct, raise minVolume
-
-REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values):
-**[PAIR]** | Age: [X]m | Fees: [X] ${pnlUnit} | PnL: [X]% | OOR: [direction or "in-range"]
-**Rule triggered:** [rule number or "none"]
-**Decision:** [STAY/CLOSE]
-**Reason:** [1 short sentence — if PnL is negative, say IL exceeds fees]
-
-FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesson with one lesson that names what went wrong, the signal that was missed or under-weighted, and what to do differently next time. The runner already records the raw stats of every close, so the lesson is only useful for the why.
-      `;
+      const managementGoal = buildManagementGoal(`${memoryHints}${exitAlerts}${autoCloseInfo}${kbContext}`, { usdcMode: usdcModeEnabled() });
       // If the LLM path fails (provider down, or no assistant message), rule 4
       // (OOR timeout) is a pure threshold, so those positions are closed in code
       // through the same close_position path; every other rule waits for the LLM.
