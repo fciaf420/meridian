@@ -356,6 +356,8 @@ export function condensePool(p) {
       token_program: p.token_x?.token_program ?? null,
       has_freeze_authority: p.token_x?.has_freeze_authority ?? null,
       has_mint_authority: p.token_x?.has_mint_authority ?? null,
+      // Token creation time (epoch ms) — the token-age window (tools/token-age.js), not pool age.
+      created_at: p.token_x?.created_at ?? null,
     },
     quote: {
       symbol: p.token_y?.symbol,

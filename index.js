@@ -331,7 +331,7 @@ async function screeningCycleBody() {
         c._gmgnSignal = gmgnSignalResult;
         // Candle-based range depth (tools/ohlcv.js). Token age from GMGN picks the timeframe tier.
         if (ohlcvDepthOn) {
-          const od = await getOhlcvDepth({ pool: c.pool, mint: baseMint, ageHours: gmgnResult?.token_age_hours ?? null }).catch(() => null);
+          const od = await getOhlcvDepth({ pool: c.pool, mint: baseMint, ageHours: c.token_age_hours ?? gmgnResult?.token_age_hours ?? null }).catch(() => null);
           c.ohlcv_depth = od ? { depthPct: od.depthPct, basis: od.short } : null;
         }
         const dynFeeResult = dynFeeMap[c.pool] || null;
@@ -342,6 +342,7 @@ async function screeningCycleBody() {
         c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
 
         let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
+        block += ` | token_age: ${c.token_age_hours != null ? `${c.token_age_hours}h (${c.token_age_source ?? "?"})` : "unknown"}`;
         if (ohlcvDepthOn) block += ` | ohlcv_depth: ${c.ohlcv_depth ? `${c.ohlcv_depth.depthPct}% (${c.ohlcv_depth.basis})` : "n/a (use volatility table)"}`;
         const srcTag = formatCandidateSources(c);
         if (srcTag) block += ` | ${srcTag}`;
@@ -1053,6 +1054,11 @@ const tgUI = createTelegramUI({
   entryPreview: async (c, opts) => {
     const { readPoolEntryState } = await import("./tools/entry-safety.js");
     return readPoolEntryState(c.pool, { apiBlacklisted: c.is_blacklisted ?? null, ...opts });
+  },
+  // Token age for the deploy confirm card (same window deploy_position enforces).
+  tokenAge: async (c) => {
+    const { candidateTokenAge, getTokenAgeInfo } = await import("./tools/token-age.js");
+    return candidateTokenAge(c) ?? getTokenAgeInfo(c.base_mint || c.base?.mint || null, { pool: c.pool });
   },
   // Candle-based range depth for the picker's Auto option (rangeDepthMode "ohlcv").
   getOhlcvDepth: (c) => getOhlcvDepth({ pool: c.pool, mint: c.base_mint || c.base?.mint || null, ageHours: c.token_age_hours ?? null }),
