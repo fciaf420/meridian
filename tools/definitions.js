@@ -130,7 +130,7 @@ For two-sided spot: just pass your total SOL as amount_y + sol_split_pct. The ex
 
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
-2. No user spec → use the configured strategy (config activeStrategy). Under "classic" that is bid_ask unless the two-sided spot conditions in your instructions are met. Under "evil_panda" it is single-sided SOL spot at the Evil Panda price_range_pct, entered only when token-level GMGN volume24H, marketCap and 5m Supertrend checks pass; this tool enforces that shape and rejects amount_x or sol_split_pct below 100.
+2. No user spec → use the configured strategy (config activeStrategy). Under "classic" that is bid_ask unless the two-sided spot conditions in your instructions are met. Under "evil_panda" it is single-sided SOL spot at the Evil Panda price_range_pct; this tool enforces that shape and rejects amount_x or sol_split_pct below 100.
 
 STRATEGIES:
 - 'bid_ask': Single-sided SOL below active bin. You only deposit SOL. bins_below = your range, bins_above = 0. As price drops, your SOL buys the base token bin by bin. You are NOT holding the token upfront — safer if it dumps.
@@ -159,7 +159,7 @@ WHEN TO USE WHICH:
 - High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token. Set sol_split_pct based on conviction level.
 - High volatility, trending, pumping → bid_ask. You earn fees from the sell pressure without holding the bag.
 - Stable, range-bound, high volume → spot two-sided. More fee capture from both sides.
-- When unsure → for autonomous runs use the active strategy. If active strategy is Evil Panda, use single-sided SOL spot only when its entry checks pass; otherwise skip.
+- When unsure → for autonomous runs use the active strategy from your instructions.
 
 HARD RULES:
 - Bin Step: Screening filters apply (config minBinStep/maxBinStep). If user specifies a pool, deploy regardless of bin step.

@@ -140,6 +140,25 @@ export function getRangeSelectionText(deployAmount, currentBalanceSol) {
   return config.strategy.rangeDepthMode === "ohlcv" ? `${ohlcvDepthText()}\n${base}` : base;
 }
 
+/**
+ * Candidate-block text for the 5m GMGN candles. The Evil Panda entry verdict is
+ * shown only under activeStrategy "evil_panda": code applies that gate only
+ * there, so a classic screener must not see it as a rule.
+ */
+export function evilPandaCandidateText(epPass, candles) {
+  const indicators = ` | supertrend=${candles?.supertrend_direction ?? "?"}/${candles?.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${candles?.rsi_2 ?? "?"}`;
+  if (config.strategy.activeStrategy !== "evil_panda") return indicators;
+  const ep = config.strategy.evilPanda;
+  return `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${ep?.minTokenVolume24h ?? 750000}, mcap>=${ep?.minMcap ?? 200000}, 5m Supertrend green/price above${indicators}`;
+}
+
+/** GMGN-guide line stating the Evil Panda entry gate; empty unless evil_panda is active. */
+export function evilPandaGuideLine() {
+  if (config.strategy.activeStrategy !== "evil_panda") return "";
+  const ep = config.strategy.evilPanda;
+  return `- Evil Panda entry requires token-level GMGN volume24H >= $${ep?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${ep?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n`;
+}
+
 /** Candle-depth rule prepended to the range rules when rangeDepthMode is "ohlcv". */
 export function ohlcvDepthText() {
   const max = config.strategy.maxRangePct ?? 80;

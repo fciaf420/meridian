@@ -46,7 +46,7 @@ import { startServer } from "./server.js";
 import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
 import { getScreeningThresholdSummary, getStartupMode, screeningCronGate } from "./runtime-helpers.js";
-import { getRangeSelectionText } from "./prompt.js";
+import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
 log("startup", "DLMM LP Agent starting...");
@@ -379,8 +379,7 @@ async function screeningCycleBody() {
               && gmgnResult.market_cap >= (config.strategy.evilPanda?.minMcap ?? 200000)
               && gmgnResult.candles.evil_panda_entry_ok;
             c._evilPandaPass = !!epPass;
-            block += `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, mcap>=${config.strategy.evilPanda?.minMcap ?? 200000}, 5m Supertrend green/price above`;
-            block += ` | supertrend=${gmgnResult.candles.supertrend_direction ?? "?"}/${gmgnResult.candles.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${gmgnResult.candles.rsi_2 ?? "?"}`;
+            block += evilPandaCandidateText(epPass, gmgnResult.candles);
           }
           if (gmgnResult.ath_proximity_pct != null && gmgnResult.ath_proximity_pct >= config.screening.athTopThresholdPct) {
             block += `\n  ATH WARNING: ${gmgnResult.ath_proximity_pct}% of ATH (>=${config.screening.athTopThresholdPct}%) — override bid_ask range to 65-80%`;
@@ -488,7 +487,7 @@ async function screeningCycleBody() {
     } catch { /* best-effort */ }
 
     const gmgnSignalGuide = candidateBlocks
-      ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n- Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n${loadedCandidates.some((c) => c.gmgn_signals) ? `${GMGN_MARKET_SIGNALS_GUIDE}\n` : ""}`
+      ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n${evilPandaGuideLine()}${loadedCandidates.some((c) => c.gmgn_signals) ? `${GMGN_MARKET_SIGNALS_GUIDE}\n` : ""}`
       : "";
 
     const rangeSourceLine = config.strategy.activeStrategy === "evil_panda"
