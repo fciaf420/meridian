@@ -206,6 +206,9 @@ export const config = {
     managementFallbackModel: u.managementFallbackModel ?? null,
     screeningFallbackModel:  u.screeningFallbackModel  ?? null,
     generalFallbackModel:    u.generalFallbackModel    ?? null,
+    // Codex agent-loop reasoning effort for every role (low|medium|high|xhigh).
+    // null keeps the per-role default: MANAGER high, others medium.
+    reasoningEffort: u.llmReasoningEffort ?? null,
   },
 
   // ─── Web UI ───────────────────────────
