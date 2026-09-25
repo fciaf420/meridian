@@ -8,7 +8,9 @@ import { log } from "./logger.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount, persistUserConfig } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV } from "./config.js";
+import { createAllSettings } from "./all-settings.js";
+import { normalizeEntryFilterValue, isLooseningChange } from "./tools/entry-safety.js";
 import { applyTradingSettings } from "./trading-settings.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
 import { registerCronRestarter, executeTool } from "./tools/executor.js";
@@ -892,6 +894,7 @@ const TELEGRAM_HELP = [
   "",
   "/menu — button menu (status, positions, candidates, wallet, settings, bot controls, trading settings)",
   "⚙️ Trading settings (menu) — TP, stop loss, trailing TP, OOR wait, deploy size, max positions, PnL watcher; risk-raising changes ask for a second tap",
+  "🧾 All settings (Settings) — edit any user-config / gmgn-config key; /cancel aborts a pending value; dryRun and risk-raising edits ask for a second tap",
   "/status — wallet + open positions",
   "/settings — effective config + which file each setting lives in",
   "/usdc [on|off] — show or toggle USDC mode",
@@ -978,6 +981,22 @@ const tgUI = createTelegramUI({
   // update_config and applied to the running config (PnL watcher + management
   // rules read config.management / config.risk live). The PnL watcher only runs
   // once cycles are started; startCronJobs() picks the new interval up otherwise.
+  // Settings → 🧾 All settings: every non-secret key config.js reads.
+  allSettings: createAllSettings({
+    config,
+    lockedKeys: LOCKED_KEYS,
+    integerKeys: INTEGER_KEYS,
+    persistUserConfig,
+    persistGmgnConfig,
+    entryFilters: { normalize: normalizeEntryFilterValue, isLoosening: isLooseningChange },
+    dryRunInEnv: DRY_RUN_SET_IN_ENV,
+    onScheduleChange: (key, value) => {
+      if (!cronStarted) return; // startCronJobs() reads the new value when cycles start
+      if (key === "pnlWatcherIntervalSec") startPnlWatcher(value);
+      else startCronJobs();
+    },
+    log,
+  }),
   applyTradingSettings: (changes) => applyTradingSettings(changes, {
     config,
     persistUserConfig,

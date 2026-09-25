@@ -944,6 +944,79 @@ export function renderTradingSettings(config, { note = null, usdcMode = false, c
   return { text: lines.join("\n"), keyboard };
 }
 
+// ─── All settings (Settings → 🧾 All settings) ──────────────────
+// Callback data: as (groups), ag:<group>:<page>, ak:<id> (key card),
+// av:<id>:<choice> (On/Off or enum index), ai:<id> (send a value), ax (cancel
+// input). <id> is the base-36 index of the key in the all-settings registry.
+export const ALL_SETTINGS_PER_PAGE = 8;
+
+const settingValueHtml = (v, svcFmt) => escapeHtml(clipText(svcFmt(v), 60));
+
+export function renderAllSettingsGroups(svc, { dryRun = false, note = null } = {}) {
+  const groups = svc.groups();
+  const lines = [
+    "🧾 <b>All settings</b>",
+    `Mode: <b>${dryRun ? "DRY RUN" : "LIVE"}</b>`,
+    "Every key user-config.json / gmgn-config.json can hold (secrets, keys and endpoints are never shown). Tap a group, then a key.",
+    "Changes save to the file and apply to the running bot where it supports it. Risk-raising changes and dryRun ask for a second tap.",
+  ];
+  if (note) lines.push("", note);
+  const keyboard = [];
+  const gb = groups.map((g) => btn(`${g.label} (${g.entries.length})`, `ag:${g.id}:0`));
+  for (let i = 0; i < gb.length; i += 2) keyboard.push(gb.slice(i, i + 2));
+  keyboard.push([btn("🛡 Entry filters", "ef"), btn("⚙️ Trading settings", "ts")]);
+  keyboard.push([btn("⚙️ Settings", "se:0"), btn("⬅ Menu", "m")]);
+  return { text: lines.join("\n"), keyboard };
+}
+
+export function renderAllSettingsGroup(svc, groupId, page = 0, { fmt }) {
+  const g = svc.groups().find((x) => x.id === groupId);
+  if (!g) return { text: "Unknown group.", keyboard: [[btn("🧾 All settings", "as")]] };
+  const pages = Math.max(1, Math.ceil(g.entries.length / ALL_SETTINGS_PER_PAGE));
+  const pg = Math.min(Math.max(0, Number(page) || 0), pages - 1);
+  const slice = g.entries.slice(pg * ALL_SETTINGS_PER_PAGE, (pg + 1) * ALL_SETTINGS_PER_PAGE);
+  const lines = [`🧾 <b>${escapeHtml(g.label)}</b>${pages > 1 ? ` (${pg + 1}/${pages})` : ""}`, ""];
+  for (const e of slice) lines.push(`<code>${escapeHtml(e.key)}</code> = <b>${settingValueHtml(svc.current(e), fmt)}</b>${e.restart ? " ⟳" : ""}`);
+  if (slice.some((e) => e.restart)) lines.push("", "⟳ = applies after a restart");
+  const keyboard = [];
+  const kb = slice.map((e) => btn(clipText(e.key, 30), `ak:${e.id}`));
+  for (let i = 0; i < kb.length; i += 2) keyboard.push(kb.slice(i, i + 2));
+  const pager = pagerRow(`ag:${g.id}`, pg, pages);
+  if (pager) keyboard.push(pager);
+  keyboard.push([btn("⬅ All settings", "as"), btn("⬅ Menu", "m")]);
+  return { text: lines.join("\n"), keyboard };
+}
+
+export function renderSettingCard(svc, e, { fmt, dryRun = false, note = null, awaitingInput = false, ttlMs = CONFIRM_TTL_MS } = {}) {
+  const cur = svc.current(e);
+  const lines = [
+    `🧾 <code>${escapeHtml(e.key)}</code>`,
+    `Current: <b>${settingValueHtml(cur, fmt)}</b>`,
+    `Type: ${escapeHtml(svc.describe(e))}`,
+    `File: ${e.file === "gmgn" ? "gmgn-config.json" : "user-config.json"}${e.restart ? " · applies after a restart (no restart button: the bot has no safe in-place restart)" : ""}`,
+  ];
+  if (e.special === "dryRun") {
+    lines.push("", dryRun
+      ? "🧪 Now <b>DRY RUN</b>: no transactions are sent. Turning it off makes the bot trade with <b>real funds</b>."
+      : "🔴 Now <b>LIVE</b>: the bot signs real transactions. Turning dryRun on stops sending them.");
+    if (svc.dryRunInEnv) lines.push("⚠️ .env sets DRY_RUN: the change applies now, but after a restart .env wins over user-config.json.");
+  }
+  if (awaitingInput) lines.push("", `✏️ <b>Send the new value</b> as your next message (${Math.round(ttlMs / 1000)}s). /cancel aborts.`);
+  if (note) lines.push("", note);
+  const keyboard = [];
+  if (e.type === "boolean") {
+    keyboard.push([btn(`${cur === true ? "✅ " : ""}On`, `av:${e.id}:1`), btn(`${cur === false ? "✅ " : ""}Off`, `av:${e.id}:0`)]);
+  } else if (e.type === "enum") {
+    const opts = e.enum.map((v, i) => btn(`${v === cur ? "✅ " : ""}${v === null ? "default" : v}`, `av:${e.id}:${i}`));
+    for (let i = 0; i < opts.length; i += 3) keyboard.push(opts.slice(i, i + 3));
+  } else if (!awaitingInput) {
+    keyboard.push([btn("✏️ Send a new value", `ai:${e.id}`)]);
+  }
+  if (awaitingInput) keyboard.push([btn("✖ Cancel input", "ax")]);
+  keyboard.push([btn(`⬅ ${clipText(e.groupLabel ?? "Group", 30)}`, `ag:${e.group}:0`), btn("🧾 All settings", "as")]);
+  return { text: lines.join("\n"), keyboard };
+}
+
 export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = {}) {
   return {
     text: [
@@ -1074,6 +1147,7 @@ export function renderExecResult(action, label, result) {
  *   buildSettingsReport(), handleAutoresearchCommand(args), readRecentErrors()
  *   setEntryFilter(key, value)            — → { ok, text, loosened } | { ok: false, error } (entry-safety.js)
  *   applyTradingSettings(changes)         — → { ok, text, changes, rescheduled } | { ok: false, error } (trading-settings.js)
+ *   allSettings                           — all-settings.js createAllSettings() service (registry, validate, risk, apply)
  *   entryPreview(candidate, { strategy }) — read-only pool status / fee mode / TWAP for the confirm card
  *   log(category, msg), now(), ttlMs
  */
@@ -1091,6 +1165,7 @@ export function createTelegramUI(deps) {
     lastManagement: null,
     lastScreening: null,
     customDeploy: null, // { chatId, expiresAt } while waiting for a "Custom…" deploy size
+    cfgInput: null, // { chatId, id, expiresAt } while waiting for an All-settings value
   };
   const isDryRun = () => process.env.DRY_RUN === "true";
   const unit = () => deps.config.management?.pnlUnit || "sol";
@@ -1392,6 +1467,75 @@ export function createTelegramUI(deps) {
     return show(ctx, tradingView({ note: r.note }), opts);
   }
 
+  // ── all settings ──
+  const svc = () => deps.allSettings || null;
+  const fmtSetting = (v) => {
+    if (v === null || v === undefined) return "unset";
+    if (typeof v === "boolean") return v ? "on" : "off";
+    if (Array.isArray(v)) return v.length ? v.join(", ") : "(empty)";
+    return String(v);
+  };
+  const withGroupLabel = (e) => ({ ...e, groupLabel: svc().groups().find((g) => g.id === e.group)?.label });
+  const settingCard = (e, extra = {}) => renderSettingCard(svc(), withGroupLabel(e), { fmt: fmtSetting, dryRun: isDryRun(), ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, ...extra });
+
+  function cfgPending(chatId = null) {
+    const c = state.cfgInput;
+    if (!c) return null;
+    if (c.expiresAt <= now()) { state.cfgInput = null; return null; }
+    if (chatId != null && c.chatId != null && String(chatId) !== c.chatId) return null;
+    return c;
+  }
+
+  function applySetting(e, value) {
+    const r = svc().apply(e, value);
+    if (!r?.ok) {
+      logf("telegram_warn", `Setting ${e.key} change failed: ${r?.error}`);
+      return { ok: false, note: `⚠️ Not changed: ${escapeHtml(r?.error ?? "error")}` };
+    }
+    logf("telegram", `Setting changed from Telegram: ${r.text}`);
+    return { ok: true, text: r.text, note: `✅ Saved: ${escapeHtml(r.text)}${r.restart ? "\n⟳ Applies after a restart." : ""}` };
+  }
+
+  /** Validate, then apply (one tap) or show a nonce confirm (risk-raising / dryRun). */
+  async function settingChange(e, raw, ctx, answer, opts = {}) {
+    const v = svc().validate(e, raw);
+    if (v.error) {
+      logf("telegram_warn", `Setting ${e.key} refused: ${v.error}`);
+      await answer(`Not changed: ${v.error}`.slice(0, 180), true);
+      return show(ctx, settingCard(e, { note: `⚠️ Not changed: ${escapeHtml(v.error)}` }), opts);
+    }
+    const before = svc().current(e);
+    if (JSON.stringify(before) === JSON.stringify(v.value)) {
+      await answer("Already set.");
+      return show(ctx, settingCard(e), opts);
+    }
+    const reasons = svc().risk(e, v.value);
+    const line = `${e.key}: ${fmtSetting(before)} → ${fmtSetting(v.value)}`;
+    if (reasons.length) {
+      await answer();
+      const nonce = nonces.put("cfg_set", { id: e.id, key: e.key, value: v.value, label: line });
+      logf("telegram", `Setting confirm requested: ${line} (${reasons.join(", ")})`);
+      const live = e.special === "dryRun" && v.value === false;
+      const text = [
+        e.special === "dryRun" ? (live ? "🔴 <b>Switch to LIVE trading?</b>" : "🧪 <b>Switch to DRY RUN?</b>") : "⚠️ <b>Raise risk?</b>",
+        `<b>${escapeHtml(clipText(line, 300))}</b>`,
+        "",
+        `This ${escapeHtml(reasons.join(" and "))}.`,
+        live ? "The bot will sign and send REAL transactions with real funds from the next action on." : null,
+        e.special === "dryRun" && svc().dryRunInEnv ? "⚠️ .env sets DRY_RUN: after a restart .env wins over this setting." : null,
+        "",
+        `Saves to ${e.file === "gmgn" ? "gmgn-config.json" : "user-config.json"}${e.restart ? " (applies after a restart)" : " and applies to the running bot"}. Expires in ${Math.round((deps.ttlMs ?? CONFIRM_TTL_MS) / 1000)}s.`,
+      ].filter((l) => l != null).join("\n");
+      return presentConfirm(ctx, {
+        nonce,
+        view: { text, keyboard: [[btn(live ? "🔴 Confirm LIVE" : "✅ Confirm change", `y:${nonce}`), btn("✖ Cancel", `n:${nonce}`)]] },
+      }, opts);
+    }
+    const r = applySetting(e, v.value);
+    await answer(r.ok ? `Saved: ${r.text}`.slice(0, 180) : "Not changed", !r.ok);
+    return show(ctx, settingCard(e, { note: r.note }), opts);
+  }
+
   // ── execution (Confirm tap) ──
   async function execute(entry, ctx) {
     const edit = (text, keyboard = [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]]) =>
@@ -1446,6 +1590,13 @@ export function createTelegramUI(deps) {
       return edit(`🔍 <b>Screening cycle finished</b>\n${escapeHtml(clipText(String(report ?? "no report"), 1500))}`, [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]]);
     }
 
+    if (action === "cfg_set") {
+      const e = svc()?.get(params.id);
+      if (!e || e.key !== params.key) return edit("Unknown setting — nothing was changed.", [[btn("🧾 All settings", "as")]]);
+      const r = applySetting(e, params.value);
+      return show(ctx, settingCard(e, { note: r.note }));
+    }
+
     if (action === "trade_set") {
       const r = applyTrading(params.changes, params);
       return show(ctx, tradingView({ note: r.note }));
@@ -1486,6 +1637,30 @@ export function createTelegramUI(deps) {
         return true;
       }
       await show(null, candidatesView(0), { fresh: true });
+      return true;
+    }
+
+    // All settings: the owner's next message is the value (commands pass through).
+    const pendingCfg = svc() ? cfgPending(ctx.chatId) : null;
+    if (/^\/cancel(@\w+)?$/i.test(text) && (pendingCfg || customPending(ctx.chatId))) {
+      state.cfgInput = null;
+      state.customDeploy = null;
+      logf("telegram", "Pending settings input cancelled (/cancel)");
+      await deps.tg.sendHTML("✖ Cancelled. Nothing was changed.", { reply_markup: { inline_keyboard: [[btn("🧾 All settings", "as"), btn("⬅ Menu", "m")]] } });
+      return true;
+    }
+    if (pendingCfg && !text.startsWith("/")) {
+      const e = svc().get(pendingCfg.id);
+      const v = e ? svc().validate(e, text) : { error: "unknown setting" };
+      if (v.error) {
+        logf("telegram_warn", `Setting ${e?.key ?? "?"} input refused: ${v.error}`);
+        await deps.tg.sendHTML(`⚠️ Not changed: ${escapeHtml(v.error)}. Send another value, or /cancel.`, {
+          reply_markup: { inline_keyboard: [[btn("✖ Cancel input", "ax")]] },
+        });
+        return true;
+      }
+      state.cfgInput = null; // single use
+      await settingChange(e, v.value, { chatId: ctx.chatId }, async () => {}, { fresh: true });
       return true;
     }
 
@@ -1610,6 +1785,7 @@ export function createTelegramUI(deps) {
           const extraRow = [btn("⚙️ Trading settings", "ts")];
           if (deps.setEntryFilter) extraRow.unshift(btn("🛡 Entry filters", "ef"));
           view.keyboard.push(extraRow);
+          if (deps.allSettings) view.keyboard.push([btn("🧾 All settings", "as")]);
           view.keyboard.push(backRow(`se:${view.page}`));
           await show(ctx, view, opts);
           return;
@@ -1660,6 +1836,64 @@ export function createTelegramUI(deps) {
           await answer();
           await show(ctx, tradingView(), opts);
           return;
+        case "as":
+        case "ag":
+        case "ak":
+        case "av":
+        case "ai":
+        case "ax": {
+          // Owner-only (transport), edited in place. Secrets are never in the registry.
+          if (!svc()) {
+            await answer("All settings isn't available here.", true);
+            return;
+          }
+          if (head === "as") {
+            await answer();
+            await show(ctx, renderAllSettingsGroups(svc(), { dryRun: isDryRun() }), opts);
+            return;
+          }
+          if (head === "ag") {
+            await answer();
+            await show(ctx, renderAllSettingsGroup(svc(), arg, sub, { fmt: fmtSetting }), opts);
+            return;
+          }
+          if (head === "ax") {
+            state.cfgInput = null;
+            await answer("Cancelled");
+            await show(ctx, renderAllSettingsGroups(svc(), { dryRun: isDryRun(), note: "✖ Input cancelled. Nothing was changed." }), opts);
+            return;
+          }
+          const e = svc().get(arg);
+          if (!e) {
+            await answer("Unknown setting.", true);
+            return;
+          }
+          if (head === "ak") {
+            await answer();
+            await show(ctx, settingCard(e), opts);
+            return;
+          }
+          if (head === "ai") {
+            if (e.type === "boolean" || e.type === "enum") {
+              await answer("Use the buttons.", true);
+              return;
+            }
+            state.cfgInput = { chatId: ctx.chatId != null ? String(ctx.chatId) : null, id: e.id, expiresAt: now() + (deps.ttlMs ?? CONFIRM_TTL_MS) };
+            await answer("Send the new value");
+            await show(ctx, settingCard(e, { awaitingInput: true }), opts);
+            return;
+          }
+          // av: On/Off or enum index
+          let raw;
+          if (e.type === "boolean" && (sub === "1" || sub === "0")) raw = sub === "1";
+          else if (e.type === "enum" && /^\d+$/.test(sub ?? "") && Number(sub) < e.enum.length) raw = e.enum[Number(sub)] ?? "off";
+          if (raw === undefined) {
+            await answer("Unknown choice.", true);
+            return;
+          }
+          await settingChange(e, raw, ctx, answer, opts);
+          return;
+        }
         case "tv": {
           // Owner-only (transport), edited in place. Risk-raising presets go
           // through the nonce confirm; the rest apply in one tap. All logged.
@@ -1826,7 +2060,10 @@ export function createTelegramUI(deps) {
           const r = nonces.take(arg);
           await answer(r.entry ? "Cancelled" : "Nothing to cancel");
           if (r.entry?.action === "trade_set") logf("telegram", `Trading settings change cancelled: ${r.entry.params.label}`);
-          const back = r.entry?.action === "trade_set" ? [[btn("⚙️ Trading settings", "ts"), btn("⬅ Menu", "m")]] : [[btn("⬅ Menu", "m")]];
+          if (r.entry?.action === "cfg_set") logf("telegram", `Setting change cancelled: ${r.entry.params.label}`);
+          const back = r.entry?.action === "trade_set" ? [[btn("⚙️ Trading settings", "ts"), btn("⬅ Menu", "m")]]
+            : r.entry?.action === "cfg_set" ? [[btn("🧾 All settings", "as"), btn("⬅ Menu", "m")]]
+              : [[btn("⬅ Menu", "m")]];
           await show(ctx, { text: "✖ Cancelled. Nothing was done.", keyboard: back });
           return;
         }
