@@ -44,18 +44,23 @@ const DEFAULTS = {
   kept_overrides: {},    // section → text for permanently kept experiment overrides
 };
 
-function readUserConfigSnapshot() {
-  const userConfigPath = path.join(__dirname, "user-config.json");
-  try {
-    if (!fs.existsSync(userConfigPath)) return {};
-    return JSON.parse(fs.readFileSync(userConfigPath, "utf8"));
-  } catch {
-    return {};
-  }
+const MANAGEMENT_THRESHOLD_KEYS = ["stopLossPct", "takeProfitFeePct", "trailingTriggerPct", "trailingDropPct"];
+
+/**
+ * Fingerprint of the threshold VALUES that shape which pools get deployed and
+ * when they exit. evolveThresholds rewrites _lastEvolved/_positionsAtEvolution
+ * every 5 closes even when it changes nothing (lessons.js "Always update the
+ * counter"), so those counters must not be what invalidates an experiment.
+ */
+export function thresholdFingerprint(cfg = config) {
+  const screening = cfg.screening || {};
+  const management = cfg.management || {};
+  const sorted = Object.fromEntries(Object.keys(screening).sort().map((k) => [k, screening[k] ?? null]));
+  const mgmt = Object.fromEntries(MANAGEMENT_THRESHOLD_KEYS.map((k) => [k, management[k] ?? null]));
+  return JSON.stringify({ screening: sorted, management: mgmt, activeStrategy: cfg.strategy?.activeStrategy ?? null });
 }
 
-function getEnvironmentSnapshot() {
-  const userConfig = readUserConfigSnapshot();
+export function getEnvironmentSnapshot(cfg = config) {
   let weightsMeta = {};
   try {
     const weights = loadWeights();
@@ -71,24 +76,21 @@ function getEnvironmentSnapshot() {
   }
 
   return {
-    thresholds_last_evolved: userConfig._lastEvolved ?? null,
-    thresholds_positions_at_evolution: userConfig._positionsAtEvolution ?? 0,
+    thresholds_fingerprint: thresholdFingerprint(cfg),
+    // Darwin metadata is recorded for the audit trail only; weight recalcs
+    // change prompt summary text, not hard filters, so they don't invalidate.
     darwin_last_recalc: weightsMeta.last_recalc,
     darwin_recalc_count: weightsMeta.recalc_count,
   };
 }
 
-function environmentChangedSince(snapshot = {}) {
-  const current = getEnvironmentSnapshot();
-  // Only invalidate on threshold evolution (changes hard screening filters).
-  // Darwin weight recalcs only affect prompt summary text, not hard filters —
-  // they shouldn't invalidate experiments since the actual screening behavior
-  // doesn't change. This was causing 50%+ of experiments to be invalidated
-  // before completing the 7-close minimum.
-  return (
-    current.thresholds_last_evolved !== (snapshot.thresholds_last_evolved ?? null) ||
-    current.thresholds_positions_at_evolution !== (snapshot.thresholds_positions_at_evolution ?? 0)
-  );
+/**
+ * True only when a threshold VALUE changed since the snapshot was taken.
+ * Legacy snapshots (evolution counters, no fingerprint) never invalidate.
+ */
+export function environmentChangedSince(snapshot = {}, cfg = config) {
+  if (snapshot?.thresholds_fingerprint == null) return false;
+  return thresholdFingerprint(cfg) !== snapshot.thresholds_fingerprint;
 }
 
 function getTrialPositionsForExperiment(experiment, perfData) {
@@ -445,8 +447,8 @@ async function evaluateExperiment(perfData, cfg, state) {
   const declinePct = cfg.autoresearch?.declinePct ?? 15;
   const cooldownCloses = cfg.autoresearch?.cooldownCloses ?? 5;
 
-  if (environmentChangedSince(experiment.environment_snapshot)) {
-    log("autoresearch", `Environment changed during ${experiment.id} — invalidating trial to avoid confounded results`);
+  if (environmentChangedSince(experiment.environment_snapshot, cfg)) {
+    log("autoresearch", `Threshold values changed during ${experiment.id} — invalidating trial to avoid confounded results`);
     finishExperiment(state, "invalidated_environment_change", 0);
     return;
   }

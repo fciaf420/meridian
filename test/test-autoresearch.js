@@ -111,3 +111,25 @@ test("maybeRunAutoresearch is a no-op when disabled", async () => {
   const res = await ar.maybeRunAutoresearch([], [], { autoresearch: { enabled: false } });
   assert.deepEqual(res, { skipped: "disabled" });
 });
+
+test("D2: evolution counters alone never invalidate; a real threshold change does", () => {
+  const cfg = structuredClone({ screening: config.screening, management: config.management, strategy: config.strategy });
+  const snap = ar.getEnvironmentSnapshot(cfg);
+  assert.equal(typeof snap.thresholds_fingerprint, "string");
+  assert.equal("thresholds_last_evolved" in snap, false, "counters are not part of the snapshot");
+
+  // evolveThresholds with no changes only bumps _lastEvolved/_positionsAtEvolution
+  // in user-config.json; the live threshold values are untouched.
+  assert.equal(ar.environmentChangedSince(snap, cfg), false);
+
+  cfg.screening.maxVolatility = (cfg.screening.maxVolatility ?? 8) - 1;
+  assert.equal(ar.environmentChangedSince(snap, cfg), true, "a changed screening value invalidates");
+
+  const cfg2 = structuredClone({ screening: config.screening, management: config.management, strategy: config.strategy });
+  const snap2 = ar.getEnvironmentSnapshot(cfg2);
+  cfg2.management.stopLossPct = (cfg2.management.stopLossPct ?? -10) - 5;
+  assert.equal(ar.environmentChangedSince(snap2, cfg2), true, "a changed stop loss invalidates");
+
+  // Legacy experiments only recorded the counters: never invalidate on them.
+  assert.equal(ar.environmentChangedSince({ thresholds_last_evolved: "x", thresholds_positions_at_evolution: 3 }, cfg), false);
+});
