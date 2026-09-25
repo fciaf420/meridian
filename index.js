@@ -8,7 +8,8 @@ import { log } from "./logger.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, persistUserConfig } from "./config.js";
+import { applyTradingSettings } from "./trading-settings.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
 import { registerCronRestarter, executeTool } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, editHTML, answerCallback, setMyCommands, isEnabled as telegramEnabled } from "./telegram.js";
@@ -889,7 +890,8 @@ const buildSettingsReportSync = () => buildSettingsReport({ color: false });
 const TELEGRAM_HELP = [
   "DLMM LP Agent — Telegram control",
   "",
-  "/menu — button menu (status, positions, candidates, wallet, settings, bot controls)",
+  "/menu — button menu (status, positions, candidates, wallet, settings, bot controls, trading settings)",
+  "⚙️ Trading settings (menu) — TP, stop loss, trailing TP, OOR wait, deploy size, max positions, PnL watcher; risk-raising changes ask for a second tap",
   "/status — wallet + open positions",
   "/settings — effective config + which file each setting lives in",
   "/usdc [on|off] — show or toggle USDC mode",
@@ -972,6 +974,21 @@ const tgUI = createTelegramUI({
     const { applyEntryFilterChange } = await import("./tools/entry-safety.js");
     return applyEntryFilterChange(key, value, { source: "telegram" });
   },
+  // Menu / Settings → ⚙️ Trading settings: user changes, persisted like
+  // update_config and applied to the running config (PnL watcher + management
+  // rules read config.management / config.risk live). The PnL watcher only runs
+  // once cycles are started; startCronJobs() picks the new interval up otherwise.
+  applyTradingSettings: (changes) => applyTradingSettings(changes, {
+    config,
+    persistUserConfig,
+    restartPnlWatcher: (sec) => {
+      if (!cronStarted) return false;
+      startPnlWatcher(sec);
+      return true;
+    },
+    log,
+    source: "telegram",
+  }),
   // Read-only pool status / fee mode / TWAP for the deploy confirm card.
   entryPreview: async (c, opts) => {
     const { readPoolEntryState } = await import("./tools/entry-safety.js");

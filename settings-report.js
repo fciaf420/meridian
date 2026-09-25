@@ -139,7 +139,7 @@ export function buildSettingsReport({ color = false } = {}) {
   // ── exits ──
   h("Exits  " + C.dim("(user-config.json)"));
   row("take profit", `${config.management.takeProfitFeePct}% fees`, "takeProfitFeePct");
-  row("stop loss", `${config.management.stopLossPct}%`, "stopLossPct");
+  row("stop loss", config.management.stopLossPct ? `${config.management.stopLossPct}%` : "off", "stopLossPct");
   row("trailing TP", config.management.trailingTakeProfit ? `on (trig ${config.management.trailingTriggerPct}% / drop ${config.management.trailingDropPct}%)` : "off", "trailing*");
   row("out-of-range wait", `${config.management.outOfRangeWaitMinutes} min`, "outOfRangeWaitMinutes");
 
