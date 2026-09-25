@@ -843,7 +843,8 @@ export async function deployPosition({
   // the SDK builds the deposit from pool.lbPair.activeId, and a cached instance
   // is up to 5 min stale — and could be refetched by another flow between our
   // range computation and the build.
-  const pool = await DLMM.create(getConnection(), new PublicKey(pool_address));
+  const pool = _poolOverridesForTest.get(String(pool_address))
+    ?? await DLMM.create(getConnection(), new PublicKey(pool_address));
   const activeIdAtLoad = pool.lbPair.activeId;
   // Deploys fund the Y side with SOL (both SOL and USDC mode swap to SOL first),
   // so a pool whose token Y isn't wrapped SOL would be funded with the wrong token.
@@ -2573,9 +2574,10 @@ export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
 export { getPool as getPoolForRead, initializedBinArrayWindow };
 
 /** Test hook: seed the pool cache with a mock DLMM instance. */
+const _poolOverridesForTest = new Map(); // test seam only; production never populates it
 export function _setPoolForTest(poolAddress, pool) {
-  if (pool == null) poolCache.delete(String(poolAddress));
-  else poolCache.set(String(poolAddress), pool);
+  if (pool == null) { poolCache.delete(String(poolAddress)); _poolOverridesForTest.delete(String(poolAddress)); }
+  else { poolCache.set(String(poolAddress), pool); _poolOverridesForTest.set(String(poolAddress), pool); }
 }
 
 export { readChunkFunding as _readChunkFundingForTest };
