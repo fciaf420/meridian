@@ -52,7 +52,11 @@ export const ENUMS = {
   pnlUnit: ["sol", "usd"],
   positionSizeBase: ["total", "wallet"],
   direction: ["asc", "desc"],
+  rangeDepthMode: ["ohlcv", "volatility"],
 };
+
+/** Structured keys edited in user-config.json directly (not listed here). */
+const HIDDEN_KEYS = new Set(["ohlcvTiers"]);
 
 /** Keys read only at startup: saved now, used after a restart. */
 export const RESTART_KEYS = new Set(["llmProvider", "webPort"]);
@@ -64,6 +68,7 @@ const BOUNDS = {
   deployAmountUsd: [1, 100_000], maxDeployUsd: [1, 100_000], minUsdcToOpen: [0, 1_000_000],
   maxDeployAmount: [0.1, 100], temperature: [0, 2], maxTokens: [256, 200_000], maxSteps: [1, 100],
   emergencyPriceDropPct: [-100, -1], webPort: [1, 65_535], twapWindowMinutes: [5, 1440],
+  ohlcvBufferMult: [1, 3], solanaTrackerDailyCap: [0, 2500],
 };
 
 /**
@@ -149,7 +154,7 @@ export function createAllSettings(deps) {
   const mappedUser = new Set(parsed.filter((e) => e.file === "user").map((e) => e.key));
   const entries = [];
   for (const e of parsed) {
-    if (locked.has(e.key) || SECRET_KEY_RE.test(e.key)) continue;
+    if (locked.has(e.key) || SECRET_KEY_RE.test(e.key) || HIDDEN_KEYS.has(e.key)) continue;
     if (e.file === "env" && mappedUser.has(e.key)) continue; // e.g. usdcMode → usdc.enabled
     const livePath = e.file === "user" && CONFIG_KEY_MAP[e.key] ? CONFIG_KEY_MAP[e.key] : e.path;
     const entry = { key: e.key, file: e.file === "gmgn" ? "gmgn" : "user", path: livePath, special: null };

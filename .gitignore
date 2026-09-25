@@ -15,6 +15,7 @@ lessons.json
 smart-wallets.json
 pool-memory.json
 token-blacklist.json
+solanatracker-usage.json
 strategy-library.json
 # Legacy nuggets memory store (no longer used; kept on disk, safe to delete)
 data/nuggets/

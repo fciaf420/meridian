@@ -193,6 +193,13 @@ export const config = {
   strategy: {
     activeStrategy: u.activeStrategy ?? "evil_panda",
     maxRangePct: u.maxRangePct ?? 80, // deepest downside range any deploy may use (%), enforced in deploy_position
+    // Range depth from candles (tools/ohlcv.js): "ohlcv" sizes price_range_pct from
+    // max drawdown × ohlcvBufferMult + ATR slack and deploy_position widens to it;
+    // "volatility" = the prompt's volatility table only.
+    rangeDepthMode: u.rangeDepthMode ?? "ohlcv",
+    ohlcvBufferMult: u.ohlcvBufferMult ?? 1.3,
+    solanaTrackerDailyCap: u.solanaTrackerDailyCap ?? 60, // SolanaTracker fallback calls per UTC day (free-plan credits)
+    ohlcvTiers: u.ohlcvTiers ?? null, // token-age → candle timeframe tiers; null = DEFAULT_OHLCV_TIERS in tools/ohlcv.js
     strategy:   u.strategy   ?? "spot",
     binsBelow:  u.binsBelow  ?? 69,  // activeBin - 69 to activeBin = 70 bins total (program max)
     evilPanda: {
@@ -436,7 +443,7 @@ export const INTEGER_KEYS = new Set([
   "maxPositions", "maxDeployAmount",
   "managementIntervalMin", "screeningIntervalMin",
   "healthCheckIntervalMin", "pnlWatcherIntervalSec",
-  "maxTokens", "maxSteps",
+  "maxTokens", "maxSteps", "solanaTrackerDailyCap",
 ]);
 
 function findSection(key) {

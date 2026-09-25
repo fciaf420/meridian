@@ -15,6 +15,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { config } from "./config.js";
+import { MIN_RANGE_PCT } from "./runtime-helpers.js";
 
 // ─── Section Override System (used by autoresearch) ──────────
 const _sectionOverrides = {};
@@ -131,14 +132,21 @@ export function getRangeSelectionText(deployAmount, currentBalanceSol) {
   // so it uses the arm that loop is about to get.
   const arm = _armStore.getStore()?.arm ?? peekNextExperimentArm();
   const rangeText = _useCandidate("range_selection", arm) ? _experiment.text : _sectionOverrides.range_selection;
-  if (rangeText) {
+  const base = rangeText
     // Same placeholders the default template leaves literal in _getDefaultSections().
-    return fillSectionPlaceholders(rangeText, {
-      deployAmount,
-      currentBalanceSol: currentBalanceSol ?? "?",
-    });
-  }
-  return _defaultRangeSelectionText(deployAmount, currentBalanceSol);
+    ? fillSectionPlaceholders(rangeText, { deployAmount, currentBalanceSol: currentBalanceSol ?? "?" })
+    : _defaultRangeSelectionText(deployAmount, currentBalanceSol);
+  // Kept outside the range_selection section so an autoresearch override can't drop it.
+  return config.strategy.rangeDepthMode === "ohlcv" ? `${ohlcvDepthText()}\n${base}` : base;
+}
+
+/** Candle-depth rule prepended to the range rules when rangeDepthMode is "ohlcv". */
+export function ohlcvDepthText() {
+  const max = config.strategy.maxRangePct ?? 80;
+  return `- OHLCV RANGE DEPTH (rangeDepthMode=ohlcv — this takes precedence over the volatility table):
+  Each candidate shows ohlcv_depth = the depth its recent candles need: max drawdown (peak high → later low) × ${config.strategy.ohlcvBufferMult ?? 1.3} + ATR slack, clamped ${MIN_RANGE_PCT}–${max}%.
+  Use that number as price_range_pct. The ATH PROXIMITY OVERRIDE may still widen it (up to ${max}%); nothing else narrows it.
+  Only when ohlcv_depth is n/a, size from the volatility table below. deploy_position widens any range shallower than the pool's ohlcv depth.`;
 }
 
 function _defaultRangeSelectionText(deployAmount, currentBalanceSol) {
