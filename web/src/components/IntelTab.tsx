@@ -65,7 +65,7 @@ type AutoresearchPayload = {
   cooldownRemaining: number;
   active: ExperimentSummary | null;
   keptOverrideSections: string[];
-  overrides?: { kept: OverrideView[]; quarantined: OverrideView[] };
+  overrides?: { kept: OverrideView[]; quarantined: OverrideView[]; pending?: OverrideView | null };
   recentExperiments: ExperimentSummary[];
   recentLessons: LessonItem[];
 };
@@ -372,7 +372,7 @@ export default function IntelTab() {
                 <div className="mt-3 space-y-2 text-sm text-cream/84">
                   <div>Cooldown remaining: {data?.autoresearch.cooldownRemaining ?? 0}</div>
                   <div>Kept overrides: {(data?.autoresearch.keptOverrideSections || []).join(", ") || "none"}</div>
-                  {[...(data?.autoresearch.overrides?.kept || []), ...(data?.autoresearch.overrides?.quarantined || [])].map((o) => (
+                  {[...(data?.autoresearch.overrides?.pending ? [data.autoresearch.overrides.pending] : []), ...(data?.autoresearch.overrides?.kept || []), ...(data?.autoresearch.overrides?.quarantined || [])].map((o) => (
                     <details key={`${o.status}-${o.section}`} className="rounded-xl border border-white/6 bg-black/10 px-3 py-2">
                       <summary className="cursor-pointer text-sm">
                         <span className="font-medium text-cream">{o.section}</span>{" "}

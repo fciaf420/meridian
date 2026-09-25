@@ -111,6 +111,8 @@ function buildAutoresearchPayload() {
           started_at: experiment.started_at,
           baseline: experiment.baseline ?? null,
           trial: experiment.trial ?? null,
+          result: experiment.result ?? null, // A/B verdict: delta_pct, ci95, n per arm
+          decision: experiment.decision ?? null,
         }))
     : [];
 

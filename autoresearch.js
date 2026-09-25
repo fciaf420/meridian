@@ -18,6 +18,8 @@ import {
   getDefaultPromptSectionText,
   setPromptSectionOverride,
   clearPromptSectionOverride,
+  setExperimentCandidate,
+  clearExperimentCandidate,
 } from "./prompt.js";
 import { loadWeights, getWeightsSummary } from "./signal-weights.js";
 import {
@@ -45,6 +47,7 @@ const DEFAULTS = {
   cooldownRemaining: 0,  // closes remaining before next experiment
   kept_overrides: {},    // section → text for permanently kept experiment overrides
   kept_meta: {},         // section → { experiment_id, kept_at, strategy, default_hash }
+  pending_proposal: null,    // A/B winner awaiting operator approve/reject
   quarantined_overrides: {}, // section → { text, reason, quarantined_at, strategy, ... } (never applied)
   reverted_overrides: [],    // operator-reverted kept overrides, newest last
 };
@@ -98,25 +101,6 @@ export function getEnvironmentSnapshot(cfg = config) {
 export function environmentChangedSince(snapshot = {}, cfg = config) {
   if (snapshot?.thresholds_fingerprint == null) return false;
   return thresholdFingerprint(cfg) !== snapshot.thresholds_fingerprint;
-}
-
-function getTrialPositionsForExperiment(experiment, perfData) {
-  if (!experiment) return [];
-
-  if (experiment.section === "manager_logic") {
-    return perfData.filter((p) => {
-      const closedAt = p.recorded_at || p.closed_at;
-      return closedAt ? closedAt >= experiment.started_at : false;
-    });
-  }
-
-  return perfData.slice(experiment.started_at_position)
-    .filter((p) => {
-      const deployedAt = p.deployed_at;
-      if (deployedAt) return deployedAt >= experiment.started_at;
-      const closedAt = p.recorded_at || p.closed_at;
-      return closedAt ? closedAt >= experiment.started_at : true;
-    });
 }
 
 // Set when autoresearch.json is present but unparseable. While degraded we
@@ -288,10 +272,13 @@ export function applyStartupOverrides(state, cfg = config) {
     const stale = overrideStaleness(section, state.kept_meta?.[section], cfg);
     log("autoresearch", `Restored kept override: ${section}${stale.length ? ` — WARNING stale: ${stale.join("; ")}` : ""}`);
   }
-  if (state.active?.modified_text && state.active?.section) {
-    setPromptSectionOverride(state.active.section, state.active.modified_text);
-    applied.push(`active:${state.active.section}`);
-    log("autoresearch", `Restored active experiment override: ${state.active.id} (${state.active.section})`);
+  // The active experiment's candidate is served to its A/B arm only; it never
+  // replaces the control text. Legacy (pre-A/B) experiments aren't restored:
+  // the next evaluation closes them as abandoned.
+  if (state.active?.design === "ab" && state.active?.modified_text && state.active?.section) {
+    setExperimentCandidate({ id: state.active.id, section: state.active.section, text: state.active.modified_text });
+    applied.push(`candidate:${state.active.section}`);
+    log("autoresearch", `Restored active A/B experiment: ${state.active.id} (${state.active.section})`);
   }
   return applied;
 }
@@ -329,6 +316,9 @@ const AUTORESEARCH_HELP = [
   "/autoresearch show <section> — full text + diff (kept, else quarantined)",
   "/autoresearch revert <section> — deactivate a kept override (kept in reverted history)",
   "/autoresearch restore <section> — re-keep the latest reverted or quarantined text",
+  "/autoresearch approve — keep the pending proposal (an A/B winner)",
+  "/autoresearch reject — discard the pending proposal",
+  "/autoresearch abort — stop the active experiment (candidate discarded)",
 ].join("\n");
 
 /**
@@ -356,7 +346,12 @@ export function handleAutoresearchCommand(argString = "", cfg = config) {
       `Autoresearch: ${enabled ? "enabled" : "disabled (overrides inactive)"} | strategy: ${cfg.strategy?.activeStrategy ?? "?"}`,
       `Kept overrides: ${Object.keys(kept).join(", ") || "none"}`,
       `Quarantined: ${Object.keys(quarantined).join(", ") || "none"}`,
-      `Active experiment: ${state.active ? `${state.active.id} (${state.active.section})` : "none"}`,
+      `Active experiment: ${state.active
+        ? `${state.active.id} (${state.active.section}) — closes control ${state.active.trial?.control ?? 0} / candidate ${state.active.trial?.candidate ?? 0} of ${cfg.autoresearch?.minClosesPerArm ?? 100} per arm`
+        : "none"}`,
+      `Pending proposal: ${state.pending_proposal
+        ? `${state.pending_proposal.experiment_id} (${state.pending_proposal.section}) Δ ${state.pending_proposal.result?.delta_pct} pp, 95% CI ${state.pending_proposal.result?.ci95?.join("..")}`
+        : "none"}`,
       `Experiments recorded: ${(state.experiments || []).length}`,
       "",
       AUTORESEARCH_HELP,
@@ -435,6 +430,33 @@ export function handleAutoresearchCommand(argString = "", cfg = config) {
     ].filter(Boolean).join("\n");
   }
 
+  if (cmd === "approve" || cmd === "reject") {
+    const p = state.pending_proposal;
+    if (!p) return "No pending proposal.";
+    const at = new Date().toISOString();
+    const exp = (state.experiments || []).findLast?.((e) => e.id === p.experiment_id);
+    if (exp) exp.decision = { action: cmd === "approve" ? "approved" : "rejected", at };
+    if (cmd === "approve") {
+      if (kept[p.section]) {
+        state.reverted_overrides = Array.isArray(state.reverted_overrides) ? state.reverted_overrides : [];
+        state.reverted_overrides.push({ section: p.section, text: kept[p.section], meta: state.kept_meta?.[p.section] ?? null, reverted_at: at, replaced_by: p.experiment_id });
+      }
+      keepOverride(state, p.section, p.text, p.experiment_id, cfg);
+    }
+    state.pending_proposal = null;
+    saveAutoresearch(state);
+    return cmd === "approve"
+      ? `Approved ${p.experiment_id}: ${p.section} kept. ${enabled ? "Applied now." : "Inactive until autoresearch is enabled."} /autoresearch revert ${p.section} undoes this.`
+      : `Rejected ${p.experiment_id}; the current ${p.section} text stays.`;
+  }
+
+  if (cmd === "abort") {
+    if (!state.active) return "No active experiment.";
+    const id = state.active.id;
+    finishExperiment(state, "aborted_by_operator", cfg.autoresearch?.cooldownCloses ?? 5);
+    return `Aborted ${id}; its candidate is no longer served.`;
+  }
+
   return `Unknown subcommand "${sub}".\n${AUTORESEARCH_HELP}`;
 }
 
@@ -456,9 +478,11 @@ export function describeOverrides(state, cfg = config) {
       reason: meta?.reason ?? null,
     };
   };
+  const p = state?.pending_proposal;
   return {
     kept: Object.entries(state?.kept_overrides || {}).map(([s, t]) => describe(s, t, state.kept_meta?.[s], "kept")),
     quarantined: Object.entries(state?.quarantined_overrides || {}).map(([s, q]) => describe(s, q.text, q, "quarantined")),
+    pending: p ? { ...describe(p.section, p.text, p, "pending"), hypothesis: p.hypothesis, result: p.result, proposed_at: p.proposed_at } : null,
   };
 }
 
@@ -513,6 +537,9 @@ async function runAutoresearchOnce(perfData, lessons, cfg) {
 
   if (state.active) {
     await evaluateExperiment(perfData, cfg, state);
+  } else if (state.pending_proposal) {
+    // One change at a time: wait for the operator to approve or reject.
+    log("autoresearch", `Proposal from ${state.pending_proposal.experiment_id} awaits operator review (/autoresearch approve | reject) — not starting a new experiment`);
   } else {
     // Decrement cooldown
     if (state.cooldownRemaining > 0) {
@@ -532,9 +559,13 @@ async function runAutoresearchOnce(perfData, lessons, cfg) {
  * evil_panda, getRangeSelectionText returns the fixed Evil Panda text before
  * it looks at any override (PR #9), so a range_selection edit would be a
  * placebo that silently activates if the strategy is ever switched back.
+ *
+ * manager_logic is not eligible: one manager prompt covers every open
+ * position, so it can't be split into concurrent control/candidate arms the
+ * way a screener run (one arm per run, tagged on the deploy) can.
  */
 export function eligibleSections(cfg = config) {
-  const sections = ["screener_criteria", "manager_logic"];
+  const sections = ["screener_criteria"];
   if (cfg?.strategy?.activeStrategy !== "evil_panda") sections.push("range_selection");
   return sections;
 }
@@ -608,10 +639,8 @@ export function validateCandidate(original, modified, cfg = config) {
 }
 
 async function analyzeAndGenerate(perfData, lessons, cfg, state) {
-  const minCloses = cfg.autoresearch?.minClosesPerTrial ?? 7;
-
-  // Need at least 15 closes to analyze, or at minimum minCloses * 2
-  if (perfData.length < Math.max(15, minCloses * 2)) {
+  // Need at least 15 closes to attribute losses from.
+  if (perfData.length < 15) {
     log("autoresearch", `Not enough data (${perfData.length} closes) — skipping`);
     return;
   }
@@ -733,37 +762,19 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
     return;
   }
 
-  // 5. Compute baseline from last N positions
-  const baselinePositions = perfData.slice(-minCloses);
-  const baselineWins = baselinePositions.filter(p => (p.pnl_usd ?? 0) > 0).length;
-  const baselineWR = baselinePositions.length > 0
-    ? (baselineWins / baselinePositions.length) * 100
-    : 0;
-  const baselineAvgPnl = baselinePositions.length > 0
-    ? baselinePositions.reduce((s, p) => s + (p.pnl_pct ?? 0), 0) / baselinePositions.length
-    : 0;
-
-  // 6. Create experiment
+  // 5. Create the experiment. No baseline window: the control arm runs
+  // concurrently (alternate screener runs get control vs candidate text).
   const experiment = {
     id: `exp_${Date.now()}`,
+    design: "ab",
     section: worstSection,
     hypothesis: hypothesis || "Targeted modification to reduce losses",
-    original_text: currentText,
-    modified_text: modifiedText,
+    original_text: currentText,   // control arm
+    modified_text: modifiedText,  // candidate arm
     started_at: new Date().toISOString(),
-    started_at_position: perfData.length,
-    baseline: {
-      win_rate: Math.round(baselineWR * 10) / 10,
-      avg_pnl_pct: Math.round(baselineAvgPnl * 100) / 100,
-      positions: baselinePositions.length,
-    },
-    trial: {
-      win_rate: null,
-      avg_pnl_pct: null,
-      positions: 0,
-    },
+    trial: { control: 0, candidate: 0, excluded: 0 },
     status: "active",
-    environment_snapshot: getEnvironmentSnapshot(),
+    environment_snapshot: getEnvironmentSnapshot(cfg),
   };
 
   // Snapshot current Darwin signal weights for audit trail.
@@ -780,19 +791,114 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
   // or an operator command may have changed it meanwhile. Never start a second
   // experiment, and never overwrite newer state with the pre-LLM snapshot.
   const fresh = loadAutoresearch();
-  if (fresh.active) {
-    log("autoresearch", `Experiment ${fresh.active.id} became active while generating — discarding this candidate`);
+  if (fresh.active || fresh.pending_proposal) {
+    log("autoresearch", `${fresh.active ? `Experiment ${fresh.active.id} became active` : "A proposal became pending"} while generating — discarding this candidate`);
     return;
   }
   fresh.active = experiment;
   saveAutoresearch(fresh);
 
-  // 7. Activate the override
-  setPromptSectionOverride(worstSection, modifiedText);
+  // 6. Serve the candidate to the candidate arm only.
+  setExperimentCandidate({ id: experiment.id, section: worstSection, text: modifiedText });
 
-  log("autoresearch", `Experiment ${experiment.id} started: ${worstSection}`);
+  log("autoresearch", `Experiment ${experiment.id} started (A/B): ${worstSection}`);
   log("autoresearch", `Hypothesis: ${hypothesis}`);
-  log("autoresearch", `Baseline WR: ${experiment.baseline.win_rate}%, avg PnL: ${experiment.baseline.avg_pnl_pct}%`);
+}
+
+// ─── Verdict: concurrent A/B with a bootstrap CI ─────────────
+
+// Positions smaller than this are dust or a failed deploy, not a trial.
+const DUST_SOL = 0.01;
+const BOOTSTRAP_ITERATIONS = 2000;
+
+/**
+ * Split an experiment's tagged closes into arms of { pnl, w }, where pnl is
+ * the close's PnL % and w its size in SOL. pnl_unknown closes (recorded as a
+ * 0 placeholder) and unsized/dust positions are excluded. Size weighting also
+ * means a dust "win" can't count like a real one.
+ */
+export function splitArms(records, experimentId) {
+  const arms = { control: [], candidate: [], excluded: 0 };
+  for (const p of records || []) {
+    if (p?.experiment_id !== experimentId) continue;
+    const arm = p.experiment_arm;
+    const pnl = Number(p.pnl_pct);
+    const w = Number(p.amount_sol);
+    if ((arm !== "control" && arm !== "candidate") || p.pnl_unknown || !Number.isFinite(pnl) || !Number.isFinite(w) || w < DUST_SOL) {
+      arms.excluded++;
+      continue;
+    }
+    arms[arm].push({ pnl, w });
+  }
+  return arms;
+}
+
+function weightedMean(xs) {
+  let num = 0;
+  let den = 0;
+  for (const { pnl, w } of xs) { num += pnl * w; den += w; }
+  return den > 0 ? num / den : 0;
+}
+
+// mulberry32: small seeded PRNG so a verdict is reproducible from its inputs.
+function seededRandom(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function seedFromId(id) {
+  return parseInt(hashText(id).slice(0, 8), 16);
+}
+
+/**
+ * Verdict for candidate vs control. Each arm is an array of { pnl, w }.
+ * - "insufficient": fewer than minPerArm closes in an arm, still under the cap
+ * - "inconclusive": the time cap passed before both arms reached minPerArm
+ * - "pass": bootstrap 95% CI of (candidate − control) size-weighted mean PnL
+ *   has lower bound > 0 AND the point estimate is >= minEffectPct
+ * - "fail": enough closes, but not a clear, large-enough improvement
+ * Evaluated once, when both arms first reach minPerArm (a fixed-sample test:
+ * re-checking after every close would inflate false positives).
+ */
+export function computeVerdict(control, candidate, {
+  minPerArm = 100,
+  minEffectPct = 1.5,
+  maxDays = 14,
+  ageDays = 0,
+  iterations = BOOTSTRAP_ITERATIONS,
+  seed = 1,
+} = {}) {
+  const base = { n_control: control.length, n_candidate: candidate.length };
+  if (Math.min(control.length, candidate.length) < minPerArm) {
+    return { ...base, verdict: ageDays >= maxDays ? "inconclusive" : "insufficient" };
+  }
+  const delta = weightedMean(candidate) - weightedMean(control);
+  const rand = seededRandom(seed);
+  const resample = (xs) => {
+    const out = new Array(xs.length);
+    for (let i = 0; i < xs.length; i++) out[i] = xs[Math.floor(rand() * xs.length)];
+    return out;
+  };
+  const diffs = new Array(iterations);
+  for (let i = 0; i < iterations; i++) diffs[i] = weightedMean(resample(candidate)) - weightedMean(resample(control));
+  diffs.sort((a, b) => a - b);
+  const q = (p) => diffs[Math.min(iterations - 1, Math.max(0, Math.floor(p * iterations)))];
+  const ci = [q(0.025), q(0.975)];
+  const round = (x) => Math.round(x * 1000) / 1000;
+  return {
+    ...base,
+    verdict: ci[0] > 0 && delta >= minEffectPct ? "pass" : "fail",
+    delta_pct: round(delta),
+    ci95: ci.map(round),
+    control_mean_pct: round(weightedMean(control)),
+    candidate_mean_pct: round(weightedMean(candidate)),
+  };
 }
 
 // ─── Evaluate Active Experiment ──────────────────────────────
@@ -800,14 +906,15 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
 async function evaluateExperiment(perfData, cfg, state) {
   const experiment = state.active;
   if (!experiment) return;
+  const ar = cfg.autoresearch || {};
+  const cooldownCloses = ar.cooldownCloses ?? 5;
 
-  const minCloses = cfg.autoresearch?.minClosesPerTrial ?? 7;
-  const minEvidenceCloses = cfg.autoresearch?.minEvidenceCloses ?? Math.max(10, minCloses + 2);
-  const minAbsoluteWinRateDeltaPct = cfg.autoresearch?.minAbsoluteWinRateDeltaPct ?? 10;
-  const minAbsolutePnlDeltaPct = cfg.autoresearch?.minAbsolutePnlDeltaPct ?? 0.5;
-  const improvementPct = cfg.autoresearch?.improvementPct ?? 15;
-  const declinePct = cfg.autoresearch?.declinePct ?? 15;
-  const cooldownCloses = cfg.autoresearch?.cooldownCloses ?? 5;
+  if (experiment.design !== "ab") {
+    // Started by the pre-A/B loop: it has no arm-tagged closes and never will.
+    log("autoresearch", `Experiment ${experiment.id} predates the A/B design — closing it as abandoned`);
+    finishExperiment(state, "abandoned_legacy_design", 0);
+    return;
+  }
 
   if (environmentChangedSince(experiment.environment_snapshot, cfg)) {
     log("autoresearch", `Threshold values changed during ${experiment.id} — invalidating trial to avoid confounded results`);
@@ -815,111 +922,76 @@ async function evaluateExperiment(perfData, cfg, state) {
     return;
   }
 
-  // Screener/range changes should only be judged on positions deployed after the
-  // experiment started. Manager changes should be judged on any positions CLOSED
-  // after the experiment started, including positions that were already open.
-  const trialPositions = getTrialPositionsForExperiment(experiment, perfData);
-  const trialCount = trialPositions.length;
+  const arms = splitArms(perfData, experiment.id);
+  experiment.trial = { control: arms.control.length, candidate: arms.candidate.length, excluded: arms.excluded };
 
-  experiment.trial.positions = trialCount;
-
-  // Circuit breaker: if first 3 trial closes are ALL losses, auto-revert
-  if (trialCount >= 3 && trialCount < minCloses) {
-    const first3 = trialPositions.slice(0, 3);
-    const allLosses = first3.every(p => (p.pnl_usd ?? 0) < 0);
-    if (allLosses) {
-      log("autoresearch", `Circuit breaker: first 3 closes all losses — reverting ${experiment.id}`);
-      finishExperiment(state, "reverted_circuit_breaker", cooldownCloses);
-      return;
-    }
-  }
-
-  // Not enough data yet
-  if (trialCount < minCloses) {
-    saveAutoresearch(state);
-    log("autoresearch", `Experiment ${experiment.id}: ${trialCount}/${minCloses} closes`);
+  // Circuit breaker (safety valve, candidate arm only): first 3 candidate closes all losses.
+  if (arms.candidate.length >= 3 && arms.candidate.length < 10 && arms.candidate.slice(0, 3).every((x) => x.pnl < 0)) {
+    log("autoresearch", `Circuit breaker: first 3 candidate closes all losses — discarding ${experiment.id}`);
+    finishExperiment(state, "reverted_circuit_breaker", cooldownCloses);
     return;
   }
 
-  // Require a slightly larger evidence window before making a keep/revert call.
-  // This reduces noisy decisions when the default minCloses is just barely met.
-  if (trialCount < minEvidenceCloses) {
+  const ageDays = (Date.now() - Date.parse(experiment.started_at)) / 86_400_000;
+  const result = computeVerdict(arms.control, arms.candidate, {
+    minPerArm: ar.minClosesPerArm ?? 100,
+    minEffectPct: ar.minEffectPct ?? 1.5,
+    maxDays: ar.maxExperimentDays ?? 14,
+    ageDays,
+    seed: seedFromId(experiment.id),
+  });
+
+  if (result.verdict === "insufficient") {
     saveAutoresearch(state);
-    log("autoresearch", `Experiment ${experiment.id}: ${trialCount}/${minEvidenceCloses} evidence closes (waiting for a less noisy verdict)`);
+    log("autoresearch", `Experiment ${experiment.id}: control ${result.n_control} / candidate ${result.n_candidate} closes (need ${ar.minClosesPerArm ?? 100} per arm, day ${ageDays.toFixed(1)} of ${ar.maxExperimentDays ?? 14})`);
     return;
   }
 
-  // Compute trial metrics
-  const trialWins = trialPositions.filter(p => (p.pnl_usd ?? 0) > 0).length;
-  const trialWR = (trialWins / trialCount) * 100;
-  const trialAvgPnl = trialPositions.reduce((s, p) => s + (p.pnl_pct ?? 0), 0) / trialCount;
-
-  experiment.trial.win_rate = Math.round(trialWR * 10) / 10;
-  experiment.trial.avg_pnl_pct = Math.round(trialAvgPnl * 100) / 100;
-
-  // Compare to baseline using composite score: 60% win rate + 40% avg PnL
-  const baselineWR = experiment.baseline.win_rate;
-  const wrImprovement = ((trialWR - baselineWR) / Math.max(baselineWR, 1)) * 100;
-  const absoluteWinRateDelta = trialWR - baselineWR;
-
-  const baselinePnl = experiment.baseline.avg_pnl_pct;
-  const pnlImprovement = baselinePnl !== 0
-    ? ((trialAvgPnl - baselinePnl) / Math.max(Math.abs(baselinePnl), 0.1)) * 100
-    : (trialAvgPnl > 0 ? 100 : trialAvgPnl < 0 ? -100 : 0);
-  const absolutePnlDelta = trialAvgPnl - baselinePnl;
-
-  const compositeImprovement = (wrImprovement * 0.6) + (pnlImprovement * 0.4);
-
-  const trialLosses = trialCount - trialWins;
-  const isImbalancedTinySample = trialCount < 2 * minEvidenceCloses && (trialWins === 0 || trialLosses === 0);
-  if (isImbalancedTinySample) {
-    log("autoresearch", `Experiment ${experiment.id}: ${trialWins}/${trialCount} wins/losses too one-sided for a confident verdict — waiting for more closes`);
-    saveAutoresearch(state);
+  experiment.result = result;
+  if (result.verdict === "inconclusive") {
+    log("autoresearch", `Experiment ${experiment.id} hit the ${ar.maxExperimentDays ?? 14}-day cap before ${ar.minClosesPerArm ?? 100} closes per arm — inconclusive, candidate discarded`);
+    finishExperiment(state, "inconclusive_time_cap", cooldownCloses);
     return;
   }
 
-  const hasMeaningfulAbsoluteDelta =
-    Math.abs(absoluteWinRateDelta) >= minAbsoluteWinRateDeltaPct ||
-    Math.abs(absolutePnlDelta) >= minAbsolutePnlDeltaPct;
-
-  if (!hasMeaningfulAbsoluteDelta) {
-    log("autoresearch", `Experiment ${experiment.id}: absolute deltas too small for a confident verdict (WR Δ ${absoluteWinRateDelta.toFixed(1)} pts, PnL Δ ${absolutePnlDelta.toFixed(2)} pts)`);
-    finishExperiment(state, "inconclusive", cooldownCloses);
+  const summary = `Δ ${result.delta_pct} pp (95% CI ${result.ci95[0]}..${result.ci95[1]}), n=${result.n_control}/${result.n_candidate}`;
+  if (result.verdict === "fail") {
+    log("autoresearch", `Experiment ${experiment.id}: no clear improvement (${summary}) — candidate discarded, current text stays`);
+    finishExperiment(state, "discarded", cooldownCloses);
     return;
   }
 
-  log("autoresearch", `Experiment ${experiment.id}: trial WR ${trialWR.toFixed(1)}% vs baseline ${baselineWR.toFixed(1)}% (WR improvement: ${wrImprovement.toFixed(1)}%, PnL improvement: ${pnlImprovement.toFixed(1)}%, composite: ${compositeImprovement.toFixed(1)}%)`);
-
-  if (compositeImprovement >= improvementPct) {
-    // KEEP — the modification helped
-    log("autoresearch", `KEEPING experiment ${experiment.id} — composite ${compositeImprovement.toFixed(1)}% improvement (WR: ${wrImprovement.toFixed(1)}%, PnL: ${pnlImprovement.toFixed(1)}%)`);
-    experiment.status = "kept";
-    // Persist the kept override so it survives restarts
-    if (!state.kept_overrides) state.kept_overrides = {};
-    state.kept_overrides[experiment.section] = experiment.modified_text;
-    state.kept_meta = { ...(state.kept_meta || {}), [experiment.section]: {
-      experiment_id: experiment.id,
-      kept_at: new Date().toISOString(),
-      strategy: cfg.strategy?.activeStrategy ?? null,
-      default_hash: defaultSectionHash(experiment.section),
-    } };
-    // Log as lesson
-    logExperimentLesson(experiment, "kept", compositeImprovement);
-    state.experiments.push(experiment);
-    state.active = null;
-    state.cooldownRemaining = cooldownCloses;
-    saveAutoresearch(state);
-  } else if (compositeImprovement <= -declinePct) {
-    // REVERT — the modification hurt
-    log("autoresearch", `REVERTING experiment ${experiment.id} — composite ${compositeImprovement.toFixed(1)}% decline (WR: ${wrImprovement.toFixed(1)}%, PnL: ${pnlImprovement.toFixed(1)}%)`);
-    logExperimentLesson(experiment, "reverted", compositeImprovement);
-    finishExperiment(state, "reverted", cooldownCloses);
-  } else {
-    // INCONCLUSIVE — revert to be safe
-    log("autoresearch", `DISCARDING experiment ${experiment.id} — inconclusive (composite: ${compositeImprovement.toFixed(1)}%, WR: ${wrImprovement.toFixed(1)}%, PnL: ${pnlImprovement.toFixed(1)}%)`);
-    logExperimentLesson(experiment, "inconclusive", compositeImprovement);
-    finishExperiment(state, "inconclusive", cooldownCloses);
+  // PASS. Proposal mode by default: a human approves before anything is kept.
+  if (ar.autoKeep === true) {
+    log("autoresearch", `Experiment ${experiment.id} passed (${summary}) — auto-keeping (autoresearchAutoKeep=true)`);
+    keepOverride(state, experiment.section, experiment.modified_text, experiment.id, cfg);
+    finishExperiment(state, "kept", cooldownCloses);
+    return;
   }
+  state.pending_proposal = {
+    experiment_id: experiment.id,
+    section: experiment.section,
+    hypothesis: experiment.hypothesis,
+    text: experiment.modified_text,
+    result,
+    proposed_at: new Date().toISOString(),
+    strategy: cfg.strategy?.activeStrategy ?? null,
+    default_hash: defaultSectionHash(experiment.section),
+  };
+  log("autoresearch", `Experiment ${experiment.id} passed (${summary}) — proposed for operator review (/autoresearch approve | reject)`);
+  finishExperiment(state, "proposed", cooldownCloses);
+}
+
+/** Record `text` as the kept override for `section` and apply it if enabled. */
+function keepOverride(state, section, text, experimentId, cfg) {
+  state.kept_overrides = { ...(state.kept_overrides || {}), [section]: text };
+  state.kept_meta = { ...(state.kept_meta || {}), [section]: {
+    experiment_id: experimentId,
+    kept_at: new Date().toISOString(),
+    strategy: cfg.strategy?.activeStrategy ?? null,
+    default_hash: defaultSectionHash(section),
+  } };
+  if (cfg?.autoresearch?.enabled === true) setPromptSectionOverride(section, text);
 }
 
 function finishExperiment(state, status, cooldownCloses) {
@@ -927,32 +999,14 @@ function finishExperiment(state, status, cooldownCloses) {
   if (!experiment) return;
 
   experiment.status = status;
-  // If this section has a kept override, restore it instead of clearing entirely
-  const keptText = state.kept_overrides?.[experiment.section];
-  if (keptText) {
-    setPromptSectionOverride(experiment.section, keptText);
-  } else {
-    clearPromptSectionOverride(experiment.section);
-  }
+  experiment.finished_at = new Date().toISOString();
+  // The candidate was only ever served to its arm; control text (kept override
+  // or default) was never replaced, so there is nothing else to restore.
+  clearExperimentCandidate();
   state.experiments.push(experiment);
   state.active = null;
   state.cooldownRemaining = cooldownCloses;
   saveAutoresearch(state);
-}
-
-function logExperimentLesson(experiment, outcome, improvementPct) {
-  try {
-    // Dynamic import to avoid circular dependency
-    import("./lessons.js").then(({ addLesson }) => {
-      const label = outcome === "kept" ? "KEPT" : outcome === "reverted" ? "REVERTED" : "INCONCLUSIVE";
-      addLesson(
-        `[AUTORESEARCH ${label}] Section "${experiment.section}": ${experiment.hypothesis}. ` +
-        `Trial WR: ${experiment.trial.win_rate}% vs baseline ${experiment.baseline.win_rate}% ` +
-        `(${improvementPct > 0 ? "+" : ""}${improvementPct.toFixed(1)}%).`,
-        ["autoresearch", experiment.section, outcome],
-      );
-    }).catch(() => {});
-  } catch { /* best-effort */ }
 }
 
 // ─── LLM Call ────────────────────────────────────────────────
@@ -982,7 +1036,7 @@ export function loadResearchProgram() {
 async function callLLM(model, sectionName, lossCount, currentText, failureDesc) {
   const provider = getLlmProvider();
 
-  const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your candidate is tested on live closes before anything is kept.
+  const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your candidate is A/B tested against the current text on live closes, and a human approves any winner before it is kept.
 
 RESEARCH DIRECTION (human-edited, from autoresearch-program.md):
 ${loadResearchProgram()}

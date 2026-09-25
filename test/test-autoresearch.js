@@ -312,6 +312,176 @@ test("generation under evil_panda never targets range_selection", async () => {
   }
 });
 
+// Seeded normal samples as { pnl, w } for verdict tests.
+function arm(n, mean, sd, seed, w = 1) {
+  let a = seed >>> 0;
+  const rand = () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  return Array.from({ length: n }, () => {
+    const z = Math.sqrt(-2 * Math.log(1 - rand())) * Math.cos(2 * Math.PI * rand());
+    return { pnl: mean + sd * z, w };
+  });
+}
+
+test("verdict: a clear effect passes, noise fails, too few closes is insufficient, the cap is inconclusive", () => {
+  const opts = { minPerArm: 100, minEffectPct: 1.5, maxDays: 14, ageDays: 3, seed: 42 };
+
+  const clear = ar.computeVerdict(arm(150, 0, 7, 1), arm(150, 5, 7, 2), opts);
+  assert.equal(clear.verdict, "pass");
+  assert.ok(clear.ci95[0] > 0 && clear.delta_pct >= 1.5);
+
+  const noise = ar.computeVerdict(arm(150, 0, 7, 3), arm(150, 0, 7, 4), opts);
+  assert.equal(noise.verdict, "fail");
+
+  // A real but tiny effect (CI may exclude 0) still fails the 1.5 pp floor.
+  const tiny = ar.computeVerdict(arm(2000, 0, 2, 5), arm(2000, 0.5, 2, 6), opts);
+  assert.equal(tiny.verdict, "fail");
+  assert.ok(tiny.delta_pct < 1.5);
+
+  assert.equal(ar.computeVerdict(arm(99, 0, 7, 7), arm(300, 9, 7, 8), opts).verdict, "insufficient");
+  assert.equal(ar.computeVerdict(arm(40, 0, 7, 9), arm(40, 9, 7, 10), { ...opts, ageDays: 14 }).verdict, "inconclusive");
+
+  // Deterministic for the same seed.
+  assert.deepEqual(ar.computeVerdict(arm(150, 0, 7, 1), arm(150, 5, 7, 2), opts), clear);
+
+  // Placebo false-positive rate stays small (the old rule kept ~45% of placebos).
+  let passes = 0;
+  for (let i = 0; i < 100; i++) {
+    const v = ar.computeVerdict(arm(100, 0, 7, 1000 + i), arm(100, 0, 7, 5000 + i), { ...opts, iterations: 400, seed: i + 1 });
+    if (v.verdict === "pass") passes++;
+  }
+  assert.ok(passes <= 5, `placebo passes ${passes}/100`);
+});
+
+test("verdict is size-weighted and excludes pnl_unknown and dust closes", () => {
+  const recs = [
+    { experiment_id: "e1", experiment_arm: "control", pnl_pct: 10, amount_sol: 1 },
+    { experiment_id: "e1", experiment_arm: "control", pnl_pct: 0, amount_sol: 0, pnl_unknown: true },
+    { experiment_id: "e1", experiment_arm: "candidate", pnl_pct: 50, amount_sol: 0.001 }, // dust
+    { experiment_id: "e1", experiment_arm: "candidate", pnl_pct: -4, amount_sol: 2 },
+    { experiment_id: "other", experiment_arm: "candidate", pnl_pct: 99, amount_sol: 1 },
+    { pnl_pct: 5, amount_sol: 1 }, // untagged
+  ];
+  const s = ar.splitArms(recs, "e1");
+  assert.deepEqual(s.control, [{ pnl: 10, w: 1 }]);
+  assert.deepEqual(s.candidate, [{ pnl: -4, w: 2 }]);
+  assert.equal(s.excluded, 2);
+  // weights matter: 1 SOL at +10% and 3 SOL at -2% → (10 - 6) / 4 = +1%
+  const v = ar.computeVerdict([{ pnl: 0, w: 1 }], [{ pnl: 10, w: 1 }, { pnl: -2, w: 3 }], { minPerArm: 1, seed: 1, iterations: 50 });
+  assert.equal(v.candidate_mean_pct, 1);
+});
+
+test("arm assignment alternates per screener run and tags deploys inside the arm", async () => {
+  const prompt = await import("../prompt.js");
+  const { trackPosition, getTrackedPosition } = await import("../state.js");
+  const candidateText = "CANDIDATE SCREENER TEXT — prefer durable narratives.";
+  prompt.setExperimentCandidate({ id: "exp_ab", section: "screener_criteria", text: candidateText });
+  try {
+    const arms = [];
+    for (let i = 0; i < 4; i++) {
+      await prompt.runWithExperimentArm(async () => {
+        await new Promise((r) => setTimeout(r, 1)); // the arm survives awaits
+        const tag = prompt.getExperimentTag();
+        arms.push(tag.experiment_arm);
+        assert.equal(tag.experiment_id, "exp_ab");
+        const sys = prompt.buildSystemPrompt("SCREENER", {}, {}, null, null, null, null);
+        assert.equal(sys.includes(candidateText), tag.experiment_arm === "candidate");
+        trackPosition({ position: `abpos${i}`, pool: "pool", pool_name: "AB-SOL", strategy: "spot", amount_sol: 1, ...prompt.getExperimentTag() });
+      });
+    }
+    for (let i = 1; i < arms.length; i++) assert.notEqual(arms[i], arms[i - 1], `arms alternate: ${arms.join(",")}`);
+    assert.deepEqual(new Set(arms), new Set(["control", "candidate"]));
+    assert.equal(getTrackedPosition("abpos0").experiment_arm, arms[0]);
+    assert.equal(getTrackedPosition("abpos1").experiment_id, "exp_ab");
+
+    // Outside a screener run (management, chat) nothing is tagged and the control text is used.
+    assert.equal(prompt.getExperimentTag(), null);
+    assert.equal(prompt.buildSystemPrompt("SCREENER", {}, {}, null, null, null, null).includes(candidateText), false);
+  } finally {
+    prompt.clearExperimentCandidate();
+  }
+  assert.equal(await prompt.runWithExperimentArm(async () => prompt.getExperimentTag()), null, "no experiment, no arm");
+});
+
+function taggedCloses(id, n, controlMean, candidateMean) {
+  const c = arm(n, controlMean, 7, 11).map((x, i) => ({ experiment_id: id, experiment_arm: "control", pnl_pct: x.pnl, pnl_usd: x.pnl, amount_sol: 1, position: `c${i}` }));
+  const k = arm(n, candidateMean, 7, 12).map((x, i) => ({ experiment_id: id, experiment_arm: "candidate", pnl_pct: x.pnl, pnl_usd: x.pnl, amount_sol: 1, position: `k${i}` }));
+  return c.flatMap((x, i) => [x, k[i]]);
+}
+
+function activeState(id, started_at = new Date().toISOString()) {
+  return {
+    experiments: [],
+    active: {
+      id, design: "ab", section: "screener_criteria", hypothesis: "h",
+      original_text: "CONTROL", modified_text: "CANDIDATE", started_at,
+      trial: { control: 0, candidate: 0, excluded: 0 }, status: "active",
+      environment_snapshot: ar.getEnvironmentSnapshot(config),
+    },
+    cooldownRemaining: 0, kept_overrides: {}, kept_meta: {}, pending_proposal: null,
+    migrations: { quarantine_legacy_kept_overrides_v1: "t" },
+  };
+}
+
+test("a passing experiment becomes a pending proposal (no auto-keep, no lessons); approve keeps it", async () => {
+  const lessonsBefore = fs.readFileSync(path.join(TMP, "lessons.json"), "utf8");
+  fs.writeFileSync(AR_FILE, ar.serializeAutoresearch(activeState("exp_pass")));
+  const cfg = { ...config, autoresearch: { ...config.autoresearch, enabled: true, minClosesPerArm: 100, minEffectPct: 1.5, autoKeep: false } };
+
+  await ar.maybeRunAutoresearch(taggedCloses("exp_pass", 120, 0, 5), [], cfg);
+  let st = ar.loadAutoresearch();
+  assert.equal(st.active, null);
+  assert.equal(st.experiments.at(-1).status, "proposed");
+  assert.equal(st.pending_proposal.experiment_id, "exp_pass");
+  assert.ok(st.pending_proposal.result.ci95[0] > 0);
+  assert.deepEqual(st.kept_overrides, {}, "not auto-kept");
+  assert.equal(fs.readFileSync(path.join(TMP, "lessons.json"), "utf8"), lessonsBefore, "results are not written to lessons.json");
+
+  // While a proposal is pending no new experiment starts.
+  let asked = false;
+  ar.__setAutoresearchGeneratorForTests(async () => { asked = true; return { hypothesis: "x", modifiedText: "y" }; });
+  await ar.maybeRunAutoresearch(Array.from({ length: 20 }, (_, i) => losingClose(i)), [], cfg);
+  ar.__setAutoresearchGeneratorForTests(null);
+  assert.equal(asked, false);
+
+  const cfgOff = { ...cfg, autoresearch: { ...cfg.autoresearch, enabled: false } };
+  assert.match(ar.handleAutoresearchCommand("status", cfgOff), /Pending proposal: exp_pass/);
+  assert.match(ar.handleAutoresearchCommand("approve", cfgOff), /Approved exp_pass/);
+  st = ar.loadAutoresearch();
+  assert.equal(st.kept_overrides.screener_criteria, "CANDIDATE");
+  assert.equal(st.kept_meta.screener_criteria.experiment_id, "exp_pass");
+  assert.equal(st.pending_proposal, null);
+  assert.equal(st.experiments.at(-1).decision.action, "approved");
+});
+
+test("autoKeep keeps a pass; noise is discarded; the time cap is inconclusive", async () => {
+  const base = { ...config.autoresearch, enabled: true, minClosesPerArm: 100, minEffectPct: 1.5 };
+
+  fs.writeFileSync(AR_FILE, ar.serializeAutoresearch(activeState("exp_auto")));
+  await ar.maybeRunAutoresearch(taggedCloses("exp_auto", 120, 0, 5), [], { ...config, autoresearch: { ...base, autoKeep: true } });
+  let st = ar.loadAutoresearch();
+  assert.equal(st.experiments.at(-1).status, "kept");
+  assert.equal(st.kept_overrides.screener_criteria, "CANDIDATE");
+  assert.equal(st.pending_proposal, null);
+
+  fs.writeFileSync(AR_FILE, ar.serializeAutoresearch(activeState("exp_noise")));
+  await ar.maybeRunAutoresearch(taggedCloses("exp_noise", 120, 0, 0), [], { ...config, autoresearch: base });
+  st = ar.loadAutoresearch();
+  assert.equal(st.experiments.at(-1).status, "discarded");
+  assert.equal(st.pending_proposal, null);
+
+  const old = new Date(Date.now() - 15 * 86_400_000).toISOString();
+  fs.writeFileSync(AR_FILE, ar.serializeAutoresearch(activeState("exp_cap", old)));
+  await ar.maybeRunAutoresearch(taggedCloses("exp_cap", 30, 0, 9), [], { ...config, autoresearch: base });
+  st = ar.loadAutoresearch();
+  assert.equal(st.experiments.at(-1).status, "inconclusive_time_cap");
+});
+
 test("research program is read from autoresearch-program.md without the editor note", () => {
   const program = ar.loadResearchProgram();
   assert.match(program, /Evil Panda/);
