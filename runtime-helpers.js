@@ -133,3 +133,18 @@ export function lpaCurrentValueUsd(lpa) {
   const parsed = parseFloat(lpa?.currentValue);
   return Number.isFinite(parsed) ? parsed : 0;
 }
+
+export const SCREENING_SOURCES = ["meteora", "gmgn", "both"];
+
+/**
+ * Validate `screeningSource`. Accepts "meteora" | "gmgn" | "both" (case- and
+ * whitespace-insensitive); anything else falls back to "meteora" with a warning.
+ * Unset (null/undefined) is the default and does not warn.
+ */
+export function normalizeScreeningSource(value, { warn = (msg) => console.warn(msg) } = {}) {
+  if (value == null) return "meteora";
+  const normalized = String(value).trim().toLowerCase();
+  if (SCREENING_SOURCES.includes(normalized)) return normalized;
+  warn(`[config] Invalid screeningSource ${JSON.stringify(value)}: expected one of ${SCREENING_SOURCES.join(" | ")}. Falling back to "meteora".`);
+  return "meteora";
+}

@@ -86,7 +86,13 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // Route to the opt-in GMGN screening source. Defaults to Meteora when
   // screening.source is unset, so the existing path is untouched.
   let pools;
-  if (config.screening.source === "gmgn") {
+  if (config.screening.source === "both") {
+    // Meteora + GMGN in parallel, deduped per pool and per token, with the
+    // Meteora pool filters applied to GMGN-only picks (tools/screening-both.js).
+    // Over-fetch so the occupied-pool filter below still leaves `limit` rows.
+    const { discoverCombinedPools } = await import("./screening-both.js");
+    ({ pools } = await discoverCombinedPools({ limit: Math.max(limit * 3, 30) }));
+  } else if (config.screening.source === "gmgn") {
     // Dynamic import keeps gmgn-screen.js (and its gmgn-cli dependency) off the
     // hot path for the default Meteora flow.
     const { discoverGmgnPools } = await import("./gmgn-screen.js");
@@ -130,6 +136,16 @@ export function normalizeCandidateForUi(candidate) {
   };
 }
 
+/**
+ * Short provenance tag for prompts, e.g. "src: meteora+gmgn (confirmed by both)".
+ * Empty when the candidate has no `sources` (single-source modes).
+ */
+export function formatCandidateSources(candidate) {
+  const sources = Array.isArray(candidate?.sources) ? candidate.sources : [];
+  if (sources.length === 0) return "";
+  return `src: ${sources.join("+")}${candidate.confirmed_by_both ? " (confirmed by both)" : ""}`;
+}
+
 export function getCandidateSignalSnapshot(candidate) {
   const c = normalizeCandidateForUi(candidate);
   return {
@@ -164,6 +180,8 @@ export function rankCandidatesByDarwin(candidates = []) {
       };
     })
     .sort((a, b) =>
+      // screeningSource "both": pools confirmed by both sources rank first.
+      (b.confirmed_by_both ? 1 : 0) - (a.confirmed_by_both ? 1 : 0) ||
       (b.darwin_score ?? 0) - (a.darwin_score ?? 0) ||
       (b.fee_active_tvl_ratio ?? 0) - (a.fee_active_tvl_ratio ?? 0) ||
       (b.volume ?? 0) - (a.volume ?? 0) ||
@@ -307,6 +325,7 @@ function condensePool(p) {
     fee_pct: p.fee_pct,
 
     // Core metrics
+    tvl: round(p.tvl),
     active_tvl: round(p.active_tvl),
     volume: round(p.volume),
     fee: round(p.fee),
