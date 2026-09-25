@@ -562,6 +562,29 @@ export async function deployPosition({
     throw new Error("Only 'bid_ask' or 'spot' strategies are allowed.");
   }
 
+  // ─── Hard guard: token-age window (every strategy) ─────────────
+  // config.screening.minTokenAgeHours / maxTokenAgeHours; null = no bound.
+  // Age is the base token's creation time (Meteora token_x.created_at, else
+  // GMGN creation/open timestamp), never the pool's. A known age outside the
+  // window refuses; an unknown age is allowed with a warning (tools/token-age.js).
+  {
+    const { checkDeployTokenAge, fmtAgeHours } = await import("./token-age.js");
+    const age = await checkDeployTokenAge({
+      mint: base_mint || null,
+      pool_address,
+      resolveMint: async () => (await getPool(pool_address)).lbPair.tokenXMint.toBase58(),
+    });
+    if (!age.pass) {
+      log("deploy", `Refusing deploy into ${pool_address}: ${age.reason}`);
+      return { success: false, blocked_by: "token_age", error: age.reason, token_age_hours: age.hours, token_age_source: age.source };
+    }
+    if (age.unknown) {
+      log("deploy_warn", `Token age unknown for ${age.mint ? age.mint.slice(0, 8) : pool_address.slice(0, 8)} (no Meteora created_at, no GMGN creation time); allowing the deploy without the age window`);
+    } else if (!age.skipped) {
+      log("deploy", `Token age ${fmtAgeHours(age.hours)} (${age.source}) is inside the window`);
+    }
+  }
+
   // Evil Panda is a named policy mapped onto the executor's supported
   // single-sided SOL spot primitive. Enforce its entry criteria here so the
   // model cannot accidentally bypass the strategy with a weaker prompt-only check.
@@ -594,7 +617,6 @@ export async function deployPosition({
     const gmgn = await fetchGmgnPriceInfo(resolvedMint);
     const tokenVolume24h = gmgn?.volume_24h ?? 0;
     const tokenMcap = gmgn?.market_cap ?? 0;
-    const tokenAgeHours = gmgn?.token_age_hours ?? null;
     const indicators = gmgn?.candles || null;
     const supertrendOk = !!indicators?.evil_panda_entry_ok;
 
@@ -605,15 +627,7 @@ export async function deployPosition({
     if (tokenMcap < (ep.minMcap ?? 200_000)) {
       failures.push(`token mcap $${Math.round(tokenMcap)} < $${ep.minMcap ?? 200_000}`);
     }
-    // Token-age window (config.screening.minTokenAgeHours / maxTokenAgeHours; null = no bound)
-    const minAge = config.screening.minTokenAgeHours;
-    const maxAge = config.screening.maxTokenAgeHours;
-    if (minAge != null && tokenAgeHours != null && tokenAgeHours < minAge) {
-      failures.push(`token age ${tokenAgeHours}h < ${minAge}h min`);
-    }
-    if (maxAge != null && tokenAgeHours != null && tokenAgeHours > maxAge) {
-      failures.push(`token age ${tokenAgeHours}h > ${maxAge}h max`);
-    }
+    // Token-age window: checked above for every strategy (tools/token-age.js).
     if (!supertrendOk) {
       failures.push(`5m Supertrend not green/above price (direction=${indicators?.supertrend_direction ?? "unknown"})`);
     }
