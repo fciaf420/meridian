@@ -636,6 +636,25 @@ export function renderWallet(wallet, { config, usdcMode, positions = null } = {}
   return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard, totals: t };
 }
 
+/**
+ * Range depth line: how far the range reaches below its upper edge, in price
+ * terms ((1 − (1+step)^−bins) — the same maths as price_range_pct), plus how far
+ * price sits below the top while in range. null when bins are unknown.
+ */
+export function fmtRangeDepth(p) {
+  const lo = Number(p?.lower_bin), hi = Number(p?.upper_bin), step = Number(p?.bin_step) / 10000;
+  if (![lo, hi].every(Number.isFinite) || !(hi > lo) || !(step > 0)) return null;
+  const bins = hi - lo; // same count the deploy log reports (bins below the entry bin)
+  const depth = (1 - Math.pow(1 + step, -(hi - lo))) * 100;
+  let line = `Range: ${depth.toFixed(0)}% deep · ${bins} bins · step ${Math.round(step * 10000)}`;
+  const a = Number(p?.active_bin);
+  if (p?.in_range && Number.isFinite(a) && a <= hi && a >= lo) {
+    const down = (1 - Math.pow(1 + step, -(hi - a))) * 100;
+    line += ` · price ${down.toFixed(0)}% below top`;
+  }
+  return line;
+}
+
 function positionBlock(p, i, unit, strip = null) {
   const range = p.in_range
     ? "✅ in range"
@@ -643,6 +662,7 @@ function positionBlock(p, i, unit, strip = null) {
   return [
     `<b>${i + 1}. ${escapeHtml(p.pair ?? shortAddr(p.position))}</b> · ${range}`,
     ...(strip ? [strip] : []),
+    ...(fmtRangeDepth(p) ? [fmtRangeDepth(p)] : []),
     `PnL: ${escapeHtml(fmtPnl(p, unit))} · Value: ${fmtValue(p, unit)}`,
     `Fees: ${fmtFees(p, unit)} unclaimed · Age: ${fmtAge(p.age_minutes)}`,
     `<code>${escapeHtml(shortAddr(p.position))}</code>`,
