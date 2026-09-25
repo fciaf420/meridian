@@ -9,7 +9,15 @@ process.env.DRY_RUN = "true";
 process.env.LPAGENT_API_KEY = "test-key";
 process.env.LPAGENT_RPM = "1000";
 
+// Throwaway keypair so lp-overview can derive an owner address. Never funded, never signs.
+{
+  const { Keypair } = await import("@solana/web3.js");
+  const bs58 = (await import("bs58")).default;
+  process.env.WALLET_PRIVATE_KEY = bs58.encode(Keypair.generate().secretKey);
+}
+
 const { fetchTopLpersStats, mapTopLpersRows, evaluateTopLpersGate } = await import("../tools/study.js");
+const { getLpOverview } = await import("../tools/lp-overview.js");
 
 const realFetch = globalThis.fetch;
 function mockFetch(handler) {
@@ -129,4 +137,42 @@ test("current value prefers numeric `value` over string `currentValue`", () => {
   assert.equal(lpaCurrentValueUsd({ currentValue: "53413.446031254" }), 53413.446031254);
   assert.equal(lpaCurrentValueUsd({ value: null, currentValue: "abc" }), 0);
   assert.equal(lpaCurrentValueUsd({}), 0);
+});
+
+// Shaped like the documented GET /lp-positions/overview 200 response (data is an object).
+const overviewData = {
+  owner: "DMQ7mJ8DTXYLoc1g1NpSv7jtDdaCzsLUdzvvY8MA4hbX",
+  chain: "SOL",
+  protocol: "meteora",
+  total_inflow: 1586491.3551108437,
+  total_pnl: { ALL: 12516.614685851924, "7D": 4.262212981880845 },
+  total_pnl_native: { ALL: 83.4853120103325, "7D": 0.022746553186898555 },
+  total_fee: { ALL: 4323.2505549474245 },
+  total_fee_native: { ALL: 8.756756271321922 },
+  win_rate: { ALL: 0.533 },
+  win_rate_native: { ALL: 0.5 },
+  roi: 0.0079,
+  fee_percent: 0.0027,
+  total_lp: "1294",
+  opening_lp: "3",
+  closed_lp: { ALL: 1291 },
+  avg_age_hour: 2.1423017107309485,
+};
+
+test("overview accepts the documented object shape and sends platform=meteora", async () => {
+  const calls = mockFetch(() => jsonResponse({ status: "success", data: overviewData }));
+  const o = await getLpOverview({ force: true });
+  const u = new URL(calls[0].url);
+  assert.equal(u.pathname, "/open-api/v1/lp-positions/overview");
+  assert.equal(u.searchParams.get("platform"), "meteora");
+  assert.equal(u.searchParams.get("protocol"), null);
+  assert.ok(o, "overview should not be null for an object-shaped data field");
+  assert.equal(o.total_pnl_usd, 12516.61);
+  assert.equal(o.win_rate_usd_pct, 53);
+});
+
+test("overview still accepts a one-element array", async () => {
+  mockFetch(() => jsonResponse({ status: "success", data: [{ ...overviewData, total_pnl: { ALL: 10 } }] }));
+  const o = await getLpOverview({ force: true });
+  assert.equal(o.total_pnl_usd, 10);
 });

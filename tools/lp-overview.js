@@ -38,7 +38,7 @@ export async function getLpOverview({ force = false } = {}) {
     if (!owner) return _cache || null;
 
     const res = await fetch(
-      `${LPAGENT_API}/lp-positions/overview?owner=${owner}&protocol=meteora`,
+      `${LPAGENT_API}/lp-positions/overview?owner=${owner}&platform=meteora`,
       { headers: { "x-api-key": apiKey } }
     );
 
@@ -48,7 +48,8 @@ export async function getLpOverview({ force = false } = {}) {
     }
 
     const json = await res.json();
-    const d = (json.data || [])[0];
+    // Docs define `data` as an object; accept a one-element array defensively.
+    const d = Array.isArray(json.data) ? json.data[0] : json.data;
     if (!d) return _cache || null;
 
     const pnlUnit = (await import("../config.js")).config.management.pnlUnit || "sol";
