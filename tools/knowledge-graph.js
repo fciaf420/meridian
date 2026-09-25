@@ -317,7 +317,8 @@ export async function buildKnowledgeGraph() {
 
     const poolKey = node.id;
     const poolData = pools[poolKey];
-    const deploys = poolData?.deploys || [];
+    // Deploys with unknown PnL (null) are neither wins nor losses.
+    const deploys = (poolData?.deploys || []).filter((d) => d.pnl_pct != null);
     const insights = [];
 
     if (deploys.length >= 3) {
@@ -478,6 +479,7 @@ export async function buildKnowledgeGraph() {
   const globalStratStats = {};
   for (const poolData of Object.values(pools)) {
     for (const d of poolData.deploys || []) {
+      if (d.pnl_pct == null) continue; // unknown PnL: not a win or a loss
       const s = d.strategy || "unknown";
       if (!globalStratStats[s]) globalStratStats[s] = { wins: 0, total: 0 };
       globalStratStats[s].total++;
