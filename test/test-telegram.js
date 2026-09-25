@@ -512,8 +512,12 @@ test("alerts: fund events carry buttons; out-of-range and gas alerts are rate-li
   hub.emit("gas_low", { sol: 0.01, reserve: 0.05 });
   await flush();
   assert.equal(t.sends().length, n + 2, "one OOR + one gas alert");
-  advance(31 * 60_000);
-  hub.emit("out_of_range", { pair: "AAA", minutesOOR: 62 });
+  advance(60 * 60_000);
+  hub.emit("out_of_range", { pair: "AAA", minutesOOR: 90 });
+  await flush();
+  assert.equal(t.sends().length, n + 2, "still inside the per-pair OOR cooldown");
+  advance(6 * 60 * 60_000);
+  hub.emit("out_of_range", { pair: "AAA", minutesOOR: 450 });
   await flush();
   assert.equal(t.sends().length, n + 3, "cooldown expired");
 
@@ -521,6 +525,30 @@ test("alerts: fund events carry buttons; out-of-range and gas alerts are rate-li
   const before = t.sends().length;
   await u.handleCallback(findData(lastMarkup(dep), "po:0"), ctxFor(dep.messageId ?? 999));
   assert.equal(t.sends().length, before + 1);
+});
+
+test("alerts: routine cycle reports are not sent but still show under Status", async () => {
+  const { u, t } = makeUI();
+  const hub = new EventEmitter();
+  u.attachAlerts((ev, fn) => hub.on(ev, fn));
+  const flush = () => new Promise((r) => setImmediate(r));
+
+  hub.emit("cycle:management", { report: "Management cycle failed: rpc", routine: false }); // cycle_error covers it
+  hub.emit("cycle:management", { report: "Management: 2 position(s) checked in code, no close rule triggered — HOLD.", routine: true });
+  hub.emit("cycle:screening", { report: "Screening: no candidate worth deploying", routine: true });
+  await flush();
+  assert.equal(t.sends().length, 0, "nothing happened → no message");
+
+  await u.handleCallback("st", ctxFor(90));
+  const status = t.edits().at(-1).text;
+  assert.match(status, /no close rule triggered — HOLD/);
+  assert.match(status, /no candidate worth deploying/);
+
+  hub.emit("cycle:management", { report: "Closed <AAA>: rule 4 OOR", routine: false });
+  hub.emit("cycle:screening", { report: "Deployed into BBB", routine: false });
+  await flush();
+  assert.equal(t.sends().length, 2);
+  assert.match(t.sends()[0].text, /Closed &lt;AAA&gt;: rule 4/);
 });
 
 // ─── Recent errors ───────────────────────────────────────────────

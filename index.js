@@ -195,6 +195,13 @@ async function resetIdleManagementInterval() {
 // screening lock taken BEFORE any await, so a cron tick, Telegram command or web
 // request can't slip in between. The operator pause (state.json) only stops the
 // scheduled cron; management and the PnL watcher never look at it.
+// Counts deploy/close events from any path so a cycle can tell whether it
+// actually moved funds. Cycle reports are only "routine" (not pushed to
+// Telegram; still visible under Status) when nothing happened.
+let _fundEvents = 0;
+on("deploy", () => { _fundEvents++; });
+on("close", () => { _fundEvents++; });
+
 function runScreeningCycle({ manual = false } = {}) {
   const gate = screeningCronGate({
     paused: isScreeningPaused(),
@@ -216,6 +223,8 @@ function runScreeningCycle({ manual = false } = {}) {
 
 async function screeningCycleBody() {
   let screenReport = null;
+  let screenFailed = false;
+  const fundEventsBefore = _fundEvents;
   try {
     // Hard guards — don't even run the agent if preconditions aren't met
     try {
@@ -468,10 +477,12 @@ ${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
+    screenFailed = true;
   } finally {
     setScreeningBusy(false);
     if (screenReport) {
-      emit("cycle:screening", { report: screenReport });
+      // A screening cycle that deployed nothing is routine: no Telegram message.
+      emit("cycle:screening", { report: screenReport, routine: !screenFailed && _fundEvents === fundEventsBefore });
       // File screening deploy to KB (direct write, no LLM)
       try { fileScreeningResult(screenReport); } catch { /* best-effort */ }
     }
@@ -514,7 +525,9 @@ function startCronJobs() {
 
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
     let mgmtReport = null;
-    let mgmtRoutine = false;
+    let mgmtFailed = false;
+    let mgmtRuleFired = false; // a hard close rule or exit alert fired this cycle
+    const fundEventsBefore = _fundEvents;
     try {
       // Pool context + trailing TP / stop loss pre-check
       let memoryHints = "";
@@ -639,12 +652,13 @@ function startCronJobs() {
         if (ruleHits.length === 0) {
           log("cron", `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD (LLM skipped)`);
           mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD.`;
-          mgmtRoutine = true; // nothing happened: dashboard still gets it, Telegram stays quiet
           return; // finally{} still releases the lock and emits the report
         }
         log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
+        mgmtRuleFired = ruleHits.some((h) => /: rule [3-6]$/.test(h));
       }
 
+      if (exitAlerts) mgmtRuleFired = true;
       const pnlUnit = config.management.pnlUnit?.toUpperCase() || "SOL";
       const { content } = await agentLoop(`
 MANAGEMENT CYCLE${memoryHints}${exitAlerts}${autoCloseInfo}${kbContext}
@@ -689,10 +703,16 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
     } catch (error) {
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
+      mgmtFailed = true;
       emit("cycle_error", { cycle: "Management", error: error.message });
     } finally {
       setManagementBusy(false);
-      if (mgmtReport) emit("cycle:management", { report: mgmtReport, routine: mgmtRoutine });
+      // Routine = nothing happened (code-only HOLD, or the LLM ran and changed
+      // nothing without a close rule firing). Routine reports aren't pushed to Telegram.
+      if (mgmtReport) {
+        const routine = !mgmtFailed && !mgmtRuleFired && _fundEvents === fundEventsBefore;
+        emit("cycle:management", { report: mgmtReport, routine });
+      }
       try {
         const pos = await getMyPositions().catch(() => null);
         for (const p of pos?.positions || []) {

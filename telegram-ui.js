@@ -1024,23 +1024,27 @@ export function createTelegramUI(deps) {
       `X=${escapeHtml(d.amountX ?? "?")} Y=${escapeHtml(d.amountY ?? "?")}`,
       "Kept OPEN for management — check it.",
     ].join("\n"), [[positionsBtn(), ...(d.position ? [closeBtn(d.position)] : [])]]),
-    out_of_range: (d) => alert("out_of_range", d.pair, 30 * 60_000,
+    out_of_range: (d) => alert("out_of_range", d.pair, 6 * 60 * 60_000,
       `⚠️ <b>Out of range</b> ${escapeHtml(d.pair)} for ${escapeHtml(d.minutesOOR)} min`,
       [[positionsBtn()]]),
-    gas_low: (d) => alert("gas_low", "gas", 30 * 60_000,
+    gas_low: (d) => alert("gas_low", "gas", 2 * 60 * 60_000,
       `⛽ <b>Gas low — deploy paused</b>\n${escapeHtml(d.reason || `Native SOL ${d.sol} is below the gas reserve${d.reserve != null ? ` of ${d.reserve} SOL` : ""}.`)}\nTop up SOL to resume USDC-mode deploys.`,
       [[btn("💰 Wallet", "wa!")]]),
     cycle_error: (d) => alert("cycle_error", `${d.cycle}:${String(d.error).slice(0, 60)}`, 15 * 60_000,
       `❌ <b>${escapeHtml(d.cycle)} cycle failed</b>\n${escapeHtml(String(d.error ?? "").slice(0, 500))}`,
       [[btn("🧯 Recent errors", "er!")]]),
-    "cycle:management": ({ report }) => {
+    // Cycle reports: always recorded for the Status view, but pushed only when
+    // something happened. `routine` (set by index.js) means nothing did: a
+    // code-only HOLD, an LLM pass that changed nothing, a screen that deployed
+    // nothing. Failures are covered by the cycle_error alert.
+    "cycle:management": ({ report, routine }) => {
       state.lastManagement = { at: now(), summary: String(report ?? "").slice(0, 400) };
-      if (/^Management cycle failed:/.test(report ?? "")) return null; // cycle_error covers it
+      if (routine || /^Management cycle failed:/.test(report ?? "")) return null;
       return sendReport("🔄 <b>Management cycle</b>", report);
     },
-    "cycle:screening": ({ report }) => {
+    "cycle:screening": ({ report, routine }) => {
       state.lastScreening = { at: now(), summary: String(report ?? "").slice(0, 400) };
-      if (/^Screening cycle failed:/.test(report ?? "")) return null;
+      if (routine || /^Screening cycle failed:/.test(report ?? "")) return null;
       return sendReport("🔍 <b>Screening cycle</b>", report);
     },
     briefing: ({ html }) => deps.tg.sendHTML(String(html ?? "")),

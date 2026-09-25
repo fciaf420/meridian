@@ -316,7 +316,7 @@ Access and confirmation rules:
 - with no owner configured, the first private chat is registered once (logged loudly) and persisted to `user-config.json`
 - anything that moves funds (close, deploy, number-reply deploy, `auto`, run screening now) shows a confirmation card first. Confirm carries a single-use nonce that expires after 60s; it executes through the same `executeTool` path the agent uses, so DRY_RUN and every safety check still apply
 
-Telegram alerts (rate-limited): deploys, closes, stop-loss / take-profit auto-closes, partial deploys, out-of-range, gas low and cycle errors, with Positions / Close (confirmation) buttons, plus management and screening cycle reports and the daily briefing.
+Telegram alerts only fire when something happened: deploys, closes, stop-loss / take-profit auto-closes, partial deploys, out-of-range (once per 6h per pair), gas low and cycle errors, with Positions / Close (confirmation) buttons, plus the daily briefing. A management or screening report is sent only when a close rule fired or funds moved; routine "all HOLD" or "nothing deployed" cycles are silent and show under Status instead.
 
 ## Web Dashboard
 
