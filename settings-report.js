@@ -143,6 +143,18 @@ export function buildSettingsReport({ color = false } = {}) {
   row("trailing TP", config.management.trailingTakeProfit ? `on (trig ${config.management.trailingTriggerPct}% / drop ${config.management.trailingDropPct}%)` : "off", "trailing*");
   row("out-of-range wait", `${config.management.outOfRangeWaitMinutes} min`, "outOfRangeWaitMinutes");
 
+  // ── entry-safety filters ──
+  const ef = config.entryFilters || {};
+  const onOff = (v) => (v ? C.green("block") : C.yellow("allow"));
+  h("Entry filters  " + C.dim("(user-config.json · Telegram ⚙️ → 🛡 Entry filters · the agent may only tighten)"));
+  row("transfer fee above", ef.blockTransferFeeAbovePct == null ? C.yellow("off") : `${ef.blockTransferFeeAbovePct}% → block`, "blockTransferFeeAbovePct");
+  row("transfer hook", onOff(ef.blockTransferHook), "blockTransferHook");
+  row("permanent delegate", onOff(ef.blockPermanentDelegate), "blockPermanentDelegate");
+  row("freeze authority", onOff(ef.blockFreezeAuthority), "blockFreezeAuthority (+ default frozen)");
+  row("mint authority", onOff(ef.blockMintAuthority), "blockMintAuthority");
+  row("pausable", onOff(ef.blockPausable), "blockPausable");
+  row("non-transferable", onOff(ef.blockNonTransferable), "blockNonTransferable");
+
   // ── screening (active source(s) only) ──
   if (srcSource === "both") {
     h("Screening — BOTH  " + C.dim("(Meteora + GMGN in parallel)"));

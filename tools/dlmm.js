@@ -449,7 +449,7 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+setInterval(() => poolCache.clear(), 5 * 60 * 1000).unref?.(); // unref: never keeps a test/CLI process alive
 
 // ─── Get Active Bin ────────────────────────────────────────────
 export async function getActiveBin({ pool_address }) {
@@ -838,6 +838,19 @@ export async function deployPosition({
   if (tokenYMint !== WSOL_MINT) {
     log("deploy", `Refusing deploy into ${pool_address}: token Y is ${tokenYMint}, not SOL`);
     return { success: false, error: `Pool ${pool_address} is not SOL-quoted (token Y ${tokenYMint}); only SOL pools are supported.` };
+  }
+  // ─── Entry-safety hard checks (config.entryFilters) ───────────
+  // Before any swap or tx is built, on every deploy path (screener, agent,
+  // manual Telegram deploys). Token facts come from the pool's own TokenReserve
+  // (the SDK read the mint at DLMM.create), so this adds no mint RPC.
+  {
+    const { runDeployEntryChecks } = await import("./entry-safety.js");
+    const entry = await runDeployEntryChecks({ pool, pool_address, strategy: activeStrategy, wallet: wallet.publicKey });
+    if (!entry.pass) {
+      log("deploy", `Refusing deploy into ${pool_address}: ${entry.reason}`);
+      return { success: false, blocked_by: "entry_filter", error: entry.reason };
+    }
+    for (const note of entry.notes || []) log("deploy", `Entry check: ${note}`);
   }
   const activeBin = await pool.getActiveBin();
   resolvedBinStep ||= pool.lbPair?.binStep ?? pool.lbPair?.bin_step ?? null;
@@ -2329,3 +2342,8 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 export { applyPriorityFee as _applyPriorityFeeForTest };
 export { sendManagedTransaction as _sendManagedTransactionForTest };
 export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
+/** Test hook: seed the pool cache with a mock DLMM instance. */
+export function _setPoolForTest(poolAddress, pool) {
+  if (pool == null) poolCache.delete(String(poolAddress));
+  else poolCache.set(String(poolAddress), pool);
+}

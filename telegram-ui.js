@@ -561,7 +561,7 @@ export const WSOL_MINT = "So11111111111111111111111111111111111111112";
 export const gmgnTokenUrl = (mint) => `https://gmgn.ai/sol/token/${mint}`;
 export const solscanTokenUrl = (mint) => `https://solscan.io/token/${mint}`;
 
-const checkMark = (ch) => (ch.pass === true ? "✅" : ch.pass === false ? "❌" : "❔");
+const checkMark = (ch) => (ch.pass === false ? "❌" : ch.off ? "➖" : ch.pass === true ? "✅" : "❔");
 
 /**
  * ❌ lines for the confirmation card: the token's and the chosen pool's failed
@@ -569,7 +569,7 @@ const checkMark = (ch) => (ch.pass === true ? "✅" : ch.pass === false ? "❌" 
  * hard block, so it says so.
  */
 export function failedFilterLines(c) {
-  return [...(c?.checks?.token || []), ...(c?.checks?.pool || [])]
+  return [...(c?.checks?.token || []), ...(c?.checks?.pool || []), ...(c?.checks?.safety || [])]
     .filter((ch) => ch.pass === false)
     .map((ch) => `❌ ${ch.text}${ch.key === "bin_step" ? " (deploy_position blocks bin steps outside this range)" : ""}`);
 }
@@ -609,6 +609,13 @@ export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora"
   const tokenChecks = r.checks?.token || [];
   if (tokenChecks.length) {
     lines.push("", "<b>Your screening filters</b> (token):", ...tokenChecks.map((ch) => `${checkMark(ch)} ${escapeHtml(ch.text)}`));
+  }
+
+  const ts = r.token_safety;
+  if (ts?.checks?.length) {
+    lines.push("", `<b>Entry filters</b> (token)${ts.pass ? "" : " — ⛔ deploy_position will refuse"}:`, ...ts.checks.map((ch) => `${checkMark(ch)} ${escapeHtml(ch.text)}`));
+  } else if (r.token_safety_error) {
+    lines.push("", `⚠️ Token safety unknown (${escapeHtml(clipText(String(r.token_safety_error), 80))})`);
   }
 
   const pools = r.pools || [];
