@@ -1,0 +1,1085 @@
+// telegram-ui.js — Telegram menus, inline-button views, two-tap confirmations
+// and alerts. Transport and owner-only access control live in telegram.js; every
+// update that reaches this module has already passed authorizeUpdate().
+//
+// Everything this module touches is injected through createTelegramUI(deps), so
+// tests run it against a mocked transport and mocked trading functions.
+//
+// Fund-moving actions (close, deploy, "auto" deploy, run screening cycle) never
+// execute on the first tap. They render a confirmation card whose Confirm button
+// carries a short nonce; the exact parameters live server-side in the nonce store
+// with a TTL, and a nonce is consumed on first use so double taps can't
+// double-execute. Execution goes through deps.executeTool (tools/executor.js),
+// i.e. the same path the agent's tools use, with every DRY_RUN guard and safety
+// check intact.
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { escapeHtml, clipText, CALLBACK_DATA_MAX_BYTES } from "./telegram.js";
+
+export const MENU_BUTTON_TEXT = "🏠 Menu";
+export const CONFIRM_TTL_MS = 60_000;
+export const PAGE_CHAR_BUDGET = 3500; // leaves headroom under Telegram's 4096 cap
+export const POSITIONS_PER_PAGE = 5;
+export const CANDIDATES_PER_PAGE = 5;
+
+export const BOT_COMMANDS = [
+  { command: "menu", description: "Main menu" },
+  { command: "status", description: "Wallet + open positions" },
+  { command: "candidates", description: "Top pools (reply a number to deploy)" },
+  { command: "settings", description: "Effective config and where it comes from" },
+  { command: "usdc", description: "Show or toggle USDC mode (on|off)" },
+  { command: "autoresearch", description: "Prompt overrides: status, list, approve, reject" },
+  { command: "thresholds", description: "Screening thresholds + performance" },
+  { command: "briefing", description: "Last-24h briefing" },
+  { command: "help", description: "All commands" },
+];
+
+// ─── Small helpers ───────────────────────────────────────────────
+function randomId(len) {
+  return crypto.randomBytes(16).toString("base64url").replace(/[-_]/g, "").slice(0, len).padEnd(len, "0");
+}
+
+/** Build callback_data, refusing anything over Telegram's 64-byte limit. */
+export function cb(...parts) {
+  const data = parts.join(":");
+  if (Buffer.byteLength(data, "utf8") > CALLBACK_DATA_MAX_BYTES) {
+    throw new Error(`callback_data too long (${Buffer.byteLength(data, "utf8")} bytes): ${data.slice(0, 20)}…`);
+  }
+  return data;
+}
+
+const btn = (text, data) => ({ text, callback_data: cb(data) });
+const urlBtn = (text, url) => ({ text, url });
+
+export function shortAddr(addr) {
+  const s = String(addr ?? "");
+  return s.length > 12 ? `${s.slice(0, 4)}…${s.slice(-4)}` : s;
+}
+
+export const meteoraPoolUrl = (pool) => `https://app.meteora.ag/dlmm/${pool}`;
+export const solscanAccountUrl = (addr) => `https://solscan.io/account/${addr}`;
+export const solscanTxUrl = (sig) => `https://solscan.io/tx/${sig}`;
+
+function fmtNum(v, digits = 4) {
+  const n = Number(v);
+  return Number.isFinite(n) ? String(Math.round(n * 10 ** digits) / 10 ** digits) : "?";
+}
+
+function fmtUsdCompact(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "?";
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}k`;
+  return `$${Math.round(n)}`;
+}
+
+function fmtSigned(v, digits) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "?";
+  return `${n >= 0 ? "+" : ""}${n.toFixed(digits)}`;
+}
+
+export function fmtAge(minutes) {
+  const m = Number(minutes);
+  if (!Number.isFinite(m) || m < 0) return "?";
+  if (m < 60) return `${Math.round(m)}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ${Math.round(m % 60)}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+function fmtAgo(ts, now) {
+  if (!ts) return "never";
+  const s = Math.max(0, Math.round((now - ts) / 1000));
+  if (s < 60) return `${s}s ago`;
+  return `${fmtAge(s / 60)} ago`;
+}
+
+/** PnL line honoring pnlUnit. A null PnL is "unknown", never 0. */
+export function fmtPnl(p, unit = "sol") {
+  if (p?.pnl_pct == null || p?.pnl_unknown) return "unknown";
+  const abs = unit === "sol" && p.pnl_sol != null
+    ? `${fmtSigned(p.pnl_sol, 4)} SOL`
+    : p.pnl_usd != null ? `${fmtSigned(p.pnl_usd, 2).replace(/^([+-])/, "$1$")}` : null;
+  return `${abs ? `${abs} ` : ""}(${fmtSigned(p.pnl_pct, 2)}%)`;
+}
+
+function fmtValue(p, unit) {
+  return unit === "sol" && p.total_value_sol != null ? `${fmtNum(p.total_value_sol, 4)} SOL` : `$${fmtNum(p.total_value_usd, 2)}`;
+}
+
+function fmtFees(p, unit) {
+  return unit === "sol" && p.unclaimed_fees_sol != null ? `${fmtNum(p.unclaimed_fees_sol, 4)} SOL` : `$${fmtNum(p.unclaimed_fees_usd, 2)}`;
+}
+
+/** meteora | gmgn | both, from the candidate's sources (falls back to the configured source). */
+export function candidateSourceTag(c, fallback = "meteora") {
+  const sources = Array.isArray(c?.sources) ? c.sources.map(String) : [];
+  if (c?.confirmed_by_both || (sources.includes("meteora") && sources.includes("gmgn"))) return "both";
+  if (sources.length) return sources[0];
+  if (c?.gmgn) return "gmgn";
+  return fallback === "both" ? "meteora" : fallback;
+}
+
+/**
+ * Greedy pagination: pack rendered blocks into pages of at most `perPage` items
+ * and `budget` characters. Returns an array of pages, each an array of indices.
+ */
+export function paginate(blocks, { perPage = 5, budget = PAGE_CHAR_BUDGET } = {}) {
+  const pages = [];
+  let cur = [];
+  let len = 0;
+  blocks.forEach((b, i) => {
+    const size = b.length + 2;
+    if (cur.length && (cur.length >= perPage || len + size > budget)) {
+      pages.push(cur);
+      cur = [];
+      len = 0;
+    }
+    cur.push(i);
+    len += size;
+  });
+  if (cur.length) pages.push(cur);
+  return pages.length ? pages : [[]];
+}
+
+/** Cut point ≤ max that doesn't split an HTML entity like &amp;. */
+function safeCut(s, max) {
+  let cut = max;
+  const amp = s.lastIndexOf("&", cut - 1);
+  if (amp !== -1 && amp > cut - 10 && s.indexOf(";", amp) >= cut) cut = amp;
+  return cut > 0 ? cut : max;
+}
+
+/**
+ * Split long text into pages on line boundaries, each at most `budget` chars.
+ * Safe on already-escaped HTML: an over-long line is never cut inside an entity.
+ */
+export function paginateText(text, budget = PAGE_CHAR_BUDGET) {
+  const lines = String(text ?? "").split("\n");
+  const pages = [];
+  let cur = "";
+  for (let line of lines) {
+    while (line.length > budget) {
+      if (cur) { pages.push(cur); cur = ""; }
+      const cut = safeCut(line, budget);
+      pages.push(line.slice(0, cut));
+      line = line.slice(cut);
+    }
+    if (cur.length + line.length + 1 > budget) { pages.push(cur); cur = ""; }
+    cur += (cur ? "\n" : "") + line;
+  }
+  if (cur || !pages.length) pages.push(cur);
+  return pages;
+}
+
+function pagerRow(prefix, page, total) {
+  if (total <= 1) return null;
+  const row = [];
+  if (page > 0) row.push(btn("◀ Prev", `${prefix}:${page - 1}`));
+  row.push(btn(`${page + 1}/${total}`, `${prefix}:${page}`));
+  if (page < total - 1) row.push(btn("Next ▶", `${prefix}:${page + 1}`));
+  return row;
+}
+
+// ─── Nonce + ref stores ──────────────────────────────────────────
+/**
+ * Server-side store for confirmation nonces. Each nonce maps to the exact
+ * action + parameters, expires after `ttlMs`, and is single-use (take()).
+ */
+export function createNonceStore({ ttlMs = CONFIRM_TTL_MS, now = () => Date.now(), max = 200 } = {}) {
+  const map = new Map();
+  const sweep = () => {
+    const t = now();
+    for (const [id, e] of map) if (e.expiresAt <= t) map.delete(id);
+    while (map.size > max) map.delete(map.keys().next().value);
+  };
+  return {
+    put(action, params, { chatId = null } = {}) {
+      sweep();
+      let id;
+      do { id = randomId(10); } while (map.has(id));
+      map.set(id, { id, action, params, chatId, messageId: null, createdAt: now(), expiresAt: now() + ttlMs });
+      return id;
+    },
+    bind(id, messageId, chatId = undefined) {
+      const e = map.get(id);
+      if (!e) return;
+      e.messageId = messageId;
+      if (chatId != null) e.chatId = String(chatId);
+    },
+    peek(id) {
+      const e = map.get(id);
+      if (!e) return { error: "unknown" };
+      if (e.expiresAt <= now()) { map.delete(id); return { error: "expired" }; }
+      return { entry: e };
+    },
+    /** Consume: returns { entry } exactly once, then { error: "unknown" }. */
+    take(id) {
+      const r = this.peek(id);
+      if (r.entry) map.delete(id);
+      return r;
+    },
+    size() { sweep(); return map.size; },
+  };
+}
+
+/** Short id → long value (addresses, candidate snapshots) so callback_data stays tiny. */
+export function createRefMap({ max = 500 } = {}) {
+  const map = new Map();
+  const byKey = new Map();
+  return {
+    put(value, key = null) {
+      if (key != null && byKey.has(key) && map.has(byKey.get(key))) {
+        const id = byKey.get(key);
+        map.set(id, value);
+        return id;
+      }
+      let id;
+      do { id = randomId(6); } while (map.has(id));
+      map.set(id, value);
+      if (key != null) byKey.set(key, id);
+      while (map.size > max) {
+        const oldest = map.keys().next().value;
+        map.delete(oldest);
+      }
+      return id;
+    },
+    get(id) { return map.get(id) ?? null; },
+  };
+}
+
+// ─── Alert rate limiter ──────────────────────────────────────────
+export function createAlertLimiter({ now = () => Date.now(), perMinute = 20 } = {}) {
+  const last = new Map();
+  let window = [];
+  return {
+    /** Per-key cooldown plus a global per-minute cap. */
+    allow(key, cooldownMs = 0) {
+      const t = now();
+      window = window.filter((x) => t - x < 60_000);
+      if (window.length >= perMinute) return false;
+      if (cooldownMs > 0 && last.has(key) && t - last.get(key) < cooldownMs) return false;
+      last.set(key, t);
+      window.push(t);
+      return true;
+    },
+  };
+}
+
+// ─── Log tail (Recent errors) ────────────────────────────────────
+/** Strip secrets and full keys/addresses from a log line before it leaves the box. */
+export function redactLogLine(line) {
+  return String(line ?? "")
+    .replace(/(?<!\d)\d{6,12}:[A-Za-z0-9_-]{30,}/g, "[redacted-bot-token]")
+    .replace(/\bsk-[A-Za-z0-9_-]{10,}\b/g, "[redacted-key]")
+    .replace(/((?:api[-_]?key|apikey|access[-_]?token|token|secret|password|passwd|authorization|bearer|private[-_]?key)["']?\s*[=:]\s*["']?)[^\s&"',;]+/gi, "$1[redacted]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]")
+    .replace(/\[\s*(?:\d{1,3}\s*,\s*){31,}\d{1,3}\s*\]/g, "[redacted-bytes]")
+    .replace(/\b[0-9a-fA-F]{40,}\b/g, (m) => `${m.slice(0, 4)}…${m.slice(-4)}`)
+    .replace(/\b[1-9A-HJ-NP-Za-km-z]{32,}\b/g, (m) => `${m.slice(0, 4)}…${m.slice(-4)}`);
+}
+
+const ERROR_LINE_RE = /\[[A-Z0-9_]*(?:ERROR|WARN)[A-Z0-9_]*\]/;
+
+/**
+ * Last `n` ERROR/WARN lines from the current log (logs/bot.logpath, else today's
+ * logs/agent-YYYY-MM-DD.log), redacted. Reads only the file's tail.
+ */
+export function readRecentErrors({ n = 15, repoDir = process.cwd(), maxBytes = 512 * 1024 } = {}) {
+  const logsDir = path.join(repoDir, "logs");
+  const candidates = [];
+  try {
+    const p = fs.readFileSync(path.join(logsDir, "bot.logpath"), "utf8").trim();
+    if (p) candidates.push(path.isAbsolute(p) ? p : path.join(repoDir, p));
+  } catch { /* no bot.logpath */ }
+  candidates.push(path.join(logsDir, `agent-${new Date().toISOString().slice(0, 10)}.log`));
+  for (const file of candidates) {
+    let fd;
+    try {
+      const { size } = fs.statSync(file);
+      const start = Math.max(0, size - maxBytes);
+      fd = fs.openSync(file, "r");
+      const buf = Buffer.alloc(size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      const lines = buf.toString("utf8").split("\n").filter((l) => ERROR_LINE_RE.test(l));
+      return { file: path.basename(file), lines: lines.slice(-n).map((l) => redactLogLine(l).slice(0, 300)) };
+    } catch { /* try the next candidate */ } finally {
+      if (fd != null) try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+  return { file: null, lines: [] };
+}
+
+// ─── Deploy plan ─────────────────────────────────────────────────
+/**
+ * Range from the default volatility table in prompt.js (upper edge of each band,
+ * per its "pick the upper half" bias). Unknown volatility gets the widest band.
+ */
+export function rangeForVolatility(volatility, strategy) {
+  const v = volatility == null || volatility === "" ? NaN : Number(volatility);
+  const spot = strategy === "spot";
+  if (!Number.isFinite(v) || v >= 8) return spot ? 85 : 75;
+  if (v >= 5) return spot ? 70 : 60;
+  if (v >= 2) return spot ? 65 : 55;
+  return spot ? 50 : 45;
+}
+
+/**
+ * Exact deploy_position arguments for a candidate. The confirmation card shows
+ * these and the Confirm tap executes exactly these. Returns { error } when the
+ * amount can't be determined (no silent fallback amount for real funds).
+ */
+export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount, usdcMode = false }) {
+  if (!candidate?.pool) return { error: "Candidate has no pool address." };
+  const evil = config.strategy?.activeStrategy === "evil_panda";
+  let strategy;
+  if (evil) strategy = "spot";
+  else if (usdcMode) strategy = "bid_ask"; // executor forces this in USDC mode
+  else strategy = config.strategy?.strategy === "bid_ask" ? "bid_ask" : "spot";
+  const price_range_pct = evil
+    ? (config.strategy?.evilPanda?.priceRangePct ?? 80)
+    : rangeForVolatility(candidate.volatility, strategy);
+
+  const args = {
+    pool_address: candidate.pool,
+    pool_name: candidate.name || null,
+    base_mint: candidate.base_mint || candidate.base?.mint || null,
+    bin_step: candidate.bin_step ?? null,
+    volatility: candidate.volatility ?? null,
+    fee_tvl_ratio: candidate.fee_active_tvl_ratio ?? candidate.fee_tvl_ratio ?? null,
+    organic_score: candidate.organic_score ?? null,
+    strategy,
+    price_range_pct,
+    bins_above: 0,
+  };
+  for (const k of Object.keys(args)) if (args[k] == null) delete args[k];
+
+  let amountLabel;
+  if (usdcMode) {
+    const usd = Number(config.usdc?.deployAmountUsd);
+    if (!(usd > 0)) return { error: "USDC mode is on but usdc.deployAmountUsd is not set." };
+    args.amount_usd = usd;
+    amountLabel = `$${usd} (USDC → SOL, auto-funded)`;
+  } else {
+    if (!wallet || wallet.error || !Number.isFinite(Number(wallet.sol))) {
+      return { error: `Can't read the wallet balance${wallet?.error ? ` (${wallet.error})` : ""} — deploy not offered.` };
+    }
+    const amt = computeDeployAmount(Number(wallet.sol));
+    if (!(amt > 0)) return { error: "Computed deploy amount is 0." };
+    args.amount_y = amt;
+    amountLabel = `${amt} SOL`;
+  }
+  const strategyLabel = evil ? `Evil Panda (single-sided SOL spot, ${price_range_pct}% range)` : `${strategy}, single-sided SOL, ${price_range_pct}% range`;
+  return { args, amountLabel, strategyLabel };
+}
+
+// ─── Views (pure renderers) ──────────────────────────────────────
+export function renderMainMenu({ header = "" } = {}) {
+  return {
+    text: `🏠 <b>Meridian</b>${header ? `\n${header}` : ""}\n\nPick a view:`,
+    keyboard: [
+      [btn("📈 Status", "st"), btn("📊 Positions", "po:0")],
+      [btn("🔍 Candidates", "ca:0"), btn("💰 Wallet", "wa")],
+      [btn("⚙️ Settings", "se:0"), btn("🎛 Bot controls", "bc")],
+    ],
+  };
+}
+
+const backRow = (refresh) => [btn("🔄 Refresh", refresh), btn("⬅ Menu", "m")];
+
+export function renderStatus(info, now = Date.now()) {
+  const lines = [
+    `📈 <b>Status</b>`,
+    `Mode: <b>${info.dryRun ? "DRY RUN" : "LIVE"}</b>${info.usdcMode ? " · 💵 USDC mode" : ""}`,
+    `Strategy: ${escapeHtml(info.activeStrategy ?? "?")}${info.strategy ? ` (${escapeHtml(info.strategy)})` : ""}`,
+    `Models: manage <code>${escapeHtml(info.managementModel ?? "?")}</code> · screen <code>${escapeHtml(info.screeningModel ?? "?")}</code>`,
+    `Screening source: ${escapeHtml(info.screeningSource ?? "meteora")}`,
+    "",
+    `Management: every ${info.managementIntervalMin}m · ${info.managementBusy ? "running" : `next in ${escapeHtml(info.nextManagement ?? "?")}`}`,
+    `Screening: every ${info.screeningIntervalMin}m · ${info.paused ? "<b>⏸ PAUSED</b>" : info.screeningBusy ? "running" : `next in ${escapeHtml(info.nextScreening ?? "?")}`}`,
+    `PnL watcher: every ${info.pnlWatcherIntervalSec ?? "?"}s (runs while paused)`,
+    `Autonomous cycles: ${info.cronStarted ? "running" : "not started"}${info.busy ? " · ⏳ action in progress" : ""}`,
+  ];
+  for (const [label, c] of [["management", info.lastManagement], ["screening", info.lastScreening]]) {
+    lines.push("", `<b>Last ${label}</b> (${fmtAgo(c?.at, now)}):`);
+    lines.push(c?.summary ? escapeHtml(c.summary) : "—");
+  }
+  return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard: [backRow("st")] };
+}
+
+export function renderWallet(wallet, { config, usdcMode }) {
+  if (!wallet || wallet.error) {
+    return { text: `💰 <b>Wallet</b>\n⚠️ Could not read balances: ${escapeHtml(wallet?.error ?? "unknown error")}`, keyboard: [backRow("wa")] };
+  }
+  const reserve = usdcMode ? config.usdc?.gasReserveSol : (config.management?.gasReserve ?? 0.2);
+  const lines = [
+    `💰 <b>Wallet</b> <code>${escapeHtml(shortAddr(wallet.wallet))}</code>`,
+    `SOL: <b>${fmtNum(wallet.sol, 4)}</b> ($${fmtNum(wallet.sol_usd, 2)}) @ $${fmtNum(wallet.sol_price, 2)}`,
+    `USDC: <b>$${fmtNum(wallet.usdc, 2)}</b>`,
+    `Gas reserve: ${fmtNum(reserve, 4)} SOL${usdcMode ? " (USDC mode, warn-only)" : ""}`,
+    `Total: $${fmtNum(wallet.total_usd, 2)}`,
+  ];
+  if (Number(wallet.sol) < Number(reserve)) lines.push("⚠️ SOL is below the gas reserve.");
+  const keyboard = [backRow("wa")];
+  if (wallet.wallet) keyboard.unshift([urlBtn("Solscan ↗", solscanAccountUrl(wallet.wallet))]);
+  return { text: lines.join("\n"), keyboard };
+}
+
+function positionBlock(p, i, unit) {
+  const range = p.in_range
+    ? "✅ in range"
+    : `⚠️ OOR${p.oor_direction ? ` ${escapeHtml(p.oor_direction)}` : ""}${p.minutes_out_of_range ? ` ${p.minutes_out_of_range}m` : ""}`;
+  return [
+    `<b>${i + 1}. ${escapeHtml(p.pair ?? shortAddr(p.position))}</b> · ${range}`,
+    `PnL: ${escapeHtml(fmtPnl(p, unit))} · Value: ${fmtValue(p, unit)}`,
+    `Fees: ${fmtFees(p, unit)} unclaimed · Age: ${fmtAge(p.age_minutes)}`,
+    `<code>${escapeHtml(shortAddr(p.position))}</code>`,
+  ].join("\n");
+}
+
+export function renderPositions(result, { page = 0, refs, unit = "sol" } = {}) {
+  if (!result || result.error) {
+    return { text: `📊 <b>Positions</b>\n⚠️ ${escapeHtml(result?.error ?? "Could not load positions")}`, keyboard: [backRow("po:0")] };
+  }
+  const positions = result.positions || [];
+  if (!positions.length) return { text: "📊 <b>Positions</b>\nNo open positions.", keyboard: [backRow("po:0")] };
+  const blocks = positions.map((p, i) => positionBlock(p, i, unit));
+  const pages = paginate(blocks, { perPage: POSITIONS_PER_PAGE });
+  const pg = Math.min(Math.max(0, page), pages.length - 1);
+  const keyboard = [];
+  for (const i of pages[pg]) {
+    const p = positions[i];
+    const row = [btn(`🔒 Close ${i + 1}`, `pc:${refs.put(p.position, `pos:${p.position}`)}`)];
+    if (p.pool) row.push(urlBtn("Meteora ↗", meteoraPoolUrl(p.pool)));
+    row.push(urlBtn("Solscan ↗", solscanAccountUrl(p.position)));
+    keyboard.push(row);
+  }
+  const pager = pagerRow("po", pg, pages.length);
+  if (pager) keyboard.push(pager);
+  keyboard.push(backRow(`po:${pg}`));
+  const text = `📊 <b>Positions</b> (${positions.length} open)\n\n${pages[pg].map((i) => blocks[i]).join("\n\n")}`;
+  return { text, keyboard, page: pg, pages: pages.length };
+}
+
+function candidateBlock(c, i, fallbackSource) {
+  const vol = c.volume ?? c.volume_window ?? c.volume_24h;
+  const metrics = [
+    `darwin ${c.darwin_score ?? "?"}`,
+    `fee/aTVL ${c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? "?"}%`,
+    `vol ${fmtUsdCompact(vol)}`,
+    `organic ${c.organic_score ?? "?"}`,
+    `volatility ${c.volatility ?? "?"}`,
+    `bin ${c.bin_step ?? "?"}`,
+  ];
+  if (c.holders != null) metrics.push(`holders ${c.holders}`);
+  return `<b>${i + 1}. ${escapeHtml(c.name ?? shortAddr(c.pool))}</b> [${escapeHtml(candidateSourceTag(c, fallbackSource))}]\n${escapeHtml(metrics.join(" · "))}`;
+}
+
+export function renderCandidates(list, { page = 0, refs, source = "meteora", fetchedAt = null, now = Date.now(), meta = null } = {}) {
+  const candidates = list || [];
+  const header = `🔍 <b>Candidates</b>${meta ? ` (${meta.total_eligible ?? candidates.length} eligible / ${meta.total_screened ?? "?"} screened)` : ""} · ${fetchedAt ? fmtAgo(fetchedAt, now) : "not screened yet"}`;
+  if (!candidates.length) {
+    return { text: `${header}\nNo candidates. Tap Screen now.`, keyboard: [[btn("🔍 Screen now", "cs")], [btn("⬅ Menu", "m")]] };
+  }
+  const blocks = candidates.map((c, i) => candidateBlock(c, i, source));
+  const pages = paginate(blocks, { perPage: CANDIDATES_PER_PAGE });
+  const pg = Math.min(Math.max(0, page), pages.length - 1);
+  const keyboard = [];
+  for (const i of pages[pg]) {
+    const c = candidates[i];
+    keyboard.push([
+      btn(`🚀 Deploy ${i + 1}`, `dp:${refs.put(c, `cand:${c.pool}`)}`),
+      urlBtn("Meteora ↗", meteoraPoolUrl(c.pool)),
+    ]);
+  }
+  const pager = pagerRow("ca", pg, pages.length);
+  if (pager) keyboard.push(pager);
+  keyboard.push([btn("🔍 Screen now", "cs"), btn("⬅ Menu", "m")]);
+  const text = `${header}\n\n${pages[pg].map((i) => blocks[i]).join("\n\n")}\n\nDeploy asks for confirmation first. You can also reply with a number.`;
+  return { text, keyboard, page: pg, pages: pages.length };
+}
+
+export function renderTextPages(title, body, { page = 0, prefix, extraRows = [] } = {}) {
+  // Paginate the ESCAPED text so entity expansion can't push a page past the cap.
+  const pages = paginateText(escapeHtml(body), PAGE_CHAR_BUDGET - title.length - 40);
+  const pg = Math.min(Math.max(0, page), pages.length - 1);
+  const keyboard = [...extraRows];
+  const pager = pagerRow(prefix, pg, pages.length);
+  if (pager) keyboard.push(pager);
+  return { text: `${title}\n<pre>${pages[pg]}</pre>`, keyboard, page: pg, pages: pages.length };
+}
+
+export function renderControls(info) {
+  return {
+    text: [
+      `🎛 <b>Bot controls</b>`,
+      `Screening: ${info.paused ? "<b>⏸ PAUSED</b>" : "▶️ running"} (management + PnL watcher always run)`,
+      `Mode: <b>${info.dryRun ? "DRY RUN" : "LIVE"}</b>`,
+    ].join("\n"),
+    keyboard: [
+      [info.paused ? btn("▶️ Resume screening", "sp:0") : btn("⏸ Pause screening", "sp:1")],
+      [btn("🔍 Run screening now", "sn")],
+      [btn("🧪 Autoresearch", "ar"), btn("🧯 Recent errors", "er")],
+      [btn("⬅ Menu", "m")],
+    ],
+  };
+}
+
+export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = {}) {
+  return {
+    text: [
+      `🔒 <b>Close position?</b>${dryRun ? " (DRY RUN)" : ""}`,
+      `<b>${escapeHtml(p.pair ?? "?")}</b>`,
+      `Position: <code>${escapeHtml(p.position)}</code>`,
+      p.pool ? `Pool: <code>${escapeHtml(p.pool)}</code>` : null,
+      `Value: ${fmtValue(p, unit)} · PnL: ${escapeHtml(fmtPnl(p, unit))}`,
+      `Unclaimed fees: ${fmtFees(p, unit)} · ${p.in_range ? "in range" : "out of range"} · age ${fmtAge(p.age_minutes)}`,
+      "",
+      `Withdraws liquidity, claims fees and swaps the base token back. Expires in ${Math.round(CONFIRM_TTL_MS / 1000)}s.`,
+    ].filter((l) => l != null).join("\n"),
+    keyboard: [[btn("✅ Confirm close", `y:${nonce}`), btn("✖ Cancel", `n:${nonce}`)]],
+  };
+}
+
+export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora" } = {}) {
+  return {
+    text: [
+      `🚀 <b>Deploy into this pool?</b>${dryRun ? " (DRY RUN)" : ""}`,
+      `<b>${escapeHtml(c.name ?? "?")}</b> [${escapeHtml(candidateSourceTag(c, source))}]`,
+      `Pool: <code>${escapeHtml(c.pool)}</code>`,
+      `Amount: <b>${escapeHtml(plan.amountLabel)}</b>`,
+      `Strategy: ${escapeHtml(plan.strategyLabel)}`,
+      `bin step ${c.bin_step ?? "?"} · volatility ${c.volatility ?? "?"} · fee/aTVL ${c.fee_active_tvl_ratio ?? "?"}%`,
+      "",
+      `Runs the normal deploy_position safety checks. Expires in ${Math.round(CONFIRM_TTL_MS / 1000)}s.`,
+    ].join("\n"),
+    keyboard: [[btn("✅ Confirm deploy", `y:${nonce}`), btn("✖ Cancel", `n:${nonce}`)], [urlBtn("Meteora ↗", meteoraPoolUrl(c.pool))]],
+  };
+}
+
+function txLinks(txs) {
+  const list = (Array.isArray(txs) ? txs : txs ? [txs] : []).filter((t) => typeof t === "string" && t.length > 20);
+  return list.slice(0, 4).map((sig, i) => `<a href="${solscanTxUrl(sig)}">tx ${i + 1}</a>`).join(" · ");
+}
+
+/** Render an executeTool result for the confirmation card. */
+export function renderExecResult(action, label, result) {
+  const title = action === "close" ? "Close" : "Deploy";
+  if (!result) return `❌ <b>${title} failed</b> ${escapeHtml(label)}\nNo result.`;
+  if (result.dry_run) {
+    return `🧪 <b>${title} — DRY RUN</b> ${escapeHtml(label)}\n${escapeHtml(result.message ?? "No transaction sent.")}`;
+  }
+  if (result.blocked) return `🛑 <b>${title} blocked</b> ${escapeHtml(label)}\n${escapeHtml(result.reason ?? "")}`;
+  if (result.success === false || result.error) {
+    return `❌ <b>${title} failed</b> ${escapeHtml(label)}\n${escapeHtml(result.error ?? result.status ?? "unknown error")}${result.txs ? `\n${txLinks(result.txs)}` : ""}`;
+  }
+  const lines = [`✅ <b>${action === "close" ? "Closed" : "Deployed"}</b> ${escapeHtml(label)}`];
+  if (result.position) lines.push(`Position: <code>${escapeHtml(result.position)}</code>`);
+  if (action === "close" && result.pnl_pct != null) lines.push(`PnL: ${fmtSigned(result.pnl_pct, 2)}%`);
+  const links = txLinks(result.txs ?? result.tx);
+  if (links) lines.push(links);
+  return lines.join("\n");
+}
+
+// ─── Controller ──────────────────────────────────────────────────
+/**
+ * deps:
+ *   tg: { sendHTML(html, extra) → Message|null, editHTML(id, html, extra) → bool, answerCallback(id, text, alert) }
+ *   config, computeDeployAmount, usdcModeEnabled()
+ *   getMyPositions({force}), getWalletBalances(), getTopCandidates({limit})
+ *   executeTool(name, args)               — tools/executor.js
+ *   runExclusive(fn, { screening })       — → { busy: true } | { value }
+ *   autoDeploy()                          — legacy "auto" (LLM picks + deploys); → text
+ *   afterDeploy()                         — e.g. launchCron
+ *   runScreeningNow()                     — → { started, reason, done: Promise<report> }
+ *   isScreeningPaused(), setScreeningPaused(bool)
+ *   getStatusInfo()                       — timers, models, busy flags
+ *   buildSettingsReport(), handleAutoresearchCommand(args), readRecentErrors()
+ *   log(category, msg), now(), ttlMs
+ */
+export function createTelegramUI(deps) {
+  const now = deps.now || (() => Date.now());
+  const logf = deps.log || (() => {});
+  const nonces = createNonceStore({ ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, now });
+  const refs = createRefMap();
+  const limiter = createAlertLimiter({ now });
+  const state = {
+    candidates: [],
+    candidatesMeta: null,
+    candidatesAt: null,
+    lastManagement: null,
+    lastScreening: null,
+  };
+  const isDryRun = () => process.env.DRY_RUN === "true";
+  const unit = () => deps.config.management?.pnlUnit || "sol";
+  const source = () => deps.config.screening?.source || "meteora";
+
+  async function show(ctx, view, { fresh = false } = {}) {
+    const extra = { reply_markup: { inline_keyboard: view.keyboard || [] } };
+    if (!fresh && ctx?.messageId != null) {
+      const ok = await deps.tg.editHTML(ctx.messageId, view.text, extra);
+      if (ok) return { message_id: ctx.messageId, edited: true };
+    }
+    return deps.tg.sendHTML(view.text, extra);
+  }
+
+  async function statusInfo() {
+    const base = (await deps.getStatusInfo?.()) || {};
+    return {
+      ...base,
+      dryRun: isDryRun(),
+      paused: !!deps.isScreeningPaused?.(),
+      lastManagement: state.lastManagement,
+      lastScreening: state.lastScreening,
+    };
+  }
+
+  async function loadCandidates() {
+    const result = await deps.getTopCandidates({ limit: 10 });
+    state.candidates = result?.candidates || [];
+    state.candidatesMeta = { total_eligible: result?.total_eligible, total_screened: result?.total_screened };
+    state.candidatesAt = now();
+    return state.candidates;
+  }
+
+  function candidatesView(page) {
+    return renderCandidates(state.candidates, {
+      page, refs, source: source(), fetchedAt: state.candidatesAt, now: now(), meta: state.candidatesMeta,
+    });
+  }
+
+  // ── confirmation builders ──
+  async function closeRequest(positionAddress) {
+    const res = await deps.getMyPositions({ force: true });
+    if (res?.error) return { view: { text: `⚠️ Could not load positions: ${escapeHtml(res.error)}`, keyboard: [[btn("⬅ Positions", "po:0")]] } };
+    const p = (res?.positions || []).find((x) => x.position === positionAddress);
+    if (!p) return { view: { text: `Position <code>${escapeHtml(shortAddr(positionAddress))}</code> is no longer open.`, keyboard: [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]] } };
+    const nonce = nonces.put("close", { position_address: p.position, label: p.pair || shortAddr(p.position) });
+    return { nonce, view: renderCloseConfirm(p, nonce, { unit: unit(), dryRun: isDryRun() }) };
+  }
+
+  async function deployRequest(candidate) {
+    const usdcMode = !!deps.usdcModeEnabled?.();
+    const wallet = usdcMode ? null : await deps.getWalletBalances().catch((e) => ({ error: e.message }));
+    const plan = buildDeployPlan(candidate, { wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, usdcMode });
+    if (plan.error) return { view: { text: `⚠️ ${escapeHtml(plan.error)}`, keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] } };
+    const nonce = nonces.put("deploy", { args: plan.args, label: candidate.name || shortAddr(candidate.pool) });
+    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source() }) };
+  }
+
+  function simpleConfirm(action, params, text, confirmLabel) {
+    const nonce = nonces.put(action, params);
+    return {
+      nonce,
+      view: {
+        text: `${text}\n\nExpires in ${Math.round((deps.ttlMs ?? CONFIRM_TTL_MS) / 1000)}s.`,
+        keyboard: [[btn(confirmLabel, `y:${nonce}`), btn("✖ Cancel", `n:${nonce}`)]],
+      },
+    };
+  }
+
+  async function presentConfirm(ctx, req, opts) {
+    const msg = await show(ctx, req.view, opts);
+    if (req.nonce) nonces.bind(req.nonce, msg?.message_id ?? null, ctx?.chatId ?? msg?.chat?.id ?? null);
+    return msg;
+  }
+
+  // ── execution (Confirm tap) ──
+  async function execute(entry, ctx) {
+    const edit = (text, keyboard = [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]]) =>
+      show(ctx, { text, keyboard });
+    const { action, params } = entry;
+
+    if (action === "close") {
+      await edit(`⏳ Closing ${escapeHtml(params.label)}…`, []);
+      const r = await deps.runExclusive(() => deps.executeTool("close_position", { position_address: params.position_address }));
+      if (r.busy) return edit(`⏳ Agent is busy — nothing was closed. Open Positions and try again.`);
+      return edit(renderExecResult("close", params.label, r.value));
+    }
+
+    if (action === "deploy") {
+      await edit(`⏳ Deploying into ${escapeHtml(params.label)}…`, []);
+      const r = await deps.runExclusive(() => deps.executeTool("deploy_position", { ...params.args }), { screening: true });
+      if (r.busy) return edit(`⏳ Agent is busy — nothing was deployed. Try again in a moment.`);
+      try { await deps.afterDeploy?.(); } catch { /* best-effort */ }
+      return edit(renderExecResult("deploy", params.label, r.value));
+    }
+
+    if (action === "auto") {
+      await edit("🤖 Agent is picking and deploying…", []);
+      const r = await deps.runExclusive(() => deps.autoDeploy(), { screening: true });
+      if (r.busy) return edit(`⏳ Agent is busy — nothing was deployed. Try again in a moment.`);
+      try { await deps.afterDeploy?.(); } catch { /* best-effort */ }
+      return edit(`🤖 <b>Auto deploy finished</b>\n${escapeHtml(clipText(String(r.value ?? ""), PAGE_CHAR_BUDGET))}`);
+    }
+
+    if (action === "screen") {
+      const run = deps.runScreeningNow();
+      if (!run.started) return edit(`⏳ Screening not started: ${escapeHtml(run.reason)}.`, [[btn("🎛 Controls", "bc"), btn("⬅ Menu", "m")]]);
+      await edit("🔍 Screening cycle running… the report arrives as a separate message.", [[btn("📈 Status", "st"), btn("⬅ Menu", "m")]]);
+      const report = await run.done;
+      return edit(`🔍 <b>Screening cycle finished</b>\n${escapeHtml(clipText(String(report ?? "no report"), 1500))}`, [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]]);
+    }
+
+    if (action === "ar_approve" || action === "ar_reject") {
+      const out = deps.handleAutoresearchCommand(action === "ar_approve" ? "approve" : "reject");
+      return edit(`🧪 ${escapeHtml(out)}`, [[btn("🧪 Autoresearch", "ar"), btn("⬅ Menu", "m")]]);
+    }
+
+    return edit("Unknown action — nothing was done.");
+  }
+
+  // ── public: text messages ──
+  /** Returns true when the UI handled the text; false lets the legacy handler run. */
+  async function handleMessage(rawText, ctx = {}) {
+    const text = String(rawText || "").trim();
+    const lower = text.toLowerCase();
+
+    if (text === "/start") {
+      await deps.tg.sendHTML("👋 Meridian control. Use the menu below, or /help for text commands.", {
+        reply_markup: { keyboard: [[{ text: MENU_BUTTON_TEXT }]], resize_keyboard: true, is_persistent: true },
+      });
+      await show(null, renderMainMenu({ header: await menuHeader() }), { fresh: true });
+      return true;
+    }
+    if (text === "/menu" || text === MENU_BUTTON_TEXT || lower === "menu") {
+      await show(null, renderMainMenu({ header: await menuHeader() }), { fresh: true });
+      return true;
+    }
+
+    if (text === "/candidates") {
+      await deps.tg.sendHTML("🔍 Screening candidates…");
+      try {
+        await loadCandidates();
+      } catch (e) {
+        await deps.tg.sendHTML(`❌ Screening failed: ${escapeHtml(e.message)}`);
+        return true;
+      }
+      await show(null, candidatesView(0), { fresh: true });
+      return true;
+    }
+
+    const pick = parseInt(text, 10);
+    if (!Number.isNaN(pick) && String(pick) === text) {
+      const c = state.candidates[pick - 1];
+      if (pick < 1 || !c) {
+        await deps.tg.sendHTML(`No pool #${pick} in the current list. Send /candidates first.`);
+        return true;
+      }
+      await presentConfirm({ chatId: ctx.chatId }, await deployRequest(c), { fresh: true });
+      return true;
+    }
+
+    if (lower === "auto") {
+      const amount = deps.usdcModeEnabled?.() ? `$${deps.config.usdc?.deployAmountUsd} (USDC mode)` : "the wallet-scaled amount";
+      await presentConfirm({ chatId: ctx.chatId }, simpleConfirm("auto", {}, `🤖 <b>Auto deploy?</b>${isDryRun() ? " (DRY RUN)" : ""}\nThe agent screens, picks the best pool and deploys ${escapeHtml(amount)} with the active strategy.`, "✅ Confirm auto deploy"), { fresh: true });
+      return true;
+    }
+
+    return false;
+  }
+
+  async function menuHeader() {
+    const paused = !!deps.isScreeningPaused?.();
+    return `Mode: <b>${isDryRun() ? "DRY RUN" : "LIVE"}</b> · screening ${paused ? "⏸ paused" : "▶️ on"}`;
+  }
+
+  // ── public: callbacks ──
+  async function handleCallback(data, ctx = {}) {
+    const fresh = data.endsWith("!");
+    const d = fresh ? data.slice(0, -1) : data;
+    const [head, arg] = d.split(":");
+    const opts = { fresh };
+    let answered = false;
+    const answer = async (text = "", alert = false) => {
+      if (answered) return;
+      answered = true;
+      await deps.tg.answerCallback(ctx.callbackId, text, alert);
+    };
+
+    try {
+      switch (head) {
+        case "m":
+          await answer();
+          await show(ctx, renderMainMenu({ header: await menuHeader() }), opts);
+          return;
+        case "st":
+          await answer();
+          await show(ctx, renderStatus(await statusInfo(), now()), opts);
+          return;
+        case "wa": {
+          await answer();
+          const wallet = await deps.getWalletBalances().catch((e) => ({ error: e.message }));
+          await show(ctx, renderWallet(wallet, { config: deps.config, usdcMode: !!deps.usdcModeEnabled?.() }), opts);
+          return;
+        }
+        case "po": {
+          await answer();
+          const res = await deps.getMyPositions({}).catch((e) => ({ error: e.message }));
+          await show(ctx, renderPositions(res, { page: Number(arg) || 0, refs, unit: unit() }), opts);
+          return;
+        }
+        case "ca":
+          await answer();
+          if (!state.candidatesAt) await loadCandidates().catch((e) => logf("telegram_error", `Candidates load failed: ${e.message}`));
+          await show(ctx, candidatesView(Number(arg) || 0), opts);
+          return;
+        case "cs":
+          await answer("Screening…");
+          await show(ctx, { text: "🔍 Screening candidates…", keyboard: [] }, opts);
+          try {
+            await loadCandidates();
+            await show(ctx, candidatesView(0));
+          } catch (e) {
+            await show(ctx, { text: `❌ Screening failed: ${escapeHtml(e.message)}`, keyboard: [[btn("🔄 Retry", "cs"), btn("⬅ Menu", "m")]] });
+          }
+          return;
+        case "se": {
+          await answer();
+          const report = deps.buildSettingsReport();
+          const view = renderTextPages("⚙️ <b>Settings</b>", report, { page: Number(arg) || 0, prefix: "se" });
+          view.keyboard.push(backRow(`se:${view.page}`));
+          await show(ctx, view, opts);
+          return;
+        }
+        case "bc":
+          await answer();
+          await show(ctx, renderControls(await statusInfo()), opts);
+          return;
+        case "sp": {
+          const pause = arg === "1";
+          deps.setScreeningPaused(pause);
+          await answer(pause ? "Screening paused" : "Screening resumed");
+          await show(ctx, renderControls(await statusInfo()), opts);
+          return;
+        }
+        case "sn": {
+          await answer();
+          await presentConfirm(ctx, simpleConfirm("screen", {}, `🔍 <b>Run a screening cycle now?</b>${isDryRun() ? " (DRY RUN)" : ""}\nThe screener may DEPLOY into the best candidate, exactly like the scheduled cycle. It won't overlap a running cycle.${deps.isScreeningPaused?.() ? "\n⏸ Scheduled screening is paused; this runs once anyway." : ""}`, "✅ Confirm run"), opts);
+          return;
+        }
+        case "ar": {
+          await answer();
+          const out = deps.handleAutoresearchCommand("status");
+          const view = renderTextPages("🧪 <b>Autoresearch</b>", out.split("\n\n/autoresearch")[0], { prefix: "ar" });
+          view.keyboard = [
+            [btn("📋 List overrides", "al:0")],
+            [btn("✅ Approve pending", "aa"), btn("❌ Reject pending", "aj")],
+            [btn("🔄 Refresh", "ar"), btn("⬅ Controls", "bc")],
+          ];
+          await show(ctx, view, opts);
+          return;
+        }
+        case "al": {
+          await answer();
+          const view = renderTextPages("🧪 <b>Autoresearch overrides</b>", deps.handleAutoresearchCommand("list"), { page: Number(arg) || 0, prefix: "al" });
+          view.keyboard.push([btn("⬅ Autoresearch", "ar")]);
+          await show(ctx, view, opts);
+          return;
+        }
+        case "aa":
+        case "aj": {
+          await answer();
+          const status = deps.handleAutoresearchCommand("status");
+          const pendingLine = status.split("\n").find((l) => l.startsWith("Pending proposal:")) || "Pending proposal: ?";
+          if (/Pending proposal: none/.test(pendingLine)) {
+            await show(ctx, { text: "🧪 No pending proposal.", keyboard: [[btn("⬅ Autoresearch", "ar")]] }, opts);
+            return;
+          }
+          const approve = head === "aa";
+          await presentConfirm(ctx, simpleConfirm(approve ? "ar_approve" : "ar_reject", {}, `🧪 <b>${approve ? "Approve" : "Reject"} the pending proposal?</b>\n${escapeHtml(pendingLine)}`, approve ? "✅ Confirm approve" : "✅ Confirm reject"), opts);
+          return;
+        }
+        case "er": {
+          await answer();
+          const { file, lines } = deps.readRecentErrors();
+          const body = lines.length ? lines.join("\n") : "No ERROR/WARN lines in the current log.";
+          const view = renderTextPages(`🧯 <b>Recent errors</b>${file ? ` (${escapeHtml(file)})` : ""}`, body, { prefix: "er" });
+          view.text = clipText(view.text, PAGE_CHAR_BUDGET);
+          view.keyboard = [[btn("🔄 Refresh", "er"), btn("⬅ Controls", "bc")]];
+          await show(ctx, view, opts);
+          return;
+        }
+        case "pc": {
+          const addr = refs.get(arg);
+          if (!addr) {
+            await answer("That button is stale — reopen Positions.", true);
+            return;
+          }
+          await answer();
+          await presentConfirm(ctx, await closeRequest(addr), opts);
+          return;
+        }
+        case "dp": {
+          const c = refs.get(arg);
+          if (!c) {
+            await answer("That button is stale — reopen Candidates.", true);
+            return;
+          }
+          await answer();
+          await presentConfirm(ctx, await deployRequest(c), opts);
+          return;
+        }
+        case "y": {
+          const peek = nonces.peek(arg);
+          if (peek.error) {
+            logf("telegram_warn", `Refused confirm ${arg}: ${peek.error} nonce`);
+            await answer(peek.error === "expired" ? "Expired — nothing was done." : "Unknown or already used — nothing was done.", true);
+            // Only rewrite the card on expiry; an already-used nonce's card shows the real result.
+            if (peek.error === "expired" && ctx.messageId != null) await show(ctx, { text: "⌛ This confirmation expired. Nothing was done.", keyboard: [[btn("⬅ Menu", "m")]] });
+            return;
+          }
+          const e = peek.entry;
+          if (e.chatId != null && ctx.chatId != null && String(ctx.chatId) !== e.chatId) {
+            logf("telegram_warn", `Refused confirm ${arg}: chat mismatch`);
+            await answer("This confirmation belongs to a different chat.", true);
+            return;
+          }
+          if (e.messageId != null && ctx.messageId !== e.messageId) {
+            logf("telegram_warn", `Refused confirm ${arg}: message mismatch`);
+            await answer("This confirmation belongs to a different message.", true);
+            return;
+          }
+          const taken = nonces.take(arg); // single-use: consumed before executing
+          if (!taken.entry) {
+            await answer("Already used — nothing was done.", true);
+            return;
+          }
+          logf("telegram", `Confirmed ${e.action} ${JSON.stringify(e.params).slice(0, 200)}`);
+          await answer("Executing…");
+          try {
+            await execute(taken.entry, ctx);
+          } catch (err) {
+            logf("telegram_error", `${e.action} failed: ${err.message}`);
+            await show(ctx, { text: `❌ <b>${escapeHtml(e.action)} failed</b>\n${escapeHtml(err.message)}`, keyboard: [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]] });
+          }
+          return;
+        }
+        case "n": {
+          const r = nonces.take(arg);
+          await answer(r.entry ? "Cancelled" : "Nothing to cancel");
+          await show(ctx, { text: "✖ Cancelled. Nothing was done.", keyboard: [[btn("⬅ Menu", "m")]] });
+          return;
+        }
+        default:
+          logf("telegram_warn", `Unknown callback data: ${d.slice(0, 20)}`);
+          await answer("Unknown button.");
+      }
+    } catch (e) {
+      logf("telegram_error", `Callback ${head} failed: ${e.message}`);
+      await answer(`Error: ${e.message}`.slice(0, 180), true);
+    } finally {
+      if (!answered) await answer();
+    }
+  }
+
+  // ── alerts ──
+  const FUND_EVENTS = new Set(["deploy", "close", "pnl_watcher_close", "deploy_partial"]);
+  function alert(kind, key, cooldownMs, text, keyboard = []) {
+    if (!FUND_EVENTS.has(kind) && !limiter.allow(`${kind}:${key}`, cooldownMs)) {
+      logf("telegram", `Alert suppressed (rate limit): ${kind} ${key}`);
+      return Promise.resolve(null);
+    }
+    return deps.tg.sendHTML(text, { reply_markup: { inline_keyboard: keyboard } });
+  }
+
+  const positionsBtn = () => btn("📊 Positions", "po:0!");
+  const closeBtn = (position) => btn("🔒 Close…", `pc:${refs.put(position, `pos:${position}`)}!`);
+
+  function fmtAlertPnl(d) {
+    const u = unit();
+    if (d.pnlPct == null) return "PnL: unknown";
+    const abs = u === "sol" && d.pnlSol != null ? `${fmtSigned(d.pnlSol, 4)} SOL` : d.pnlUsd != null ? `${fmtSigned(d.pnlUsd, 2).replace(/^([+-])/, "$1$")}` : "";
+    return `PnL: ${abs} (${fmtSigned(d.pnlPct, 2)}%)`;
+  }
+
+  const handlers = {
+    deploy: (d) => {
+      const amount = d.amountUsd != null ? `$${fmtNum(d.amountUsd, 2)} (${fmtNum(d.amountSol, 4)} SOL)` : `${fmtNum(d.amountSol, 4)} SOL`;
+      const kb = [[positionsBtn(), ...(d.position ? [closeBtn(d.position)] : [])]];
+      if (d.pool) kb.push([urlBtn("Meteora ↗", meteoraPoolUrl(d.pool))]);
+      return alert("deploy", d.position, 0, [
+        `✅ <b>Deployed</b> ${escapeHtml(d.pair)}`,
+        `Amount: ${amount}`,
+        d.position ? `Position: <code>${escapeHtml(shortAddr(d.position))}</code>` : null,
+        txLinks(d.txs ?? d.tx) || null,
+      ].filter(Boolean).join("\n"), kb);
+    },
+    close: (d) => alert("close", d.position, 0, [
+      `🔒 <b>Closed</b> ${escapeHtml(d.pair)}`,
+      fmtAlertPnl(d),
+      txLinks(d.txs) || null,
+    ].filter(Boolean).join("\n"), [[positionsBtn()]]),
+    pnl_watcher_close: (d) => alert("pnl_watcher_close", d.position, 0, [
+      `⚡ <b>${/stop|loss/i.test(d.reason || "") ? "Stop-loss" : /tp|profit|trail/i.test(d.reason || "") ? "Take-profit" : "Exit"} hit — auto-closed</b> ${escapeHtml(d.pair)}`,
+      escapeHtml(d.reason ?? ""),
+      fmtAlertPnl(d),
+      txLinks(d.txs) || null,
+    ].filter(Boolean).join("\n"), [[positionsBtn()]]),
+    deploy_partial: (d) => alert("deploy_partial", d.position, 0, [
+      `⚠️ <b>Partial deploy</b> ${escapeHtml(d.pair)}`,
+      `Position <code>${escapeHtml(shortAddr(d.position))}</code> is ${escapeHtml(d.status)} after a liquidity-add failure: ${escapeHtml(String(d.error ?? "").slice(0, 300))}`,
+      `X=${escapeHtml(d.amountX ?? "?")} Y=${escapeHtml(d.amountY ?? "?")}`,
+      "Kept OPEN for management — check it.",
+    ].join("\n"), [[positionsBtn(), ...(d.position ? [closeBtn(d.position)] : [])]]),
+    out_of_range: (d) => alert("out_of_range", d.pair, 6 * 60 * 60_000,
+      `⚠️ <b>Out of range</b> ${escapeHtml(d.pair)} for ${escapeHtml(d.minutesOOR)} min`,
+      [[positionsBtn()]]),
+    gas_low: (d) => alert("gas_low", "gas", 2 * 60 * 60_000,
+      `⛽ <b>Gas low — deploy paused</b>\n${escapeHtml(d.reason || `Native SOL ${d.sol} is below the gas reserve${d.reserve != null ? ` of ${d.reserve} SOL` : ""}.`)}\nTop up SOL to resume USDC-mode deploys.`,
+      [[btn("💰 Wallet", "wa!")]]),
+    cycle_error: (d) => alert("cycle_error", `${d.cycle}:${String(d.error).slice(0, 60)}`, 15 * 60_000,
+      `❌ <b>${escapeHtml(d.cycle)} cycle failed</b>\n${escapeHtml(String(d.error ?? "").slice(0, 500))}`,
+      [[btn("🧯 Recent errors", "er!")]]),
+    // Cycle reports: always recorded for the Status view, but pushed only when
+    // something happened. `routine` (set by index.js) means nothing did: a
+    // code-only HOLD, an LLM pass that changed nothing, a screen that deployed
+    // nothing. Failures are covered by the cycle_error alert.
+    "cycle:management": ({ report, routine }) => {
+      state.lastManagement = { at: now(), summary: String(report ?? "").slice(0, 400) };
+      if (routine || /^Management cycle failed:/.test(report ?? "")) return null;
+      return sendReport("🔄 <b>Management cycle</b>", report);
+    },
+    "cycle:screening": ({ report, routine }) => {
+      state.lastScreening = { at: now(), summary: String(report ?? "").slice(0, 400) };
+      if (routine || /^Screening cycle failed:/.test(report ?? "")) return null;
+      return sendReport("🔍 <b>Screening cycle</b>", report);
+    },
+    briefing: ({ html }) => deps.tg.sendHTML(String(html ?? "")),
+  };
+
+  async function sendReport(title, report) {
+    const pages = paginateText(escapeHtml(String(report ?? "")), PAGE_CHAR_BUDGET - 100);
+    for (let i = 0; i < pages.length; i++) {
+      const last = i === pages.length - 1;
+      await deps.tg.sendHTML(`${i === 0 ? `${title}\n\n` : ""}${pages[i]}`, last
+        ? { reply_markup: { inline_keyboard: [[positionsBtn(), btn("🏠 Menu", "m!")]] } }
+        : {});
+    }
+  }
+
+  /** Subscribe alert handlers to the notifier hub. */
+  function attachAlerts(on) {
+    for (const [event, fn] of Object.entries(handlers)) {
+      on(event, (data) => {
+        Promise.resolve()
+          .then(() => fn(data || {}))
+          .catch((e) => logf("telegram_error", `Alert ${event} failed: ${e.message}`));
+      });
+    }
+  }
+
+  return {
+    handleMessage,
+    handleCallback,
+    attachAlerts,
+    alerts: handlers,
+    nonces,
+    refs,
+    state,
+    loadCandidates,
+    getCandidates: () => state.candidates,
+  };
+}
