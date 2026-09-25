@@ -23,7 +23,7 @@ let _weightsDegraded = false;
 
 // ─── Signal Definitions ─────────────────────────────────────────
 
-const SIGNAL_NAMES = [
+export const SIGNAL_NAMES = [
   "organic_score",
   "fee_tvl_ratio",
   "volume",
@@ -39,6 +39,9 @@ const SIGNAL_NAMES = [
   "gmgn_signal_present", // smart money/KOL/whale activity on token
   "change_1h",          // 1-hour price change from GMGN
   "candle_price_range",  // real-time volatility from 5m candle spread
+  // GMGN market-signal feed (tools/gmgn-signals.js)
+  "gmgn_buy_pressure",  // smart-money / KOL / large-buy signals on the token
+  "gmgn_spike",         // price-spike / new-ATH signals on the token
 ];
 
 const DEFAULT_WEIGHTS = Object.fromEntries(SIGNAL_NAMES.map((s) => [s, 1.0]));
@@ -53,7 +56,10 @@ const HIGHER_IS_BETTER = new Set([
 ]);
 
 // Boolean signals — compared by win rate when present vs absent
-const BOOLEAN_SIGNALS = new Set(["smart_wallets_present", "gmgn_signal_present"]);
+const BOOLEAN_SIGNALS = new Set(["smart_wallets_present", "gmgn_signal_present", "gmgn_buy_pressure", "gmgn_spike"]);
+// Booleans whose prior is "absent=better" until closes teach otherwise. Price spikes
+// usually precede upside OOR for single-sided bid_ask, so a spike starts as a penalty.
+const ABSENT_BETTER_PRIOR = new Set(["gmgn_spike"]);
 
 // Categorical signals — compared by win rate across categories
 const CATEGORICAL_SIGNALS = new Set(["narrative_quality", "volume_trend"]);
@@ -63,7 +69,7 @@ const CATEGORICAL_SIGNALS = new Set(["narrative_quality", "volume_trend"]);
 const DEFAULT_DIRECTIONS = Object.fromEntries(
   SIGNAL_NAMES.map((s) => {
     if (HIGHER_IS_BETTER.has(s)) return [s, "higher"];
-    if (BOOLEAN_SIGNALS.has(s)) return [s, "present=better"];
+    if (BOOLEAN_SIGNALS.has(s)) return [s, ABSENT_BETTER_PRIOR.has(s) ? "absent=better" : "present=better"];
     return [s, "unknown"];
   })
 );
@@ -84,6 +90,13 @@ export function loadWeights() {
   }
   try {
     const data = JSON.parse(fs.readFileSync(WEIGHTS_FILE, "utf8"));
+    // Signals added after the file was created start at the neutral weight;
+    // learned weights for existing signals are left as they are. Persisted
+    // on the next recalc.
+    if (!data.weights || typeof data.weights !== "object") data.weights = {};
+    for (const name of SIGNAL_NAMES) {
+      if (data.weights[name] == null) data.weights[name] = DEFAULT_WEIGHTS[name];
+    }
     // Gracefully add directions field to existing files that lack it
     if (!data.directions) {
       data.directions = { ...DEFAULT_DIRECTIONS };
@@ -92,7 +105,7 @@ export function loadWeights() {
       for (const name of SIGNAL_NAMES) {
         if (data.directions[name] == null) {
           if (HIGHER_IS_BETTER.has(name)) data.directions[name] = "higher";
-          else if (BOOLEAN_SIGNALS.has(name)) data.directions[name] = "present=better";
+          else if (BOOLEAN_SIGNALS.has(name)) data.directions[name] = ABSENT_BETTER_PRIOR.has(name) ? "absent=better" : "present=better";
           else data.directions[name] = "unknown";
         }
       }

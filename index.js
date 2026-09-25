@@ -35,6 +35,7 @@ import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { fetchGmgnPriceInfo, fetchGmgnSignal } from "./tools/gmgn.js";
 import { getOhlcvDepth } from "./tools/ohlcv.js";
+import { formatGmgnSignalsLine, gmgnSignalSnapshotFields, GMGN_MARKET_SIGNALS_GUIDE } from "./tools/gmgn-signals.js";
 import {
   sessionHistory, appendHistory, getHistory,
   isBusy, setBusy,
@@ -391,6 +392,8 @@ async function screeningCycleBody() {
         if (gmgnSignalResult) {
           block += `\n  GMGN signal: ${gmgnSignalResult.summary}`;
         }
+        const marketSignalsLine = formatGmgnSignalsLine(c.gmgn_signals);
+        if (marketSignalsLine) block += `\n  ${marketSignalsLine}`;
         return { pool: c.pool, block };
       }));
       const rankedCandidates = rankCandidatesByDarwin(candidates);
@@ -452,6 +455,8 @@ async function screeningCycleBody() {
             gmgn_signal_amount_2h: c._gmgnSignal?.signal_amount_usd_2h ?? null,
             gmgn_latest_signal_age_min: c._gmgnSignal?.latest_signal_age_min ?? null,
             gmgn_latest_sold_ratio: c._gmgnSignal?.latest_sold_ratio_percent ?? null,
+            // GMGN market-signal feed: gmgn_buy_pressure / gmgn_spike (weighted) + raw counts
+            ...gmgnSignalSnapshotFields(c.gmgn_signals),
           }, c.base_mint || c.base?.mint || null);
         } catch { /* staging is best-effort */ }
       }
@@ -483,7 +488,7 @@ async function screeningCycleBody() {
     } catch { /* best-effort */ }
 
     const gmgnSignalGuide = candidateBlocks
-      ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n- Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n`
+      ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n- Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n${loadedCandidates.some((c) => c.gmgn_signals) ? `${GMGN_MARKET_SIGNALS_GUIDE}\n` : ""}`
       : "";
 
     const rangeSourceLine = config.strategy.rangeDepthMode === "ohlcv" && config.strategy.activeStrategy !== "evil_panda"

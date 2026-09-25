@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
 import { scoreSignalSnapshot } from "../signal-weights.js";
+import { fetchGmgnSignalMap, attachGmgnSignals, gmgnSignalBooleans } from "./gmgn-signals.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
@@ -124,6 +125,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const entry = await screenEntryCandidates(pools || []);
   pools = entry.kept;
 
+  // GMGN market signals (buy pressure / spikes): one cached fetch per cycle,
+  // attached as `gmgn_signals` before Darwin ranking. Informational only.
+  await attachScreeningGmgnSignals(pools);
+
   // Exclude pools where the wallet already has an open position
   const { getMyPositions } = await import("./dlmm.js");
   const { positions } = await getMyPositions();
@@ -140,6 +145,22 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     total_screened: screenedCount,
     entry_filtered: entry.dropped.length,
   };
+}
+
+/**
+ * Attach `gmgn_signals` to every candidate when config.screening.gmgnSignalsEnabled
+ * is on. Never throws; a failed fetch leaves gmgn_signals null (unknown).
+ */
+export async function attachScreeningGmgnSignals(pools, { cfg = config, fetchMap = fetchGmgnSignalMap } = {}) {
+  if (!Array.isArray(pools) || pools.length === 0) return;
+  if (cfg.screening?.gmgnSignalsEnabled === false) return;
+  try {
+    const map = await fetchMap({ cfg });
+    const hits = attachGmgnSignals(pools, map);
+    if (map?.ok) log("gmgn_signals", `${hits}/${pools.length} candidate(s) have GMGN market signals`);
+  } catch (e) {
+    log("gmgn_signals", `Attach failed: ${e?.message || e}`);
+  }
 }
 
 export function normalizeCandidateForUi(candidate) {
@@ -177,6 +198,8 @@ export function getCandidateSignalSnapshot(candidate) {
     gmgn_signal_present: c._gmgnSignal ? ((c._gmgnSignal.signal_count_30m || 0) > 0) : c.gmgn_signal_present ?? null,
     change_1h: c._gmgnResult?.change_1h ?? c.change_1h ?? null,
     candle_price_range: c._gmgnResult?.candles?.price_range_pct ?? c.candle_price_range ?? null,
+    // GMGN market-signal feed (tools/gmgn-signals.js); null = not fetched.
+    ...gmgnSignalBooleans(c.gmgn_signals),
   };
 }
 
