@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { on } from "./notifier.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -106,7 +107,7 @@ async function poll(onMessage) {
           chatId = incomingChatId;
           saveChatId(chatId);
           log("telegram", `Registered chat ID: ${chatId}`);
-          await sendMessage("Connected! I'm your LP agent. Ask me anything or use commands like /status.");
+          await sendMessage("Connected! I'm your DLMM LP agent. Send /help to see everything you can control, or just chat.");
         }
 
         // Only accept messages from the registered chat
@@ -135,20 +136,35 @@ export function stopPolling() {
 }
 
 // ─── Notification helpers ────────────────────────────────────────
-export async function notifyDeploy({ pair, amountSol, position, tx }) {
+export async function notifyDeploy({ pair, amountSol, amountUsd, position, tx }) {
+  const amountLine = amountUsd != null
+    ? `Amount: $${Number(amountUsd).toFixed(2)} (${Number(amountSol).toFixed(4)} SOL)\n`
+    : `Amount: ${amountSol} SOL\n`;
   await sendHTML(
     `✅ <b>Deployed</b> ${pair}\n` +
-    `Amount: ${amountSol} SOL\n` +
+    amountLine +
     `Position: <code>${position?.slice(0, 8)}...</code>\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
-  const sign = pnlUsd >= 0 ? "+" : "";
+export async function notifyGasLow({ sol, reserve, reason }) {
+  await sendHTML(
+    `⛽ <b>Gas low — deploy paused</b>\n` +
+    (reason ? `${reason}` : `Native SOL ${sol} is below the gas reserve${reserve != null ? ` of ${reserve} SOL` : ""}.`) +
+    `\nTop up SOL to resume USDC-mode deploys.`
+  );
+}
+
+export async function notifyClose({ pair, pnlUsd, pnlSol, pnlPct }) {
+  const { config } = await import("./config.js");
+  const unit = config.management.pnlUnit || "sol";
+  const val = unit === "sol" && pnlSol != null ? pnlSol : (pnlUsd ?? 0);
+  const sign = val >= 0 ? "+" : "";
+  const label = unit === "sol" && pnlSol != null ? `${sign}${val.toFixed(4)} SOL` : `${sign}$${val.toFixed(2)}`;
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    (pnlPct == null ? `PnL: unknown (PnL data unavailable at close)` : `PnL: ${label} (${sign}${pnlPct.toFixed(2)}%)`)
   );
 }
 
@@ -169,3 +185,23 @@ export async function notifyCycleSummary({ cycleType, positions, walletSol }) {
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+// ─── Subscribe to notifier events ────────────────────────────────
+// Telegram receives all notifications via the pub/sub hub.
+// Guards with isEnabled() so nothing fires when TOKEN is missing.
+on("deploy", (data) => { if (isEnabled()) notifyDeploy(data).catch(() => {}); });
+on("close", (data) => { if (isEnabled()) notifyClose(data).catch(() => {}); });
+on("out_of_range", (data) => { if (isEnabled()) notifyOutOfRange(data).catch(() => {}); });
+on("gas_low", (data) => { if (isEnabled()) notifyGasLow(data).catch(() => {}); });
+on("deploy_partial", (data) => {
+  if (!isEnabled()) return;
+  sendMessage(`⚠️ Partial deploy: ${data.pair}\nPosition ${data.position} is ${data.status} after a liquidity-add failure (${data.error}).\nX=${data.amountX ?? "?"} Y=${data.amountY ?? "?"}\nKept OPEN for management/close — check it.`).catch(() => {});
+});
+on("pnl_watcher_close", (data) => {
+  if (!isEnabled()) return;
+  const sign = (data.pnlPct || 0) >= 0 ? "+" : "";
+  sendMessage(`⚡ PnL Watcher Auto-Close: ${data.pair}\n${data.reason}\nPnL: ${sign}${data.pnlPct?.toFixed(1)}%`).catch(() => {});
+});
+on("cycle:management", ({ report }) => { if (isEnabled()) sendMessage(`🔄 Management Cycle\n\n${report}`).catch(() => {}); });
+on("cycle:screening", ({ report }) => { if (isEnabled()) sendMessage(`🔍 Screening Cycle\n\n${report}`).catch(() => {}); });
+on("briefing", ({ html }) => { if (isEnabled()) sendHTML(html).catch(() => {}); });

@@ -18,7 +18,7 @@ Pools are pre-filtered for safety:
 - Both tokens organic score >= 60
 
 Returns condensed pool data: address, name, tokens, bin_step, fee_pct,
-active_tvl, fee_window, volume_window, fee_tvl_ratio, volatility, organic_score,
+active_tvl, volume, fee_active_tvl_ratio, volatility, organic_score,
 holders, mcap, active_positions, price_change_pct, warning count.
 
 Use this as the primary tool for finding new LP opportunities.`,
@@ -106,7 +106,7 @@ This is an on-chain call via the SDK. Returns:
 - price: human-readable price (token X per token Y)
 - pricePerLamport: raw price in lamports
 
-Always call this before deploying a position to get the freshest price.`,
+deploy_position reads the active bin itself, so this is not a prerequisite for deploying; use it when you need the current price or bin for analysis or a report.`,
       parameters: {
         type: "object",
         properties: {
@@ -126,32 +126,45 @@ Always call this before deploying a position to get the freshest price.`,
       name: "deploy_position",
       description: `Open a new DLMM liquidity position.
 
-You have autonomy to choose strategy and range based on pool metrics.
+For two-sided spot: just pass your total SOL as amount_y + sol_split_pct. The executor auto-swaps the token portion via Jupiter. No need to pre-buy tokens.
+
+PRIORITY ORDER for strategy and bins:
+1. User explicitly specifies → always follow exactly (user override is absolute)
+2. No user spec → use active strategy. Current default is Evil Panda: single-sided SOL spot, price_range_pct=80, token-level GMGN volume24H >= $750k, marketCap >= $200k, and 5m Supertrend green/price above.
 
 STRATEGIES:
-- 'bid_ask': Single-sided SOL below active bin. You only deposit SOL. As price drops, your SOL buys the base token bin by bin. You are NOT holding the token upfront — safer if it dumps.
-- 'spot': Two-sided — deposits BOTH tokens around active bin. You ARE holding the base token. If the token dumps, you absorb more loss because you already held it. More fee capture but more risk.
+- 'bid_ask': Single-sided SOL below active bin. You only deposit SOL. bins_below = your range, bins_above = 0. As price drops, your SOL buys the base token bin by bin. You are NOT holding the token upfront — safer if it dumps.
+- 'spot': Uniform liquidity distribution. Can be used THREE ways:
+  (a) SOL-only spot: Only provide amount_y (SOL), no amount_x. Bins go BELOW active bin only (bins_below = range, bins_above = 0). Same direction as bid_ask but spot distribution instead of bid_ask curve.
+  (b) Token-only spot: Only provide amount_x (base token), no amount_y. Bins go ABOVE active bin only (bins_below = 0, bins_above = range). You are selling the token as price rises.
+  (c) Two-sided spot: Just provide total SOL as amount_y + sol_split_pct. Token is auto-swapped. The executor swaps the token portion via Jupiter and deploys with both sides. sol_split_pct controls conviction: 100 = pure SOL, 80 = mostly SOL / 20% token, 50 = equal, 25 = mostly token (bullish).
 - Never use 'curve'.
+
+SPOT BIN DIRECTION — CRITICAL:
+- SOL (quote token / Y) fills bins BELOW the active bin (active_bin minus N)
+- Base token (X) fills bins ABOVE the active bin (active_bin plus N)
+- If you only deposit SOL on spot → bins_below = range, bins_above = 0
+- If you only deposit token on spot → bins_below = 0, bins_above = range
+- If two-sided spot → just pass sol_split_pct + total SOL as amount_y. Bins are split automatically based on sol_split_pct.
 
 SINGLE-SIDED (bid_ask) vs TWO-SIDED (spot) — CRITICAL:
 - Single-sided = you do NOT hold the base token. SOL sits below price, only converts as price drops into your range. Safe default.
-- Two-sided = you ARE holding the base token in the LP. If token dumps, your position loses more because you had exposure from the start. Requires conviction the token will hold or go up.
+- Two-sided = the executor auto-swaps part of your SOL into the base token. If token dumps, your position loses more because you had exposure from the start. Requires conviction the token will hold or go up.
+- bid_ask = concentrated bid curve below price. SOL converts to token as price drops into range. Ideal for earning fees on sell pressure.
+- spot SOL-only = uniform distribution below price. Similar direction to bid_ask but different fee capture shape.
+- spot two-sided = executor auto-swaps token portion, you hold both tokens. More fee capture but more downside risk.
 
 WHEN TO USE WHICH:
 - Meme tokens, new tokens, unproven tokens → ALWAYS bid_ask single-sided. Never take two-sided exposure on tokens you don't trust.
-- High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token.
+- High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token. Set sol_split_pct based on conviction level.
 - High volatility, trending, pumping → bid_ask. You earn fees from the sell pressure without holding the bag.
-- Stable, range-bound, high volume → spot. More fee capture from both sides.
-- When unsure → ALWAYS default to bid_ask single-sided. It's the safe choice.
+- Stable, range-bound, high volume → spot two-sided. More fee capture from both sides.
+- When unsure → for autonomous runs use the active strategy. If active strategy is Evil Panda, use single-sided SOL spot only when its entry checks pass; otherwise skip.
 
 HARD RULES:
-- Bin Step: Only deploy in pools with bin_step between 80 and 125.
-- Range: total bins (below + above + 1) cannot exceed 70.
+- Bin Step: Screening filters apply (config minBinStep/maxBinStep). If user specifies a pool, deploy regardless of bin step.
 
-BIN RANGE GUIDELINES:
-- Low volatility (<3) → narrow range: 35–45 bins
-- Medium volatility (3–6) → medium range: 45–55 bins
-- High volatility (>6) → wide range: 55–69 bins
+RANGE: Pass price_range_pct, the % price move the range covers from the active bin (80 = liquidity reaching down to 80% below the current price on a SOL-only position). The tool converts it to a bin count from the pool's bin_step, so the same % means the same coverage on any bin step; how wide to go is set by the range rules in your instructions. Positions wider than 69 bins are deployed over several transactions automatically; positions under 20 bins in total are rejected. Pass bins_below / bins_above only when you need an exact bin count.
 
 WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
       parameters: {
@@ -176,15 +189,23 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           strategy: {
             type: "string",
             enum: ["bid_ask", "spot"],
-            description: "DLMM strategy. bid_ask = single-sided SOL below price (volatile tokens). spot = symmetric around price (stable pairs). Default: bid_ask."
+            description: "DLMM strategy. 'bid_ask' = single-sided SOL only. 'spot' = uniform distribution; with sol_split_pct auto-swaps token portion via Jupiter for two-sided. If user specifies, use exactly what they said. Otherwise use the active strategy's lp_strategy field. Default: bid_ask."
           },
           bins_above: {
             type: "number",
-            description: "Number of bins above active bin. Only used with 'spot' strategy. For bid_ask, this is always 0."
+            description: "Number of bins above active bin (token X side). Set > 0 when depositing base token (amount_x). For SOL-only positions (bid_ask or spot), this should be 0. For two-sided spot, set proportionally to token conviction."
           },
           bins_below: {
             type: "number",
-            description: "Number of bins below active bin. Choose 35–69 based on pool volatility. Low volatility → 35–45. High volatility → 55–69."
+            description: "Number of bins below active bin. NOT NEEDED if you provide price_range_pct instead (preferred)."
+          },
+          price_range_pct: {
+            type: "number",
+            description: "PREFERRED: Target price range in % (e.g. 80 for Evil Panda's 80% downside range). Bins are auto-calculated from the pool's bin_step."
+          },
+          sol_split_pct: {
+            type: "number",
+            description: "For two-sided spot only: % of total SOL to keep as SOL (below active bin). The rest is auto-swapped to base token via Jupiter. E.g. 80 = keep 80% as SOL / auto-swap 20% to token. Default 50 (equal split). For bid_ask or SOL-only spot, omit this. Bins are split proportionally."
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
@@ -192,7 +213,8 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           volatility: { type: "number", description: "Pool volatility at deploy time" },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
-          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" }
+          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" },
+          study_avg_hold_hours: { type: "number", description: "Average hold time (hours) of top LPers in this pool from study_top_lpers. Used by management to compare your hold time." }
         },
         required: ["pool_address"]
       }
@@ -270,11 +292,8 @@ WARNING: This executes a real on-chain transaction.`,
       name: "close_position",
       description: `Remove all liquidity and close a position.
 This withdraws all tokens back to the wallet and closes the position account.
-Use when:
-- Position has been out of range for > 30 minutes
-- IL exceeds accumulated fees
-- Token shows danger signals (organic score drop, volume crash)
-- Rebalancing (close old + open new)
+When to close is decided by the management rules in your instructions, not by this tool.
+After withdrawing, it swaps the base tokens this close withdrew back to SOL (skipping dust under $0.10; in USDC mode the runner then settles the proceeds to USDC). The result includes pnl_usd, pnl_pct, txs, and a swap object; status "success_with_exposure" means the withdrawn tokens could not be swapped safely and remain in the wallet.
 
 WARNING: This executes a real on-chain transaction. Cannot be undone.`,
       parameters: {
@@ -387,9 +406,12 @@ Examples:
 - { maxTvl: 50000 }              — tighter TVL cap
 - { binsBelow: 50 }              — narrower bin range
 - { maxPositions: 5 }            — allow more concurrent positions
-- { managementModel: "deepseek-chat" }  — switch management cycle model
-- { screeningModel: "deepseek-chat" }   — switch screening cycle model
+- { managementModel: "gpt-4o" }               — switch management cycle model (also: "openai/gpt-5.4-nano")
+- { screeningModel: "gpt-4o" }                — switch screening cycle model (also: "openai/gpt-5.4-nano")
 - { stopLossPct: -15 }                  — close position if PnL drops below -15%
+- { minTokenFeesSol: 20 }             — lower global fees gate
+- { gasReserve: 0.3 }                 — keep more SOL for gas
+- { positionSizePct: 0.25 }           — smaller positions per deploy
 - { trailingTakeProfit: true }           — enable/disable trailing take profit
 - { trailingTriggerPct: 5 }             — activate trailing TP when PnL hits +5%
 - { trailingDropPct: 2 }                — close when PnL drops 2% from peak
@@ -398,16 +420,19 @@ Always provide a reason. This is logged as a lesson and visible in future cycles
       parameters: {
         type: "object",
         properties: {
-          changes: {
-            type: "object",
-            description: "Key-value pairs of settings to update. e.g. { \"takeProfitFeePct\": 8 }"
+          setting: {
+            type: "string",
+            description: "The config key to change. e.g. managementIntervalMin, stopLossPct, takeProfitFeePct, deployAmountSol, maxPositions, timeframe, etc."
+          },
+          value: {
+            description: "The new value for the setting (number, string, or boolean)"
           },
           reason: {
             type: "string",
-            description: "Why you are making this change — what you observed that justified it"
+            description: "Why you are making this change"
           }
         },
-        required: ["changes", "reason"]
+        required: ["setting", "value", "reason"]
       }
     }
   },
@@ -451,7 +476,7 @@ Use when the user says "add smart wallet", "track this wallet", "add to smart wa
     type: "function",
     function: {
       name: "remove_smart_wallet",
-      description: "Remove a wallet from the smart wallet tracker.",
+      description: "Remove a wallet from the smart wallet tracker. It stops counting as a smart-wallet signal in screening immediately. Use only when the user asks to stop tracking that wallet.",
       parameters: {
         type: "object",
         properties: {
@@ -516,6 +541,10 @@ Fetches top 100 holders — use limit to control how many to display (default 20
 Each holder includes: address, amount, % of supply, SOL balance, tags (Pool/AMM/etc), and funding info (who funded this wallet, amount, slot).
 is_pool=true means it's a liquidity pool address, not a real holder — filter these out when analyzing concentration.
 
+Also returns global_fees_sol — total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees).
+This is a key signal: low global_fees_sol means transactions are bundled or the token is a scam.
+HARD GATE: if global_fees_sol < config.screening.minTokenFeesSol (default 30), do NOT deploy.
+
 NOTE: Requires mint address. If you only have a symbol/name, call get_token_info first to resolve the mint.`,
       parameters: {
         type: "object",
@@ -564,8 +593,9 @@ Returns pool address, name, bin_step, fee %, TVL, volume, and token mints.`,
 Use this when the user asks "who are the top LPers in this pool?" or wants to
 know how others are performing in a specific pool without saving lessons.
 
-Returns: aggregate patterns (avg hold time, win rate, ROI) and per-LPer summaries.
-Requires LPAGENT_API_KEY to be set.`,
+Returns: aggregate patterns (avg hold time, pct_top_winners, ROI) and per-LPer summaries.
+pct_top_winners is the share of owners in the top-winners list (0-100), not a win rate.
+Data comes from the Meridian study API, not LPAgent.`,
       parameters: {
         type: "object",
         properties: {
@@ -588,12 +618,13 @@ Requires LPAGENT_API_KEY to be set.`,
     function: {
       name: "study_top_lpers",
       description: `Fetch and analyze top LPers for a pool to learn from their behaviour.
-Returns aggregate patterns (avg hold time, win rate, ROI) and historical samples.
+Returns aggregate patterns (avg hold time, pct_top_winners, ROI) and historical samples.
+pct_top_winners is the share of owners in the top-winners list (0-100), not a win rate.
 
 Use this before deploying into a new pool to:
 - See if top performers are scalpers (< 1h holds) or long-term holders.
 - Match your strategy and range to what is actually working for others.
-- Avoid pools where even the best performers have low win rates.`,
+- Avoid pools where even the best performers have poor ROI.`,
       parameters: {
         type: "object",
         properties: {
@@ -678,9 +709,12 @@ Use after studying top LPers or observing a pattern worth remembering.
 Lessons are injected into the system prompt on every future cycle.
 Write concrete, actionable rules — not vague observations.
 
+Use 'role' to target a specific agent type so it only appears in the right context.
+Use 'pinned: true' for critical rules that must always be present regardless of memory cap.
+
 Examples:
-- "PREFER: pools where top LPers hold < 30 min — scalping beats holding in high-volatility pairs"
-- "AVOID: entering pools where top performers show avg_hold > 4h and low win_rate — they're stuck"`,
+- rule: "PREFER: pools where top LPers hold < 30 min", tags: ["scalping"], role: "SCREENER"
+- rule: "AVOID: closing when OOR < 30min — price often recovers", tags: ["oor"], role: "MANAGER", pinned: true`,
       parameters: {
         type: "object",
         properties: {
@@ -691,7 +725,16 @@ Examples:
           tags: {
             type: "array",
             items: { type: "string" },
-            description: "Optional tags e.g. ['hold_time', 'scalping', 'pool_type']"
+            description: "Tags e.g. ['narrative', 'screening', 'oor', 'fees', 'management']"
+          },
+          role: {
+            type: "string",
+            enum: ["SCREENER", "MANAGER", "GENERAL"],
+            description: "Which agent role this lesson applies to. Omit for all roles."
+          },
+          pinned: {
+            type: "boolean",
+            description: "Pin this lesson so it's always injected regardless of memory cap. Use for critical rules."
           }
         },
         required: ["rule"]
@@ -731,12 +774,7 @@ fee trend over last 24 hours, liquidity amounts.`,
       description: `Store a fact in holographic memory for cross-session learning.
 Use this to remember patterns, outcomes, or strategies that should persist across restarts.
 Nuggets: "pools" (pool outcomes), "strategies" (what strategies work), "lessons" (general rules), "patterns" (market patterns).
-Or create a new nugget name for a new category.
-
-Examples:
-- remember_fact("pools", "BONK-SOL", "high volume but unstable, close within 30min")
-- remember_fact("strategies", "bid_ask_bs100", "works well for volatile tokens, 70%+ win rate")
-- remember_fact("lessons", "evening_volatility", "volume drops after 8pm UTC, avoid new deploys")`,
+Or create a new nugget name for a new category. Writing an existing nugget+key replaces its value.`,
       parameters: {
         type: "object",
         properties: {
@@ -755,12 +793,7 @@ Examples:
       name: "recall_memory",
       description: `Query holographic memory for relevant facts from past sessions.
 Use this before making decisions to check if you've learned something relevant.
-Supports fuzzy matching — you don't need an exact key, just a related query.
-
-Examples:
-- recall_memory("BONK") → might recall "BONK-SOL: high volume but unstable"
-- recall_memory("bid_ask strategy") → might recall strategy effectiveness data
-- recall_memory("evening trading") → might recall timing-based lessons`,
+Supports fuzzy matching — you don't need an exact key, just a related query (a token symbol, strategy name, or topic).`,
       parameters: {
         type: "object",
         properties: {
@@ -770,5 +803,366 @@ Examples:
         required: ["query"]
       }
     }
-  }
+  },
+  {
+    type: "function",
+    function: {
+      name: "forget_fact",
+      description: `Remove a fact from holographic memory.
+Use this to clean up stale, incorrect, or outdated facts.
+Specify the nugget name and the exact key of the fact to forget (recall_memory shows keys).`,
+      parameters: {
+        type: "object",
+        properties: {
+          nugget: { type: "string", description: "Memory category the fact belongs to (pools, strategies, lessons, patterns, or custom)" },
+          key: { type: "string", description: "The exact key of the fact to remove" }
+        },
+        required: ["nugget", "key"]
+      }
+    }
+  },
+
+  // ─── Strategy Library ──────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "add_strategy",
+      description: `Save a new LP strategy to the strategy library.
+Use when the user pastes a tweet or description of a strategy.
+Parse the text and extract structured criteria, then call this tool to store it.`,
+      parameters: {
+        type: "object",
+        properties: {
+          id:           { type: "string", description: "Short slug e.g. 'overnight_classic_bid_ask'" },
+          name:         { type: "string", description: "Human-readable name" },
+          author:       { type: "string", description: "Strategy author/creator" },
+          lp_strategy:  { type: "string", enum: ["bid_ask", "spot", "curve"], description: "LP strategy type" },
+          token_criteria: { type: "object", description: "Token selection criteria" },
+          entry:        { type: "object", description: "Entry conditions" },
+          range:        { type: "object", description: "Bin range configuration" },
+          exit:         { type: "object", description: "Exit rules" },
+          best_for:     { type: "string", description: "Ideal market conditions" },
+          raw:          { type: "string", description: "Original tweet/text" }
+        },
+        required: ["id", "name"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "list_strategies",
+      description: "List all saved strategies in the library with a summary of each. Shows which one is currently active.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_strategy",
+      description: "Get full details of a specific strategy including all criteria and raw text.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "string", description: "Strategy ID from list_strategies" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "set_active_strategy",
+      description: "Mark a saved strategy-library entry as the active reference. Screening cycles show it to the screener as a non-binding note (\"SAVED STRATEGY (reference, not mandatory)\"). It does not change the configured trading strategy (config.strategy.activeStrategy, e.g. evil_panda), the deploy defaults, or the exit rules; tell the user that when they ask to switch strategies. Use when the user asks to activate a saved strategy by id from list_strategies.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "string", description: "Strategy ID to activate" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "remove_strategy",
+      description: "Permanently delete a saved strategy from the library. If it was the active reference, the next saved strategy becomes active. Use only when the user asks to delete it.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "string", description: "Strategy ID to remove" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  // ─── Lesson Management ─────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "list_lessons",
+      description: "Browse saved lessons with optional filters. Use to find a lesson ID before pinning/unpinning.",
+      parameters: {
+        type: "object",
+        properties: {
+          role:   { type: "string", enum: ["SCREENER", "MANAGER", "GENERAL"], description: "Filter by role" },
+          pinned: { type: "boolean", description: "Filter to only pinned (true) or unpinned (false) lessons" },
+          tag:    { type: "string", description: "Filter by a specific tag" },
+          limit:  { type: "number", description: "Max lessons to return (default 30)" }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "pin_lesson",
+      description: "Pin a lesson by ID so it's always injected into the prompt regardless of memory cap.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "number", description: "Lesson ID (from list_lessons)" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "unpin_lesson",
+      description: "Unpin a previously pinned lesson.",
+      parameters: {
+        type: "object",
+        properties: { id: { type: "number", description: "Lesson ID to unpin" } },
+        required: ["id"]
+      }
+    }
+  },
+
+  // ─── Performance History ────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "get_performance_history",
+      description: `Retrieve closed position records filtered by time window.
+Use when the user asks about recent performance, last 24h positions, P&L history, etc.`,
+      parameters: {
+        type: "object",
+        properties: {
+          hours: { type: "number", description: "How many hours back to look (default 24). Use 168 for last 7 days." },
+          limit: { type: "number", description: "Max records to return (default 50)" }
+        }
+      }
+    }
+  },
+
+  // ─── Pool Memory ────────────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "get_pool_memory",
+      description: `Check your deploy history for a pool BEFORE deploying.
+Returns all past deploys, PnL, win rate, and any notes you've added.
+Call this tool before deploying to any pool — you may have been here before and it didn't work.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: { type: "string", description: "The pool address to look up" }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "add_pool_note",
+      description: "Annotate a pool with a freeform note that persists across sessions.",
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: { type: "string", description: "Pool address to annotate" },
+          note: { type: "string", description: "The note to save" }
+        },
+        required: ["pool_address", "note"]
+      }
+    }
+  },
+
+  // ─── Token Blacklist ────────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "add_to_blacklist",
+      description: "Permanently blacklist a base token mint so it's never deployed into again.",
+      parameters: {
+        type: "object",
+        properties: {
+          mint: { type: "string", description: "The base token mint address to blacklist" },
+          symbol: { type: "string", description: "Token symbol" },
+          reason: { type: "string", description: "Why this token is being blacklisted" }
+        },
+        required: ["mint", "reason"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "remove_from_blacklist",
+      description: "Remove a token mint from the blacklist so screening and deploys can use it again. Use only when the user asks; a mint blacklisted for a scam or rug reason should stay listed.",
+      parameters: {
+        type: "object",
+        properties: { mint: { type: "string", description: "The mint address to remove" } },
+        required: ["mint"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "list_blacklist",
+      description: "List all blacklisted token mints with their reasons.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+
+  // ─── Token Narrative ────────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "get_token_narrative",
+      description: `Get the narrative/story behind a token from Jupiter ChainInsight.
+Returns a plain-text description of what the token is about.
+GOOD signals: specific origin story, active community, trending catalyst, named entities.
+BAD signals: empty/null, pure hype only, completely generic, copy-paste of another token.`,
+      parameters: {
+        type: "object",
+        properties: {
+          mint: { type: "string", description: "Token mint address (base58)" }
+        },
+        required: ["mint"]
+      }
+    }
+  },
+
+  // ─── Knowledge Base ──────────────────────────────────────────
+
+  {
+    type: "function",
+    function: {
+      name: "kb_read",
+      description: `Read an article from the knowledge base. Pass "INDEX.md" (or omit path) to read the index — a table of contents of all articles with summaries. Pass "CONCEPTS.md" to read recurring themes. Pass a specific path (e.g. "pools/bonk-sol.md") to read a full article.
+TIP: Always read INDEX.md first to find what you need, then drill into specific articles.`,
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Article path within knowledge/ (e.g. 'INDEX.md', 'pools/bonk-sol.md'). Defaults to INDEX.md." }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "kb_write",
+      description: `Write or update a markdown article in the knowledge base. Use this to file observations, compile analysis, or update existing articles.
+Articles should be concise, interlinked using [[concept]] syntax, and organized into categories: pools/, strategies/, patterns/, lessons/, performance/.
+The INDEX.md is auto-updated when you write an article. Writing an existing path overwrites the whole article.`,
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Article path within knowledge/ (e.g. 'pools/bonk-sol.md')" },
+          content: { type: "string", description: "Full markdown content of the article" }
+        },
+        required: ["path", "content"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "kb_search",
+      description: `Full-text search across all knowledge base articles. Returns matching file paths with context lines.
+Use this to find articles related to a topic before reading them in full.`,
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Text to search for across all articles" }
+        },
+        required: ["query"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "kb_list",
+      description: "List all knowledge base articles, optionally filtered by category. Shows title, summary, word count, and last updated date.",
+      parameters: {
+        type: "object",
+        properties: {
+          category: { type: "string", description: "Filter by category: pools, strategies, patterns, lessons, performance" },
+          limit: { type: "number", description: "Max articles to return (default 50)" }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "kb_delete",
+      description: "Permanently delete an article from the knowledge base and its INDEX.md entry. Use for articles that are wrong or merged into another; prefer kb_write to correct an article.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Article path to delete (e.g. 'pools/old-pool.md')" }
+        },
+        required: ["path"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "kb_migrate",
+      description: `One-time migration: converts existing lessons.json, pool-memory.json, and nuggets data into initial knowledge base articles. Safe to re-run — skips articles that already exist. Also rebuilds INDEX.md and CONCEPTS.md.`,
+      parameters: { type: "object", properties: {} }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "kb_stats",
+      description: "Get knowledge base statistics: article count, word count, categories breakdown, and last updated timestamp.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "kb_rebuild_indexes",
+      description: "Rebuild INDEX.md and CONCEPTS.md from scratch by scanning all articles. Use after bulk writes or when indexes become out of sync.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+
 ];

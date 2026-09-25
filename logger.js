@@ -42,7 +42,7 @@ function actionHint(action) {
   const r = action.result || {};
   switch (action.tool) {
     case "deploy_position":   return ` ${a.pool_name || a.pool_address?.slice(0,8)} ${a.amount_sol} SOL`;
-    case "close_position":    return ` ${a.position_address?.slice(0,8)}${r.pnl_usd != null ? ` | PnL $${r.pnl_usd >= 0 ? "+" : ""}${r.pnl_usd} (${r.pnl_pct}%)` : ""}`;
+    case "close_position":    return ` ${a.position_address?.slice(0,8)}${r.pnl_pct != null ? ` | PnL ${r.pnl_pct}%${r.pnl_sol != null ? ` (${r.pnl_sol} SOL)` : r.pnl_usd != null ? ` ($${r.pnl_usd})` : ""}` : ""}`;
     case "claim_fees":        return ` ${a.position_address?.slice(0,8)}`;
     case "get_active_bin":    return ` bin ${r.binId ?? ""}`;
     case "get_pool_detail":   return ` ${r.name || a.pool_address?.slice(0,8) || ""}`;

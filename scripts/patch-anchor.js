@@ -51,9 +51,26 @@ if (!anchorPkg.exports) {
 // ─── Fix 2: Patch DLMM index.mjs bare directory imports ──────────────────────
 const dlmmMjs = path.join(root, "node_modules/@meteora-ag/dlmm/dist/index.mjs");
 
+// Signatures of what this script rewrites. If a DLMM release changes its dist
+// layout so NEITHER the unpatched nor the patched form is present, the patch
+// would silently be a no-op and the bot would only break later, at the first
+// lazy SDK import. Treat that as a hard install failure instead.
+const UNPATCHED_UTILS_IMPORT = /from ["']@coral-xyz\/anchor\/dist\/cjs\/utils\/\w+["']/;
+const UNPATCHED_BN_IMPORT = /import \{[^}]*\bBN\b[^}]*\} from ["']@coral-xyz\/anchor["'];/;
+const PATCHED_UTILS_IMPORT = /from "@coral-xyz\/anchor\/dist\/cjs\/utils\/\w+\/index\.js"/;
+const PATCHED_BN_PRELUDE = 'import BN from "bn.js"';
+
+function fail(msg) {
+  console.error(`\npatch-anchor: ERROR: ${msg}`);
+  console.error("patch-anchor: the @meteora-ag/dlmm dist layout changed. Pin a known-good version in package.json or update scripts/patch-anchor.js.\n");
+  process.exit(1);
+}
+
 if (fs.existsSync(dlmmMjs)) {
   let src = fs.readFileSync(dlmmMjs, "utf8");
   const original = src;
+  const hadUnpatched = UNPATCHED_UTILS_IMPORT.test(src) || UNPATCHED_BN_IMPORT.test(src);
+  const hadPatched = PATCHED_UTILS_IMPORT.test(src) || src.startsWith(PATCHED_BN_PRELUDE);
 
   // Replace all bare directory imports of anchor utils with explicit .js paths
   src = src.replace(
@@ -65,7 +82,8 @@ if (fs.existsSync(dlmmMjs)) {
   // We rewrite the imports to remove BN and then add a top-level BN import.
   
   // First, ensure BN is imported from bn.js at the top if any BN imports exist
-  if (src.includes('from "@coral-xyz/anchor"') && src.includes('BN')) {
+  // Guard: skip if we already prepended the import (idempotent re-runs)
+  if (!src.startsWith('import BN from "bn.js"') && src.includes('from "@coral-xyz/anchor"') && src.includes('BN')) {
     src = 'import BN from "bn.js";\n' + src;
   }
 
@@ -97,10 +115,20 @@ if (fs.existsSync(dlmmMjs)) {
     }
   );
 
+  // Post-condition: nothing unpatched may survive (an import shape the
+  // rewrites above no longer match would otherwise pass silently).
+  if (UNPATCHED_UTILS_IMPORT.test(src) || UNPATCHED_BN_IMPORT.test(src)) {
+    fail(`${dlmmMjs} still contains unpatched @coral-xyz/anchor imports after patching.`);
+  }
+
   if (src !== original) {
     fs.writeFileSync(dlmmMjs, src);
     console.log("Patched: @meteora-ag/dlmm/dist/index.mjs directory imports");
-  } else {
+  } else if (hadPatched && !hadUnpatched) {
     console.log("Skip: @meteora-ag/dlmm/dist/index.mjs already patched");
+  } else {
+    fail(`${dlmmMjs} contains neither the unpatched nor the patched anchor import pattern (pattern not found).`);
   }
+} else {
+  console.log("Skip: @meteora-ag/dlmm/dist/index.mjs not installed");
 }

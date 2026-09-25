@@ -1,162 +1,225 @@
 /**
  * Study top LPers for a pool and extract behavioural patterns.
- * Used by the /learn command — not called on every cycle.
+ * Used by the /learn command - not called on every cycle.
  */
+
+import { getKey, fetchWithRetry } from "../lpagent-keys.js";
+import { log } from "../logger.js";
 
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
-const LPAGENT_KEY = process.env.LPAGENT_API_KEY;
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const MERIDIAN_API = "https://api.agentmeridian.xyz/api";
+const MERIDIAN_PUBLIC_KEY = "bWVyaWRpYW4taXMtdGhlLWJlc3QtYWdlbnRz";
 
 /**
- * Fetch top LPers for a pool, filter to credible performers,
- * and return condensed behaviour patterns for LLM consumption.
+ * Fetch interpreted LP study data from Meridian and normalize it for the agent.
  */
 export async function studyTopLPers({ pool_address, limit = 4 }) {
-  if (!LPAGENT_KEY) {
-    return { pool: pool_address, message: "LPAGENT_API_KEY not set in .env — study_top_lpers is disabled.", patterns: [], lpers: [] };
-  }
-
-  // ── 1. Top LPers for this pool ──────────────────────────────
-  const topRes = await fetch(
-    `${LPAGENT_API}/pools/${pool_address}/top-lpers?sort_order=desc&page=1&limit=20`,
-    { headers: { "x-api-key": LPAGENT_KEY } }
+  const res = await fetch(
+    `${MERIDIAN_API}/study-top-lp/${pool_address}`,
+    { headers: { "x-api-key": MERIDIAN_PUBLIC_KEY } }
   );
 
-  if (!topRes.ok) {
-    if (topRes.status === 429) {
-      throw new Error(`Rate limit exceeded. Please wait 60 seconds before studying this pool again.`);
+  if (!res.ok) {
+    throw new Error(`study-top-lp API error: ${res.status}`);
+  }
+
+  const data = await res.json();
+  const winnersByPct = Array.isArray(data.topWinnersByPct) ? data.topWinnersByPct : [];
+  const winnersByUsd = Array.isArray(data.topWinnersByUsd) ? data.topWinnersByUsd : [];
+  const losersByPct = Array.isArray(data.topLosersByPct) ? data.topLosersByPct : [];
+  const historicalOwners = Array.isArray(data.topHistoricalOwners) ? data.topHistoricalOwners : [];
+  const ownerCount = Number(data.ownerCount || historicalOwners.length || winnersByPct.length || 0);
+
+  const uniqueRows = new Map();
+  for (const row of [...winnersByPct, ...winnersByUsd, ...losersByPct]) {
+    if (row?.owner && !uniqueRows.has(row.owner)) {
+      uniqueRows.set(row.owner, row);
     }
-    throw new Error(`top-lpers API error: ${topRes.status}`);
   }
 
-  const topData = await topRes.json();
-  const all = topData.data || [];
+  const lpers = historicalOwners.slice(0, limit).map((owner) => ({
+    owner: owner.owner ? `${owner.owner.slice(0, 8)}...` : "unknown",
+    summary: {
+      preferred_strategy: owner.preferredStrategy || data.suggestedStyle?.strategy || "unknown",
+      preferred_range_style: owner.preferredRangeStyle || data.suggestedStyle?.rangeStyle || "unknown",
+      avg_hold_hours: isNum(owner.avgHoldHours) ? Number(owner.avgHoldHours.toFixed(2)) : null,
+      avg_pnl_pct: isNum(owner.avgPnlPct) ? `${owner.avgPnlPct.toFixed(1)}%` : null,
+      fee_pct_of_capital: isNum(owner.avgFeePercent) ? `${owner.avgFeePercent.toFixed(1)}%` : null,
+      avg_width_bins: isNum(owner.avgWidthBins) ? owner.avgWidthBins : null,
+    },
+    positions: Array.isArray(owner.topPositions)
+      ? owner.topPositions.map((position) => ({
+          pool: position.pool || pool_address,
+          pair: position.pairName || null,
+          hold_hours: isNum(position.ageHours) ? Number(position.ageHours.toFixed(2)) : null,
+          pnl_usd: isNum(position.pnlUsd) ? Math.round(position.pnlUsd) : null,
+          pnl_pct: isNum(position.pnlPct) ? `${position.pnlPct.toFixed(1)}%` : null,
+          fee_usd: isNum(position.feeUsd) ? Math.round(position.feeUsd) : null,
+          in_range_pct: position.inRange == null ? null : (position.inRange ? "100%" : "0%"),
+          range_pct: null,
+          range_bins: isNum(position.widthBins) ? position.widthBins : null,
+          strategy: position.strategy || owner.preferredStrategy || data.suggestedStyle?.strategy || null,
+          closed_reason: position.closedAt ? "closed" : "open",
+        }))
+      : [],
+  }));
 
-  // Filter to LPers with enough data to be meaningful
-  const credible = all.filter(
-    (l) => l.total_lp >= 3 && l.win_rate >= 0.6 && l.total_inflow > 1000
-  );
-
-  // Sort by ROI descending, take top N
-  const top = credible
-    .sort((a, b) => b.roi - a.roi)
-    .slice(0, limit);
-
-  if (top.length === 0) {
+  if (lpers.length === 0 && uniqueRows.size === 0) {
     return {
       pool: pool_address,
-      message: "No credible LPers found (need ≥3 positions, ≥60% win rate, ≥$1k inflow).",
+      message: "No interpreted LP study data returned from Meridian.",
       patterns: [],
-      historical_samples: [],
+      lpers: [],
     };
   }
 
-  // ── 2. Historical positions for each top LPer ───────────────
-  const historicalSamples = [];
-
-  for (const lper of top) {
-    try {
-      // Small buffer to avoid race conditions on the 5-req limit
-      await sleep(1000); 
-
-      const histRes = await fetch(
-        `${LPAGENT_API}/lp-positions/historical?owner=${lper.owner}&page=1&limit=50`,
-        { headers: { "x-api-key": LPAGENT_KEY } }
-      );
-
-      if (!histRes.ok) continue;
-
-      const histData = await histRes.json();
-      const positions = histData.data || [];
-
-      historicalSamples.push({
-        owner: lper.owner.slice(0, 8) + "...",
-        summary: {
-          total_positions: lper.total_lp,
-          win_rate: Math.round(lper.win_rate * 100) + "%",
-          avg_hold_hours: Number(lper.avg_age_hour?.toFixed(2)),
-          roi: (lper.roi * 100).toFixed(2) + "%",
-          fee_pct_of_capital: (lper.fee_percent * 100).toFixed(2) + "%",
-          total_pnl_usd: Math.round(lper.total_pnl),
-        },
-        positions: positions.map((p) => ({
-          pool: p.pool,
-          pair: p.pairName || `${p.tokenName0}-${p.tokenName1}`,
-          hold_hours: p.ageHour != null ? Number(p.ageHour?.toFixed(2)) : null,
-          pnl_usd: Math.round(p.pnl?.value || 0),
-          pnl_pct: ((p.pnl?.percent || 0) * 100).toFixed(1) + "%",
-          fee_usd: Math.round(p.collectedFee || 0),
-          in_range_pct: p.inRangePct != null ? Math.round(p.inRangePct * 100) + "%" : null,
-          strategy: p.strategy || null,
-          closed_reason: p.closeReason || null,
-        })),
-      });
-    } catch {
-      // skip failed fetches
-    }
-  }
-
-  // ── 3. Aggregate patterns ────────────────────────────────────
+  const numericRows = [...uniqueRows.values()];
+  const pctTopWinners = winnersByPct.length > 0 && ownerCount > 0
+    ? Math.round((winnersByPct.length / ownerCount) * 100)
+    : null;
   const patterns = {
-    top_lper_count: top.length,
-    avg_hold_hours: avg(top.map((l) => l.avg_age_hour).filter(isNum)),
-    avg_win_rate: avg(top.map((l) => l.win_rate).filter(isNum)),
-    avg_roi_pct: avg(top.map((l) => l.roi * 100).filter(isNum)),
-    avg_fee_pct_of_capital: avg(top.map((l) => l.fee_percent * 100).filter(isNum)),
-    best_roi: (Math.max(...top.map((l) => l.roi)) * 100).toFixed(2) + "%",
-    // Scalpers (hold < 1h) vs holders (> 4h)
-    scalper_count: top.filter((l) => l.avg_age_hour < 1).length,
-    holder_count: top.filter((l) => l.avg_age_hour >= 4).length,
+    top_lper_count: ownerCount,
+    active_position_count: Number(data.activePositionCount || 0),
+    avg_hold_hours: avg(numericRows.map((row) => row.avgAgeHours).filter(isNum)),
+    // Share of owners that appear in Meridian's top-winners-by-% list (0-100).
+    // This is NOT a win rate: it measures list size relative to owner count.
+    pct_top_winners: pctTopWinners,
+    // Deprecated alias kept for backward compatibility (signal-tracker weights
+    // were learned on this value). Same number as pct_top_winners.
+    avg_win_rate: pctTopWinners,
+    avg_roi_pct: avg(numericRows.map((row) => row.pnlPct).filter(isNum)),
+    avg_fee_pct_of_capital: avg(numericRows.map((row) => row.feePercent).filter(isNum)),
+    best_roi: winnersByPct.length > 0 && isNum(winnersByPct[0]?.pnlPct)
+      ? `${winnersByPct[0].pnlPct.toFixed(2)}%`
+      : null,
+    scalper_count: numericRows.filter((row) => isNum(row.avgAgeHours) && row.avgAgeHours < 1).length,
+    holder_count: numericRows.filter((row) => isNum(row.avgAgeHours) && row.avgAgeHours >= 4).length,
+    suggested_strategy: data.suggestedStyle?.strategy || null,
+    suggested_range_style: data.suggestedStyle?.rangeStyle || null,
   };
 
   return {
     pool: pool_address,
     patterns,
-    lpers: historicalSamples,
+    lpers,
+    raw_study: {
+      poolAddress: data.poolAddress,
+      ownerCount,
+      activePositionCount: Number(data.activePositionCount || 0),
+      suggestedStyle: data.suggestedStyle || null,
+    },
   };
 }
 
-// ─── Rate limiter for LP Agent API (5 req/min) ─────────────
-const _lpagentCalls = [];
+// ─── LPAgent top-lpers (Premium) for the two-sided spot deploy gate ───────
+// Docs: https://docs.lpagent.io/api-reference/pools/get-top-lpers-for-a-pool.md
+// Premium/Enterprise only; Basic (free) keys get 401.
 
-function checkRateLimit() {
-  const now = Date.now();
-  // Remove calls older than 60 seconds
-  while (_lpagentCalls.length > 0 && now - _lpagentCalls[0] > 60_000) {
-    _lpagentCalls.shift();
-  }
-  if (_lpagentCalls.length >= 5) {
-    const waitSec = Math.ceil((60_000 - (now - _lpagentCalls[0])) / 1000);
-    return { allowed: false, waitSec };
-  }
-  _lpagentCalls.push(now);
-  return { allowed: true };
+const _topLpersLogged = new Set();
+function logTopLpersOnce(reason) {
+  if (_topLpersLogged.has(reason)) return;
+  _topLpersLogged.add(reason);
+  log("study", `top-lpers unavailable (${reason}) — two-sided spot gate fails closed`);
 }
 
-// ─── Pool Info (deep intel) ─────────────────────────────────
+function finiteOrNull(value) {
+  const n = Number(value);
+  return value != null && value !== "" && Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Map raw LPAgent top-lpers rows to the fields the deploy gate needs.
+ * win_rate is recomputed as win_lp / total_lp (0..1) because the docs do not
+ * state the unit of the API's own `win_rate` field. total_inflow is USD.
+ */
+export function mapTopLpersRows(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((r) => {
+    const total = finiteOrNull(r?.total_lp);
+    const wins = finiteOrNull(r?.win_lp);
+    return {
+      owner: r?.owner ?? null,
+      total_lp: total,
+      win_lp: wins,
+      win_rate: total != null && total > 0 && wins != null ? wins / total : null, // 0..1
+      total_inflow: finiteOrNull(r?.total_inflow), // USD
+      total_pnl: finiteOrNull(r?.total_pnl), // USD
+      total_pnl_native: finiteOrNull(r?.total_pnl_native), // SOL
+      avg_age_hour: finiteOrNull(r?.avg_age_hour),
+      api_win_rate: finiteOrNull(r?.win_rate), // unit undocumented, informational only
+    };
+  });
+}
+
+/**
+ * Condition 2 of the two-sided spot gate. Credible = at least 3 LPs, a win
+ * rate of at least 60% and at least $1,000 deposited. Passes only with at
+ * least 2 credible LPers whose average win rate is at least 80%.
+ */
+export function evaluateTopLpersGate(lpers) {
+  const credible = (Array.isArray(lpers) ? lpers : []).filter((lp) =>
+    lp && lp.total_lp != null && lp.total_lp >= 3
+    && lp.win_rate != null && lp.win_rate >= 0.6
+    && lp.total_inflow != null && lp.total_inflow >= 1000
+  );
+  const avgWR = credible.length > 0
+    ? credible.reduce((s, lp) => s + lp.win_rate, 0) / credible.length
+    : 0;
+  return { passes: credible.length >= 2 && avgWR >= 0.80, credible, avgWR };
+}
+
+/**
+ * Fetch top LPers for a pool from LPAgent (GET /pools/{id}/top-lpers).
+ * Returns [] with no key, on any error, or on 401 (Basic tier), so callers
+ * fail closed. The reason is logged once per process.
+ */
+export async function fetchTopLpersStats({ pool_address, limit = 20 }) {
+  const apiKey = await getKey();
+  if (!apiKey) {
+    logTopLpersOnce("LPAGENT_API_KEY not set");
+    return [];
+  }
+  const size = Math.min(100, Math.max(1, Math.floor(Number(limit) || 20)));
+  const url = `${LPAGENT_API}/pools/${pool_address}/top-lpers`
+    + `?chain=SOL&platform=meteora&order_by=total_pnl_native&sort_order=desc&page=1&limit=${size}`;
+  try {
+    const res = await fetchWithRetry(url, { headers: { "x-api-key": apiKey } });
+    if (res.status === 401) {
+      logTopLpersOnce("HTTP 401: Premium or Enterprise key required");
+      return [];
+    }
+    if (!res.ok) {
+      logTopLpersOnce(`HTTP ${res.status}`);
+      return [];
+    }
+    const json = await res.json();
+    if (json?.status !== "success" || !Array.isArray(json.data)) {
+      logTopLpersOnce("unexpected response shape");
+      return [];
+    }
+    return mapTopLpersRows(json.data);
+  } catch (e) {
+    logTopLpersOnce(`error: ${e.message}`);
+    return [];
+  }
+}
 
 /**
  * Get detailed pool info from LP Agent API.
  * Auto-stores key facts in nuggets memory.
  */
 export async function getPoolInfo({ pool_address }) {
-  if (!LPAGENT_KEY) {
-    return { error: "LPAGENT_API_KEY not set — get_pool_info is disabled." };
+  const apiKey = await getKey();
+  if (!apiKey) {
+    return { error: "LPAGENT_API_KEY not set - get_pool_info is disabled." };
   }
 
-  const rateCheck = checkRateLimit();
-  if (!rateCheck.allowed) {
-    return { error: `Rate limited (5/min). Try again in ${rateCheck.waitSec}s.` };
-  }
-
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${LPAGENT_API}/pools/${pool_address}/info`,
-    { headers: { "x-api-key": LPAGENT_KEY } }
+    { headers: { "x-api-key": apiKey } }
   );
 
   if (!res.ok) {
-    if (res.status === 429) return { error: "Rate limited by LP Agent API. Wait 60s." };
     throw new Error(`Pool info API error: ${res.status}`);
   }
 
@@ -164,15 +227,12 @@ export async function getPoolInfo({ pool_address }) {
   const d = raw.data;
   if (!d) return { error: "No data returned for this pool." };
 
-  // Extract token info
-  const tokens = d.tokenInfo?.[0]?.data || [];
-  const tokenX = tokens[0] || {};
-  const tokenY = tokens[1] || {};
-
-  // Extract fee info
+  // Docs: tokenInfo is a tuple [tokenX result, tokenY result], each { status, data: [token] }.
+  // The old tokenInfo[0].data[1] lookup is kept only as a fallback.
+  const tokenX = d.tokenInfo?.[0]?.data?.[0] || {};
+  const tokenY = d.tokenInfo?.[1]?.data?.[0] || d.tokenInfo?.[0]?.data?.[1] || {};
   const feeInfo = d.feeInfo || {};
 
-  // Condensed response for LLM
   const result = {
     pool: pool_address,
     type: d.type,
@@ -219,13 +279,12 @@ export async function getPoolInfo({ pool_address }) {
       sell_volume: tokenX.stats1h.sellVolume,
       num_traders: tokenX.stats1h.numTraders,
     } : null,
-    fee_trend_7d: (d.feeStats || []).slice(-24).map(h => ({
+    fee_trend_7d: (d.feeStats || []).slice(-24).map((h) => ({
       hour: h.hour,
       fee_usd: h.feeUsd,
     })),
   };
 
-  // Auto-store in nuggets memory
   try {
     const { rememberFact } = await import("../memory.js");
     const pair = `${tokenX.symbol || "?"}-${tokenY.symbol || "SOL"}`;
@@ -247,9 +306,9 @@ export async function getPoolInfo({ pool_address }) {
 
 function avg(arr) {
   if (!arr.length) return null;
-  return Math.round((arr.reduce((s, x) => s + x, 0) / arr.length) * 100) / 100;
+  return Math.round((arr.reduce((sum, value) => sum + value, 0) / arr.length) * 100) / 100;
 }
 
-function isNum(n) {
-  return typeof n === "number" && isFinite(n);
+function isNum(value) {
+  return typeof value === "number" && Number.isFinite(value);
 }

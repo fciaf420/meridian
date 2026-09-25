@@ -1,0 +1,155 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #01161e;
+  --color-teal: #124559;
+  --color-steel: #598392;
+  --color-ash: #aec3b0;
+  --color-cream: #eff6e0;
+  --color-glow: #ffd166;
+
+  --font-sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --animate-fade-in-up: fade-in-up 0.3s ease-out both;
+  --animate-slide-in-right: slide-in-right 0.3s ease-out both;
+  --animate-subtle-glow: subtle-glow 2s ease-in-out infinite;
+  --animate-shimmer-sweep: shimmer-sweep 6s linear infinite;
+}
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes subtle-glow {
+  0%, 100% {
+    box-shadow: 0 0 4px rgba(89, 131, 146, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 12px rgba(89, 131, 146, 0.6);
+  }
+}
+
+@keyframes shimmer-sweep {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(120%);
+  }
+}
+
+@keyframes notification-sweep {
+  0% {
+    transform: translateX(-140%);
+    opacity: 0;
+  }
+  18% {
+    opacity: 0.7;
+  }
+  42% {
+    opacity: 0.32;
+  }
+  100% {
+    transform: translateX(180%);
+    opacity: 0;
+  }
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  height: 100%;
+}
+
+html {
+  background:
+    radial-gradient(circle at top left, rgba(89, 131, 146, 0.18), transparent 28%),
+    radial-gradient(circle at top right, rgba(255, 209, 102, 0.09), transparent 24%),
+    linear-gradient(180deg, #05202a 0%, #01161e 48%, #000d12 100%);
+}
+
+body {
+  font-family: var(--font-sans);
+  background:
+    radial-gradient(circle at top left, rgba(89, 131, 146, 0.18), transparent 28%),
+    radial-gradient(circle at top right, rgba(255, 209, 102, 0.09), transparent 24%),
+    linear-gradient(180deg, #05202a 0%, #01161e 48%, #000d12 100%);
+  color: var(--color-cream);
+  margin: 0;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+#root {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(89, 131, 146, 0.18), transparent 28%),
+    radial-gradient(circle at top right, rgba(255, 209, 102, 0.09), transparent 24%),
+    linear-gradient(180deg, #05202a 0%, #01161e 48%, #000d12 100%);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(239, 246, 224, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(239, 246, 224, 0.03) 1px, transparent 1px);
+  background-size: 72px 72px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.7), transparent 88%);
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at center, transparent 44%, rgba(0, 0, 0, 0.26) 100%);
+}
+
+.notif-sweep::before {
+  content: "";
+  position: absolute;
+  inset: -20% auto -20% -35%;
+  width: 36%;
+  transform: skewX(-18deg);
+  pointer-events: none;
+  animation: notification-sweep 920ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.notif-sweep--amber::before {
+  background: linear-gradient(90deg, transparent, rgba(255, 209, 102, 0.28), transparent);
+}
+
+.notif-sweep--emerald::before {
+  background: linear-gradient(90deg, transparent, rgba(110, 231, 183, 0.24), transparent);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-teal); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-steel); }

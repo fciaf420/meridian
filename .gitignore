@@ -4,6 +4,7 @@ node_modules/
 # Environment & secrets
 .env
 .env.*
+!.env.example
 
 # User config (contains RPC URL, wallet key, API keys)
 user-config.json
@@ -12,12 +13,34 @@ user-config.json
 state.json
 lessons.json
 smart-wallets.json
+pool-memory.json
+token-blacklist.json
+strategy-library.json
+
+# Knowledge base (LLM-maintained, user-specific)
+knowledge/
 
 # Logs
 logs/
+
+# Web UI
+web/node_modules/
+web/dist/
 
 # OS
 .DS_Store
 
 # Dev context
 context.md
+
+# Personal Claude Code config
+CLAUDE.local.md
+
+# Chorus iOS CLI binary (installed locally, not source)
+build-ios-apps/
+
+# GMGN screening config (may hold apiKey) — example is tracked
+gmgn-config.json
+
+# runtime state (regenerated)
+signal-weights.json

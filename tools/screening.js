@@ -1,4 +1,7 @@
 import { config } from "../config.js";
+import { isBlacklisted } from "../token-blacklist.js";
+import { log } from "../logger.js";
+import { scoreSignalSnapshot } from "../signal-weights.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 
@@ -46,8 +49,26 @@ export async function discoverPools({
 
   const condensed = (data.data || []).map(condensePool);
 
-  // Attach score and disqualification reason
-  const pools = condensed;
+  // Filter blacklisted base tokens
+  const pools = condensed.filter((candidate) => {
+    const p = normalizeCandidateForUi(candidate);
+    if (isBlacklisted(p.base?.mint)) {
+      log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
+      return false;
+    }
+    if (p.volatility != null && p.volatility > s.maxVolatility) {
+      return false;
+    }
+    if (p.price_change_pct != null && Math.abs(p.price_change_pct) > s.maxPriceChangePct) {
+      return false;
+    }
+    return true;
+  });
+
+  const filtered = condensed.length - pools.length;
+  if (filtered > 0) {
+    log("blacklist", `Filtered ${filtered} pool(s) with blacklisted tokens`);
+  }
 
   return {
     total: data.total,
@@ -61,7 +82,28 @@ export async function discoverPools({
  */
 export async function getTopCandidates({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
-  const { pools } = await discoverPools({ page_size: 50 });
+
+  // Route to the opt-in GMGN screening source. Defaults to Meteora when
+  // screening.source is unset, so the existing path is untouched.
+  let pools;
+  if (config.screening.source === "gmgn") {
+    // Dynamic import keeps gmgn-screen.js (and its gmgn-cli dependency) off the
+    // hot path for the default Meteora flow.
+    const { discoverGmgnPools } = await import("./gmgn-screen.js");
+    ({ pools } = await discoverGmgnPools({ limit: Math.max(limit, 10) }));
+
+    // Parity with the Meteora path (which filters blacklisted base tokens
+    // inside discoverPools): drop blacklisted base mints here.
+    pools = (pools || []).filter((p) => {
+      if (isBlacklisted(p.base?.mint)) {
+        log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
+        return false;
+      }
+      return true;
+    });
+  } else {
+    ({ pools } = await discoverPools({ page_size: 50 }));
+  }
 
   // Exclude pools where the wallet already has an open position
   const { getMyPositions } = await import("./dlmm.js");
@@ -69,14 +111,66 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
-  const eligible = pools
-    .filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
-    .slice(0, limit);
+  const eligible = rankCandidatesByDarwin(
+    pools.filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
+  );
 
   return {
-    candidates: eligible,
+    candidates: eligible.slice(0, limit).map(normalizeCandidateForUi),
+    total_eligible: eligible.length,
     total_screened: pools.length,
   };
+}
+
+export function normalizeCandidateForUi(candidate) {
+  return {
+    ...candidate,
+    volume: candidate.volume ?? candidate.volume_window ?? candidate.volume_24h ?? null,
+    active_pct: candidate.active_pct ?? candidate.active_bin_pct ?? null,
+  };
+}
+
+export function getCandidateSignalSnapshot(candidate) {
+  const c = normalizeCandidateForUi(candidate);
+  return {
+    organic_score: c.organic_score ?? c.base?.organic ?? null,
+    fee_tvl_ratio: c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? null,
+    volume: c.volume ?? null,
+    mcap: c.mcap ?? null,
+    holder_count: c.holders ?? null,
+    smart_wallets_present: c._smartWalletCount != null ? c._smartWalletCount > 0 : c.smart_wallets_present ?? null,
+    narrative_quality: c.narrative_quality ?? null,
+    study_win_rate: c.study_win_rate ?? null,
+    volatility: c.volatility ?? null,
+    ath_proximity: c._gmgnResult?.ath_proximity_pct ?? c.ath_proximity ?? null,
+    volume_trend: c._gmgnResult?.candles?.volume_trend ?? c.volume_trend ?? null,
+    gmgn_signal_present: c._gmgnSignal ? ((c._gmgnSignal.signal_count_30m || 0) > 0) : c.gmgn_signal_present ?? null,
+    change_1h: c._gmgnResult?.change_1h ?? c.change_1h ?? null,
+    candle_price_range: c._gmgnResult?.candles?.price_range_pct ?? c.candle_price_range ?? null,
+  };
+}
+
+export function rankCandidatesByDarwin(candidates = []) {
+  return candidates
+    .map((candidate, index) => {
+      const normalized = normalizeCandidateForUi(candidate);
+      const darwin = scoreSignalSnapshot(getCandidateSignalSnapshot(normalized), { topN: 3 });
+      return {
+        ...normalized,
+        darwin_score: darwin.score_pct,
+        darwin_weight_coverage: darwin.coverage,
+        darwin_top_signals: darwin.topSignals,
+        _darwin_sort_index: index,
+      };
+    })
+    .sort((a, b) =>
+      (b.darwin_score ?? 0) - (a.darwin_score ?? 0) ||
+      (b.fee_active_tvl_ratio ?? 0) - (a.fee_active_tvl_ratio ?? 0) ||
+      (b.volume ?? 0) - (a.volume ?? 0) ||
+      (b.organic_score ?? 0) - (a.organic_score ?? 0) ||
+      (a._darwin_sort_index ?? 0) - (b._darwin_sort_index ?? 0)
+    )
+    .map(({ _darwin_sort_index, ...candidate }) => candidate);
 }
 
 /**
@@ -85,25 +179,109 @@ export async function getTopCandidates({ limit = 10 } = {}) {
  * Returns the full unfiltered API object (all fields, not condensed).
  */
 export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
-  const url = `${POOL_DISCOVERY_BASE}/pools?` +
-    `page_size=1` +
-    `&filter_by=${encodeURIComponent(`pool_address=${pool_address}`)}` +
-    `&timeframe=${timeframe}`;
+  const fetchPool = async (tf) => {
+    const url = `${POOL_DISCOVERY_BASE}/pools?` +
+      `page_size=1` +
+      `&filter_by=${encodeURIComponent(`pool_address=${pool_address}`)}` +
+      `&timeframe=${tf}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
+    const data = await res.json();
+    return (data.data || [])[0] || null;
+  };
 
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json();
-  const pool = (data.data || [])[0];
+  // Fetch requested timeframe, 1h context, AND OHLCV candles in parallel
+  const [pool, pool1h, ohlcvData] = await Promise.all([
+    fetchPool(timeframe),
+    timeframe !== "1h" ? fetchPool("1h").catch(() => null) : null,
+    fetchOhlcvSummary(pool_address).catch(() => null),
+  ]);
 
   if (!pool) {
     throw new Error(`Pool ${pool_address} not found`);
   }
 
-  return pool;
+  const condensed = condensePool(pool);
+  condensed.timeframe = timeframe;
+  condensed._summary = `${timeframe}: fee/TVL ${condensed.fee_active_tvl_ratio || 0}%, ${condensed.swap_count || 0} swaps, volatility ${condensed.volatility}`;
+
+  // Attach 1h context so LLM can see the bigger picture alongside the 5m snapshot
+  if (pool1h) {
+    condensed.context_1h = {
+      volume: round(pool1h.volume),
+      fee: round(pool1h.fee),
+      fee_active_tvl_ratio: fix(pool1h.fee_active_tvl_ratio, 4),
+      swap_count: pool1h.swap_count,
+    };
+    condensed._summary += ` | 1h context: volume $${round(pool1h.volume)}, fee $${round(pool1h.fee)}, fee/TVL ${fix(pool1h.fee_active_tvl_ratio, 4)}%, ${pool1h.swap_count} swaps`;
+  }
+
+  // Attach OHLCV summary — definitive "is this pool alive?" signal
+  if (ohlcvData) {
+    condensed.ohlcv_summary = ohlcvData;
+    condensed._summary += ` | OHLCV (${ohlcvData.period}): last 3 vols $${ohlcvData.latest_3_volumes?.join(', $')}, ${ohlcvData.zero_volume_candles}/${ohlcvData.candles} empty, trend ${ohlcvData.volume_trend}, price ${ohlcvData.price_direction}`;
+  }
+
+  return condensed;
+}
+
+/**
+ * Fetch OHLCV candles and summarize into actionable signals.
+ * Returns a compact summary the LLM can act on without parsing raw candles.
+ */
+const OHLCV_BASE = "https://dlmm.datapi.meteora.ag/pools";
+
+async function fetchOhlcvSummary(poolAddress, timeframe = "5m") {
+  const res = await fetch(`${OHLCV_BASE}/${poolAddress}/ohlcv?timeframe=${timeframe}`);
+  if (!res.ok) return null;
+
+  const json = await res.json();
+  const candles = json.data || [];
+  if (candles.length === 0) return null;
+
+  const volumes = candles.map(c => c.volume || 0);
+  const closes = candles.map(c => c.close || 0);
+  const zeroCount = volumes.filter(v => v === 0).length;
+  const volAvg = volumes.length > 0 ? Math.round(volumes.reduce((s, v) => s + v, 0) / volumes.length) : 0;
+  const volMin = Math.round(Math.min(...volumes));
+  const volMax = Math.round(Math.max(...volumes));
+
+  // Volume trend: compare first half avg vs second half avg
+  const mid = Math.floor(volumes.length / 2);
+  const firstHalf = volumes.slice(0, mid);
+  const secondHalf = volumes.slice(mid);
+  const firstAvg = firstHalf.reduce((s, v) => s + v, 0) / (firstHalf.length || 1);
+  const secondAvg = secondHalf.reduce((s, v) => s + v, 0) / (secondHalf.length || 1);
+  const volTrend = secondAvg > firstAvg * 1.2 ? "increasing" : secondAvg < firstAvg * 0.8 ? "decreasing" : "stable";
+
+  // Price direction: compare first vs last close
+  const firstClose = closes[0] || 0;
+  const lastClose = closes[closes.length - 1] || 0;
+  const priceChangePct = firstClose > 0 ? ((lastClose - firstClose) / firstClose) * 100 : 0;
+  const priceDir = priceChangePct > 2 ? "up" : priceChangePct < -2 ? "down" : "ranging";
+
+  // Latest candle age
+  const latestCandle = candles[candles.length - 1];
+  const latestTs = latestCandle.timestamp ? latestCandle.timestamp * 1000 : Date.parse(latestCandle.timestamp_str);
+  const ageMs = Date.now() - latestTs;
+  const ageMins = Math.floor(ageMs / 60000);
+  const ageLabel = ageMins <= 0 ? "just now" : `${ageMins} min ago`;
+
+  // Last 3 candle volumes — the LLM sees the actual recent trajectory
+  const latest3 = volumes.slice(-3).map(v => Math.round(v));
+
+  return {
+    timeframe,
+    candles: candles.length,
+    period: `last ${candles.length * (timeframe === "5m" ? 5 : timeframe === "30m" ? 30 : 60)} min`,
+    latest_3_volumes: latest3,
+    zero_volume_candles: zeroCount,
+    volume_trend: volTrend,
+    price_direction: priceDir,
+    price_change_pct: fix(priceChangePct, 2),
+    latest_candle_volume: Math.round(latestCandle.volume || 0),
+    latest_candle_age: ageLabel,
+  };
 }
 
 /**
@@ -128,16 +306,15 @@ function condensePool(p) {
     bin_step: p.dlmm_params?.bin_step || null,
     fee_pct: p.fee_pct,
 
-    // Core metrics (the numbers that matter)
+    // Core metrics
     active_tvl: round(p.active_tvl),
-    fee_window: round(p.fee),
-    volume_window: round(p.volume),
-    // API sometimes returns 0 for fee_active_tvl_ratio on short timeframes — compute from raw values as fallback
+    volume: round(p.volume),
+    fee: round(p.fee),
     fee_active_tvl_ratio: p.fee_active_tvl_ratio > 0
       ? fix(p.fee_active_tvl_ratio, 4)
       : (p.active_tvl > 0 ? fix((p.fee / p.active_tvl) * 100, 4) : 0),
+    swap_count: p.swap_count,
     volatility: fix(p.volatility, 2),
-
 
     // Token health
     holders: p.base_token_holders,
@@ -156,18 +333,43 @@ function condensePool(p) {
     min_price: p.min_price,
     max_price: p.max_price,
 
-    // Activity trends
-    volume_change_pct: fix(p.volume_change_pct, 1),
-    fee_change_pct: fix(p.fee_change_pct, 1),
-    swap_count: p.swap_count,
+    // Activity
     unique_traders: p.unique_traders,
   };
 }
 
+/**
+ * Fetch the current dynamic fee for a pool via the DLMM SDK (on-chain).
+ * Returns { base_fee_pct, dynamic_fee_pct } or null on failure.
+ * Reuses a single Connection to avoid RPC rate limit pressure.
+ */
+let _feeConn = null;
+export async function fetchDynamicFee(poolAddress) {
+  try {
+    const { default: DLMM } = await import("@meteora-ag/dlmm");
+    const { Connection, PublicKey } = await import("@solana/web3.js");
+    if (!_feeConn) _feeConn = new Connection(process.env.RPC_URL, "confirmed");
+    const pool = await DLMM.create(_feeConn, new PublicKey(poolAddress));
+    // getDynamicFee() returns the TOTAL current fee % (base + variable), not the
+    // variable component alone. Take base from getFeeInfo() (which correctly
+    // accounts for baseFeePowerFactor) and derive the true dynamic part.
+    const feeInfo = pool.getFeeInfo();
+    const baseFeePct = Number(feeInfo.baseFeeRatePercentage?.toString?.() ?? feeInfo.baseFeeRatePercentage);
+    const totalFeePct = Number(pool.getDynamicFee().toString());
+    return {
+      base_fee_pct: baseFeePct,
+      dynamic_fee_pct: Math.max(0, totalFeePct - baseFeePct),
+      total_fee_pct: totalFeePct,
+    };
+  } catch { return null; }
+}
+
 function round(n) {
-  return n != null ? Math.round(n) : null;
+  const num = Number(n);
+  return Number.isFinite(num) ? Math.round(num) : null;
 }
 
 function fix(n, decimals) {
-  return n != null ? Number(n.toFixed(decimals)) : null;
+  const num = Number(n);
+  return Number.isFinite(num) ? Number(num.toFixed(decimals)) : null;
 }

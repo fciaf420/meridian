@@ -65,6 +65,8 @@ export async function checkSmartWalletsOnPool({ pool_address }) {
       tracked_wallets: 0,
       in_pool: [],
       confidence_boost: false,
+      degraded: false,
+      errors: 0,
       signal: "No smart wallets tracked yet — neutral signal",
     };
   }
@@ -76,28 +78,44 @@ export async function checkSmartWalletsOnPool({ pool_address }) {
       try {
         const cached = _cache.get(wallet.address);
         if (cached && Date.now() - cached.fetchedAt < CACHE_TTL) {
-          return { wallet, positions: cached.positions };
+          return { wallet, positions: cached.positions, errored: false };
         }
         const { positions } = await getWalletPositions({ wallet_address: wallet.address });
         _cache.set(wallet.address, { positions: positions || [], fetchedAt: Date.now() });
-        return { wallet, positions: positions || [] };
-      } catch {
-        return { wallet, positions: [] };
+        return { wallet, positions: positions || [], errored: false };
+      } catch (err) {
+        log("smart_wallets", `Position lookup failed for ${wallet.name} (${wallet.address}): ${err?.message || err}`);
+        return { wallet, positions: [], errored: true };
       }
     })
   );
 
+  const errors = results.filter((r) => r.errored).length;
+  // A failed lookup yields an empty positions array, which is indistinguishable
+  // from a genuine "not in pool". Flag the result as degraded so callers don't
+  // treat RPC failures as a confirmed "no smart money" signal.
+  const degraded = errors > 0;
+
   const inPool = results
     .filter((r) => r.positions.some((p) => p.pool === pool_address))
     .map((r) => ({ name: r.wallet.name, category: r.wallet.category, address: r.wallet.address }));
+
+  let signal;
+  if (inPool.length > 0) {
+    signal = `${inPool.length}/${wallets.length} smart wallet(s) are in this pool: ${inPool.map((w) => w.name).join(", ")} — STRONG signal`;
+  } else if (degraded) {
+    signal = `0/${wallets.length} smart wallets confirmed in this pool, but ${errors} wallet lookup(s) failed — signal is DEGRADED, do not treat as a confirmed zero`;
+  } else {
+    signal = `0/${wallets.length} smart wallets in this pool — neutral, rely on fundamentals`;
+  }
 
   return {
     pool: pool_address,
     tracked_wallets: wallets.length,
     in_pool: inPool,
     confidence_boost: inPool.length > 0,
-    signal: inPool.length > 0
-      ? `${inPool.length}/${wallets.length} smart wallet(s) are in this pool: ${inPool.map((w) => w.name).join(", ")} — STRONG signal`
-      : `0/${wallets.length} smart wallets in this pool — neutral, rely on fundamentals`,
+    degraded,
+    errors,
+    signal,
   };
 }

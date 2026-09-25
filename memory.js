@@ -3,10 +3,11 @@
  * Provides cross-session learning via HRR-based memory.
  */
 
-import { NuggetShelf } from "nuggets";
+import { NuggetShelf, promoteFacts } from "nuggets";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { config } from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SAVE_DIR = path.join(__dirname, "data", "nuggets");
@@ -23,11 +24,18 @@ export function initMemory() {
   shelf = new NuggetShelf({ saveDir: SAVE_DIR, autoSave: true });
   shelf.loadAll();
 
-  // Ensure core nuggets exist
-  shelf.getOrCreate("pools");       // pool outcomes and patterns
-  shelf.getOrCreate("strategies");  // strategy effectiveness
-  shelf.getOrCreate("lessons");     // general learned lessons
-  shelf.getOrCreate("patterns");    // market patterns
+  // Ensure core nuggets exist. Defensively set maxFacts directly on each
+  // nugget instance too, so the cap applies even if the shelf drops the option.
+  const pools = shelf.getOrCreate("pools", { maxFacts: 150 });       // pool outcomes (durable)
+  pools.maxFacts = 150;
+  const strategies = shelf.getOrCreate("strategies", { maxFacts: 80 });    // strategy effectiveness
+  strategies.maxFacts = 80;
+  const lessons = shelf.getOrCreate("lessons", { maxFacts: 100 });      // general learned lessons
+  lessons.maxFacts = 100;
+  const patterns = shelf.getOrCreate("patterns", { maxFacts: 80 });      // market patterns
+  patterns.maxFacts = 80;
+  const snapshots = shelf.getOrCreate("snapshots", { maxFacts: 100 });   // transient mid-position snapshots
+  snapshots.maxFacts = 100;
 
   log("memory", `Nuggets memory initialized (${shelf.size} nuggets loaded from ${SAVE_DIR})`);
   return shelf;
@@ -80,12 +88,12 @@ export function recallForScreening(poolData) {
   if (rawName) {
     const name = sanitizeKey(rawName);
     const r = s.recall(name, "pools", SESSION_ID);
-    if (r.found) results.push({ source: "pools", ...r });
+    if (r.found && r.confidence >= 0.4) results.push({ source: "pools", ...r });
   }
 
   if (poolData?.base_token) {
     const r = s.recall(sanitizeKey(poolData.base_token), "pools", SESSION_ID);
-    if (r.found && !results.some(x => x.key === r.key)) {
+    if (r.found && r.confidence >= 0.4 && !results.some(x => x.key === r.key)) {
       results.push({ source: "pools", ...r });
     }
   }
@@ -93,7 +101,7 @@ export function recallForScreening(poolData) {
   // Check strategy patterns by bin_step
   if (poolData?.bin_step) {
     const r = s.recall(`bid_ask_bs${poolData.bin_step}`, "strategies", SESSION_ID);
-    if (r.found) results.push({ source: "strategies", ...r });
+    if (r.found && r.confidence >= 0.4) results.push({ source: "strategies", ...r });
   }
 
   return results;
@@ -105,18 +113,42 @@ export function recallForScreening(poolData) {
 export function recallForManagement(position) {
   const s = getShelf();
   const results = [];
+  const seen = new Set();
 
-  // Position objects have `pair` (e.g. "Gany-SOL"), not `pool_name`
+  const MIN_CONFIDENCE = 0.4;
+  const addResult = (source, r) => {
+    if (r.found && r.confidence >= MIN_CONFIDENCE && !seen.has(r.key)) {
+      seen.add(r.key);
+      results.push({ source, ...r });
+    }
+  };
+
+  // 1. Pool name — direct history for this specific pool
   const rawKey = position?.pair || position?.pool_name;
   if (rawKey) {
     const poolKey = sanitizeKey(rawKey);
-    const r = s.recall(poolKey, "pools", SESSION_ID);
-    if (r.found) results.push({ source: "pools", ...r });
+    addResult("pools", s.recall(poolKey, "pools", SESSION_ID));
   }
 
-  // Check for learned lessons about management
-  const r = s.recall("management", "lessons", SESSION_ID);
-  if (r.found) results.push({ source: "lessons", ...r });
+  // 2. Strategy + bin step — recalls past outcomes for this combo (e.g. "bid_ask_bs125")
+  if (position?.strategy && position?.bin_step) {
+    const stratKey = `${position.strategy}_bs${position.bin_step}`;
+    addResult("strategies", s.recall(stratKey, "strategies", SESSION_ID));
+  }
+
+  // 3. Strategy alone — broader pattern (e.g. "bid_ask" across all bin steps)
+  if (position?.strategy) {
+    addResult("strategies", s.recall(position.strategy, "strategies", SESSION_ID));
+  }
+
+  // 4. Volatility range — recall patterns for similar volatility levels
+  if (position?.volatility != null) {
+    const volBucket = `volatility_${Math.round(position.volatility)}`;
+    addResult("patterns", s.recall(volBucket, "patterns", SESSION_ID));
+  }
+
+  // 5. General management lessons
+  addResult("lessons", s.recall("management", "lessons", SESSION_ID));
 
   return results;
 }
@@ -148,6 +180,106 @@ export function getMemoryContext() {
   return lines.length > 0 ? lines.join("\n") : null;
 }
 
+const ROLE_NUGGET_PRIORITY = {
+  SCREENER: ["strategies", "pools", "patterns", "lessons"],
+  MANAGER: ["pools", "patterns", "strategies", "lessons"],
+  GENERAL: ["pools", "strategies", "patterns", "lessons"],
+};
+
+export function getMemoryFactsForPrompt(agentType = "GENERAL", maxFacts = 12) {
+  const s = getShelf();
+  const order = ROLE_NUGGET_PRIORITY[agentType] || ROLE_NUGGET_PRIORITY.GENERAL;
+  const available = new Map();
+
+  for (const info of s.list()) {
+    try {
+      available.set(info.name, s.get(info.name));
+    } catch { /* ignore missing nugget */ }
+  }
+
+  const facts = [];
+  const seen = new Set();
+
+  for (const nuggetName of order) {
+    const nugget = available.get(nuggetName);
+    if (!nugget) continue;
+
+    const topFacts = nugget.facts()
+      .filter((fact) => (fact.hits ?? 0) > 0)
+      .sort((a, b) => {
+        const hitDiff = (b.hits ?? 0) - (a.hits ?? 0);
+        if (hitDiff !== 0) return hitDiff;
+        return String(a.key).localeCompare(String(b.key));
+      })
+      .slice(0, 4);
+
+    for (const fact of topFacts) {
+      const dedupeKey = `${nuggetName}:${fact.key}:${fact.value}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      facts.push({
+        nugget: nuggetName,
+        key: fact.key,
+        value: fact.value,
+        hits: fact.hits ?? 0,
+      });
+      if (facts.length >= maxFacts) {
+        return facts;
+      }
+    }
+  }
+
+  return facts;
+}
+
+/**
+ * Structured memory snapshot for the web UI and API consumers.
+ */
+export function getMemoryDashboardData() {
+  const s = getShelf();
+  const nuggets = [];
+  let totalFacts = 0;
+  let recalledFacts = 0;
+
+  for (const nuggetInfo of s.list()) {
+    try {
+      const nugget = s.get(nuggetInfo.name);
+      const facts = nugget.facts();
+      const status = typeof nugget.status === "function" ? nugget.status() : null;
+
+      totalFacts += facts.length;
+      recalledFacts += facts.filter((fact) => (fact.hits ?? 0) > 0).length;
+
+      nuggets.push({
+        name: nuggetInfo.name,
+        fact_count: status?.fact_count ?? facts.length,
+        capacity_used_pct: status?.capacity_used_pct ?? null,
+        facts: facts
+          .slice()
+          .sort((a, b) => (b.hits ?? 0) - (a.hits ?? 0))
+          .slice(0, 8)
+          .map((fact) => ({
+            key: fact.key,
+            value: fact.value,
+            hits: fact.hits ?? 0,
+          })),
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  nuggets.sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    total_nuggets: nuggets.length,
+    total_facts: totalFacts,
+    recalled_facts: recalledFacts,
+    context: getMemoryContext(),
+    nuggets,
+  };
+}
+
 /**
  * Store mid-position observations during management cycles.
  * Builds up a picture of how pools behave over time.
@@ -157,14 +289,19 @@ export function rememberPositionSnapshot(position) {
   const pair = position.pair || position.pool_name || "unknown";
   const key = pair.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
 
-  // Pool behavior snapshot
-  const inRange = position.in_range ? "in-range" : "OOR";
+  // Pool behavior snapshot — use configured PnL unit
+  const inRange = position.in_range ? "in-range" : `OOR-${position.oor_direction || "unknown"}`;
   const pnl = position.pnl_pct != null ? `${position.pnl_pct.toFixed(1)}%` : "?";
-  const fees = position.unclaimed_fees_usd != null ? `$${position.unclaimed_fees_usd}` : "?";
+  const unit = config.management.pnlUnit || "sol";
+  const useSol = unit === "sol" && position.unclaimed_fees_sol != null;
+  const fees = useSol ? `${position.unclaimed_fees_sol} SOL` : (position.unclaimed_fees_usd != null ? `$${position.unclaimed_fees_usd}` : "?");
   const age = position.age_minutes != null ? `${position.age_minutes}m` : "?";
 
   const snapshot = `${inRange}, PnL ${pnl}, fees ${fees}, age ${age}`;
-  s.remember("pools", key, snapshot);
+  // Write transient snapshots to a dedicated namespace so they never collide
+  // with durable pool outcomes written by rememberPoolOutcome under the same key.
+  s.getOrCreate("snapshots", { maxFacts: 100 });
+  s.remember("snapshots", key, snapshot);
 
   // Track pool patterns (volume/fee trends)
   if (position.fee_tvl_ratio != null) {
@@ -173,7 +310,40 @@ export function rememberPositionSnapshot(position) {
     s.remember("patterns", patternKey, `fee/TVL=${position.fee_tvl_ratio} at ${new Date().toISOString().slice(11, 16)}`);
   }
 
+  // Track volatility patterns — builds up data for volatility-based decisions
+  if (position.volatility != null) {
+    const volBucket = `volatility_${Math.round(position.volatility)}`;
+    s.getOrCreate("patterns");
+    s.remember("patterns", volBucket, `${pair} ${inRange} at vol=${position.volatility}, PnL ${pnl}`);
+  }
+
+  // Track strategy+bin_step performance snapshots
+  if (position.strategy && position.bin_step) {
+    const stratKey = `${position.strategy}_bs${position.bin_step}`;
+    s.remember("strategies", stratKey, `${pair} ${inRange}, PnL ${pnl}, age ${age}`);
+  }
+
   log("memory", `Snapshot stored: ${key} → ${snapshot}`);
+}
+
+/**
+ * Clean up transient nugget entries when a position closes.
+ * Removes the mid-position snapshot and pattern entries that are no longer relevant.
+ * Pool outcomes and strategy lessons are kept (they inform future decisions).
+ */
+export function forgetPositionSnapshot(position) {
+  const s = getShelf();
+  const pair = position?.pair || position?.pool_name;
+  if (!pair) return;
+  const key = pair.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
+
+  // Remove the transient snapshot (the "in-range, PnL X%" entry) from its own
+  // namespace. Durable pool outcomes live in the "pools" nugget and are kept.
+  try { s.forget("snapshots", key); } catch { /* ignore */ }
+  // Remove the transient fee/TVL pattern entry too.
+  try { s.forget("patterns", `${key}_feeTvl`); } catch { /* ignore */ }
+
+  log("memory", `Cleaned up transient snapshot for ${key}`);
 }
 
 /**
@@ -195,4 +365,54 @@ export function recallMemory(query, nuggetName) {
   const result = s.recall(query, nuggetName || undefined, SESSION_ID);
   log("memory", `LLM recall "${query}" → ${result.found ? result.answer : "not found"}`);
   return result;
+}
+
+/**
+ * Let the LLM forget a fact from memory.
+ */
+export function forgetFact(nuggetName, key) {
+  const s = getShelf();
+  try {
+    const nugget = s.get(nuggetName);
+    nugget.forget(key);
+    log("memory", `LLM forgot fact in ${nuggetName}: ${key}`);
+    return { forgotten: true, nugget: nuggetName, key };
+  } catch (e) {
+    log("memory", `Failed to forget ${nuggetName}/${key}: ${e.message}`);
+    return { forgotten: false, error: e.message };
+  }
+}
+
+/**
+ * Promote high-hit facts to MEMORY.md for permanent context.
+ * Call periodically (e.g. after each management cycle).
+ */
+export function maybePromote() {
+  const s = getShelf();
+  try {
+    const promoted = promoteFacts(s);
+    if (promoted > 0) {
+      log("memory", `Promoted ${promoted} facts to MEMORY.md`);
+    }
+    return promoted;
+  } catch (e) {
+    log("memory", `Promotion failed: ${e.message}`);
+    return 0;
+  }
+}
+
+/**
+ * Log capacity warnings for any nuggets approaching their limits.
+ */
+export function checkCapacity() {
+  const s = getShelf();
+  for (const info of s.list()) {
+    try {
+      const nugget = s.get(info.name);
+      const st = nugget.status();
+      if (st.capacity_used_pct > 70) {
+        log("memory", `WARNING: ${info.name} nugget at ${st.capacity_used_pct}% capacity (${st.fact_count} facts)`);
+      }
+    } catch { continue; }
+  }
 }

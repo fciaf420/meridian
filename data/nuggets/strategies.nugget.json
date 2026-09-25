@@ -1,0 +1,1 @@
+{"version":3,"name":"strategies","D":16384,"banks":4,"ensembles":1,"max_facts":0,"facts":[{"key":"spotbs100","value":"profitable, PnL 0.0%, vol=null, fee_tvl=null","hits":0,"last_hit_session":""}],"config":{"sharpen_p":1,"corvacs_a":0,"temp_T":0.9,"orth_iters":1}}

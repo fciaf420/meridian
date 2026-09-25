@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Meridian - Autonomous Liquidity Agent</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0a1a;--bg-card:#12122a;--purple:#9945FF;--green:#14F195;--blue:#4A9FFF;
+  --amber:#FFB020;--red:#FF4545;--white:#EEEEF0;--gray:#8888AA;--dark-gray:#2A2A4A;
+}
+html{scroll-behavior:smooth;scroll-snap-type:y mandatory;overflow-y:scroll;overflow-x:hidden}
+body{background:var(--bg);color:var(--white);font-family:'Inter','Segoe UI',system-ui,sans-serif;line-height:1.5}
+.section{min-height:100vh;scroll-snap-align:start;position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 40px;overflow:hidden}
+.section-title{font-size:14px;text-transform:uppercase;letter-spacing:4px;color:var(--gray);margin-bottom:12px}
+.section h2{font-size:36px;font-weight:700;margin-bottom:32px;text-align:center}
+.glow-purple{text-shadow:0 0 20px rgba(153,69,255,.6),0 0 40px rgba(153,69,255,.3)}
+.glow-green{text-shadow:0 0 20px rgba(20,241,149,.6),0 0 40px rgba(20,241,149,.3)}
+.glow-blue{text-shadow:0 0 20px rgba(74,159,255,.6),0 0 40px rgba(74,159,255,.3)}
+.neon-box{background:var(--bg-card);border-radius:12px;padding:24px;border:1px solid rgba(153,69,255,.3);box-shadow:0 0 15px rgba(153,69,255,.15);transition:all .3s}
+.neon-box:hover{box-shadow:0 0 25px rgba(153,69,255,.3);border-color:rgba(153,69,255,.5)}
+.neon-box.blue{border-color:rgba(74,159,255,.3);box-shadow:0 0 15px rgba(74,159,255,.15)}
+.neon-box.blue:hover{box-shadow:0 0 25px rgba(74,159,255,.3);border-color:rgba(74,159,255,.5)}
+.neon-box.green{border-color:rgba(20,241,149,.3);box-shadow:0 0 15px rgba(20,241,149,.15)}
+.neon-box.green:hover{box-shadow:0 0 25px rgba(20,241,149,.3);border-color:rgba(20,241,149,.5)}
+.neon-box.amber{border-color:rgba(255,176,32,.3);box-shadow:0 0 15px rgba(255,176,32,.15)}
+.mono{font-family:'JetBrains Mono','Fira Code',monospace}
+
+/* Nav dots */
+#nav{position:fixed;right:20px;top:50%;transform:translateY(-50%);z-index:100;display:flex;flex-direction:column;gap:12px}
+.nav-dot{width:12px;height:12px;border-radius:50%;border:2px solid var(--gray);background:transparent;cursor:pointer;transition:all .3s;position:relative}
+.nav-dot.active{background:var(--purple);border-color:var(--purple);box-shadow:0 0 10px rgba(153,69,255,.5)}
+.nav-dot:hover{border-color:var(--purple)}
+.nav-dot .tooltip{position:absolute;right:24px;top:50%;transform:translateY(-50%);background:var(--bg-card);border:1px solid var(--dark-gray);padding:4px 10px;border-radius:6px;font-size:11px;white-space:nowrap;opacity:0;pointer-events:none;transition:opacity .2s}
+.nav-dot:hover .tooltip{opacity:1}
+
+/* Particles */
+#particles{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;opacity:.4}
+.section>*{position:relative;z-index:1}
+
+/* ===== SECTION 1: HERO ===== */
+#hero .hero-title{font-size:80px;font-weight:800;letter-spacing:-2px;background:linear-gradient(135deg,var(--purple),var(--blue),var(--green));-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:titlePulse 3s ease-in-out infinite}
+@keyframes titlePulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
+#hero .tagline{font-size:24px;color:var(--gray);margin:8px 0 48px;letter-spacing:2px}
+.arch-diagram{display:flex;align-items:center;justify-content:center;gap:20px;flex-wrap:wrap;margin-bottom:48px;max-width:900px}
+.agent-node{width:140px;text-align:center;transition:transform .3s}
+.agent-node:hover{transform:scale(1.08)}
+.hex{width:80px;height:80px;margin:0 auto 8px;position:relative;display:flex;align-items:center;justify-content:center;font-size:28px}
+.hex::before{content:'';position:absolute;inset:0;background:var(--bg-card);clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);border:2px solid currentColor}
+.hex.green{color:var(--green)}.hex.blue{color:var(--blue)}.hex.purple{color:var(--purple)}
+.agent-label{font-size:14px;font-weight:600;color:var(--white)}.agent-sub{font-size:11px;color:var(--gray)}
+.center-node{width:160px}
+.center-node .hex{width:100px;height:100px;font-size:14px;font-weight:600}
+.connector{width:60px;height:2px;background:linear-gradient(90deg,transparent,var(--dark-gray),transparent);position:relative}
+.connector::after{content:'';position:absolute;width:6px;height:6px;border-radius:50%;top:-2px;animation:packet 2s linear infinite}
+.connector.g::after{background:var(--green);box-shadow:0 0 8px var(--green)}
+.connector.b::after{background:var(--blue);box-shadow:0 0 8px var(--blue)}
+@keyframes packet{0%{left:0}100%{left:calc(100% - 6px)}}
+.stats-row{display:flex;gap:32px}
+.stat{text-align:center}.stat-value{font-size:28px;font-weight:700}.stat-label{font-size:12px;color:var(--gray);text-transform:uppercase;letter-spacing:1px}
+.stat:nth-child(1) .stat-value{color:var(--green)}
+.stat:nth-child(2) .stat-value{color:var(--amber)}
+.stat:nth-child(3) .stat-value{color:var(--blue)}
+
+/* ===== SECTION 2: SCREENING ===== */
+.screening-layout{display:flex;gap:48px;align-items:flex-start;max-width:1200px;width:100%}
+.funnel-container{flex:1;position:relative;height:480px}
+.funnel{position:relative;width:100%;height:100%}
+.funnel svg{width:100%;height:100%}
+.funnel-label{position:absolute;left:50%;transform:translateX(-50%);font-size:12px;font-weight:500;color:var(--white);padding:3px 10px;border-radius:4px;background:rgba(153,69,255,.15);border:1px solid rgba(153,69,255,.2);white-space:nowrap}
+.enrich-cards{flex:1;display:flex;flex-direction:column;gap:12px}
+.enrich-card{padding:16px 20px;border-radius:10px;background:var(--bg-card);border:1px solid var(--dark-gray);cursor:pointer;transition:all .3s;display:flex;align-items:center;gap:14px}
+.enrich-card:hover{transform:translateX(8px)}
+.enrich-card .icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+.enrich-card:nth-child(1) .icon{background:rgba(74,159,255,.15);border:1px solid rgba(74,159,255,.3)}
+.enrich-card:nth-child(2) .icon{background:rgba(153,69,255,.15);border:1px solid rgba(153,69,255,.3)}
+.enrich-card:nth-child(3) .icon{background:rgba(20,241,149,.15);border:1px solid rgba(20,241,149,.3)}
+.enrich-card:nth-child(4) .icon{background:rgba(255,176,32,.15);border:1px solid rgba(255,176,32,.3)}
+.enrich-card:nth-child(5) .icon{background:rgba(20,241,149,.15);border:1px solid rgba(20,241,149,.3)}
+.enrich-card:hover .icon{transform:scale(1.1)}
+.enrich-card .info h4{font-size:14px;font-weight:600;margin-bottom:2px}.enrich-card .info p{font-size:11px;color:var(--gray)}
+.enrich-card:nth-child(1):hover{border-color:var(--blue);box-shadow:0 0 20px rgba(74,159,255,.2)}
+.enrich-card:nth-child(2):hover{border-color:var(--purple);box-shadow:0 0 20px rgba(153,69,255,.2)}
+.enrich-card:nth-child(3):hover{border-color:var(--green);box-shadow:0 0 20px rgba(20,241,149,.2)}
+.enrich-card:nth-child(4):hover{border-color:var(--amber);box-shadow:0 0 20px rgba(255,176,32,.2)}
+.enrich-card:nth-child(5):hover{border-color:var(--green);box-shadow:0 0 20px rgba(20,241,149,.2)}
+.parallel-badge{text-align:center;font-size:11px;text-transform:uppercase;letter-spacing:3px;color:var(--green);margin-bottom:8px;animation:pulseBadge 2s ease-in-out infinite}
+@keyframes pulseBadge{0%,100%{opacity:.5}50%{opacity:1}}
+
+/* Funnel dots */
+.funnel-dot{position:absolute;width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation-timing-function:linear;animation-iteration-count:infinite}
+@keyframes dotFall{0%{top:0;opacity:1}100%{top:440px;opacity:1}}
+@keyframes dotDie{0%{opacity:1;transform:scale(1)}50%{opacity:.8;background:var(--red);box-shadow:0 0 8px var(--red)}100%{opacity:0;transform:scale(0)}}
+
+/* ===== SECTION 3: SIGNALS ===== */
+.signals-layout{max-width:1000px;width:100%}
+.bar-chart{display:flex;flex-direction:column;gap:8px;margin-bottom:32px}
+.bar-row{display:flex;align-items:center;gap:12px;height:32px}
+.bar-label{width:140px;text-align:right;font-size:13px;font-family:'JetBrains Mono',monospace;color:var(--gray)}
+.bar-track{flex:1;height:24px;background:var(--bg-card);border-radius:4px;position:relative;overflow:visible}
+.bar-fill{height:100%;border-radius:4px;transition:width 1.5s ease-out;position:relative;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:600;min-width:40px}
+.bar-fill.boost{background:linear-gradient(90deg,rgba(20,241,149,.2),rgba(20,241,149,.5));color:var(--green)}
+.bar-fill.decay{background:linear-gradient(90deg,rgba(255,176,32,.2),rgba(255,176,32,.5));color:var(--amber)}
+.neutral-line{position:absolute;left:40%;top:-4px;bottom:-4px;width:2px;background:var(--dark-gray);border:1px dashed var(--gray);z-index:2}
+.neutral-label{position:absolute;left:40%;top:-20px;transform:translateX(-50%);font-size:10px;color:var(--gray)}
+.annotations{display:flex;gap:16px;flex-wrap:wrap;justify-content:center}
+.annotation{padding:10px 16px;border-radius:8px;font-size:13px;display:flex;align-items:center;gap:8px}
+.annotation .dot{width:8px;height:8px;border-radius:50%}
+.annotation.green .dot{background:var(--green);box-shadow:0 0 6px var(--green)}
+.annotation.amber .dot{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+.recalc-note{text-align:center;margin-top:24px;font-size:14px;color:var(--purple)}
+
+/* ===== SECTION 4: DEPLOYMENT ===== */
+.deploy-layout{display:flex;gap:48px;align-items:flex-start;max-width:1200px;width:100%}
+.bin-chart-area{flex:1.2}
+.bin-chart{display:flex;align-items:flex-end;gap:2px;height:300px;padding:0 20px}
+.bin{width:8px;border-radius:2px 2px 0 0;transition:height 1s ease-out,background .3s;cursor:pointer;position:relative}
+.bin:hover{filter:brightness(1.4)}
+.bin.active{background:var(--white)!important;box-shadow:0 0 12px rgba(255,255,255,.5)}
+.bin-label{text-align:center;margin-top:8px;font-size:12px;color:var(--gray)}
+.active-label{position:absolute;top:-24px;left:50%;transform:translateX(-50%);font-size:10px;color:var(--white);white-space:nowrap;background:rgba(255,255,255,.1);padding:2px 6px;border-radius:4px}
+.exit-rules{flex:1}
+.exit-rules h3{font-size:18px;margin-bottom:20px;color:var(--red)}
+.exit-item{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:8px;margin-bottom:8px;transition:all .5s;background:var(--bg-card);border:1px solid var(--dark-gray)}
+.exit-item.lit{border-color:currentColor;box-shadow:0 0 15px currentColor}
+.exit-dot{width:14px;height:14px;border-radius:50%;border:2px solid var(--dark-gray);transition:all .5s;flex-shrink:0}
+.exit-item.lit .exit-dot{background:currentColor;border-color:currentColor;box-shadow:0 0 8px currentColor}
+.exit-item .text{font-size:14px;color:var(--gray);transition:color .5s}
+.exit-item.lit .text{color:var(--white)}
+.exit-footer{margin-top:20px;font-size:12px;color:var(--gray);font-style:italic}
+
+/* ===== SECTION 5: MEMORY ===== */
+.memory-layout{max-width:900px;width:100%;display:flex;flex-direction:column;gap:16px}
+.mem-layer{padding:24px 28px;transition:all .3s;cursor:pointer}
+.mem-layer:hover{transform:scale(1.02)}
+.mem-header{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.mem-header h3{font-size:18px;font-weight:600}
+.mem-badge{font-size:10px;padding:2px 8px;border-radius:10px;text-transform:uppercase;letter-spacing:1px}
+.orbit-container{display:flex;align-items:center;gap:24px}
+.orbit{width:80px;height:80px;position:relative;flex-shrink:0}
+.orbit-center{width:30px;height:30px;border-radius:50%;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:radial-gradient(circle,var(--purple),rgba(153,69,255,.3))}
+.orbit-item{position:absolute;font-size:10px;color:var(--purple);animation:orbitSpin 8s linear infinite}
+.orbit-item:nth-child(2){animation-delay:-2s}.orbit-item:nth-child(3){animation-delay:-4s}.orbit-item:nth-child(4){animation-delay:-6s}
+@keyframes orbitSpin{0%{transform:rotate(var(--start)) translateX(34px) rotate(calc(-1*var(--start)))}100%{transform:rotate(calc(var(--start)+360deg)) translateX(34px) rotate(calc(-1*(var(--start)+360deg)))}}
+.mem-table{width:100%;font-size:13px;border-collapse:collapse}
+.mem-table th{color:var(--gray);font-weight:500;text-align:left;padding:4px 12px;border-bottom:1px solid var(--dark-gray)}
+.mem-table td{padding:6px 12px;font-family:'JetBrains Mono',monospace;font-size:12px}
+.tag{display:inline-block;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:500;margin:2px}
+.tag.prefer{background:rgba(20,241,149,.12);color:var(--green);border:1px solid rgba(20,241,149,.25)}
+.tag.avoid{background:rgba(255,176,32,.12);color:var(--amber);border:1px solid rgba(255,176,32,.25)}
+.promote-arrow{text-align:center;color:var(--green);font-size:13px;padding:8px;animation:promoteGlow 2s ease-in-out infinite}
+@keyframes promoteGlow{0%,100%{opacity:.5}50%{opacity:1}}
+
+/* ===== SECTION 6: AUTO-LEARN ===== */
+.learn-layout{display:flex;gap:48px;align-items:center;max-width:1100px;width:100%}
+.loop-container{flex:1;position:relative;width:400px;height:400px;flex-shrink:0}
+.loop-node{position:absolute;padding:14px 20px;border-radius:10px;background:var(--bg-card);font-size:14px;font-weight:600;text-align:center;transition:all .5s;border:2px solid var(--dark-gray);min-width:160px}
+.loop-node.active{transform:scale(1.08);box-shadow:0 0 25px currentColor;border-color:currentColor}
+.loop-arrow{position:absolute;color:var(--dark-gray);font-size:24px;transition:color .5s}
+.loop-arrow.active{color:var(--purple)}
+.learn-details{flex:1;display:flex;flex-direction:column;gap:16px}
+.param-list{display:flex;flex-wrap:wrap;gap:6px}
+.param{font-size:11px;padding:3px 8px;border-radius:4px;background:rgba(255,176,32,.1);color:var(--amber);border:1px solid rgba(255,176,32,.2);font-family:'JetBrains Mono',monospace}
+.progress-bar{height:20px;background:var(--bg-card);border-radius:10px;overflow:hidden;display:flex;border:1px solid var(--dark-gray)}
+.progress-fill{height:100%;transition:width .5s}
+.progress-seg{flex:1;border-right:1px solid var(--bg)}
+.circuit-breaker{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--gray)}
+.cb-dot{width:10px;height:10px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red);animation:cbPulse 1.5s ease-in-out infinite}
+@keyframes cbPulse{0%,100%{opacity:.4}50%{opacity:1}}
+</style>
+</head>
+<body>
+
+<canvas id="particles"></canvas>
+
+<!-- Navigation dots -->
+<nav id="nav"></nav>
+
+<!-- ===== SECTION 1: HERO ===== -->
+<div class="section" id="hero">
+  <div class="hero-title">MERIDIAN</div>
+  <div class="tagline">Autonomous Liquidity. Evolved.</div>
+  <div class="arch-diagram">
+    <div class="agent-node">
+      <div class="hex green"><span>&#128269;</span></div>
+      <div class="agent-label" style="color:var(--green)">SCREENER</div>
+      <div class="agent-sub">every 30 min</div>
+    </div>
+    <div class="connector g"></div>
+    <div class="agent-node center-node">
+      <div class="hex purple"><span style="font-size:13px;-webkit-text-fill-color:var(--white)">ReAct<br>Loop</span></div>
+      <div class="agent-label" style="color:var(--purple)">Agent Engine</div>
+      <div class="agent-sub">LLM-powered</div>
+    </div>
+    <div class="connector b" style="animation-direction:reverse"></div>
+    <div class="agent-node">
+      <div class="hex blue"><span>&#128737;</span></div>
+      <div class="agent-label" style="color:var(--blue)">MANAGER</div>
+      <div class="agent-sub">every 3-10 min</div>
+    </div>
+  </div>
+  <div style="margin-bottom:16px">
+    <div class="agent-node" style="display:inline-block">
+      <div class="hex purple"><span>&#128172;</span></div>
+      <div class="agent-label" style="color:var(--purple)">GENERAL</div>
+      <div class="agent-sub">on demand</div>
+    </div>
+  </div>
+  <div class="stats-row">
+    <div class="stat"><div class="stat-value">11</div><div class="stat-label">Signals Tracked</div></div>
+    <div class="stat"><div class="stat-value">8</div><div class="stat-label">Auto-Evolving Thresholds</div></div>
+    <div class="stat"><div class="stat-value">4</div><div class="stat-label">Memory Layers</div></div>
+  </div>
+</div>
+
+<!-- ===== SECTION 2: SCREENING ===== -->
+<div class="section" id="screening">
+  <div class="section-title">Step 1</div>
+  <h2 class="glow-purple">Pool Screening</h2>
+  <div class="screening-layout">
+    <div class="funnel-container">
+      <div class="funnel" id="funnelArea">
+        <svg viewBox="0 0 400 480" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="funnelGrad" x1="200" y1="0" x2="200" y2="480" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="rgba(153,69,255,.2)"/>
+              <stop offset="100%" stop-color="rgba(20,241,149,.2)"/>
+            </linearGradient>
+          </defs>
+          <path d="M 40 0 L 360 0 L 280 480 L 120 480 Z" fill="url(#funnelGrad)" stroke="rgba(153,69,255,.3)" stroke-width="1"/>
+          <!-- Filter lines -->
+          <line x1="55" y1="96" x2="345" y2="96" stroke="rgba(153,69,255,.15)" stroke-width="1" stroke-dasharray="4"/>
+          <line x1="70" y1="192" x2="330" y2="192" stroke="rgba(153,69,255,.15)" stroke-width="1" stroke-dasharray="4"/>
+          <line x1="85" y1="288" x2="315" y2="288" stroke="rgba(153,69,255,.15)" stroke-width="1" stroke-dasharray="4"/>
+          <line x1="100" y1="384" x2="300" y2="384" stroke="rgba(153,69,255,.15)" stroke-width="1" stroke-dasharray="4"/>
+        </svg>
+        <div class="funnel-label" style="top:36px">TVL $10k - $150k</div>
+        <div class="funnel-label" style="top:132px">Organic Score &gt; 60</div>
+        <div class="funnel-label" style="top:228px">Holders &gt; 500</div>
+        <div class="funnel-label" style="top:324px">Fee/TVL &gt; 5%</div>
+        <div class="funnel-label" style="top:420px;background:rgba(20,241,149,.15);border-color:rgba(20,241,149,.2)">Bin Step 80-125</div>
+      </div>
+    </div>
+    <div>
+      <div class="parallel-badge">&#9889; Parallel Enrichment</div>
+      <div class="enrich-cards">
+        <div class="enrich-card"><div class="icon">&#128200;</div><div class="info"><h4>Token Info</h4><p>Market cap, holders, organic score via Jupiter</p></div></div>
+        <div class="enrich-card"><div class="icon">&#127856;</div><div class="info"><h4>Holder Distribution</h4><p>Top 10 concentration, bundler detection</p></div></div>
+        <div class="enrich-card"><div class="icon">&#128214;</div><div class="info"><h4>Narrative Quality</h4><p>AI story analysis via ChainInsight</p></div></div>
+        <div class="enrich-card"><div class="icon">&#128171;</div><div class="info"><h4>Smart Wallets</h4><p>Whale/VC wallet detection on pool</p></div></div>
+        <div class="enrich-card"><div class="icon">&#128640;</div><div class="info"><h4>OKX Momentum</h4><p>ATH proximity, 5m/1h/4h/24h price changes</p></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== SECTION 3: SIGNAL WEIGHTS ===== -->
+<div class="section" id="signals">
+  <div class="section-title">Step 2</div>
+  <h2 class="glow-green">Darwinian Signal Weights</h2>
+  <div class="signals-layout">
+    <div class="bar-chart" id="barChart"></div>
+    <div class="annotations">
+      <div class="annotation neon-box green"><div class="dot"></div>Top Quartile: x1.05 boost</div>
+      <div class="annotation neon-box amber"><div class="dot"></div>Bottom Quartile: x0.95 decay</div>
+      <div class="annotation neon-box" style="border-color:rgba(136,136,170,.3)"><div class="dot" style="background:var(--gray)"></div>Mean Reversion: 2%</div>
+      <div class="annotation neon-box" style="border-color:rgba(136,136,170,.3)"><div class="dot" style="background:var(--gray)"></div>Bounds: 0.3 - 2.5</div>
+    </div>
+    <div class="recalc-note glow-purple">Recalculated every 5 closed positions</div>
+  </div>
+</div>
+
+<!-- ===== SECTION 4: DEPLOYMENT ===== -->
+<div class="section" id="deployment">
+  <div class="section-title">Step 3</div>
+  <h2 class="glow-blue">Deployment & Exit Rules</h2>
+  <div class="deploy-layout">
+    <div class="bin-chart-area">
+      <div class="bin-chart" id="binChart"></div>
+      <div class="bin-label">bid_ask strategy &mdash; bins below active price</div>
+    </div>
+    <div class="exit-rules">
+      <h3>&#9888; Hard Exit Rules</h3>
+      <div class="exit-item" data-color="var(--purple)" style="color:var(--purple)"><div class="exit-dot"></div><div class="text">Position instruction met</div></div>
+      <div class="exit-item" data-color="var(--green)" style="color:var(--green)"><div class="exit-dot"></div><div class="text">Take profit &ge; 5%</div></div>
+      <div class="exit-item" data-color="var(--amber)" style="color:var(--amber)"><div class="exit-dot"></div><div class="text">OOR timeout &ge; 30 min</div></div>
+      <div class="exit-item" data-color="var(--amber)" style="color:var(--amber)"><div class="exit-dot"></div><div class="text">Low fee + low volume</div></div>
+      <div class="exit-item" data-color="var(--red)" style="color:var(--red)"><div class="exit-dot"></div><div class="text">Emergency drop &le; -50%</div></div>
+      <div class="exit-footer">PnL watcher every 30s &mdash; no LLM needed</div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== SECTION 5: MEMORY ===== -->
+<div class="section" id="memory">
+  <div class="section-title">Step 4</div>
+  <h2 class="glow-purple">Memory Systems</h2>
+  <div class="memory-layout">
+    <div class="neon-box mem-layer" style="border-color:rgba(153,69,255,.4)">
+      <div class="mem-header">
+        <h3 style="color:var(--purple)">Nuggets</h3>
+        <span class="mem-badge" style="background:rgba(153,69,255,.15);color:var(--purple)">Holographic Memory (HRR)</span>
+      </div>
+      <div class="orbit-container">
+        <div class="orbit">
+          <div class="orbit-center"></div>
+          <div class="orbit-item" style="--start:0deg;top:50%;left:50%">pools</div>
+          <div class="orbit-item" style="--start:90deg;top:50%;left:50%">strategies</div>
+          <div class="orbit-item" style="--start:180deg;top:50%;left:50%">lessons</div>
+          <div class="orbit-item" style="--start:270deg;top:50%;left:50%">patterns</div>
+        </div>
+        <div style="font-size:13px;color:var(--gray)">Vector superpositions with fuzzy recall &mdash; sub-millisecond retrieval across 4 memory banks</div>
+      </div>
+    </div>
+    <div class="neon-box blue mem-layer">
+      <div class="mem-header">
+        <h3 style="color:var(--blue)">Pool Memory</h3>
+        <span class="mem-badge" style="background:rgba(74,159,255,.15);color:var(--blue)">Structured History</span>
+      </div>
+      <table class="mem-table">
+        <tr><th>Pool</th><th>Deploys</th><th>Avg PnL</th><th>Win Rate</th></tr>
+        <tr><td>BONK-SOL</td><td>12</td><td style="color:var(--green)">+2.4%</td><td>75%</td></tr>
+        <tr><td>WIF-SOL</td><td>8</td><td style="color:var(--green)">+1.8%</td><td>62%</td></tr>
+        <tr><td>MEME-SOL</td><td>5</td><td style="color:var(--red)">-1.2%</td><td>40%</td></tr>
+      </table>
+    </div>
+    <div class="neon-box green mem-layer">
+      <div class="mem-header">
+        <h3 style="color:var(--green)">Lessons</h3>
+        <span class="mem-badge" style="background:rgba(20,241,149,.15);color:var(--green)">Tagged Rules</span>
+      </div>
+      <div>
+        <span class="tag prefer">PREFER: high organic + smart wallets = +3.2%</span>
+        <span class="tag avoid">AVOID: vol &gt; 6 + bid_ask = OOR downside</span>
+      </div>
+    </div>
+    <div class="promote-arrow">&#8593; 3+ recalls &rarr; auto-promote to permanent context &#8593;</div>
+  </div>
+</div>
+
+<!-- ===== SECTION 6: AUTO-LEARNING ===== -->
+<div class="section" id="autolearn">
+  <div class="section-title">Step 5</div>
+  <h2 class="glow-purple">Auto-Learning</h2>
+  <div class="learn-layout">
+    <div class="loop-container">
+      <div class="loop-node" id="ln0" style="top:20px;left:50%;transform:translateX(-50%);color:var(--purple)">Position Closes</div>
+      <div class="loop-node" id="ln1" style="top:50%;right:0;transform:translateY(-50%);color:var(--green)">Derive Lesson</div>
+      <div class="loop-node" id="ln2" style="bottom:20px;left:50%;transform:translateX(-50%);color:var(--amber)">Evolve Thresholds</div>
+      <div class="loop-node" id="ln3" style="top:50%;left:0;transform:translateY(-50%);color:var(--blue)">Autoresearch</div>
+      <!-- Arrows -->
+      <div class="loop-arrow" id="la0" style="top:28%;right:18%">&#8600;</div>
+      <div class="loop-arrow" id="la1" style="bottom:28%;right:18%">&#8599;</div>
+      <div class="loop-arrow" id="la2" style="bottom:28%;left:18%">&#8598;</div>
+      <div class="loop-arrow" id="la3" style="top:28%;left:18%">&#8601;</div>
+    </div>
+    <div class="learn-details">
+      <div class="neon-box amber" style="padding:16px">
+        <h4 style="font-size:14px;margin-bottom:8px;color:var(--amber)">8 Evolving Parameters</h4>
+        <div class="param-list">
+          <span class="param">maxVolatility</span><span class="param">minOrganic</span>
+          <span class="param">stopLossPct</span><span class="param">takeProfitFeePct</span>
+          <span class="param">minBinStep</span><span class="param">maxBinStep</span>
+          <span class="param">outOfRangeWait</span><span class="param">athThreshold</span>
+        </div>
+        <div style="margin-top:8px;font-size:12px;color:var(--amber)">&plusmn;20% max change per evolution step</div>
+      </div>
+      <div class="neon-box blue" style="padding:16px">
+        <h4 style="font-size:14px;margin-bottom:8px;color:var(--blue)">A/B Test Progress</h4>
+        <div class="progress-bar">
+          <div class="progress-seg" style="background:var(--blue)"></div>
+          <div class="progress-seg" style="background:var(--blue)"></div>
+          <div class="progress-seg" style="background:var(--blue)"></div>
+          <div class="progress-seg" style="background:var(--dark-gray)"></div>
+          <div class="progress-seg" style="background:var(--dark-gray)"></div>
+          <div class="progress-seg" style="background:var(--dark-gray)"></div>
+          <div class="progress-seg" style="background:var(--dark-gray)"></div>
+        </div>
+        <div style="margin-top:6px;font-size:12px;color:var(--gray)">3 / 7 positions tested</div>
+      </div>
+      <div class="circuit-breaker">
+        <div class="cb-dot"></div>
+        <span>Circuit breaker: 3 consecutive losses &rarr; auto-revert</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ===== PARTICLES =====
+(function(){
+  const c=document.getElementById('particles'),ctx=c.getContext('2d');
+  let w,h;
+  function resize(){w=c.width=innerWidth;h=c.height=innerHeight}
+  resize();window.addEventListener('resize',resize);
+  const pts=Array.from({length:50},(_,i)=>({
+    x:((i*7919)%1000)/1000*2000,
+    y:((i*6271)%1000)/1000*1200,
+    vx:((i*3571)%100-50)/200,
+    vy:((i*2347)%100-50)/200,
+    r:1.5+((i*4391)%100)/50,
+    c:i%3===0?'rgba(153,69,255,':'rgba(74,159,255,',
+    o:.08+((i*8123)%100)/500
+  }));
+  function draw(){
+    ctx.clearRect(0,0,w,h);
+    pts.forEach(p=>{
+      p.x+=p.vx;p.y+=p.vy;
+      if(p.x<0)p.x=w;if(p.x>w)p.x=0;if(p.y<0)p.y=h;if(p.y>h)p.y=0;
+      ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+      ctx.fillStyle=p.c+p.o+')';ctx.fill();
+    });
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+// ===== NAV DOTS =====
+const sections=['hero','screening','signals','deployment','memory','autolearn'];
+const labels=['Overview','Screening','Signals','Deploy','Memory','Auto-Learn'];
+const nav=document.getElementById('nav');
+sections.forEach((id,i)=>{
+  const d=document.createElement('div');d.className='nav-dot';
+  d.innerHTML=`<div class="tooltip">${labels[i]}</div>`;
+  d.onclick=()=>document.getElementById(id).scrollIntoView({behavior:'smooth'});
+  nav.appendChild(d);
+});
+const dots=nav.querySelectorAll('.nav-dot');
+const obs=new IntersectionObserver(es=>{
+  es.forEach(e=>{
+    if(e.isIntersecting){
+      const idx=sections.indexOf(e.target.id);
+      dots.forEach((d,i)=>d.classList.toggle('active',i===idx));
+    }
+  });
+},{threshold:.5});
+sections.forEach(id=>obs.observe(document.getElementById(id)));
+
+// Arrow key navigation
+document.addEventListener('keydown',e=>{
+  const active=[...dots].findIndex(d=>d.classList.contains('active'));
+  if(e.key==='ArrowDown'&&active<sections.length-1)document.getElementById(sections[active+1]).scrollIntoView({behavior:'smooth'});
+  if(e.key==='ArrowUp'&&active>0)document.getElementById(sections[active-1]).scrollIntoView({behavior:'smooth'});
+});
+
+// ===== BAR CHART =====
+const signalData=[
+  {label:'smart_wallets',value:1.40},{label:'organic_score',value:1.35},
+  {label:'fee_tvl_ratio',value:1.25},{label:'study_win_rate',value:1.20},
+  {label:'holder_count',value:1.15},{label:'ath_proximity',value:1.10},
+  {label:'mcap',value:1.05},
+  {label:'volume',value:0.85},{label:'volatility',value:0.75},
+  {label:'narrative_quality',value:0.70}
+];
+const bc=document.getElementById('barChart');
+signalData.forEach(s=>{
+  const row=document.createElement('div');row.className='bar-row';
+  const pct=((s.value/2.5)*100);
+  const cls=s.value>1?'boost':'decay';
+  row.innerHTML=`<div class="bar-label">${s.label}</div><div class="bar-track"><div class="bar-fill ${cls}" style="width:0%" data-target="${pct}">${s.value.toFixed(2)}</div></div>`;
+  bc.appendChild(row);
+});
+// Animate on scroll
+const sigObs=new IntersectionObserver(([e])=>{
+  if(e.isIntersecting){
+    bc.querySelectorAll('.bar-fill').forEach(b=>{b.style.width=b.dataset.target+'%'});
+    sigObs.disconnect();
+  }
+},{threshold:.3});
+sigObs.observe(document.getElementById('signals'));
+
+// ===== BIN CHART =====
+const binChart=document.getElementById('binChart');
+for(let i=0;i<69;i++){
+  const bin=document.createElement('div');bin.className='bin';
+  const activeBin=35;
+  if(i===activeBin){
+    bin.classList.add('active');
+    bin.innerHTML='<div class="active-label">Active Bin</div>';
+    bin.style.height='280px';bin.style.background='var(--white)';
+  }else if(i<activeBin){
+    const h=40+(activeBin-i)*6;
+    bin.style.height=Math.min(h,260)+'px';
+    bin.style.background=`rgba(74,159,255,${.3+((activeBin-i)/activeBin)*.5})`;
+  }else{
+    bin.style.height='0';bin.style.background='transparent';
+  }
+  binChart.appendChild(bin);
+}
+
+// ===== EXIT RULES ANIMATION =====
+const exitItems=document.querySelectorAll('.exit-item');
+let exitIdx=0;
+const exitObs=new IntersectionObserver(([e])=>{
+  if(e.isIntersecting){
+    function lightNext(){
+      if(exitIdx<exitItems.length){exitItems[exitIdx].classList.add('lit');exitIdx++;setTimeout(lightNext,600)}
+    }
+    lightNext();exitObs.disconnect();
+  }
+},{threshold:.3});
+exitObs.observe(document.getElementById('deployment'));
+
+// ===== LOOP ANIMATION =====
+let loopIdx=0;
+setInterval(()=>{
+  for(let i=0;i<4;i++){
+    document.getElementById('ln'+i).classList.toggle('active',i===loopIdx);
+    document.getElementById('la'+i).classList.toggle('active',i===loopIdx);
+  }
+  loopIdx=(loopIdx+1)%4;
+},1200);
+
+// ===== FUNNEL DOTS =====
+const funnelArea=document.getElementById('funnelArea');
+function spawnDot(){
+  const dot=document.createElement('div');dot.className='funnel-dot';
+  const x=120+Math.random()*160;
+  dot.style.left=x+'px';dot.style.top='0';
+  const survives=Math.random()>.6;
+  const dieAt=Math.random()*380+60;
+  const dur=3+Math.random()*2;
+  if(survives){
+    dot.style.animation=`dotFall ${dur}s linear`;
+    dot.addEventListener('animationend',()=>dot.remove());
+  }else{
+    dot.style.animation=`dotFall ${dur*(dieAt/440)}s linear forwards`;
+    setTimeout(()=>{dot.style.animation=`dotDie .5s forwards`;setTimeout(()=>dot.remove(),500)},dur*(dieAt/440)*1000);
+  }
+  funnelArea.appendChild(dot);
+}
+setInterval(spawnDot,400);
+</script>
+</body>
+</html>

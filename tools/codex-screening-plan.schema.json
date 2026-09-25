@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Screening Plan",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "skip",
+        "deploy"
+      ]
+    },
+    "reasoning": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pool_address": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pool_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "base_mint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "strategy": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "bid_ask",
+        "spot",
+        null
+      ]
+    },
+    "price_range_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "amount_sol": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "sol_split_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "action",
+    "reasoning",
+    "pool_address",
+    "pool_name",
+    "base_mint",
+    "strategy",
+    "price_range_pct",
+    "amount_sol",
+    "sol_split_pct"
+  ],
+  "additionalProperties": false
+}

@@ -9,6 +9,7 @@ import readline from "readline";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -104,6 +105,14 @@ const existing = fs.existsSync(CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
   : {};
 
+const DEFAULT_MODELS_BY_PROVIDER = {
+  claude: "sonnet",
+  codex: "gpt-4o",
+  deepseek: "deepseek-chat",
+  minimax: "MiniMax-M2.7",
+  openrouter: "openai/gpt-5.4-nano",
+};
+
 const e = (key, fallback) => existing[key] ?? fallback;
 
 console.log(`
@@ -137,6 +146,14 @@ const rpcUrl = await ask(
   e("rpcUrl", process.env.RPC_URL || "https://api.mainnet-beta.solana.com")
 );
 
+// Extract Helius API key from RPC URL if possible
+const heliusMatch = rpcUrl.match(/api-key=([^&]+)/);
+const heliusDefault = heliusMatch?.[1] || process.env.HELIUS_API_KEY || "";
+const heliusApiKey = await ask(
+  "Helius API key (same key as RPC URL, for wallet balance)",
+  e("heliusApiKey", heliusDefault)
+);
+
 const walletKey = await ask(
   "Wallet private key (base58)",
   e("walletKey", process.env.WALLET_PRIVATE_KEY ? "*** (already set in .env)" : "")
@@ -159,7 +176,10 @@ const maxPositions = await askNum(
 
 const minSolToOpen = await askNum(
   "Min SOL balance to open a new position",
-  e("minSolToOpen", parseFloat((deployAmountSol + 0.05).toFixed(3))),
+  e("minSolToOpen", getEffectiveMinSolToOpen({
+    deployAmountSol,
+    gasReserve: e("gasReserve", 0.2),
+  })),
   { min: 0.05 }
 );
 
@@ -168,6 +188,40 @@ const maxDeployAmount = await askNum(
   e("maxDeployAmount", 50),
   { min: deployAmountSol }
 );
+
+// ─── USDC Mode ──────────────────────────────────────────────────────────────────
+console.log("\n── USDC Mode ─────────────────────────────────");
+console.log("  Hold capital in USDC: auto-swap USDC→SOL on entry, settle back to USDC on exit.");
+
+const usdcModeAns = await ask(
+  "Enable USDC mode? (true/false)",
+  String(e("usdcMode", false))
+);
+const usdcMode = usdcModeAns === "true" || usdcModeAns === true;
+
+let deployAmountUsd, maxDeployUsd, minUsdcToOpen, gasReserveSol;
+if (usdcMode) {
+  deployAmountUsd = await askNum(
+    "USD to deploy per position",
+    e("deployAmountUsd", 50),
+    { min: 1 }
+  );
+  maxDeployUsd = await askNum(
+    "Max USD per single position (safety cap)",
+    e("maxDeployUsd", Math.max(500, deployAmountUsd)),
+    { min: deployAmountUsd }
+  );
+  minUsdcToOpen = await askNum(
+    "Min USDC balance to open a new position",
+    e("minUsdcToOpen", deployAmountUsd),
+    { min: 0 }
+  );
+  gasReserveSol = await askNum(
+    "Native SOL gas reserve to keep (warn-only, no auto top-up)",
+    e("gasReserveSol", 0.05),
+    { min: 0.01 }
+  );
+}
 
 // ─── Risk ─────────────────────────────────────────────────────────────────────
 console.log("\n── Risk & Filters ────────────────────────────");
@@ -240,9 +294,35 @@ const screeningIntervalMin = await askNum(
 // ─── LLM ──────────────────────────────────────────────────────────────────────
 console.log("\n── LLM ───────────────────────────────────────");
 
-const llmModel = await ask(
-  "LLM model (DeepSeek model ID)",
-  e("llmModel", process.env.LLM_MODEL || "deepseek-chat")
+const defaultLlmProvider = e("llmProvider", process.env.LLM_PROVIDER || "codex");
+const llmProviderChoice = await askChoice("LLM provider:", [
+  { label: `Claude OAuth${defaultLlmProvider === "claude" ? " (default)" : ""}`, key: "claude" },
+  { label: `Codex OAuth${defaultLlmProvider === "codex" ? " (default)" : ""}`, key: "codex" },
+  { label: `OpenRouter${defaultLlmProvider === "openrouter" ? " (default)" : ""}`, key: "openrouter" },
+  { label: `DeepSeek${defaultLlmProvider === "deepseek" ? " (default)" : ""}`, key: "deepseek" },
+  { label: `MiniMax Token Plan${defaultLlmProvider === "minimax" ? " (default)" : ""}`, key: "minimax" },
+]);
+const llmProvider = llmProviderChoice.key || defaultLlmProvider;
+const providerDefaultModel = DEFAULT_MODELS_BY_PROVIDER[llmProvider] || "gpt-4o";
+const globalDefaultLlmModel = e(
+  "llmModel",
+  process.env.LLM_MODEL || providerDefaultModel
+);
+const managementModel = await ask(
+  "Manager model ID",
+  e("managementModel", globalDefaultLlmModel)
+);
+const screeningModel = await ask(
+  "Screener model ID",
+  e("screeningModel", globalDefaultLlmModel)
+);
+const generalModel = await ask(
+  "General/chat model ID",
+  e("generalModel", globalDefaultLlmModel)
+);
+const autoresearchModel = await ask(
+  "Autoresearch model ID",
+  e("autoresearchModel", globalDefaultLlmModel)
 );
 
 const dryRun = await ask(
@@ -261,6 +341,8 @@ const userConfig = {
   maxPositions,
   minSolToOpen,
   maxDeployAmount,
+  usdcMode,
+  ...(usdcMode ? { deployAmountUsd, maxDeployUsd, minUsdcToOpen, gasReserveSol } : {}),
   timeframe,
   maxVolatility,
   maxPriceChangePct,
@@ -271,7 +353,12 @@ const userConfig = {
   outOfRangeWaitMinutes,
   managementIntervalMin,
   screeningIntervalMin,
-  llmModel,
+  llmProvider,
+  llmModel: globalDefaultLlmModel,
+  managementModel,
+  screeningModel,
+  generalModel,
+  autoresearchModel,
   dryRun: dryRun === "true",
 };
 
@@ -288,7 +375,9 @@ Preset:       ${presetName}
 Timeframe:    ${timeframe}
 
   Deploy:     ${deployAmountSol} SOL/position  |  Max: ${maxPositions} positions
-  Min balance: ${minSolToOpen} SOL to open
+  Min balance: ${minSolToOpen} SOL to open${usdcMode ? `
+  USDC mode:  ON — $${deployAmountUsd}/position  |  max $${maxDeployUsd}  |  gas reserve ${gasReserveSol} SOL` : `
+  USDC mode:  OFF`}
   Take profit: fees >= ${takeProfitFeePct}%
   Volatility:  max ${maxVolatility}
   Organic:     min ${minOrganic}
@@ -297,7 +386,11 @@ Timeframe:    ${timeframe}
   OOR close:   after ${outOfRangeWaitMinutes} min
   Mgmt:        every ${managementIntervalMin} min
   Screening:   every ${screeningIntervalMin} min
-  Model:       ${llmModel}
+  Provider:    ${llmProvider}
+  Manager:     ${managementModel}
+  Screener:    ${screeningModel}
+  General:     ${generalModel}
+  Research:    ${autoresearchModel}
   Dry run:     ${dryRun}
 
 Run "npm start" to launch the agent.

@@ -1,0 +1,23 @@
+{
+  "name": "meridian-explainer-video",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "studio": "remotion studio",
+    "render": "remotion render MeridianExplainer out/meridian-explainer.mp4 --codec h264 --crf 18",
+    "generate-audio": "npx ts-node src/audio/generate-narration.ts"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.0",
+    "@remotion/google-fonts": "4.0.0",
+    "edge-tts": "^1.0.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "remotion": "4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.3.0"
+  }
+}
