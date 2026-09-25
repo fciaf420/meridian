@@ -14,6 +14,7 @@
 
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { candidateTokenAge } from "./token-age.js";
 
 export const WSOL_MINT = "So11111111111111111111111111111111111111112";
 export const LOOKUP_TIMEOUT_MS = 15_000;
@@ -255,7 +256,9 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
     ...c,
     holders: c.holders ?? price?.holders ?? null,
     mcap: c.mcap ?? price?.market_cap ?? null,
-    token_age_hours: price?.token_age_hours ?? null,
+    // Token creation time: Meteora token_x.created_at first, GMGN as the fallback.
+    token_age_hours: candidateTokenAge(c)?.hours ?? price?.token_age_hours ?? null,
+    token_age_source: candidateTokenAge(c)?.source ?? (price?.token_age_hours != null ? "gmgn" : null),
     change_1h: price?.change_1h ?? null,
     change_24h: price?.change_24h ?? null,
     gmgn_smart_wallets: signal?.smart_money_count_30m ?? null,
@@ -299,7 +302,7 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
   out.checks = out.pools[0]?.checks ?? screeningFilterChecks({
     holders: price?.holders ?? null,
     mcap: price?.market_cap ?? null,
-    token_age_hours: price?.token_age_hours ?? null,
+    token_age_hours: out.pools[0]?.token_age_hours ?? price?.token_age_hours ?? null,
   }, screening);
   if (out.error) log("telegram_warn", `Token lookup ${mint.slice(0, 8)}: ${out.error}`);
   return out;

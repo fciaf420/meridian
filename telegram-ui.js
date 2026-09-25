@@ -23,6 +23,7 @@ import {
   parseCustomDeploySize, stopLossOff,
 } from "./trading-settings.js";
 import { renderBinStrip, renderBinChart, withTimeout } from "./tools/bin-visual.js";
+import { evaluateTokenAgeWindow, tokenAgeWindow, fmtAgeHours, fmtWindow } from "./tools/token-age.js";
 import { resolveSolPrice, valueDlmmPositions } from "./portfolio-value.js";
 
 export const MENU_BUTTON_TEXT = "🏠 Menu";
@@ -741,6 +742,8 @@ function candidateBlock(c, i, fallbackSource) {
     `bin ${c.bin_step ?? "?"}`,
   ];
   if (c.holders != null) metrics.push(`holders ${c.holders}`);
+  if (c.token_age_hours != null) metrics.push(`age ${fmtAgeHours(c.token_age_hours)}`);
+  else if (c.token_age_unknown) metrics.push("age ?");
   const fm = feeModeOf(c);
   if (fm) metrics.push(fm.solFees ? "fees SOL" : fm.mode === "InputOnly" ? "fees token" : "fees ?");
   return `<b>${i + 1}. ${escapeHtml(c.name ?? shortAddr(c.pool))}</b> [${escapeHtml(candidateSourceTag(c, fallbackSource))}]\n${escapeHtml(metrics.join(" · "))}`;
@@ -788,7 +791,7 @@ const checkMark = (ch) => (ch.pass === false ? "❌" : ch.off ? "➖" : ch.pass 
 export function failedFilterLines(c) {
   return [...(c?.checks?.token || []), ...(c?.checks?.pool || []), ...(c?.checks?.safety || [])]
     .filter((ch) => ch.pass === false)
-    .map((ch) => `❌ ${ch.text}${ch.key === "bin_step" ? " (deploy_position blocks bin steps outside this range)" : ""}`);
+    .map((ch) => `❌ ${ch.text}${ch.key === "bin_step" ? " (deploy_position blocks bin steps outside this range)" : ch.key === "age" ? " (deploy_position refuses tokens outside the age window)" : ""}`);
 }
 
 function fmtPct(v) {
@@ -832,7 +835,7 @@ export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora"
   const tokenFacts = [
     `mcap ${fmtUsdCompact(top?.mcap ?? price?.market_cap)}`,
     `holders ${top?.holders ?? price?.holders ?? "?"}`,
-    `age ${price?.token_age_hours != null ? fmtAge(price.token_age_hours * 60) : "?"}`,
+    `age ${(top?.token_age_hours ?? price?.token_age_hours) != null ? fmtAge((top?.token_age_hours ?? price?.token_age_hours) * 60) : "?"}`,
     `1h ${fmtPct(price?.change_1h)}`,
     `24h ${fmtPct(price?.change_24h)}`,
   ];
@@ -1106,7 +1109,17 @@ export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = 
   };
 }
 
-export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora", warnings = [], ttlMs = CONFIRM_TTL_MS, entryState = null, entryFilters = null } = {}) {
+/** Confirm-card line for the token-age check ({ hours, source, check }), or null. */
+export function tokenAgeLine(tokenAge) {
+  if (!tokenAge) return null;
+  const { hours, source, check } = tokenAge;
+  const src = source ? ` · ${source}` : "";
+  if (!check?.configured) return hours != null ? `🕒 Token age: ${fmtAgeHours(hours)}${src}` : null;
+  if (check.unknown) return `❔ Token age: unknown (window ${fmtWindow(check.window)}) — deploy_position allows it and logs a warning`;
+  return `${check.pass ? "✅" : "⛔"} Token age: ${fmtAgeHours(hours)} (window ${fmtWindow(check.window)}${src})`;
+}
+
+export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora", warnings = [], ttlMs = CONFIRM_TTL_MS, entryState = null, entryFilters = null, tokenAge = null } = {}) {
   const strategy = plan.evil ? escapeHtml(plan.strategyLabel) : `<b>${STRATEGY_LABELS[plan.args.strategy] ?? escapeHtml(plan.args.strategy)}</b>`;
   const lines = [
     `🚀 <b>Deploy into this pool?</b>${dryRun ? " (DRY RUN)" : ""}`,
@@ -1119,6 +1132,8 @@ export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "
     `bin step ${c.bin_step ?? "?"} · volatility ${c.volatility ?? "?"} · fee/aTVL ${c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? "?"}%`,
   ];
   if (plan.range.tooFewBins) lines.push(`⚠️ Under ${MIN_BINS} bins: deploy_position will reject this.`);
+  const ageLine = tokenAgeLine(tokenAge);
+  if (ageLine) lines.push(escapeHtml(ageLine));
   lines.push(...entryStateLines({ ...c, entry_state: entryState ?? c.entry_state }, entryFilters).map((l) => escapeHtml(l)));
   if (warnings.length) lines.push("", "⚠️ <b>Outside your screening filters:</b>", ...warnings.map((w) => escapeHtml(w)));
   lines.push("", `Runs the normal deploy_position safety checks. Expires in ${Math.round(ttlMs / 1000)}s.`);
@@ -1231,6 +1246,7 @@ export function renderExecResult(action, label, result) {
  *   applyTradingSettings(changes)         — → { ok, text, changes, rescheduled } | { ok: false, error } (trading-settings.js)
  *   allSettings                           — all-settings.js createAllSettings() service (registry, validate, risk, apply)
  *   entryPreview(candidate, { strategy }) — read-only pool status / fee mode / TWAP for the confirm card
+ *   tokenAge(candidate) — { hours, source } (hours null = unknown) for the token-age window
  *   getOhlcvDepth(candidate)              — candle-based range depth (tools/ohlcv.js) for Auto + the card; optional
  *   log(category, msg), now(), ttlMs
  */
@@ -1333,6 +1349,29 @@ export function createTelegramUI(deps) {
       wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, sizing, usdcMode, strategy, priceRangePct,
     });
     if (plan.error) return { view: { text: `⚠️ ${escapeHtml(plan.error)}`, keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] } };
+    // Token-age window: the same check deploy_position enforces as a hard block,
+    // so a token outside it gets no Confirm button. Unknown age is shown and allowed.
+    let tokenAge = null;
+    if (deps.tokenAge) {
+      const info = await Promise.race([
+        Promise.resolve().then(() => deps.tokenAge(candidate)),
+        new Promise((resolve) => setTimeout(() => resolve(null), ENTRY_PREVIEW_TIMEOUT_MS).unref?.()),
+      ]).catch(() => null);
+      const window = tokenAgeWindow(deps.config.screening);
+      const hours = info?.hours ?? null;
+      tokenAge = { hours, source: info?.source ?? null, check: { ...evaluateTokenAgeWindow(hours, window), window } };
+      if (tokenAge.check.pass === false) {
+        logf("telegram", `Manual deploy blocked for ${candidate.name || candidate.pool}: ${tokenAge.check.reason}`);
+        return { view: {
+          text: [
+            `⛔ <b>Token age outside your window</b>`,
+            `<b>${escapeHtml(candidate.name ?? shortAddr(candidate.pool))}</b>: ${escapeHtml(tokenAge.check.reason)} (window ${escapeHtml(fmtWindow(window))}${tokenAge.source ? `, source ${escapeHtml(tokenAge.source)}` : ""}).`,
+            "deploy_position refuses tokens outside minTokenAgeHours/maxTokenAgeHours, so no deploy is offered.",
+          ].join("\n"),
+          keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]],
+        } };
+      }
+    }
     // Read-only entry preview (pool status, fee mode, TWAP) for the card; best
     // effort — deploy_position re-runs every check as a hard gate.
     let entryState = null;
@@ -1343,7 +1382,7 @@ export function createTelegramUI(deps) {
       ]).catch((e) => ({ error: e.message }));
     }
     const nonce = nonces.put("deploy", { args: plan.args, label: candidate.name || shortAddr(candidate.pool) });
-    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source(), warnings, ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, entryState, entryFilters: deps.config.entryFilters || null }) };
+    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source(), warnings, ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, entryState, entryFilters: deps.config.entryFilters || null, tokenAge }) };
   }
 
   /**
