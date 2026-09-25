@@ -887,6 +887,18 @@ export async function deployPosition({
         const onchain = await readPositionAmounts(pool, newPosition.publicKey);
 
         if (onchain && onchain.empty) {
+          // Reclaim the position account's rent (~0.06-0.1 SOL for wide ranges);
+          // otherwise every failed deploy leaks it. closePositionIfEmpty is
+          // enforced on-chain, so it can't close a position holding liquidity.
+          try {
+            const emptyPosition = await pool.getPosition(newPosition.publicKey);
+            const closeTx = await pool.closePositionIfEmpty({ owner: wallet.publicKey, position: emptyPosition });
+            const closeHash = await sendManagedTransaction(closeTx, [wallet], "close empty position after failed deploy");
+            txHashes.push(closeHash);
+            log("deploy", `Closed empty position ${posAddr.slice(0, 8)} to reclaim rent: ${closeHash}`);
+          } catch (closeErr) {
+            log("deploy_warn", `Could not close empty position ${posAddr.slice(0, 8)} (rent stays locked until closed): ${closeErr.message}`);
+          }
           recordClose(posAddr, "deploy failed (liquidity add error, verified empty on-chain)");
           return {
             success: false,
