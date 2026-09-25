@@ -14,6 +14,8 @@ import {
   trackPosition,
   markOutOfRange,
   markInRange,
+  recordActiveBin,
+  depthUseAtClose,
   recordClaim,
   recordClose,
   updateTrackedPosition,
@@ -27,7 +29,7 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw } from "./close-swap.js";
-import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS } from "../runtime-helpers.js";
+import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS, fitDeployAmount } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
 import { getDepthForDeploy } from "./ohlcv.js";
 import {
@@ -745,6 +747,7 @@ export async function deployPosition({
     log("deploy", `Auto-calculated bins_below=${bins_below} from price_range_pct=${price_range_pct}% at bin_step=${resolvedBinStep}`);
   }
 
+  let ohlcvDepthPct = null; // candle depth seen below (recorded on the position for buffer evolution)
   // ─── Hard guard: validate actual range % — always check, even when price_range_pct is set ───
   // Models sometimes pass bins_below AND price_range_pct but the bins don't match the %.
   // Always verify the actual range and correct if too narrow.
@@ -768,6 +771,7 @@ export async function deployPosition({
     if (config.strategy?.rangeDepthMode === "ohlcv") {
       const currentPct = (1 - Math.pow(1 + stepPct, -bins_below)) * 100;
       const od = await getDepthForDeploy({ pool: pool_address, mint: base_mint || null }).catch(() => null);
+      ohlcvDepthPct = od?.depthPct > 0 ? od.depthPct : null;
       if (od?.depthPct > 0) {
         const maxPctCap = Number(config.strategy?.maxRangePct) || 80;
         const targetPct = Math.max(MIN_RANGE_PCT, Math.min(od.depthPct, maxPctCap, 99));
@@ -800,6 +804,13 @@ export async function deployPosition({
       bins_below = cappedBins;
     }
   }
+
+  // Range-depth context stored on the tracked position (ohlcvBufferMult evolution).
+  const depthTrackFields = () => ({
+    range_depth_mode: config.strategy?.rangeDepthMode ?? null,
+    ohlcv_buffer_mult: config.strategy?.rangeDepthMode === "ohlcv" ? (config.strategy?.ohlcvBufferMult ?? null) : null,
+    ohlcv_depth_pct: ohlcvDepthPct,
+  });
 
   // ─── Detect auto-swap need ────────────────────────────────────
   // When the model wants two-sided spot but only has SOL:
@@ -891,6 +902,28 @@ export async function deployPosition({
   if (tokenYMint !== WSOL_MINT) {
     log("deploy", `Refusing deploy into ${pool_address}: token Y is ${tokenYMint}, not SOL`);
     return { success: false, error: `Pool ${pool_address} is not SOL-quoted (token Y ${tokenYMint}); only SOL pools are supported.` };
+  }
+
+  // ─── Rent guard: deposit + position rent + fees must leave the gas reserve ───
+  // A wide position's account rent grows with its bins (~0.095 SOL at 162 bins)
+  // and comes out of free SOL on top of the deposit. With the exact bin count
+  // known, shrink a SOL-only deposit that would dip into gasReserve.
+  if (totalSolAmount > 0 && !((amount_x ?? 0) > 0) && !needsAutoSwap) {
+    try {
+      const freeSol = (await getConnection().getBalance(wallet.publicKey, "confirmed")) / 1e9;
+      const reserve = Number(config.management.gasReserve ?? 0.2);
+      const fit = fitDeployAmount({ freeSol, reserve, amount: totalSolAmount, totalBins });
+      if (fit.shrunk) {
+        if (fit.amount < 0.1) {
+          return { success: false, error: `Deploy skipped — ${freeSol.toFixed(4)} SOL free can't cover ${totalSolAmount} SOL + ~${fit.overhead.toFixed(4)} SOL position rent/fees and keep the ${reserve} SOL gas reserve.` };
+        }
+        log("deploy", `Rent guard: ${totalSolAmount} SOL + ~${fit.overhead.toFixed(4)} rent/fees (${totalBins} bins) would dip into the ${reserve} SOL gas reserve (free ${freeSol.toFixed(4)}); deploying ${fit.amount} SOL instead`);
+        totalSolAmount = fit.amount;
+        amount_y = fit.amount;
+      }
+    } catch (e) {
+      log("deploy_warn", `Rent guard skipped (balance read failed: ${e.message}); sizing already reserved worst-case rent`);
+    }
   }
   // ─── Entry-safety hard checks (config.entryFilters) ───────────
   // Before any swap or tx is built, on every deploy path (screener, agent,
@@ -1134,6 +1167,7 @@ export async function deployPosition({
         active_bin: activeBin.binId,
         initial_value_usd: 0,
         study_avg_hold_hours,
+        ...depthTrackFields(),
         ...getExperimentTag(),
       });
       log("deploy", `Pre-tracked position ${posAddr.slice(0, 8)} (wide-range: liquidity pending)`);
@@ -1309,6 +1343,7 @@ export async function deployPosition({
       initial_value_usd,
       study_avg_hold_hours,
       signal_snapshot,
+      ...depthTrackFields(),
       ...getExperimentTag(), // autoresearch A/B arm, when deployed inside one
     });
 
@@ -1796,6 +1831,7 @@ export async function getMyPositions({ force = false } = {}) {
       }
       if (inRange) markInRange(r.position);
       else markOutOfRange(r.position, oorDirection);
+      if (activeBin != null) recordActiveBin(r.position, activeBin);
 
       const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
       const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
@@ -2390,6 +2426,7 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: closeReason,
+        ...depthUseAtClose(tracked, closeReason),
         deployed_at: tracked.deployed_at,
         signal_snapshot: tracked.signal_snapshot || null,
         ...(tracked.experiment_id && { experiment_id: tracked.experiment_id, experiment_arm: tracked.experiment_arm }),

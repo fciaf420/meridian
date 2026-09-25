@@ -74,10 +74,10 @@ test("example: pct 0.45, reserve 0.1, total 2.6 → 1.13; capped by free SOL", (
   assert.equal(s.skip, false);
   assert.equal(s.label, "1.13 SOL = 45% of (2.60 SOL total − 0.1 reserve)");
 
-  // Same total, but only 1.0 SOL free: capped at free − reserve = 0.9.
+  // Same total, but only 1.0 SOL free: capped at free − reserve − ~0.12 rent/fees = 0.77.
   const capped = computeDeploySizing(1.0, portfolio(1.0, [pos(1.6)]));
-  assert.equal(capped.amount, 0.9);
-  assert.match(capped.label, /^0\.90 SOL = free SOL 1\.00 − 0\.1 reserve \(cap; 45% of \(2\.60 SOL total − 0\.1 reserve\) = 1\.13\)$/);
+  assert.equal(capped.amount, 0.77);
+  assert.match(capped.label, /^0\.77 SOL = free SOL 1\.00 − 0\.1 reserve − ~0\.12 rent\/fees \(cap; 45% of \(2\.60 SOL total − 0\.1 reserve\) = 1\.13\)$/);
 });
 
 test("total vs wallet basis", () => {
@@ -108,11 +108,12 @@ test("free-SOL cap: never more than free SOL − gasReserve, even after rounding
   setSizing({ pct: 0.45, reserve: 0.1, floor: 0.1, ceil: 5 });
   // Big portfolio, little free SOL.
   const s = computeDeploySizing(0.6, portfolio(0.6, [pos(10)]));
-  assert.equal(s.amount, 0.5);
-  // 0.45 × (2.6 − 0.1) = 1.125 rounds up to 1.13, but only 1.125 is free: round DOWN to the cap.
-  const edge = computeDeploySizing(1.225, portfolio(1.225, [pos(1.375)]));
+  assert.equal(s.amount, 0.37); // 0.6 − 0.1 reserve − ~0.1215 rent/fees, rounded down
+  // 0.45 × (2.6 − 0.1) = 1.125 rounds up to 1.13, but only 1.125 fits after reserve + ~0.1215
+  // rent/fees: round DOWN to the cap.
+  const edge = computeDeploySizing(1.3465, portfolio(1.3465, [pos(1.2535)]));
   assert.equal(edge.amount, 1.12);
-  assert.ok(edge.amount <= 1.225 - 0.1);
+  assert.ok(edge.amount <= 1.3465 - 0.1 - 0.1215);
   // Nothing free at all → skip, not a negative or forced amount.
   const none = computeDeploySizing(0.05, portfolio(0.05, [pos(5)]));
   assert.equal(none.amount, 0);
@@ -129,7 +130,7 @@ test("below-floor skip: amount 0 with a clear reason; the floor is never forced"
   // Big enough total, but the free-SOL cap lands under the floor → skip too.
   const capped = computeDeploySizing(0.8, portfolio(0.8, [pos(10)]));
   assert.equal(capped.skip, true);
-  assert.match(capped.reason, /^size 0\.70 below floor 1 \(free SOL 0\.80 − 0\.1 reserve \(cap;/);
+  assert.match(capped.reason, /^size 0\.57 below floor 1 \(free SOL 0\.80 − 0\.1 reserve − ~0\.12 rent\/fees \(cap;/);
   // A floor above the ceiling is treated as the ceiling (it can't block every deploy).
   setSizing({ pct: 0.5, reserve: 0.1, floor: 3, ceil: 1 });
   assert.equal(computeDeploySizing(5, portfolio(5, [])).amount, 1);
@@ -161,8 +162,9 @@ test("an open position lowers the next deploy size proportionally to its value",
   setSizing({ pct: 0.5, reserve: 0.1, floor: 0.1, ceil: 10 });
   // 3 SOL free, nothing open: 0.5 × 2.9 = 1.45.
   assert.equal(computeDeploySizing(3, portfolio(3, [])).amount, 1.45);
-  // After deploying 1.45 the total is unchanged (1.55 free + 1.45 position): same size, still affordable.
-  assert.equal(computeDeploySizing(1.55, portfolio(1.55, [pos(1.45)])).amount, 1.45);
+  // After deploying 1.45 the total is unchanged (1.55 free + 1.45 position), but free SOL must also
+  // cover the next position's rent/fees: capped at 1.55 − 0.1 − ~0.1215 = 1.32.
+  assert.equal(computeDeploySizing(1.55, portfolio(1.55, [pos(1.45)])).amount, 1.32);
   // The position loses half its value: total 2.275 → 0.5 × 2.175 = 1.0875 → 1.09.
   const down = computeDeploySizing(1.55, portfolio(1.55, [pos(0.725)]));
   assert.equal(down.amount, 1.09);
@@ -178,10 +180,12 @@ test("an open position lowers the next deploy size proportionally to its value",
 test("user's current settings (pct 0.55, reserve 0.1, floor = max = 1.1): fixed 1.1 once total ≥ 2.1", () => {
   setSizing({ pct: 0.55, reserve: 0.1, floor: 1.1, ceil: 1.1 });
   config.management.minSolToOpen = 1.2;
-  // Total ≥ 2.1 with ≥ 1.2 free → exactly 1.1, like today.
-  for (const [free, positions] of [[2.1, []], [3, []], [1.5, [pos(1.1)]], [1.2, [pos(1.1)]], [1.2, [pos(2), pos(1.5)]]]) {
+  // Total ≥ 2.1 with ≥ 1.1 + 0.1 reserve + ~0.12 rent/fees free → exactly 1.1.
+  for (const [free, positions] of [[2.1, []], [3, []], [1.5, [pos(1.1)]], [1.33, [pos(1.1)]], [1.33, [pos(2), pos(1.5)]]]) {
     assert.equal(computeDeploySizing(free, portfolio(free, positions)).amount, 1.1, `free ${free}, ${positions.length} positions`);
   }
+  // 1.2 free no longer fits 1.1 + reserve + position rent → skip instead of eating the gas reserve.
+  assert.equal(computeDeploySizing(1.2, portfolio(1.2, [pos(1.1)])).skip, true);
   // Total under 2.1: 0.55 × (total − 0.1) < 1.1 → skip (today this forced 1.1).
   const s = computeDeploySizing(1.2, portfolio(1.2, []));
   assert.equal(s.skip, true);
@@ -232,4 +236,23 @@ test("All settings lists positionSizeBase as a total/wallet enum under Capital &
   assert.deepEqual(svc.risk(e, "wallet"), []);
   config.management.positionSizeBase = "total";
   assert.deepEqual(svc.risk(e, "wallet"), [], "total → wallet shrinks deploys: one tap");
+});
+
+test("rent guard: deposit + position rent + fees never dip into the gas reserve", async () => {
+  const { estimatePositionRentSol, fitDeployAmount, worstCaseDeployOverheadSol } = await import("../runtime-helpers.js");
+  assert.ok(Math.abs(estimatePositionRentSol(70) - 0.0574) < 1e-9);
+  assert.ok(Math.abs(estimatePositionRentSol(162) - 0.0948) < 0.001, "matches the live 162-bin OP-SOL account");
+  assert.ok(worstCaseDeployOverheadSol({ minBinStep: 80, maxRangePct: 80 }) > 0.11);
+  // The live OP-SOL case: 1.643 free, 1.51 requested, 162 bins → shrunk to keep the 0.1 reserve.
+  const op = fitDeployAmount({ freeSol: 1.643, reserve: 0.1, amount: 1.51, totalBins: 162 });
+  assert.equal(op.shrunk, true);
+  assert.equal(op.amount, 1.43);
+  assert.ok(1.643 - op.amount - op.overhead >= 0.1);
+  // Plenty of SOL → untouched.
+  assert.deepEqual(
+    (({ amount, shrunk }) => ({ amount, shrunk }))(fitDeployAmount({ freeSol: 5, reserve: 0.1, amount: 1.5, totalBins: 162 })),
+    { amount: 1.5, shrunk: false },
+  );
+  // Nothing fits → 0 (deploy_position rejects).
+  assert.equal(fitDeployAmount({ freeSol: 0.15, reserve: 0.1, amount: 1, totalBins: 70 }).amount, 0);
 });

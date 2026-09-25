@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { getEffectiveMinSolToOpen, normalizeScreeningSource } from "./runtime-helpers.js";
+import { getEffectiveMinSolToOpen, normalizeScreeningSource, worstCaseDeployOverheadSol } from "./runtime-helpers.js";
 import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 import { computePortfolioSol } from "./portfolio-value.js";
 
@@ -351,13 +351,16 @@ export function computeDeploySizing(walletSol, portfolio = null) {
 
   const raw  = pct * Math.max(0, baseSol - reserve);
   const size = Math.min(ceil, raw);
-  const cap  = Math.max(0, freeSol - reserve);
+  // Position rent + tx fees also come out of free SOL (worst case: the deepest
+  // allowed range at the smallest bin step); deploy_position re-fits exactly.
+  const overhead = worstCaseDeployOverheadSol({ minBinStep: config.screening.minBinStep, maxRangePct: config.strategy.maxRangePct });
+  const cap  = Math.max(0, freeSol - reserve - overhead);
   const capAmt = floor2(cap);
   const amount = Math.min(round2(size), capAmt);
 
   const of = `${fmtPct(pct)} of (${fmtSol(baseSol)} SOL ${basis === "total" ? "total" : "free wallet"} − ${reserve} reserve)`;
   let why;
-  if (round2(size) > capAmt) why = `free SOL ${fmtSol(freeSol)} − ${reserve} reserve (cap; ${of} = ${fmtSol(size)})`;
+  if (round2(size) > capAmt) why = `free SOL ${fmtSol(freeSol)} − ${reserve} reserve − ~${fmtSol(overhead)} rent/fees (cap; ${of} = ${fmtSol(size)})`;
   else if (raw > ceil) why = `max ${ceil} (${of} = ${fmtSol(raw)})`;
   else why = of;
   const note = fallbackReason ? ` [wallet basis: ${fallbackReason}]` : "";
@@ -580,6 +583,7 @@ export function reloadScreeningThresholds() {
     if (fresh.stopLossPct           != null) m.stopLossPct           = fresh.stopLossPct;
     if (fresh.takeProfitFeePct      != null) m.takeProfitFeePct      = fresh.takeProfitFeePct;
     if (fresh.outOfRangeWaitMinutes != null) m.outOfRangeWaitMinutes = fresh.outOfRangeWaitMinutes;
+    if (fresh.ohlcvBufferMult       != null) config.strategy.ohlcvBufferMult = fresh.ohlcvBufferMult; // evolved by lessons.js
   } catch { /* ignore */ }
   // Refresh GMGN screening keys from gmgn-config.json (mirrors the gmgn block above)
   try {

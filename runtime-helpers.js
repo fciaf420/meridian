@@ -39,6 +39,7 @@ export const CONFIG_KEY_MAP = {
   screeningModel: ["llm", "screeningModel"],
   generalModel: ["llm", "generalModel"],
   binsBelow: ["strategy", "binsBelow"],
+  ohlcvBufferMult: ["strategy", "ohlcvBufferMult"], // candle range-depth buffer; bounded 1.0–1.8 in executor
   // usdc mode
   usdcMode: ["usdc", "enabled"],
   deployAmountUsd: ["usdc", "deployAmountUsd"],
@@ -183,4 +184,38 @@ export function screeningCronGate({ paused = false, busy = false, screeningBusy 
   if (screeningBusy) return { run: false, reason: "a screening cycle is already running", touchTimer: false };
   if (managementBusy) return { run: false, reason: "a management cycle is in progress", touchTimer: true };
   return { run: true, reason: null, touchTimer: false };
+}
+
+// ─── Deploy overhead (position rent + tx fees) ───────────────────
+// A DLMM position account's rent grows with its bin count. Measured live:
+// ~0.0574 SOL for a standard 70-bin position, ~0.0948 SOL for 162 bins, i.e.
+// ~0.00041 SOL per extra bin. Rent comes back when the position closes, but
+// it must come out of free SOL at deploy, never out of the gas reserve.
+export const POSITION_RENT_BASE_SOL = 0.0574;
+export const POSITION_RENT_PER_EXTRA_BIN_SOL = 0.00041;
+export const DEPLOY_TX_FEES_SOL = 0.01; // priority fees + Sender tips across create/add txs
+
+export function estimatePositionRentSol(totalBins) {
+  const bins = Math.max(0, Number(totalBins) || 0);
+  return POSITION_RENT_BASE_SOL + POSITION_RENT_PER_EXTRA_BIN_SOL * Math.max(0, bins - 70);
+}
+
+/** Rent + fees for the deepest range a deploy can use (maxRangePct at the smallest allowed bin step). */
+export function worstCaseDeployOverheadSol({ minBinStep = 80, maxRangePct = 80 } = {}) {
+  const step = Number(minBinStep) > 0 ? Number(minBinStep) : 80;
+  const pct = Number(maxRangePct) > 0 && Number(maxRangePct) < 100 ? Number(maxRangePct) : 80;
+  return estimatePositionRentSol(calculateBinsForPriceRange(step, pct)) + DEPLOY_TX_FEES_SOL;
+}
+
+/**
+ * Fit a SOL deposit so deposit + rent(totalBins) + fees leaves the gas reserve
+ * intact. Returns { amount, shrunk, overhead, available }. amount can be <= 0
+ * when nothing fits (caller rejects).
+ */
+export function fitDeployAmount({ freeSol, reserve, amount, totalBins }) {
+  const overhead = estimatePositionRentSol(totalBins) + DEPLOY_TX_FEES_SOL;
+  const available = Number(freeSol) - Number(reserve) - overhead;
+  const fitted = Math.floor(Math.max(0, available) * 100) / 100;
+  if (Number(amount) <= fitted + 1e-9) return { amount: Number(amount), shrunk: false, overhead, available };
+  return { amount: fitted, shrunk: true, overhead, available };
 }
