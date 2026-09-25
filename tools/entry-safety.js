@@ -690,3 +690,101 @@ export async function runDeployEntryChecks({
 
   return { pass: true, reason: null, notes, token, status, feeMode, twap };
 }
+
+/* ============================== changes ============================== */
+
+export const ENTRY_FILTER_KEYS = Object.keys(ENTRY_FILTER_DEFAULTS);
+const BOOL_KEYS = new Set([...TOKEN_GUARD_BOOL_KEYS, "solFeePoolsOnly"]);
+const NULLABLE_PCT_KEYS = { blockTransferFeeAbovePct: [0, 100], twapSpikeMaxPct: [0, 1000] };
+
+/** Normalize a requested value ("off"/"null" → null, "true"/"false" → bool, numeric strings → number). */
+export function normalizeEntryFilterValue(key, value) {
+  let v = value;
+  if (typeof v === "string") {
+    const t = v.trim().toLowerCase();
+    if (t === "off" || t === "null" || t === "none") v = null;
+    else if (t === "true" || t === "on") v = true;
+    else if (t === "false") v = false;
+    else if (/^-?\d+(\.\d+)?$/.test(t)) v = Number(t);
+  }
+  if (BOOL_KEYS.has(key)) {
+    if (typeof v !== "boolean") return { error: `${key} must be true or false` };
+    return { value: v };
+  }
+  if (key in NULLABLE_PCT_KEYS) {
+    if (v === null) return { value: null };
+    const [lo, hi] = NULLABLE_PCT_KEYS[key];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < lo || v > hi) return { error: `${key} must be null (off) or a number in [${lo}, ${hi}]` };
+    return { value: v };
+  }
+  if (key === "twapWindowMinutes") {
+    if (!Number.isInteger(v) || v < 5 || v > 1440) return { error: "twapWindowMinutes must be an integer in [5, 1440]" };
+    return { value: v };
+  }
+  return { error: `${key} is not an entry filter` };
+}
+
+/**
+ * Does changing `key` from `before` to `after` loosen an entry guard?
+ * Booleans: true → false loosens. Nullable % limits: raising the limit or
+ * turning it off (null) loosens. twapWindowMinutes has no clear direction, so
+ * any change counts as user-only.
+ */
+export function isLooseningChange(key, before, after) {
+  if (BOOL_KEYS.has(key)) return before === true && after === false;
+  if (key in NULLABLE_PCT_KEYS) {
+    if (after === before) return false;
+    if (after === null) return true;
+    if (before === null || before === undefined) return false;
+    return Number(after) > Number(before);
+  }
+  if (key === "twapWindowMinutes") return after !== before;
+  return false;
+}
+
+/**
+ * The LLM's update_config may TIGHTEN entry filters but never loosen them.
+ * Returns { ok: true, value } or { ok: false, reason }.
+ */
+export function checkAgentEntryFilterChange(key, value, current = currentEntryFilters()) {
+  const n = normalizeEntryFilterValue(key, value);
+  if (n.error) return { ok: false, reason: `update_config rejected: ${n.error}.` };
+  const before = current[key];
+  if (isLooseningChange(key, before, n.value)) {
+    return {
+      ok: false,
+      reason: `update_config refused: ${key} ${JSON.stringify(before)} → ${JSON.stringify(n.value)} would loosen an entry-safety guard. Only the user can loosen entry filters (Telegram ⚙️ Settings → 🛡 Entry filters, or user-config.json).`,
+    };
+  }
+  return { ok: true, value: n.value };
+}
+
+/**
+ * User-initiated change (Telegram toggle): validate, apply to the running
+ * config immediately and persist through persistUserConfig (the update_config
+ * write path). Loosening is allowed here — this is the user. Logs every change.
+ * Returns { ok, key, before, after, text } or { ok: false, error }.
+ */
+export async function applyEntryFilterChange(key, value, { source = "telegram" } = {}) {
+  const { persistUserConfig } = await import("../config.js");
+  const n = normalizeEntryFilterValue(key, value);
+  if (n.error) return { ok: false, error: n.error };
+  config.entryFilters ||= { ...ENTRY_FILTER_DEFAULTS };
+  const before = config.entryFilters[key];
+  try {
+    persistUserConfig({ [key]: n.value });
+  } catch (e) {
+    log("config_error", `Entry filter ${key} not saved (${source}): ${e.message}`);
+    return { ok: false, error: `could not save user-config.json: ${e.message}` };
+  }
+  config.entryFilters[key] = n.value;
+  const loosened = isLooseningChange(key, before, n.value);
+  log("config", `Entry filter ${key}: ${JSON.stringify(before)} → ${JSON.stringify(n.value)} (${source}${loosened ? ", loosened by user" : ""})`);
+  return { ok: true, key, before, after: n.value, loosened, text: `${key}: ${fmtFilterValue(key, before)} → ${fmtFilterValue(key, n.value)}` };
+}
+
+export function fmtFilterValue(key, v) {
+  if (BOOL_KEYS.has(key)) return key === "solFeePoolsOnly" ? (v ? "on" : "off") : (v ? "block" : "allow");
+  if (v == null) return "off";
+  return key === "twapWindowMinutes" ? `${v} min` : `${v}%`;
+}

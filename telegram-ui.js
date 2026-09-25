@@ -711,9 +711,51 @@ export function renderControls(info) {
       [info.paused ? btn("▶️ Resume screening", "sp:0") : btn("⏸ Pause screening", "sp:1")],
       [btn("🔍 Run screening now", "sn")],
       [btn("🧪 Autoresearch", "ar"), btn("🧯 Recent errors", "er")],
+      [btn("🛡 Entry filters", "ef")],
       [btn("⬅ Menu", "m")],
     ],
   };
+}
+
+// ─── Entry filters (Settings → 🛡 Entry filters) ─────────────────
+// Callback data: ef (view), et:<code> (toggle a boolean), ev:<code>:<value>
+// (preset). Codes keep every callback_data far under 64 bytes.
+export const ENTRY_TOGGLES = [
+  ["fh", "blockTransferHook", "Transfer hook"],
+  ["fd", "blockPermanentDelegate", "Permanent delegate"],
+  ["fz", "blockFreezeAuthority", "Freeze authority"],
+  ["fm", "blockMintAuthority", "Mint authority"],
+  ["fp", "blockPausable", "Pausable"],
+  ["fn", "blockNonTransferable", "Non-transferable"],
+  ["fs", "solFeePoolsOnly", "SOL-fee pools only"],
+];
+export const ENTRY_PRESETS = {
+  tf: { key: "blockTransferFeeAbovePct", label: "Transfer fee >", values: [null, 0.5, 1, 2, 5] },
+  tw: { key: "twapSpikeMaxPct", label: "TWAP spike >", values: [null, 10, 15, 25] },
+};
+
+export function renderEntryFilters(filters = {}, { note = null } = {}) {
+  const f = filters || {};
+  const pct = (v) => (v == null ? "off" : `${v}%`);
+  const lines = [
+    "🛡 <b>Entry filters</b>",
+    "Checked in screening, on the token lookup card and as a hard check in deploy_position (every deploy path).",
+    "✅ = guard on (blocks), ❌ = off. Changes save to user-config.json and apply now. The agent can only tighten these.",
+    "",
+    `Transfer fee limit: <b>${pct(f.blockTransferFeeAbovePct)}</b> · TWAP spike limit: <b>${pct(f.twapSpikeMaxPct)}</b> over ${escapeHtml(f.twapWindowMinutes ?? 60)} min (bid_ask)`,
+    "Pool status (disabled / not yet active / blacklisted) is always checked.",
+  ];
+  if (note) lines.push("", note);
+  const keyboard = [];
+  for (let i = 0; i < ENTRY_TOGGLES.length; i += 2) {
+    keyboard.push(ENTRY_TOGGLES.slice(i, i + 2).map(([code, key, label]) => btn(`${f[key] ? "✅" : "❌"} ${label}`, `et:${code}`)));
+  }
+  for (const [code, p] of Object.entries(ENTRY_PRESETS)) {
+    keyboard.push([{ text: `${p.label}`, callback_data: cb("ef") }]);
+    keyboard.push(p.values.map((v) => btn(`${f[p.key] === v ? "● " : ""}${v == null ? "Off" : `${v}%`}`, `ev:${code}:${v == null ? "off" : v}`)));
+  }
+  keyboard.push([btn("⚙️ Settings", "se:0"), btn("⬅ Menu", "m")]);
+  return { text: lines.join("\n"), keyboard };
 }
 
 export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = {}) {
@@ -844,6 +886,8 @@ export function renderExecResult(action, label, result) {
  *   isScreeningPaused(), setScreeningPaused(bool)
  *   getStatusInfo()                       — timers, models, busy flags
  *   buildSettingsReport(), handleAutoresearchCommand(args), readRecentErrors()
+ *   setEntryFilter(key, value)            — → { ok, text, loosened } | { ok: false, error } (entry-safety.js)
+ *   entryPreview(candidate, { strategy }) — read-only pool status / fee mode / TWAP for the confirm card
  *   log(category, msg), now(), ttlMs
  */
 export function createTelegramUI(deps) {
@@ -1273,6 +1317,7 @@ export function createTelegramUI(deps) {
           await answer();
           const report = deps.buildSettingsReport();
           const view = renderTextPages("⚙️ <b>Settings</b>", report, { page: Number(arg) || 0, prefix: "se" });
+          if (deps.setEntryFilter) view.keyboard.push([btn("🛡 Entry filters", "ef")]);
           view.keyboard.push(backRow(`se:${view.page}`));
           await show(ctx, view, opts);
           return;
@@ -1281,6 +1326,44 @@ export function createTelegramUI(deps) {
           await answer();
           await show(ctx, renderControls(await statusInfo()), opts);
           return;
+        case "ef":
+          await answer();
+          await show(ctx, renderEntryFilters(deps.config.entryFilters), opts);
+          return;
+        case "et":
+        case "ev": {
+          // Owner-only (transport), edited in place, no 2-tap confirm: these
+          // tighten/loosen filters and never move funds. Every change is logged.
+          if (!deps.setEntryFilter) {
+            await answer("Entry filters can't be changed here.", true);
+            return;
+          }
+          let key;
+          let value;
+          if (head === "et") {
+            key = ENTRY_TOGGLES.find(([code]) => code === arg)?.[1];
+            if (key) value = !deps.config.entryFilters?.[key];
+          } else {
+            const p = ENTRY_PRESETS[arg];
+            const v = sub === "off" ? null : Number(sub);
+            if (p && p.values.includes(v)) { key = p.key; value = v; }
+          }
+          if (!key) {
+            await answer("Unknown filter.", true);
+            return;
+          }
+          const r = await deps.setEntryFilter(key, value);
+          if (!r?.ok) {
+            logf("telegram_warn", `Entry filter ${key} change failed: ${r?.error}`);
+            await answer(`Not changed: ${r?.error ?? "error"}`.slice(0, 180), true);
+            await show(ctx, renderEntryFilters(deps.config.entryFilters, { note: `⚠️ Not changed: ${escapeHtml(r?.error ?? "error")}` }), opts);
+            return;
+          }
+          logf("telegram", `Entry filter changed from Telegram: ${r.text}`);
+          await answer(`Saved: ${r.text}`.slice(0, 180));
+          await show(ctx, renderEntryFilters(deps.config.entryFilters, { note: `✅ Saved: ${escapeHtml(r.text)}${r.loosened ? " (loosened)" : ""}` }), opts);
+          return;
+        }
         case "sp": {
           const pause = arg === "1";
           deps.setScreeningPaused(pause);

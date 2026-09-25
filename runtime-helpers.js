@@ -45,6 +45,18 @@ export const CONFIG_KEY_MAP = {
   maxDeployUsd: ["usdc", "maxDeployUsd"],
   minUsdcToOpen: ["usdc", "minUsdcToOpen"],
   gasReserveSol: ["usdc", "gasReserveSol"],
+  // entry-safety filters: the agent may only TIGHTEN these (tools/entry-safety.js
+  // checkAgentEntryFilterChange); the user loosens via Telegram or the file.
+  blockTransferFeeAbovePct: ["entryFilters", "blockTransferFeeAbovePct"],
+  blockTransferHook: ["entryFilters", "blockTransferHook"],
+  blockPermanentDelegate: ["entryFilters", "blockPermanentDelegate"],
+  blockFreezeAuthority: ["entryFilters", "blockFreezeAuthority"],
+  blockMintAuthority: ["entryFilters", "blockMintAuthority"],
+  blockPausable: ["entryFilters", "blockPausable"],
+  blockNonTransferable: ["entryFilters", "blockNonTransferable"],
+  solFeePoolsOnly: ["entryFilters", "solFeePoolsOnly"],
+  twapSpikeMaxPct: ["entryFilters", "twapSpikeMaxPct"],
+  twapWindowMinutes: ["entryFilters", "twapWindowMinutes"],
 };
 
 /**

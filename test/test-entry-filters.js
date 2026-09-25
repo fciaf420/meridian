@@ -519,3 +519,141 @@ test("re-center shadow: logs the new range, txs, bin arrays and TWAP gate for up
   assert.equal(await shadow.buildRecenterShadow({ ...pos, oor_direction: "downside", active_bin: 800 }, deps), null);
   assert.equal(await shadow.buildRecenterShadow({ ...pos, in_range: true }, deps), null);
 });
+
+// ─── 6. Telegram toggles + the LLM can't loosen ──────────────────
+const tg = await import("../telegram.js");
+const OWNER = "111";
+
+function entryUI() {
+  const calls = [];
+  const t = {
+    sendHTML: async (text, extra = {}) => { calls.push({ m: "send", text, extra }); return { message_id: 900, chat: { id: Number(OWNER) } }; },
+    editHTML: async (messageId, text, extra = {}) => { calls.push({ m: "edit", messageId, text, extra }); return true; },
+    answerCallback: async (cid, text, alert) => { calls.push({ m: "answer", text, alert }); return true; },
+  };
+  const logs = [];
+  const u = ui.createTelegramUI({
+    tg: t,
+    config,
+    setEntryFilter: (key, value) => es.applyEntryFilterChange(key, value, { source: "telegram" }),
+    buildSettingsReport: () => "settings",
+    getStatusInfo: () => ({}),
+    log: (cat, msg) => logs.push([cat, msg]),
+  });
+  return { u, calls, logs };
+}
+const readCfg = () => JSON.parse(fs.readFileSync(USER_CFG, "utf8"));
+const kb = (call) => call.extra?.reply_markup?.inline_keyboard || [];
+const datas = (keyboard) => keyboard.flat().map((b) => b.callback_data).filter(Boolean);
+const ctx = { chatId: OWNER, fromId: OWNER, messageId: 42, callbackId: "cq" };
+
+test("telegram: Settings → 🛡 Entry filters shows ✅/❌ toggles and presets; every callback_data ≤ 64 bytes", async () => {
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  const { u, calls } = entryUI();
+  await u.handleCallback("se:0", ctx);
+  assert.ok(datas(kb(calls.at(-1))).includes("ef"), "Settings has the Entry filters button");
+  await u.handleCallback("ef", ctx);
+  const view = calls.at(-1);
+  assert.equal(view.m, "edit", "edited in place");
+  const texts = kb(view).flat().map((b) => b.text);
+  assert.ok(texts.includes("✅ Transfer hook"));
+  assert.ok(texts.includes("❌ Mint authority"));
+  assert.ok(texts.includes("❌ SOL-fee pools only"));
+  assert.ok(texts.includes("● 1%") && texts.includes("● 15%"), "current presets marked");
+  for (const code of ["off", "0.5", "1", "2", "5"]) assert.ok(datas(kb(view)).includes(`ev:tf:${code}`));
+  for (const code of ["off", "10", "15", "25"]) assert.ok(datas(kb(view)).includes(`ev:tw:${code}`));
+  for (const d of datas(kb(view))) assert.ok(Buffer.byteLength(d) <= 64, d);
+  assert.throws(() => ui.cb("x".repeat(65)));
+});
+
+test("telegram: toggles and presets persist to user-config.json (other keys kept), apply immediately, are logged", async () => {
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  const { u, calls, logs } = entryUI();
+  await u.handleCallback("et:fh", ctx); // transfer hook: block → allow (the user may loosen)
+  assert.equal(config.entryFilters.blockTransferHook, false, "running config updated");
+  let saved = readCfg();
+  assert.equal(saved.blockTransferHook, false);
+  assert.equal(saved.someOtherKey, "keep-me");
+  assert.equal(saved.maxPositions, 2);
+  assert.equal(fs.readFileSync(USER_CFG, "utf8"), JSON.stringify(saved, null, 2), "same 2-space JSON format as update_config");
+  const answer = calls.find((c) => c.m === "answer");
+  assert.match(answer.text, /^Saved: blockTransferHook: block → allow$/);
+  assert.match(calls.at(-1).text, /✅ Saved: blockTransferHook: block → allow \(loosened\)/);
+  assert.ok(logs.some(([, m]) => /Entry filter changed from Telegram/.test(m)));
+  assert.ok(fs.readFileSync(path.join(TMP, "logs", fs.readdirSync(path.join(TMP, "logs"))[0]), "utf8").includes("Entry filter blockTransferHook: true → false (telegram, loosened by user)"));
+
+  await u.handleCallback("ev:tf:off", ctx);
+  await u.handleCallback("ev:tw:25", ctx);
+  await u.handleCallback("et:fs", ctx);
+  saved = readCfg();
+  assert.equal(saved.blockTransferFeeAbovePct, null);
+  assert.equal(saved.twapSpikeMaxPct, 25);
+  assert.equal(saved.solFeePoolsOnly, true);
+  assert.equal(config.entryFilters.twapSpikeMaxPct, 25);
+
+  // The next deploy check uses the new value at once: 5% fee is now allowed.
+  const facts = es.mintFactsFromSdkReserve(reserve({ tlv: [transferFeeTlv(500)] }));
+  assert.equal(es.evaluateTokenGuards(facts).pass, true);
+
+  // Unknown code / non-preset value is refused without a change.
+  const before = fs.readFileSync(USER_CFG, "utf8");
+  await u.handleCallback("ev:tf:7", ctx);
+  await u.handleCallback("et:zz", ctx);
+  assert.equal(fs.readFileSync(USER_CFG, "utf8"), before);
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+});
+
+test("telegram: owner-only — a stranger's toggle callback is dropped by the transport, nothing changes", async () => {
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  const apiCalls = [];
+  tg.__setTelegramTestHooks({ token: "TEST", owner: OWNER, allowlist: "", fetch: async (url) => { apiCalls.push(String(url)); return { ok: true, json: async () => ({ ok: true, result: {} }) }; } });
+  const { u } = entryUI();
+  const before = fs.readFileSync(USER_CFG, "utf8");
+  const h = { onCallback: (d, c) => u.handleCallback(d, c) };
+  const stranger = { update_id: 3, callback_query: { id: "cqx", data: "et:fz", from: { id: 999 }, message: { message_id: 9, chat: { id: 999, type: "private" } } } };
+  assert.equal((await tg.processUpdate(stranger, h)).handled, false);
+  assert.equal(config.entryFilters.blockFreezeAuthority, true);
+  assert.equal(fs.readFileSync(USER_CFG, "utf8"), before);
+  assert.equal(apiCalls.length, 0, "no Telegram API call for strangers");
+});
+
+test("LLM update_config: tightening is applied; disabling a guard or raising a limit is refused", async () => {
+  const { executeTool } = await import("../tools/executor.js");
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockMintAuthority: false };
+
+  const loosen = [
+    { setting: "blockTransferHook", value: false },
+    { setting: "blockFreezeAuthority", value: "false" },
+    { setting: "blockTransferFeeAbovePct", value: 5 },
+    { setting: "blockTransferFeeAbovePct", value: null },
+    { setting: "twapSpikeMaxPct", value: "off" },
+    { setting: "twapSpikeMaxPct", value: 30 },
+    { setting: "twapWindowMinutes", value: 15 },
+    { changes: { blockPausable: false, maxPositions: 3 } },
+  ];
+  const before = fs.readFileSync(USER_CFG, "utf8");
+  for (const args of loosen) {
+    const r = await executeTool("update_config", { ...args, reason: "test" });
+    assert.equal(r.blocked, true, JSON.stringify(args));
+    assert.match(r.reason, /would loosen an entry-safety guard\. Only the user can loosen/);
+  }
+  assert.equal(fs.readFileSync(USER_CFG, "utf8"), before, "nothing persisted");
+  assert.deepEqual(config.entryFilters, { ...es.ENTRY_FILTER_DEFAULTS, blockMintAuthority: false });
+
+  // Direct tool call (bypassing runSafetyChecks) is refused too.
+  const { checkAgentEntryFilterChange } = es;
+  assert.equal(checkAgentEntryFilterChange("blockNonTransferable", false).ok, false);
+
+  const tighten = await executeTool("update_config", { changes: { blockMintAuthority: true, blockTransferFeeAbovePct: 0.5, twapSpikeMaxPct: 10, solFeePoolsOnly: true }, reason: "test tighten" });
+  assert.equal(tighten.success, true, JSON.stringify(tighten));
+  assert.equal(config.entryFilters.blockMintAuthority, true);
+  assert.equal(config.entryFilters.twapSpikeMaxPct, 10);
+  const saved = readCfg();
+  assert.equal(saved.blockTransferFeeAbovePct, 0.5);
+  assert.equal(saved.solFeePoolsOnly, true);
+  assert.equal(saved.someOtherKey, "keep-me");
+  // Turning an off limit back on is tightening.
+  config.entryFilters.twapSpikeMaxPct = null;
+  assert.equal(checkAgentEntryFilterChange("twapSpikeMaxPct", 20).ok, true);
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+});

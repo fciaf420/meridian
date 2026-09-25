@@ -416,6 +416,11 @@ Examples:
 - { trailingTriggerPct: 5 }             — activate trailing TP when PnL hits +5%
 - { trailingDropPct: 2 }                — close when PnL drops 2% from peak
 
+Entry-safety filters (blockTransferFeeAbovePct, blockTransferHook, blockPermanentDelegate,
+blockFreezeAuthority, blockMintAuthority, blockPausable, blockNonTransferable, solFeePoolsOnly,
+twapSpikeMaxPct, twapWindowMinutes) can only be TIGHTENED by you (turn a block on, lower a limit).
+Disabling a guard or raising a limit is refused — only the user can loosen them.
+
 Always provide a reason. This is logged as a lesson and visible in future cycles.`,
       parameters: {
         type: "object",

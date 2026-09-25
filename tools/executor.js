@@ -20,6 +20,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds, persistUserConfig } from "../config.js";
+import { checkAgentEntryFilterChange, ENTRY_FILTER_KEYS } from "./entry-safety.js";
 import { updateStagedSignals, getPoolForMint } from "../signal-tracker.js";
 import { execSync, spawn } from "child_process";
 import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } from "../runtime-helpers.js";
@@ -169,16 +170,24 @@ const toolMap = {
     }
     const applied = {};
     const unknown = [];
+    const refused = {};
 
     for (const [key, val] of Object.entries(changes)) {
       if (!CONFIG_KEY_MAP[key]) { unknown.push(key); continue; }
+      // Entry-safety filters: tighten only (belt-and-braces with runSafetyChecks).
+      if (ENTRY_FILTER_KEYS.includes(key)) {
+        const chk = checkAgentEntryFilterChange(key, val);
+        if (!chk.ok) { refused[key] = chk.reason; log("safety_block", chk.reason); continue; }
+        applied[key] = chk.value;
+        continue;
+      }
       // Coerce numeric strings to numbers (model sometimes passes "5" instead of 5)
       const coerced = typeof val === "string" && /^-?\d+(\.\d+)?$/.test(val) ? Number(val) : val;
       applied[key] = coerced;
     }
 
     if (Object.keys(applied).length === 0) {
-      return { success: false, unknown, reason };
+      return { success: false, unknown, reason, ...(Object.keys(refused).length ? { refused } : {}) };
     }
 
     // Apply to live config immediately
@@ -211,7 +220,7 @@ const toolMap = {
     }
 
     log("config", `Agent self-tuned: ${JSON.stringify(applied)} — ${reason}`);
-    return { success: true, applied, unknown, reason };
+    return { success: true, applied, unknown, reason, ...(Object.keys(refused).length ? { refused } : {}) };
   },
 };
 
@@ -265,6 +274,12 @@ function validateConfigUpdate(args) {
   }
 
   for (const [key, rawVal] of Object.entries(changes)) {
+    // Entry-safety filters: the agent may tighten, never loosen.
+    if (ENTRY_FILTER_KEYS.includes(key)) {
+      const chk = checkAgentEntryFilterChange(key, rawVal);
+      if (!chk.ok) return { pass: false, reason: chk.reason };
+      continue;
+    }
     const bounds = RISK_CONFIG_BOUNDS[key];
     if (!bounds) continue;
     // Coerce numeric strings the same way update_config does.
