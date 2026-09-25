@@ -527,6 +527,86 @@ async function runAutoresearchOnce(perfData, lessons, cfg) {
 
 // ─── Analyze + Generate Experiment ───────────────────────────
 
+/**
+ * Sections an experiment may target under the current strategy. Under
+ * evil_panda, getRangeSelectionText returns the fixed Evil Panda text before
+ * it looks at any override (PR #9), so a range_selection edit would be a
+ * placebo that silently activates if the strategy is ever switched back.
+ */
+export function eligibleSections(cfg = config) {
+  const sections = ["screener_criteria", "manager_logic"];
+  if (cfg?.strategy?.activeStrategy !== "evil_panda") sections.push("range_selection");
+  return sections;
+}
+
+/** Map recent losing closes to the prompt section most likely responsible. */
+export function attributeLosses(recent) {
+  const sectionLosses = { screener_criteria: [], manager_logic: [], range_selection: [] };
+  for (const p of recent) {
+    if ((p.pnl_usd ?? 0) >= 0) continue; // skip winners
+    if (p.pnl_unknown) continue;          // a 0 placeholder, not a measured loss
+
+    const reason = (p.close_reason || "").toLowerCase();
+
+    if (reason.includes("stop_loss") || reason.includes("trailing_tp") || reason.includes("oor downside")) {
+      sectionLosses.manager_logic.push(p);
+    } else if (reason.includes("oor upside")) {
+      // Checked BEFORE range efficiency: a single-sided-below position that went
+      // OOR upside always has low range efficiency, but wider range only adds
+      // bins below and cannot catch an upside move. That is a strategy/screening
+      // problem, so bid_ask and SOL-only spot go to the screener.
+      const strat = (p.strategy || "").toLowerCase();
+      const twoSided = p.sol_split_pct != null && p.sol_split_pct < 100;
+      if (strat.includes("bid_ask") || (strat === "spot" && !twoSided)) {
+        sectionLosses.screener_criteria.push(p);
+      } else {
+        sectionLosses.range_selection.push(p);
+      }
+    } else if ((p.range_efficiency ?? 100) < 30) {
+      sectionLosses.range_selection.push(p);
+    } else {
+      sectionLosses.screener_criteria.push(p);
+    }
+  }
+  return sectionLosses;
+}
+
+// A line is protected when it states a binding rule. Candidates must keep every
+// protected line verbatim and may not add new ones (added HARD rules can never
+// be removed by a later experiment, which is how the 1h-appreciation filter
+// ratcheted from 25% down to 0.5%).
+const PROTECTED_LINE = /HARD RULE|HARD SKIP|\bMUST\b|\bNEVER\b/;
+
+/**
+ * Validate a generated candidate against the section it replaces.
+ * Returns null when acceptable, otherwise the rejection reason.
+ */
+export function validateCandidate(original, modified, cfg = config) {
+  const maxDiffPct = cfg?.autoresearch?.maxDiffPct ?? 30;
+  const origLines = String(original ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const modLines = String(modified ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+  if (!modLines.length) return "empty candidate";
+  const modSet = new Set(modLines);
+  const origSet = new Set(origLines);
+
+  const dropped = origLines.filter((l) => PROTECTED_LINE.test(l) && !modSet.has(l));
+  if (dropped.length) return `changes or drops a protected line: "${dropped[0].slice(0, 100)}"`;
+  const addedProtected = modLines.filter((l) => PROTECTED_LINE.test(l) && !origSet.has(l));
+  if (addedProtected.length) return `adds a new binding rule: "${addedProtected[0].slice(0, 100)}"`;
+
+  if (/^-{3,}$/m.test(String(modified))) return "contains --- delimiter lines";
+
+  const placeholders = (t) => new Set(String(t).match(/\$\{\w+\}/g) || []);
+  const missing = [...placeholders(original)].filter((ph) => !placeholders(modified).has(ph));
+  if (missing.length) return `drops template placeholder(s): ${missing.join(", ")}`;
+
+  const { removed, added } = lineDiff(original, modified);
+  const changed = Math.max(removed.length, added.length);
+  const pct = (changed / Math.max(origLines.length, 1)) * 100;
+  if (pct > maxDiffPct) return `diff too large: ${changed}/${origLines.length} lines (${pct.toFixed(0)}% > ${maxDiffPct}%)`;
+  return null;
+}
+
 async function analyzeAndGenerate(perfData, lessons, cfg, state) {
   const minCloses = cfg.autoresearch?.minClosesPerTrial ?? 7;
 
@@ -537,42 +617,14 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
   }
 
   // 1. Attribute recent losses to prompt sections
-  const recent = perfData.slice(-15);
-  const sectionLosses = {
-    screener_criteria: [],
-    manager_logic: [],
-    range_selection: [],
-  };
+  const sectionLosses = attributeLosses(perfData.slice(-15));
 
-  for (const p of recent) {
-    if ((p.pnl_usd ?? 0) >= 0) continue; // skip winners
-
-    const reason = (p.close_reason || "").toLowerCase();
-
-    if (reason.includes("stop_loss") || reason.includes("trailing_tp") || reason.includes("oor downside")) {
-      sectionLosses.manager_logic.push(p);
-    } else if ((p.range_efficiency ?? 100) < 30) {
-      sectionLosses.range_selection.push(p);
-    } else if (reason.includes("oor upside")) {
-      // OOR upside on single-sided-below (bid_ask, SOL-only spot) is a
-      // STRATEGY problem, not a range problem — wider range only adds bins
-      // below and literally cannot catch upside moves.  Attribute to screener
-      // so the LLM considers strategy changes, not range widening.
-      const strat = (p.strategy || "").toLowerCase();
-      if (strat.includes("bid_ask") || strat === "spot") {
-        sectionLosses.screener_criteria.push(p);
-      } else {
-        sectionLosses.range_selection.push(p);
-      }
-    } else {
-      sectionLosses.screener_criteria.push(p);
-    }
-  }
-
-  // 2. Pick the worst section — with rotation to avoid optimizing the same section repeatedly
-  const sections = Object.entries(sectionLosses).filter(([, losses]) => losses.length > 0);
+  // 2. Pick the worst section — with rotation to avoid optimizing the same section repeatedly.
+  // Sections whose text the agent never sees under the current strategy are skipped.
+  const allowed = new Set(eligibleSections(cfg));
+  const sections = Object.entries(sectionLosses).filter(([s, losses]) => allowed.has(s) && losses.length > 0);
   if (sections.length === 0) {
-    log("autoresearch", "No losses in recent closes — nothing to optimize");
+    log("autoresearch", `No attributed losses in an eligible section (${[...allowed].join(", ")}) — nothing to optimize`);
     return;
   }
 
@@ -663,6 +715,21 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
 
   if (!modifiedText || modifiedText.trim() === currentText.trim()) {
     log("autoresearch", "LLM returned identical or empty text — skipping");
+    return;
+  }
+
+  // Reject before anything goes live. A cooldown stops the next close from
+  // immediately asking the generator again.
+  const invalid = validateCandidate(currentText, modifiedText, cfg);
+  if (invalid) {
+    log("autoresearch", `Rejected candidate for ${worstSection} (never went live): ${invalid}`);
+    try {
+      const fresh = loadAutoresearch();
+      if (!fresh.active) {
+        fresh.cooldownRemaining = cfg.autoresearch?.cooldownCloses ?? 5;
+        saveAutoresearch(fresh);
+      }
+    } catch { /* degraded file: nothing to record */ }
     return;
   }
 
@@ -898,24 +965,37 @@ function safeWeightsSummary() {
   }
 }
 
+// Human-written research direction (karpathy/autoresearch's program.md idea).
+const PROGRAM_FILE = path.join(__dirname, "autoresearch-program.md");
+const PROGRAM_FALLBACK = "(autoresearch-program.md is missing.) Make one small, reversible change that reduces losses. Prefer removing or simplifying a rule over adding one.";
+
+export function loadResearchProgram() {
+  try {
+    // Drop the leading editor note (an HTML comment addressed to the human).
+    const text = fs.readFileSync(PROGRAM_FILE, "utf8").replace(/^\s*<!--[\s\S]*?-->\s*/, "").trim();
+    return text || PROGRAM_FALLBACK;
+  } catch {
+    return PROGRAM_FALLBACK;
+  }
+}
+
 async function callLLM(model, sectionName, lossCount, currentText, failureDesc) {
   const provider = getLlmProvider();
 
-  const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your goal is to make small, surgical edits that reduce losses.
+  const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your candidate is tested on live closes before anything is kept.
 
-KEY DOMAIN KNOWLEDGE for your modifications:
-- STRATEGIES: The agent can deploy "bid_ask" (single-sided SOL below price — earns fees on sell pressure, safe but goes idle if price pumps UP) or "spot" with sol_split_pct (two-sided, e.g. 80% SOL / 20% token — captures fees in both directions, better for pumping tokens but riskier if token dumps).
-- OOR UPSIDE: Price pumped above the position range. For bid_ask, SOL sits idle earning nothing. Spot two-sided would have captured fees on the way up.
-- OOR DOWNSIDE: Price dropped below the position range. SOL converted to token, real loss. Wider range helps stay in range longer.
-- If failures show repeated "OOR upside" with bid_ask, consider switching to spot with high sol_split_pct (80-90) for those pool types, or improving screener criteria to avoid deploying into tokens that are mid-pump.
-- If failures show "OOR downside", consider widening price_range_pct or tightening screening thresholds.
-- HARD RULE: NEVER propose widening price_range_pct to fix OOR upside on bid_ask or SOL-only spot strategies. These strategies place bins BELOW the active bin only — wider range adds more bins below, which CANNOT reach a price that pumped ABOVE. This is a physical impossibility, not a tuning problem. If OOR upside is the issue, the fix is strategy selection or screener criteria, never range width.
-- Active trading strategy: ${config.strategy.activeStrategy}. Changes must stay compatible with it.
+RESEARCH DIRECTION (human-edited, from autoresearch-program.md):
+${loadResearchProgram()}
+
+MECHANICAL RULES (enforced in code; a candidate that breaks one is rejected before it goes live):
+- Keep every line containing HARD RULE, HARD SKIP, MUST or NEVER exactly as written, and do not add new ones.
+- Change at most ~${config.autoresearch?.maxDiffPct ?? 30}% of the lines.
 - Keep template placeholders such as \${deployAmount} and \${currentBalanceSol} exactly as written; the runner fills them in.
+- Active trading strategy: ${config.strategy.activeStrategy}. Changes must stay compatible with it.
 - Current learned signal weights:
 ${safeWeightsSummary()}`;
 
-  const userMsg = `Section "${sectionName}" has caused ${lossCount} recent losses.
+  const userMsg = `Section "${sectionName}" was attributed ${lossCount} recent losses.
 
 Current text:
 ---
@@ -925,9 +1005,9 @@ ${currentText}
 Recent failures:
 ${failureDesc}
 
-Generate exactly ONE small, targeted modification. Change only one instruction or threshold. Do not rewrite the whole section.
+Propose exactly ONE small change. Removing or simplifying an instruction is as valid as adding or tightening one, and is preferred when a rule is not clearly earning its keep: all else equal, a shorter prompt wins. Do not rewrite the whole section.
 
-Return a JSON object: {"hypothesis": one sentence on what you changed and why, "modified_text": the full section text with your single change applied, without the --- delimiters}.`;
+Return a JSON object: {"hypothesis": one sentence on what you changed (added, removed, loosened or tightened) and why, "modified_text": the full section text with your single change applied, without the --- delimiters}.`;
   const schema = {
     type: "object",
     additionalProperties: false,

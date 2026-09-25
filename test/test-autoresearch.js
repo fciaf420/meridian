@@ -230,3 +230,90 @@ test("operator commands: revert and restore round-trip, quarantine restores with
   const chunks = ar.autoresearchTelegramChunks("a < b & c > d");
   assert.deepEqual(chunks, ["a &lt; b &amp; c &gt; d"]);
 });
+
+const SECTION = [
+  "1. SCREEN: use get_top_candidates.",
+  "2. STUDY: call study_top_lpers.",
+  "3. MEMORY: call get_pool_memory.",
+  "   - HARD SKIP if global_fees_sol < 30 SOL. No exceptions.",
+  "   - Smart wallets present → strong signal.",
+  "   - Bundlers 5-15% are normal.",
+  "   - GOOD narrative: specific origin.",
+  "   - BAD narrative: generic hype.",
+  "5. DEPLOY: deploy_position.",
+  "   - HARD RULE: Minimum 0.1 SOL absolute floor.",
+  "   - You MUST use the amount from the cycle goal: ${deployAmount}.",
+  "   - Focus on one deployment per cycle.",
+].join("\n");
+
+test("protected lines: dropping or editing a HARD line is rejected, a small edit passes", () => {
+  const cfg = { autoresearch: { maxDiffPct: 30 } };
+  const dropHard = SECTION.split("\n").filter((l) => !l.includes("HARD SKIP")).join("\n");
+  assert.match(ar.validateCandidate(SECTION, dropHard, cfg), /protected line/);
+
+  const editHard = SECTION.replace("0.1 SOL absolute floor", "0.05 SOL absolute floor");
+  assert.match(ar.validateCandidate(SECTION, editHard, cfg), /protected line/);
+
+  const addHard = `${SECTION}\n   - HARD SKIP if the token is up more than 1% in the last hour.`;
+  assert.match(ar.validateCandidate(SECTION, addHard, cfg), /new binding rule/);
+
+  const dropPlaceholder = SECTION.replace("${deployAmount}", "0.5"); // also edits a MUST line
+  assert.ok(ar.validateCandidate(SECTION, dropPlaceholder, cfg));
+
+  // Deleting a heuristic (simplification) and rewording one are both fine.
+  const deleteOne = SECTION.split("\n").filter((l) => !l.includes("Bundlers")).join("\n");
+  assert.equal(ar.validateCandidate(SECTION, deleteOne, cfg), null);
+  const reword = SECTION.replace("strong signal", "moderate signal");
+  assert.equal(ar.validateCandidate(SECTION, reword, cfg), null);
+  assert.match(ar.validateCandidate(SECTION, `---\n${SECTION}\n---`, cfg), /delimiter/);
+});
+
+test("diff cap: more than 30% of lines changed is rejected", () => {
+  const cfg = { autoresearch: { maxDiffPct: 30 } };
+  const lines = SECTION.split("\n");
+  const editable = lines.map((l, i) => ({ l, i })).filter(({ l }) => !/HARD|MUST|NEVER/.test(l));
+  const rewrite = (n) => {
+    const out = lines.slice();
+    for (const { i } of editable.slice(0, n)) out[i] = `${out[i]} (rewritten)`;
+    return out.join("\n");
+  };
+  assert.equal(ar.validateCandidate(SECTION, rewrite(3), cfg), null, "3/12 lines = 25% passes");
+  assert.match(ar.validateCandidate(SECTION, rewrite(4), cfg), /diff too large/, "4/12 lines = 33% fails");
+  assert.match(ar.validateCandidate(SECTION, rewrite(4), { autoresearch: { maxDiffPct: 30 } }), /33%/);
+  assert.equal(ar.validateCandidate(SECTION, rewrite(4), { autoresearch: { maxDiffPct: 40 } }), null, "the cap is configurable");
+});
+
+test("inactive sections are skipped under evil_panda; OOR upside is attributed before range efficiency", () => {
+  assert.deepEqual(ar.eligibleSections({ strategy: { activeStrategy: "evil_panda" } }).includes("range_selection"), false);
+  assert.ok(ar.eligibleSections({ strategy: { activeStrategy: "bid_ask" } }).includes("range_selection"));
+
+  const oorUpside = { pnl_usd: -1, close_reason: "agent decision (OOR upside)", strategy: "spot", sol_split_pct: 100, range_efficiency: 5 };
+  const lowEff = { pnl_usd: -1, close_reason: "agent decision", strategy: "spot", range_efficiency: 10 };
+  const unknown = { pnl_usd: -1, pnl_unknown: true, close_reason: "agent decision" };
+  const losses = ar.attributeLosses([oorUpside, oorUpside, lowEff, unknown]);
+  assert.equal(losses.screener_criteria.length, 2, "single-sided OOR upside goes to the screener even with low range efficiency");
+  assert.equal(losses.range_selection.length, 1);
+  assert.equal(losses.manager_logic.length, 0);
+});
+
+test("generation under evil_panda never targets range_selection", async () => {
+  // Plenty of range_selection-attributed losses, but only range_selection.
+  const perf = Array.from({ length: 20 }, (_, i) => losingClose(i, { close_reason: "agent decision", range_efficiency: 5 }));
+  fs.writeFileSync(AR_FILE, ar.serializeAutoresearch({ experiments: [], active: null, cooldownRemaining: 0, kept_overrides: {}, migrations: { quarantine_legacy_kept_overrides_v1: "t" } }));
+  let called = null;
+  ar.__setAutoresearchGeneratorForTests(async (model, section) => { called = section; return { hypothesis: "x", modifiedText: "y" }; });
+  try {
+    const cfg = { autoresearch: { enabled: true }, strategy: { activeStrategy: "evil_panda" }, screening: config.screening, management: config.management };
+    await ar.maybeRunAutoresearch(perf, [], cfg);
+    assert.equal(called, null, "generator must not be asked to edit range_selection under evil_panda");
+    assert.equal(ar.loadAutoresearch().active, null);
+  } finally {
+    ar.__setAutoresearchGeneratorForTests(null);
+  }
+});
+
+test("research program is read from autoresearch-program.md without the editor note", () => {
+  const program = ar.loadResearchProgram();
+  assert.match(program, /Evil Panda/);
+  assert.doesNotMatch(program, /<!--/);
+});

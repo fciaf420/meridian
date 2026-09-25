@@ -246,6 +246,7 @@ export const config = {
     cooldownCloses: u.autoresearchCooldownCloses ?? 5,
     llmModel: u.autoresearchModel ?? DEFAULT_MODEL,
     reasoningEffort: u.autoresearchReasoningEffort ?? "medium",
+    maxDiffPct: u.autoresearchMaxDiffPct ?? 30, // reject candidates that change more than this % of lines
   },
 
   // ─── Knowledge Base ─────────────��──────
