@@ -529,18 +529,25 @@ export async function deployPosition({
   // pass an explicit amount, respect it exactly; the only enforced floor is the
   // existing 0.1 SOL hard minimum, which we apply by REJECTING (never raising).
   const callerProvidedAmount = (amount_y != null) || (amount_sol != null) || (amount_x != null);
+  let sizingSkip = null;
   try {
-    const { computeDeployAmount } = await import("../config.js");
+    const { resolveDeploySizing } = await import("../config.js");
     const { getWalletBalances } = await import("./wallet.js");
     const bal = await getWalletBalances();
     if (!callerProvidedAmount && bal?.sol > 0) {
-      // Amount missing entirely — default it from wallet balance + positionSizePct.
-      const computed = computeDeployAmount(bal.sol);
-      log("deploy", `Amount not provided; defaulting to ${computed} SOL (computed from ${bal.sol} SOL wallet)`);
-      totalSolAmount = computed;
-      amount_y = computed;
+      // Amount missing entirely — default it from positionSizePct × the portfolio
+      // total (or free wallet SOL, per positionSizeBase), capped by free SOL.
+      const sizing = await resolveDeploySizing({ wallet: bal });
+      if (sizing.skip) {
+        sizingSkip = sizing.reason;
+      } else {
+        log("deploy", `Amount not provided; defaulting to ${sizing.amount} SOL (${sizing.label})`);
+        totalSolAmount = sizing.amount;
+        amount_y = sizing.amount;
+      }
     }
   } catch { /* best-effort — use what the model passed */ }
+  if (sizingSkip) return { success: false, error: `Deploy skipped — ${sizingSkip}` };
 
   // Hard floor: reject (do not silently raise) explicit amounts below 0.1 SOL.
   if (callerProvidedAmount && totalSolAmount > 0 && totalSolAmount < 0.1) {

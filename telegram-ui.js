@@ -23,6 +23,7 @@ import {
   parseCustomDeploySize, stopLossOff,
 } from "./trading-settings.js";
 import { renderBinStrip, renderBinChart, withTimeout } from "./tools/bin-visual.js";
+import { resolveSolPrice, valueDlmmPositions } from "./portfolio-value.js";
 
 export const MENU_BUTTON_TEXT = "🏠 Menu";
 export const CONFIRM_TTL_MS = 60_000;
@@ -362,7 +363,7 @@ export function defaultPickerStrategy(config, usdcMode = false) {
  * configured default applies. Evil Panda ignores both (its own spot plan).
  * Always single-sided SOL: bins_above 0, never sol_split_pct or amount_x.
  */
-export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount, usdcMode = false, strategy: chosen = null, priceRangePct = null }) {
+export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount, sizing = null, usdcMode = false, strategy: chosen = null, priceRangePct = null }) {
   if (!candidate?.pool) return { error: "Candidate has no pool address." };
   const evil = config.strategy?.activeStrategy === "evil_panda";
   let strategy;
@@ -404,10 +405,18 @@ export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount
     if (!wallet || wallet.error || !Number.isFinite(Number(wallet.sol))) {
       return { error: `Can't read the wallet balance${wallet?.error ? ` (${wallet.error})` : ""} — deploy not offered.` };
     }
-    const amt = computeDeployAmount(Number(wallet.sol));
-    if (!(amt > 0)) return { error: "Computed deploy amount is 0." };
-    args.amount_y = amt;
-    amountLabel = `${amt} SOL`;
+    // `sizing` = resolveDeploySizing() result (portfolio basis, free-SOL cap,
+    // floor skip); computeDeployAmount is the plain fallback.
+    if (sizing) {
+      if (sizing.skip || !(sizing.amount > 0)) return { error: `Deploy skipped — ${sizing.reason ?? "computed deploy amount is 0"}.` };
+      args.amount_y = sizing.amount;
+      amountLabel = `${sizing.amount} SOL (${sizing.label})`;
+    } else {
+      const amt = computeDeployAmount(Number(wallet.sol));
+      if (!(amt > 0)) return { error: "Computed deploy amount is 0." };
+      args.amount_y = amt;
+      amountLabel = `${amt} SOL`;
+    }
   }
   const strategyLabel = evil ? `Evil Panda (single-sided SOL spot, ${price_range_pct}% range)` : `${strategy}, single-sided SOL, ${price_range_pct}% range`;
   return { args, amountLabel, strategyLabel, evil, range: rangeInfo(price_range_pct, candidate.bin_step) };
@@ -490,14 +499,12 @@ const finitePos = (v) => { const n = Number(v); return v != null && Number.isFin
  * unknown (missing or 0) is excluded from the subtotal and flagged, never
  * counted as 0. Returns plain numbers; renderWallet formats them.
  *
- * Fees are added on top of total_value_usd because both sources exclude them:
- * LP Agent `value` reconciles as value + collectedFee + unCollectedFee −
- * inputValue = pnl.value, and Meteora's UnrealizedPnL.balances is the token X +
- * Y balance with unclaimed fees reported separately (dlmm.datapi OpenAPI).
+ * Position valuation (value + unclaimed fees, counted once) lives in
+ * portfolio-value.js so deploy sizing uses the exact same numbers.
  */
 export function computeWalletTotals(wallet, positionsResult = null) {
   const posList = Array.isArray(positionsResult?.positions) ? positionsResult.positions : [];
-  const price = finitePos(wallet?.sol_price) ?? finitePos(posList.find((p) => finitePos(p.sol_price))?.sol_price);
+  const price = resolveSolPrice(wallet, posList);
   const toSol = (usd) => (price && usd != null ? usd / price : null);
 
   // ── In wallet ──
@@ -529,23 +536,17 @@ export function computeWalletTotals(wallet, positionsResult = null) {
   const walletUsd = walletItems.reduce((a, x) => a + x.usd, 0) + dustUsd;
 
   // ── In DLMM positions ──
-  const positions = posList.map((p) => {
-    const valueUsd = finitePos(p.total_value_usd) ?? (price && finitePos(p.total_value_sol) ? finitePos(p.total_value_sol) * price : null);
-    const feesUsd = Number.isFinite(Number(p.unclaimed_fees_usd)) && Number(p.unclaimed_fees_usd) > 0 ? Number(p.unclaimed_fees_usd) : 0;
+  const valued = valueDlmmPositions(posList, price);
+  const positions = valued.positions.map(({ raw: p, ...v }) => {
     const c = p.composition || null;
     return {
-      position: p.position,
-      pair: p.pair ?? shortAddr(p.position),
-      known: valueUsd != null,
-      valueUsd,
-      feesUsd,
-      totalUsd: valueUsd != null ? valueUsd + feesUsd : null,
+      ...v,
+      pair: v.pair ?? shortAddr(p.position),
       solSide: c && Number.isFinite(Number(c.sol_amount)) ? { sol: Number(c.sol_amount), usd: Number(c.sol_usd) || (price ? Number(c.sol_amount) * price : null) } : null,
       tokenSide: c && Number.isFinite(Number(c.token_usd)) ? { amount: Number(c.token_amount), usd: Number(c.token_usd), sol: toSol(Number(c.token_usd)) } : null,
     };
   });
-  const dlmmUsd = positions.reduce((a, x) => a + (x.known ? x.totalUsd : 0), 0);
-  const unknownCount = positions.filter((x) => !x.known).length;
+  const { dlmmUsd, unknownCount } = valued;
   const totalUsd = walletUsd + dlmmUsd;
   return {
     price,
@@ -1162,6 +1163,7 @@ export function renderExecResult(action, label, result) {
  * deps:
  *   tg: { sendHTML(html, extra) → Message|null, editHTML(id, html, extra) → bool, answerCallback(id, text, alert) }
  *   config, computeDeployAmount, usdcModeEnabled()
+ *   resolveDeploySizing({ wallet, positions })? — config.js; portfolio-based deploy size for the confirm card
  *   getMyPositions({force}), getWalletBalances(), getTopCandidates({limit})
  *   executeTool(name, args)               — tools/executor.js
  *   runExclusive(fn, { screening })       — → { busy: true } | { value }
@@ -1266,8 +1268,14 @@ export function createTelegramUI(deps) {
   async function deployRequest(candidate, { strategy = null, priceRangePct = null, warnings = [] } = {}) {
     const usdcMode = !!deps.usdcModeEnabled?.(); // re-read: the mode may have changed mid-picker
     const wallet = usdcMode ? null : await deps.getWalletBalances().catch((e) => ({ error: e.message }));
+    // Portfolio-based size (getMyPositions is cached); only with a readable wallet.
+    let sizing = null;
+    if (!usdcMode && deps.resolveDeploySizing && wallet && !wallet.error) {
+      const positions = await Promise.resolve().then(() => deps.getMyPositions()).catch((e) => ({ error: e.message }));
+      sizing = await Promise.resolve().then(() => deps.resolveDeploySizing({ wallet, positions })).catch(() => null);
+    }
     const plan = buildDeployPlan(candidate, {
-      wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, usdcMode, strategy, priceRangePct,
+      wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, sizing, usdcMode, strategy, priceRangePct,
     });
     if (plan.error) return { view: { text: `⚠️ ${escapeHtml(plan.error)}`, keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] } };
     // Read-only entry preview (pool status, fee mode, TWAP) for the card; best

@@ -3,6 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { getEffectiveMinSolToOpen, normalizeScreeningSource } from "./runtime-helpers.js";
 import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
+import { computePortfolioSol } from "./portfolio-value.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // MERIDIAN_USER_CONFIG_PATH lets tests point every reader/writer at a temp file.
@@ -164,6 +165,7 @@ export const config = {
     deployAmountSol:       u.deployAmountSol ?? 0.5,
     gasReserve:            u.gasReserve        ?? 0.2,   // always keep this much SOL for gas
     positionSizePct:       u.positionSizePct   ?? 0.35,  // % of deployable capital per position
+    positionSizeBase:      u.positionSizeBase  ?? "total", // "total" (wallet SOL + open DLMM positions) or "wallet" (free SOL only)
     pnlUnit:               u.pnlUnit           ?? "sol", // "sol" or "usd" — how PnL is displayed
     priorityFeeLevel:      u.priorityFeeLevel  ?? "Medium",
   },
@@ -291,19 +293,111 @@ export const config = {
   },
 };
 
+/** "total" unless positionSizeBase is "wallet" (case-insensitive). */
+export function getPositionSizeBase() {
+  return String(config.management.positionSizeBase ?? "total").toLowerCase() === "wallet" ? "wallet" : "total";
+}
+
+// Round half-up to 2 dp; the epsilon absorbs float noise (0.55 × 1.1 = 0.6049…).
+const round2 = (x) => Math.round(Number(x) * 100 + 1e-6) / 100;
+// Round DOWN to 2 dp; the epsilon absorbs float noise (1.2 − 0.1 = 1.0999…).
+const floor2 = (x) => Math.floor(Number(x) * 100 + 1e-6) / 100;
+const fmtSol = (x) => Number(x).toFixed(2);
+const fmtPct = (p) => `${parseFloat((Number(p) * 100).toFixed(1))}%`;
+
 /**
- * Compute the optimal deploy amount for a given wallet balance.
- * Scales position size with wallet growth (compounding).
+ * Deploy size (pure). `portfolio` is computePortfolioSol()'s result, or null.
+ *
+ *   base   = total SOL (free wallet SOL + open DLMM positions incl. unclaimed
+ *            fees) when positionSizeBase is "total" and the total is known;
+ *            otherwise free wallet SOL (the conservative fallback)
+ *   size   = min(maxDeployAmount, positionSizePct × max(0, base − gasReserve))
+ *   amount = min(round2(size), floor2(max(0, freeSol − gasReserve)))  ← never more than deployable SOL
+ *   amount < deployAmountSol (the floor) → amount 0 + skip reason; the floor is never forced
+ *
+ * The floor is min(deployAmountSol, maxDeployAmount) so a floor above the
+ * ceiling can't block every deploy. Returns { amount, skip, reason, label,
+ * basis, preferredBasis, fallbackReason, baseSol, freeSol, size, cap, floor,
+ * ceil, pct, reserve }.
  */
-export function computeDeployAmount(walletSol) {
-  const reserve  = config.management.gasReserve      ?? 0.2;
-  const pct      = config.management.positionSizePct ?? 0.35;
-  const floor    = config.management.deployAmountSol;
-  const ceil     = config.risk.maxDeployAmount;
-  const deployable = Math.max(0, walletSol - reserve);
-  const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
-  return parseFloat(result.toFixed(2));
+export function computeDeploySizing(walletSol, portfolio = null) {
+  const reserve = Number(config.management.gasReserve ?? 0.2);
+  const pct     = Number(config.management.positionSizePct ?? 0.35);
+  const ceil    = Number(config.risk.maxDeployAmount);
+  const floor   = Math.min(Number(config.management.deployAmountSol), ceil);
+  const preferredBasis = getPositionSizeBase();
+  const common = { preferredBasis, pct, reserve, floor, ceil };
+
+  const freeSol = Number(walletSol);
+  if (walletSol == null || !Number.isFinite(freeSol) || freeSol < 0) {
+    const reason = "free wallet SOL unknown";
+    return { ...common, amount: 0, skip: true, reason, label: `skip: ${reason}`, basis: null, fallbackReason: null, baseSol: null, freeSol: null, size: 0, cap: 0 };
+  }
+
+  const useTotal = preferredBasis === "total" && portfolio?.ok === true && Number.isFinite(Number(portfolio.totalSol));
+  const basis = useTotal ? "total" : "wallet";
+  const fallbackReason = preferredBasis === "total" && !useTotal ? (portfolio?.reason || "portfolio total not provided") : null;
+  const baseSol = useTotal ? Number(portfolio.totalSol) : freeSol;
+
+  const raw  = pct * Math.max(0, baseSol - reserve);
+  const size = Math.min(ceil, raw);
+  const cap  = Math.max(0, freeSol - reserve);
+  const capAmt = floor2(cap);
+  const amount = Math.min(round2(size), capAmt);
+
+  const of = `${fmtPct(pct)} of (${fmtSol(baseSol)} SOL ${basis === "total" ? "total" : "free wallet"} − ${reserve} reserve)`;
+  let why;
+  if (round2(size) > capAmt) why = `free SOL ${fmtSol(freeSol)} − ${reserve} reserve (cap; ${of} = ${fmtSol(size)})`;
+  else if (raw > ceil) why = `max ${ceil} (${of} = ${fmtSol(raw)})`;
+  else why = of;
+  const note = fallbackReason ? ` [wallet basis: ${fallbackReason}]` : "";
+
+  if (amount + 1e-9 < floor || !(amount > 0)) {
+    const reason = `size ${fmtSol(amount)} below floor ${floor} (${why})${note}`;
+    return { ...common, amount: 0, skip: true, reason, label: `skip: ${reason}`, basis, fallbackReason, baseSol, freeSol, size, cap };
+  }
+  return { ...common, amount, skip: false, reason: null, label: `${fmtSol(amount)} SOL = ${why}${note}`, basis, fallbackReason, baseSol, freeSol, size, cap };
+}
+
+/**
+ * Deploy size from live data. Pass `wallet` (getWalletBalances() result)
+ * and/or `positions` (getMyPositions() result) when the caller already has
+ * them; anything left undefined is fetched (getMyPositions is cached 5 min and
+ * invalidated on deploy/close). positions are only needed on the "total" basis.
+ * A failed/unknown valuation falls back to the free-wallet basis and is logged.
+ */
+export async function resolveDeploySizing({ wallet, positions } = {}) {
+  let w = wallet;
+  if (w === undefined) {
+    w = await import("./tools/wallet.js").then((m) => m.getWalletBalances()).catch((e) => ({ error: e.message }));
+  }
+  if (!w || w.error) {
+    const s = computeDeploySizing(null);
+    const reason = `wallet balance unavailable${w?.error ? ` (${w.error})` : ""}`;
+    return { ...s, reason, label: `skip: ${reason}` };
+  }
+  let portfolio = null;
+  if (getPositionSizeBase() === "total") {
+    let pr = positions;
+    if (pr === undefined) {
+      pr = await import("./tools/dlmm.js").then((m) => m.getMyPositions()).catch((e) => ({ error: e.message }));
+    }
+    portfolio = computePortfolioSol({ walletSol: w.sol, wallet: w, positionsResult: pr });
+  }
+  const s = computeDeploySizing(Number(w.sol), portfolio);
+  const { log } = await import("./logger.js");
+  if (s.fallbackReason) log("sizing_warn", `Portfolio total unknown (${s.fallbackReason}) — sizing from free wallet SOL instead`);
+  log("sizing", s.label);
+  return s;
+}
+
+/**
+ * Deploy amount (SOL) for a free wallet balance, 0 when sizing skips.
+ * Sync, so without a `portfolio` it sizes on the free-wallet basis; live
+ * callers use resolveDeploySizing() for the portfolio total.
+ */
+export function computeDeployAmount(walletSol, portfolio = null) {
+  return computeDeploySizing(walletSol, portfolio).amount;
 }
 
 // Keys that map into each config section

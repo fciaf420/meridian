@@ -9,7 +9,7 @@ import { getMyPositions } from "./tools/dlmm.js";
 import { getPositionBins } from "./tools/bin-visual.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, resolveDeploySizing, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV } from "./config.js";
 import { createAllSettings } from "./all-settings.js";
 import { normalizeEntryFilterValue, isLooseningChange } from "./tools/entry-safety.js";
 import { applyTradingSettings } from "./trading-settings.js";
@@ -67,7 +67,6 @@ if (config.knowledgeBase?.enabled) {
 }
 
 const TP_PCT  = config.management.takeProfitFeePct;
-const DEPLOY  = config.management.deployAmountSol;
 
 // Human-readable "how much to deploy" directive, mode-aware. In USDC mode the
 // agent thinks in USD and the executor auto-funds the SOL from USDC.
@@ -232,8 +231,10 @@ async function screeningCycleBody() {
   const fundEventsBefore = _fundEvents;
   try {
     // Hard guards — don't even run the agent if preconditions aren't met
+    let preCheckPositions;
     try {
       const [positions, balance] = await Promise.all([getMyPositions(), getWalletBalances()]);
+      preCheckPositions = positions;
       if (positions.total_positions >= config.risk.maxPositions) {
         log("cron", `Screening skipped — max positions reached (${positions.total_positions}/${config.risk.maxPositions})`);
         return;
@@ -260,10 +261,18 @@ async function screeningCycleBody() {
 
     const screenModel = getScreenerModelLabel();
     log("cron", `Starting screening cycle [model: ${screenModel}]`);
-    // Compute dynamic deploy amount based on current wallet (compounding)
-    const currentBalance = await getWalletBalances().catch(() => null);
-    const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance?.sol ?? "?"} SOL)`);
+    // Deploy size from the whole portfolio (free SOL + open positions, just
+    // fetched above) or the free wallet (positionSizeBase), capped by free SOL.
+    // USDC mode sizes in USD (deployAmountUsd), so the SOL figure there is only a placeholder.
+    const currentBalance = await getWalletBalances().catch((e) => ({ error: e.message }));
+    const sizing = usdcModeEnabled() ? null : await resolveDeploySizing({ wallet: currentBalance, positions: preCheckPositions });
+    if (sizing?.skip) {
+      log("cron", `Screening skipped — ${sizing.reason}`);
+      return;
+    }
+    const deployAmount = sizing ? sizing.amount : config.management.deployAmountSol;
+    const sizingNote = sizing ? ` (${sizing.label})` : "";
+    log("cron", `Computed deploy amount: ${sizing ? sizing.label : `USDC mode, $${config.usdc.deployAmountUsd}`} (wallet: ${currentBalance?.sol ?? "?"} SOL)`);
 
     // Load saved strategies for reference (LLM picks per token)
     const activeStrategy = getActiveStrategy();
@@ -467,13 +476,13 @@ HARD SKIP rules still apply:
 - top_10_real_holders_pct > 60% OR bundlers > 30% → skip
 - No smart wallets or GMGN confirmation + empty/hype narrative → skip
 
-Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL.
+Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL${sizingNote}.
 Size your price_range_pct from the VOLATILITY TABLE in the range selection rules below — NOT from study avg_range_pct.
 study_top_lpers is useful for strategy choice (bid_ask vs spot), hold times, and win rates — but their range data is from a different market regime and should not drive your range.` : `1. get_top_candidates, pick the best one.
 2. check_smart_wallets_on_pool, get_token_holders (check global_fees_sol >= ${config.screening.minTokenFeesSol}), get_token_narrative.
 3. HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL or holders/narrative red flags.
 4. study_top_lpers → use for strategy choice, hold times, win rates. Do NOT use avg_range_pct for your range — size from the VOLATILITY TABLE instead.
-5. deploy_position with ${deployAmount} SOL and price_range_pct from volatility table (adjusted by lessons).`}
+5. deploy_position with ${deployAmount} SOL${sizingNote} and price_range_pct from volatility table (adjusted by lessons).`}
 ${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
 ? `\n\nUSDC MODE IS ON: deploy sizing/funding is automatic — the system swaps USDC→SOL ($${config.usdc.deployAmountUsd}/position) and deploys single-sided. Do NOT pick a SOL amount or call swap_token to prepare funds; just call deploy_position for the chosen pool.`
 : ""}
@@ -953,10 +962,11 @@ async function runRemote(fn, { screening = false } = {}) {
 
 // Legacy "auto": the screener LLM picks a pool and calls deploy_position.
 async function autoDeployViaAgent() {
-  const balance = await getWalletBalances().catch(() => null);
-  const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
+  const sizing = usdcModeEnabled() ? null : await resolveDeploySizing();
+  if (sizing?.skip) return `Deploy skipped — ${sizing.reason}`;
+  const amt = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${sizing.amount} SOL (${sizing.label})`;
   const { content } = await screenerLoop(
-    `get_top_candidates, pick the best one, deploy_position with ${amt} SOL. Execute now, don't ask.`,
+    `get_top_candidates, pick the best one, deploy_position with ${amt}. Execute now, don't ask.`,
     config.llm.maxSteps,
   );
   return content;
@@ -968,6 +978,7 @@ const tgUI = createTelegramUI({
   tg: { sendHTML, editHTML, answerCallback },
   config,
   computeDeployAmount,
+  resolveDeploySizing,
   usdcModeEnabled,
   getMyPositions,
   getPositionBins, // read-only bin charts (📊 Bins, Positions strips); never throws
@@ -1333,9 +1344,9 @@ Commands:
     if (!isNaN(pick) && pick >= 1 && pick <= startupCandidates.length) {
       await runScreeningBusy(async () => {
         const pool = startupCandidates[pick - 1];
-        const currentBalance = await getWalletBalances().catch(() => null);
-        const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : DEPLOY;
-        const amtPhrase = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${deployAmount} SOL`;
+        const sizing = usdcModeEnabled() ? null : await resolveDeploySizing();
+        if (sizing?.skip) { console.log(`\nDeploy skipped — ${sizing.reason}\n`); launchCron({ announce: true }); return; }
+        const amtPhrase = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${sizing.amount} SOL (${sizing.label})`;
         console.log(`\nDeploying ${amtPhrase} into ${pool.name}...\n`);
         const { content: reply } = await screenerLoop(
           `Deploy ${amtPhrase} into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
@@ -1351,9 +1362,9 @@ Commands:
     if (input.toLowerCase() === "auto") {
       await runScreeningBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
-        const currentBalance = await getWalletBalances().catch(() => null);
-        const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : DEPLOY;
-        const amtPhrase = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${deployAmount} SOL`;
+        const sizing = usdcModeEnabled() ? null : await resolveDeploySizing();
+        if (sizing?.skip) { console.log(`\nDeploy skipped — ${sizing.reason}\n`); launchCron({ announce: true }); return; }
+        const amtPhrase = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${sizing.amount} SOL (${sizing.label})`;
         const { content: reply } = await screenerLoop(
           `get_top_candidates, pick the best one, deploy_position with ${amtPhrase}. Execute now, don't ask.`,
           config.llm.maxSteps
@@ -1552,11 +1563,15 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
     }
     setScreeningBusy(true);
     try {
-      const currentBalance = await getWalletBalances().catch(() => null);
-      const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : DEPLOY;
+      const sizing = usdcModeEnabled() ? null : await resolveDeploySizing();
+      const deployStep = usdcModeEnabled()
+        ? `get_top_candidates then deploy $${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)`
+        : sizing.skip
+          ? `do NOT deploy (sizing skip: ${sizing.reason})`
+          : `get_top_candidates then deploy ${sizing.amount} SOL (${sizing.label})`;
       await screenerLoop(`
 STARTUP CHECK
-1. get_wallet_balance. 2. get_my_positions. 3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${deployAmount} SOL. 4. Report.
+1. get_wallet_balance. 2. get_my_positions. 3. If SOL >= ${config.management.minSolToOpen}: ${deployStep}. 4. Report.
       `, config.llm.maxSteps, []);
     } catch (e) {
       log("startup_error", e.message);

@@ -8,7 +8,7 @@ import { fileURLToPath } from "url";
 import path from "path";
 import fs from "fs";
 
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
+import { config, reloadScreeningThresholds, resolveDeploySizing } from "./config.js";
 import {
   sessionHistory,
   getHistory,
@@ -50,6 +50,17 @@ const DEFAULT_PORT = 3737;
 // ---------------------------------------------------------------------------
 
 /** Send JSON through a WebSocket if it's open. */
+/**
+ * "<amount> SOL (<basis>)" for a dashboard deploy prompt, or { skip, reason }
+ * when sizing skips. USDC mode deploys a fixed USD amount (auto-funded).
+ */
+async function deployAmountPhrase() {
+  if (config.usdc?.enabled) return { skip: false, text: `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` };
+  const sizing = await resolveDeploySizing();
+  if (sizing.skip) return { skip: true, reason: sizing.reason };
+  return { skip: false, text: `${sizing.amount} SOL (${sizing.label})` };
+}
+
 function wsSend(ws, data) {
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify(data));
@@ -668,10 +679,13 @@ export function startServer(timersFn) {
           setBusy(true);
           setScreeningBusy(true);
           try {
-            const currentBalance = await getWalletBalances().catch(() => null);
-            const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
+            const amtPhrase = await deployAmountPhrase();
+            if (amtPhrase.skip) {
+              wsSend(ws, { type: "error", text: `Deploy skipped — ${amtPhrase.reason}` });
+              break;
+            }
             const { content } = await screenerLoop(
-              `get_top_candidates, pick the best one, deploy_position with ${deployAmount} SOL. Execute now, don't ask.`,
+              `get_top_candidates, pick the best one, deploy_position with ${amtPhrase.text}. Execute now, don't ask.`,
               config.llm.maxSteps, [],
             );
             appendHistory("auto", content);
@@ -708,10 +722,13 @@ export function startServer(timersFn) {
                 break;
               }
               const pool = candidates[pick - 1];
-              const currentBalance = await getWalletBalances().catch(() => null);
-              const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
+              const amtPhrase = await deployAmountPhrase();
+              if (amtPhrase.skip) {
+                wsSend(ws, { type: "error", text: `Deploy skipped — ${amtPhrase.reason}` });
+                break;
+              }
               const { content } = await screenerLoop(
-                `Deploy ${deployAmount} SOL into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
+                `Deploy ${amtPhrase.text} into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
                 config.llm.maxSteps, [],
               );
               appendHistory(`deploy #${pick} ${pool.name}`, content);
