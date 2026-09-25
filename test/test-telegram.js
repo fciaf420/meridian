@@ -586,3 +586,220 @@ test("nonce store: TTL, single use, unknown ids", () => {
   assert.equal(s.take(id2).error, "expired");
   assert.equal(s.take("nope").error, "unknown");
 });
+
+// ─── Deploy picker (strategy → range → confirm) ──────────────────
+const customCfg = (over = {}) => baseConfig({ strategy: { activeStrategy: "custom", strategy: "bid_ask" }, ...over });
+const CAND1 = "CandPool1111111111111111111111111111111111111";
+
+/** Open the picker for candidate #n from the Candidates view; returns the resulting edit. */
+async function openPicker(u, t, n = 1, messageId = 50) {
+  await u.handleCallback("ca:0", ctxFor(messageId));
+  const dp = allCallbackData(lastMarkup(t.edits().at(-1))).filter((d) => d.startsWith("dp:"))[n - 1];
+  await u.handleCallback(dp, ctxFor(messageId));
+  return t.edits().at(-1);
+}
+const buttonByText = (call, re) => lastMarkup(call).flat().find((b) => re.test(b.text));
+const stepIdOf = (call) => allCallbackData(lastMarkup(call)).find((d) => /^d[srbx]:/.test(d)).split(":")[1];
+
+test("picker: Evil Panda skips the picker and keeps its fixed spot plan", async () => {
+  const { u, t } = makeUI(); // baseConfig is evil_panda
+  const card = await openPicker(u, t);
+  assert.match(card.text, /Deploy into this pool\?/);
+  assert.match(card.text, /Evil Panda/);
+  assert.ok(!findData(lastMarkup(card), "ds:"), "no strategy step");
+  assert.equal(u.steps.size(), 0);
+});
+
+test("picker: strategy step offers Bid-Ask and Spot, marks the default, no two-sided option", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  const step = await openPicker(u, t);
+  assert.match(step.text, /How do you want to deploy AAA-SOL\?/);
+  const labels = lastMarkup(step).flat().map((b) => b.text);
+  assert.deepEqual(labels, ["Bid-Ask ✓", "Spot", "✖ Cancel"], "default bid_ask marked; nothing two-sided");
+  assert.ok(!/two-sided|sol_split/i.test(step.text));
+  assert.equal(step.messageId, 50, "edits the Candidates message in place");
+  assert.equal(exec.length, 0);
+
+  const spotDefault = makeUI({ config: baseConfig({ strategy: { activeStrategy: "custom", strategy: "spot" } }) });
+  const s2 = await openPicker(spotDefault.u, spotDefault.t);
+  assert.deepEqual(lastMarkup(s2).flat().map((b) => b.text).slice(0, 2), ["Bid-Ask", "Spot ✓"]);
+});
+
+test("picker: USDC mode skips to the range step with Bid-Ask only", async () => {
+  const { u, t, exec } = makeUI({ config: baseConfig({ strategy: { activeStrategy: "custom", strategy: "spot" } }), usdcModeEnabled: () => true });
+  const step = await openPicker(u, t);
+  assert.ok(!findData(lastMarkup(step), "ds:"), "no strategy buttons");
+  assert.match(step.text, /Bid-Ask/);
+  assert.match(step.text, /USDC mode is on: only Bid-Ask/);
+  const id = stepIdOf(step);
+  await u.handleCallback(`ds:${id}:s`, ctxFor(50)); // forged Spot tap is refused
+  assert.ok(t.answers().some((a) => a.alert && /isn't available/.test(a.text)));
+  await u.handleCallback(buttonByText(step, /^Auto/).callback_data, ctxFor(50));
+  const card = t.edits().at(-1);
+  await u.handleCallback(findData(lastMarkup(card), "y:"), ctxFor(50));
+  const d = exec.find((e) => e.name === "deploy_position");
+  assert.equal(d.args.strategy, "bid_ask");
+  assert.equal(d.args.amount_usd, 50);
+  assert.equal(d.args.price_range_pct, 55, "auto bid_ask for volatility 3.2");
+  assert.ok(!("sol_split_pct" in d.args) && !("amount_x" in d.args));
+  // Back leaves the picker (there is no strategy step) and returns to Candidates.
+  const again = await openPicker(u, t);
+  await u.handleCallback(findData(lastMarkup(again), "db:"), ctxFor(50));
+  assert.match(t.edits().at(-1).text, /Candidates/);
+});
+
+test("picker: every strategy × range yields the exact single-sided deploy args", async () => {
+  const expectedAuto = { bid_ask: ui.rangeForVolatility(3.2, "bid_ask"), spot: ui.rangeForVolatility(3.2, "spot") };
+  assert.deepEqual(expectedAuto, { bid_ask: 55, spot: 65 });
+  for (const [key, strategy] of [["b", "bid_ask"], ["s", "spot"]]) {
+    for (const [range, pct] of [["a", expectedAuto[strategy]], ["25", 25], ["50", 50], ["80", 80]]) {
+      const { u, t, exec } = makeUI({ config: customCfg() });
+      const id = stepIdOf(await openPicker(u, t));
+      await u.handleCallback(`ds:${id}:${key}`, ctxFor(50));
+      if (range === "a") assert.ok(buttonByText(t.edits().at(-1), new RegExp(`^Auto \\(${pct}%\\)$`)), "Auto shows the computed %");
+      await u.handleCallback(`dr:${id}:${range}`, ctxFor(50));
+      const card = t.edits().at(-1);
+      assert.equal(card.messageId, 50, "same message through every step");
+      assert.match(card.text, new RegExp(`Strategy: <b>${strategy === "spot" ? "Spot" : "Bid-Ask"}</b> · single-sided SOL`));
+      assert.match(card.text, /Amount: <b>1\.4 SOL/);
+      assert.match(card.text, /Expires in 60s/);
+      assert.equal(exec.length, 0, "no deploy before Confirm");
+      await u.handleCallback(findData(lastMarkup(card), "y:"), ctxFor(50));
+      const deploys = exec.filter((e) => e.name === "deploy_position");
+      assert.equal(deploys.length, 1);
+      assert.deepEqual(deploys[0].args, {
+        pool_address: CAND1, pool_name: "AAA-SOL", base_mint: "MintA", bin_step: 100, volatility: 3.2,
+        fee_tvl_ratio: 1.2, organic_score: 80, strategy, price_range_pct: pct, bins_above: 0, amount_y: 1.4,
+      }, `${strategy} ${range}`);
+    }
+  }
+});
+
+test("picker: card shows the bin count; presets under the 35% floor are labelled and widened by deploy", async () => {
+  const { u, t } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  const rangeStep = t.edits().at(-1);
+  assert.deepEqual(lastMarkup(rangeStep).flat().map((b) => b.text), ["Auto (55%)", "25% → 35% min", "50%", "80%", "⬅ Back", "✖ Cancel"]);
+  assert.match(rangeStep.text, /35% minimum/);
+  await u.handleCallback(`dr:${id}:50`, ctxFor(50));
+  assert.match(t.edits().at(-1).text, /Range: 50% \(~70 bins at bin step 100\)/);
+
+  const again = makeUI({ config: customCfg() });
+  const id2 = stepIdOf(await openPicker(again.u, again.t));
+  await again.u.handleCallback(`ds:${id2}:s`, ctxFor(50));
+  await again.u.handleCallback(`dr:${id2}:25`, ctxFor(50));
+  const card = again.t.edits().at(-1);
+  assert.match(card.text, /25% requested → deploy widens it to the 35% minimum \(~44 bins at bin step 100\)/);
+  await again.u.handleCallback(findData(lastMarkup(card), "y:"), ctxFor(50));
+  assert.equal(again.exec.find((e) => e.name === "deploy_position").args.price_range_pct, 25, "deploy_position does the widening");
+
+  // A wide bin step where the 35% floor is under MIN_BINS: that preset is hidden.
+  const wide = { ...candidates().candidates[0], bin_step: 250 };
+  assert.deepEqual(ui.rangeOptions(wide, "spot").map((o) => o.key), ["a", "50", "80"], "25% (→35% = 18 bins at bs250) hidden");
+  assert.equal(ui.rangeInfo(25, 250).tooFewBins, true);
+  assert.equal(ui.rangeInfo(50, 250).tooFewBins, false);
+  const w = makeUI({ config: customCfg(), getTopCandidates: async () => ({ candidates: [wide] }) });
+  const wid = stepIdOf(await openPicker(w.u, w.t));
+  await w.u.handleCallback(`ds:${wid}:s`, ctxFor(50));
+  assert.match(w.t.edits().at(-1).text, /hidden/);
+  await w.u.handleCallback(`dr:${wid}:25`, ctxFor(50)); // forged hidden preset
+  assert.ok(w.t.answers().some((a) => a.alert && /isn't available/.test(a.text)));
+  assert.equal(w.exec.length, 0);
+});
+
+test("picker: Back returns to the strategy step; Cancel ends it; nothing executes", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  await u.handleCallback(`ds:${id}:s`, ctxFor(50));
+  await u.handleCallback(`db:${id}`, ctxFor(50));
+  assert.match(t.edits().at(-1).text, /How do you want to deploy/);
+  await u.handleCallback(`dr:${id}:50`, ctxFor(50)); // range without a strategy after Back
+  assert.ok(t.answers().some((a) => /Pick a strategy first/.test(a.text)));
+  await u.handleCallback(`dx:${id}`, ctxFor(50));
+  assert.match(t.edits().at(-1).text, /Cancelled\. Nothing was done/);
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  assert.match(t.edits().at(-1).text, /This menu expired, tap Candidates again/);
+  assert.equal(exec.length, 0);
+  assert.equal(u.nonces.size(), 0, "no confirmation nonce was ever created");
+});
+
+test("picker: expired or unknown step ids are refused", async () => {
+  const { u, t, exec, advance } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  advance(ui.CONFIRM_TTL_MS + 1);
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  assert.ok(t.answers().some((a) => a.alert && a.text === "This menu expired, tap Candidates again."));
+  assert.match(t.edits().at(-1).text, /This menu expired, tap Candidates again/);
+  await u.handleCallback("dr:nope:50", ctxFor(50));
+  assert.match(t.edits().at(-1).text, /expired/);
+  assert.equal(exec.length, 0);
+});
+
+test("picker: wrong-chat and wrong-message step callbacks are refused", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  const editsBefore = t.edits().length;
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50, { chatId: "222" }));
+  await u.handleCallback(`ds:${id}:b`, ctxFor(77));
+  await u.handleCallback(`dx:${id}`, ctxFor(50, { chatId: "222" }));
+  assert.equal(t.edits().length, editsBefore, "refusals don't touch the message");
+  assert.ok(t.answers().some((a) => /different chat/.test(a.text)));
+  assert.ok(t.answers().some((a) => /different message/.test(a.text)));
+  // The owner's own taps still work (the refusals didn't consume the step).
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  await u.handleCallback(`dr:${id}:50`, ctxFor(50));
+  await u.handleCallback(findData(lastMarkup(t.edits().at(-1)), "y:"), ctxFor(50, { chatId: "222" }));
+  assert.equal(exec.length, 0, "wrong-chat confirm refused");
+});
+
+test("picker: confirm executes exactly once; replays and a double range tap are refused", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  await Promise.all([u.handleCallback(`dr:${id}:80`, ctxFor(50)), u.handleCallback(`dr:${id}:50`, ctxFor(50))]);
+  assert.equal(u.nonces.size(), 1, "one confirmation card from a double tap");
+  const yes = findData(lastMarkup(t.edits().filter((e) => /Deploy into this pool/.test(e.text)).at(-1)), "y:");
+  await Promise.all([u.handleCallback(yes, ctxFor(50)), u.handleCallback(yes, ctxFor(50))]);
+  await u.handleCallback(yes, ctxFor(50));
+  assert.equal(exec.filter((e) => e.name === "deploy_position").length, 1);
+  assert.ok(t.answers().some((a) => a.alert && /already used/i.test(a.text)));
+  await u.handleCallback(`dr:${id}:50`, ctxFor(50)); // step replay after confirm
+  assert.equal(exec.filter((e) => e.name === "deploy_position").length, 1);
+});
+
+test("picker: the number reply after /candidates goes through the picker", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  await u.handleMessage("/candidates", { chatId: OWNER });
+  await u.handleMessage("2", { chatId: OWNER });
+  const stepMsg = t.sends().at(-1);
+  assert.match(stepMsg.text, /How do you want to deploy BBB-SOL\?/);
+  assert.equal(exec.length, 0);
+  const msgId = 500 + t.sends().length; // mock message ids are sequential
+  const id = stepIdOf(stepMsg);
+  await u.handleCallback(`ds:${id}:s`, ctxFor(msgId + 1)); // different message: refused
+  assert.ok(t.answers().some((a) => /different message/.test(a.text)));
+  await u.handleCallback(`ds:${id}:s`, ctxFor(msgId));
+  assert.ok(buttonByText(t.edits().at(-1), /^Auto \(85%\)$/), "volatility 9 → spot auto 85%");
+  await u.handleCallback(`dr:${id}:a`, ctxFor(msgId));
+  const card = t.edits().at(-1);
+  assert.equal(card.messageId, msgId);
+  await u.handleCallback(findData(lastMarkup(card), "y:"), ctxFor(msgId));
+  const d = exec.find((e) => e.name === "deploy_position");
+  assert.equal(d.args.pool_address, "CandPool2222222222222222222222222222222222222");
+  assert.equal(d.args.strategy, "spot");
+  assert.equal(d.args.price_range_pct, 85);
+  assert.equal(d.args.bins_above, 0);
+});
+
+test("picker: every callback_data across the picker is ≤ 64 bytes", async () => {
+  const { u, t } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  await u.handleCallback(`ds:${id}:s`, ctxFor(50));
+  await u.handleCallback(`dr:${id}:80`, ctxFor(50));
+  const usdc = makeUI({ config: customCfg(), usdcModeEnabled: () => true });
+  await openPicker(usdc.u, usdc.t);
+  const all = [...t.calls, ...usdc.t.calls].flatMap((c) => allCallbackData(lastMarkup(c)));
+  for (const prefix of ["ds:", "dr:", "db:", "dx:", "y:", "n:"]) assert.ok(all.some((d) => d.startsWith(prefix)), prefix);
+  for (const d of all) assert.ok(Buffer.byteLength(d, "utf8") <= 64, d);
+});

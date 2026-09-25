@@ -874,7 +874,7 @@ const TELEGRAM_HELP = [
   "/settings — effective config + which file each setting lives in",
   "/usdc [on|off] — show or toggle USDC mode",
   "/candidates — refresh top pools (then reply a number to deploy)",
-  "1 / 2 / 3 … — deploy into that pool (asks for confirmation)",
+  "1 / 2 / 3 … — deploy into that pool: pick Bid-Ask or Spot (single-sided SOL) and a range (Auto/25/50/80%), then confirm",
   "auto — agent picks the best pool and deploys (asks for confirmation)",
   "go — start autonomous cycles",
   "/briefing — last-24h briefing",

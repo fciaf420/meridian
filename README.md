@@ -308,6 +308,8 @@ The web UI exposes the same chat surface and a command palette.
 
 Send `/menu` (or `/start`, or tap the persistent 🏠 Menu button) for the button menu: Status · Positions · Candidates · Wallet · Settings · Bot controls. Views edit the same message in place and have Refresh / Back buttons. Every text command from the REPL still works (`/status`, `/candidates`, `/settings`, `/usdc`, `/autoresearch …`, `/help`, …).
 
+Deploying a candidate (the 🚀 Deploy button, or replying with its number after `/candidates`) opens a short picker in the same message: choose **Bid-Ask** or **Spot** (both single-sided SOL; ✓ marks your configured strategy), then a range: **Auto** (from the pool's volatility, shown as a %), **25%**, **50%** or **80%**. `deploy_position` enforces a 35% minimum range, so the 25% preset is labelled "→ 35% min" and widened at deploy; a preset that would fall under the 20-bin minimum at the pool's bin step is hidden. The confirmation card then shows the strategy, range, approximate bin count and amount. Two-sided spot is not offered. Under `activeStrategy: "evil_panda"` the picker is skipped (fixed Evil Panda spot plan), and in USDC mode only Bid-Ask is offered.
+
 Bot controls: pause/resume scheduled screening (persisted in `state.json`; management and the PnL watcher keep running), run a screening cycle now, autoresearch status/list/approve/reject, and the last ERROR/WARN log lines (redacted).
 
 Access and confirmation rules:
