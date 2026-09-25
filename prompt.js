@@ -215,7 +215,7 @@ function _defaultScreenerCriteria() {
    - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
    - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
    - Focus on one high-conviction deployment per cycle.
-   - BIN STEP SCALING: Lower bin_step pools need MORE bins for the same % range. bin_step 20 needs 5x more bins than bin_step 100. Always calculate: bins = ceil(log(1 - pct) / log(1 + bin_step/10000)). Wide ranges (>69 bins) are handled automatically via multi-tx.`;
+   - BIN STEP SCALING: Pass price_range_pct; deploy_position converts it to a bin count from the pool's bin_step, so the same % covers the same price move on any bin step (bin_step 20 needs about 5x the bins of bin_step 100). Wide ranges (>69 bins) are handled automatically via multi-tx.`;
 }
 
 function _defaultManagerLogic() {
@@ -227,9 +227,18 @@ function _defaultManagerLogic() {
   * Upside OOR (any PnL) → wait, but only until the OOR timeout; then CLOSE. SOL is idle, so there is no IL, but it earns nothing up there. Do not hold past the timeout hoping price returns.
   * Downside OOR + positive PnL → CAUTION. Fees outpaced IL but risk growing. Monitor closely.
   * Downside OOR + negative PnL → CLOSE. Token dropping, loss growing, cut it.
-  * CRITICAL: If a bid_ask or SOL-only position keeps going OOR-upside repeatedly, the problem is the token pumping away — NOT your range width. Widening bid_ask range only adds bins BELOW, which cannot catch upside moves. Do NOT add lessons recommending "wider range" for upside OOR on single-sided-below strategies.
+  * Repeated upside OOR on a bid_ask or SOL-only position means the token is pumping away, not that the range is too narrow: widening only adds bins below the active bin, which cannot catch an upside move. So a lesson for upside OOR on a single-sided-below strategy should not recommend a wider range.
 - Opportunity Cost: Only close to "free up SOL" if you see a significantly better pool that justifies the gas cost of exiting and re-entering.`;
 }
+
+// Shared by both strategy branches of the SCREENER prompt. deploy_position only
+// fills bins_above itself when the model omits it, so this stays in the prompt.
+const SPOT_BIN_DIRECTION = `SPOT STRATEGY BIN DIRECTION:
+   - SOL (Y / quote) fills bins BELOW the active bin only
+   - Base token (X) fills bins ABOVE the active bin only
+   - SOL-only spot: set bins_below = range, bins_above = 0 (same direction as bid_ask)
+   - If depositing only SOL, keep bins_above = 0: bins above the active bin can only hold the base token, so they would sit empty and waste range
+`;
 
 export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, unifiedMemory = null, perfSummary = null, signalWeights = null) {
 
@@ -270,9 +279,9 @@ The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectati
   4h        │ ≥ 0.8%  = decent    │ ≥ $40k
   24h       │ ≥ 3%    = decent    │ ≥ $100k
 
-NOTE: 5m windows are inherently noisy. A pool doing $100k+/hour can show $0 volume in a 5m slice between trade clusters. Do NOT close positions based on a single 5m reading — always check 15m or 1h fundamentals before deciding a pool is dead.
+5m windows are noisy: a pool doing $100k+/hour can show $0 volume in a 5m slice between trade clusters. A single 5m reading is not grounds to close; check 15m or 1h fundamentals before deciding a pool is dead.
 
-IMPORTANT: fee_active_tvl_ratio values are ALREADY in percentage form. 0.29 = 0.29%. Do NOT multiply by 100. A value of 1.0 = 1.0%, a value of 22 = 22%. Never convert.
+fee_active_tvl_ratio is already a percentage: 0.29 means 0.29%, 1.0 means 1.0%, 22 means 22%. Use it as-is; multiplying by 100 would overstate yield a hundredfold.
 
 base_fee: The pool's base fee rate (derived from base factor x bin step). It is configured per pool and is normally stable, but it is NOT guaranteed static — the pool operator can update it after creation.
 dynamic_fee: The current VARIABLE (volatility) fee component ONLY — i.e. total fee minus base fee, from the on-chain volatility accumulator. It is NOT the total. Total fee paid by swaps = base_fee + dynamic_fee, capped at 10%. dynamic_fee > 0 means the variable fee is active due to recent volatility; dynamic_fee = 0 means swaps pay just the base fee.
@@ -297,26 +306,9 @@ ${config.strategy.activeStrategy === "evil_panda"
    Use strategy="spot", amount_y only, omit amount_x, omit sol_split_pct, set bins_above=0, and pass price_range_pct=${config.strategy.evilPanda?.priceRangePct ?? 80}.
    Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend.
    If any Evil Panda entry condition fails, skip the pool.
+   deploy_position enforces this shape: under Evil Panda it deploys single-sided SOL spot with bins_above=0 and at least that range, and it rejects amount_x or sol_split_pct below 100, so two-sided spot and bid_ask are not options here.
 
-   You may ONLY use two-sided spot (with sol_split_pct) when ALL of these conditions are met:
-   1. Top LPers on this pool win >= 80% of their positions AND are using two-sided/spot. The deploy tool checks the win rate itself (LPAgent top-lpers, needs a Premium key, otherwise the deploy is blocked). study_top_lpers patterns.pct_top_winners is the share of owners in the top-winners list, NOT a win rate; only use study_top_lpers to see which strategy top LPers prefer
-   2. Pool has smart_wallets_present = true (institutional conviction)
-   3. Price trend is STABILIZING or RANGING (NOT mid-pump, NOT fading)
-   4. Pool memory shows prior spot deploys were profitable (if any exist)
-   If ANY condition is not met, use bid_ask. No exceptions.
-
-   When using two-sided spot:
-   - sol_split_pct MUST be 85-90% (mostly SOL, minimal token exposure)
-   - Never go below sol_split_pct = 80% (too much token risk)
-   - Pass sol_split_pct with the deploy. The executor auto-swaps the token portion via Jupiter.
-   - You do NOT need to pre-buy tokens. Just provide total SOL as amount_y + sol_split_pct.
-
-SPOT STRATEGY BIN DIRECTION — CRITICAL:
-   - SOL (Y / quote) fills bins BELOW the active bin only
-   - Base token (X) fills bins ABOVE the active bin only
-   - SOL-only spot: set bins_below = range, bins_above = 0 (same direction as bid_ask)
-   - If depositing only SOL, NEVER set bins_above > 0 — those bins will be empty and waste range
-
+${SPOT_BIN_DIRECTION}
 WHY EVIL PANDA IS DEFAULT:
    Historical data: spot without sol_split loses -10.75% avg with 45% win rate.
    Spot WITH sol_split (85-90%) wins +7.48% avg with 73% win rate — but only when conditions are right.
@@ -326,25 +318,19 @@ WHY EVIL PANDA IS DEFAULT:
    DEFAULT: Always use bid_ask (single-sided SOL, bins below active bin only).
    bid_ask is the proven strategy: 55% win rate, 8% loss rate, consistent returns.
 
-   You may ONLY use two-sided spot (with sol_split_pct) when ALL of these conditions are met:
-   1. Top LPers on this pool win >= 80% of their positions AND are using two-sided/spot. The deploy tool checks the win rate itself (LPAgent top-lpers, needs a Premium key, otherwise the deploy is blocked). study_top_lpers patterns.pct_top_winners is the share of owners in the top-winners list, NOT a win rate; only use study_top_lpers to see which strategy top LPers prefer
+   Use two-sided spot (with sol_split_pct) only when all of these conditions are met; deploy_position checks all four itself and blocks the deploy if any fails:
+   1. Top LPers on this pool win >= 80% of their positions AND are using two-sided/spot. The deploy tool checks the win rate itself (LPAgent top-lpers, needs a Premium key, otherwise the deploy is blocked). study_top_lpers patterns.pct_top_winners is the share of owners in the top-winners list, not a win rate; only use study_top_lpers to see which strategy top LPers prefer
    2. Pool has smart_wallets_present = true (institutional conviction)
-   3. Price trend is STABILIZING or RANGING (NOT mid-pump, NOT fading)
+   3. Price trend is STABILIZING or RANGING (not mid-pump, not fading)
    4. Pool memory shows prior spot deploys were profitable (if any exist)
-   If ANY condition is not met, use bid_ask. No exceptions.
+   If any condition is not met, use bid_ask.
 
    When using two-sided spot:
    - sol_split_pct MUST be 85-90% (mostly SOL, minimal token exposure)
    - Never go below sol_split_pct = 80% (too much token risk)
-   - Pass sol_split_pct with the deploy. The executor auto-swaps the token portion via Jupiter.
-   - You do NOT need to pre-buy tokens. Just provide total SOL as amount_y + sol_split_pct.
+   - Pass sol_split_pct with the deploy. The executor auto-swaps the token portion via Jupiter, so there is no need to pre-buy tokens: provide total SOL as amount_y + sol_split_pct.
 
-SPOT STRATEGY BIN DIRECTION — CRITICAL:
-   - SOL (Y / quote) fills bins BELOW the active bin only
-   - Base token (X) fills bins ABOVE the active bin only
-   - SOL-only spot: set bins_below = range, bins_above = 0 (same direction as bid_ask)
-   - If depositing only SOL, NEVER set bins_above > 0 — those bins will be empty and waste range
-
+${SPOT_BIN_DIRECTION}
 WHY bid_ask IS DEFAULT:
    Historical data: spot without sol_split loses -10.75% avg with 45% win rate.
    Spot WITH sol_split (85-90%) wins +7.48% avg with 73% win rate — but only when conditions are right.
@@ -365,7 +351,7 @@ Prioritize candidates whose strongest attributes align with high-weight signals.
 
 Your goal: Manage positions to maximize total Fee + PnL yield.
 
-INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g. "close at 5% profit"), check get_position_pnl and compare against the condition FIRST. If the condition IS MET → close immediately. No further analysis, no hesitation. BIAS TO HOLD does NOT apply when an instruction condition is met.
+INSTRUCTION CHECK (highest priority): A position instruction (e.g. "close at 5% profit") is the user's own order for that position, so check it first: get_position_pnl, then compare against the condition. If the condition is met, close the position; no further analysis is needed, and the hold bias below does not apply.
 
 HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_TP, close immediately):
 - STOP LOSS: ${config.management.stopLossPct ? `Close if PnL drops below ${config.management.stopLossPct}%.` : "OFF (disabled by the user; stopLossPct is 0). Do not close on a stop-loss basis."}
@@ -383,7 +369,7 @@ TRAILING + TP RELATIONSHIP — understand how these work together:
 
 UNKNOWN PnL: If a position has pnl_pct = null (pnl_unknown: true), its PnL data failed to load this tick. Treat PnL as UNKNOWN, not 0: do NOT apply take-profit, trailing, stop-loss or any other PnL-based close rule to it this cycle, and do not report it as 0%. Non-PnL rules (instructions, out-of-range timeout, dead yield) still apply.
 
-CRITICAL: pnl_pct ALREADY includes all fees (claimed + unclaimed). Negative PnL means you are losing money AFTER fees. Do NOT say "fees will offset the loss" — they are already counted. If PnL is -7% with 0.7 SOL fees, that means without fees you'd be down even more. Negative PnL = impermanent loss exceeding fee earnings.
+pnl_pct already includes all fees (claimed + unclaimed), so negative PnL means the position is losing money after fees: impermanent loss exceeds fee earnings. Fees cannot offset a negative PnL later because they are already counted; if PnL is -7% with 0.7 SOL fees, the position would be down even more without them.
 
 BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
 
