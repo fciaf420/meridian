@@ -487,7 +487,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         const dsModel = DEEPSEEK_FALLBACK_MODELS[agentType] || "deepseek-chat";
 
         const fallbackKey = process.env.DEEPSEEK_API_KEY;
-        if (fallbackKey) {
+        // Same API as the primary when PROVIDER is deepseek: a pinned older model is not a fallback.
+        if (fallbackKey && PROVIDER !== "deepseek") {
           try {
             log("agent", `All ${PROVIDER} retries exhausted — falling back to ${dsModel} via DeepSeek API`);
             const fallbackClient = new OpenAI({
@@ -500,7 +501,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               tools: toolsForRole(agentType),
               tool_choice: "auto",
               temperature: config.llm.temperature,
-              max_tokens: config.llm.maxTokens,
+              // deepseek-reasoner counts its chain of thought toward max_tokens.
+              max_tokens: dsModel === "deepseek-reasoner" ? Math.max(config.llm.maxTokens, 32768) : config.llm.maxTokens,
             });
             if (dsResponse?.choices?.length) {
               msg = dsResponse.choices[0].message;
