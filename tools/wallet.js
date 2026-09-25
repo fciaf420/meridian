@@ -144,6 +144,61 @@ export async function getWalletBalances() {
 }
 
 /**
+ * On-chain balance of one mint for the wallet, read straight from RPC at
+ * `confirmed` (not the Helius indexed balances API, which lags behind txs that
+ * just confirmed). Sums every token account the owner holds for the mint. The
+ * `mint` filter makes the RPC resolve the mint's own program, so Token and
+ * Token-2022 accounts are both covered.
+ *
+ * Returns { raw: bigint, decimals: number|null, accounts }. decimals is null
+ * only when the owner has no account for the mint (raw is then 0n). Throws when
+ * the read fails or an account is unparseable, so callers can treat the balance
+ * as unknown instead of zero.
+ *
+ * @param {string} mint
+ * @param {object} [deps] Test seam only: { connection, owner }.
+ */
+export async function getOnchainTokenBalance(mint, deps = {}) {
+  const connection = deps.connection ?? getConnection();
+  const owner = deps.owner ?? getWallet().publicKey;
+  const res = await connection.getParsedTokenAccountsByOwner(
+    owner,
+    { mint: new PublicKey(mint) },
+    { commitment: "confirmed" },
+  );
+  if (!res || !Array.isArray(res.value)) throw new Error(`getParsedTokenAccountsByOwner returned no value for ${mint}`);
+  let raw = 0n;
+  let decimals = null;
+  for (const { account } of res.value) {
+    const amt = account?.data?.parsed?.info?.tokenAmount;
+    if (amt?.amount == null || !/^\d+$/.test(String(amt.amount))) {
+      throw new Error(`Unparseable token account for ${mint}`);
+    }
+    raw += BigInt(amt.amount);
+    if (decimals == null && Number.isInteger(amt.decimals)) decimals = amt.decimals;
+  }
+  return { raw, decimals, accounts: res.value.length };
+}
+
+/**
+ * Best-effort USD price for one mint from Jupiter Price v3. Returns null when
+ * the token has no price or the request fails; never throws.
+ */
+export async function getTokenUsdPrice(mint) {
+  try {
+    const res = await jupiterFetch(`${JUPITER_PRICE_API}?ids=${mint}`, {
+      headers: { "x-api-key": JUPITER_API_KEY },
+    }, { timeoutMs: 5000, maxRetries: 0 });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const price = Number(body?.[mint]?.usdPrice);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Swap tokens via Jupiter Swap v2 (order → sign → execute), with the swap/v1
  * quote+swap API as a fallback that is only used before anything is signed.
  */
