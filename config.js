@@ -85,6 +85,7 @@ export const config = {
     athTopThresholdPct: u.athTopThresholdPct ?? 90,
     minTokenAgeHours:  u.minTokenAgeHours  ?? null, // null = no minimum (token age from GMGN creation_timestamp)
     maxTokenAgeHours:  u.maxTokenAgeHours  ?? null, // null = no maximum
+    gmgnSignalsEnabled: u.gmgnSignalsEnabled ?? true, // GMGN market-signal feed (buy pressure / spikes) on candidates; informational
   },
 
   // ─── GMGN Screening (opt-in via screening.source = "gmgn" or "both") ─
