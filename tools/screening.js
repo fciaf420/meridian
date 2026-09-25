@@ -4,6 +4,7 @@ import { log } from "../logger.js";
 import { scoreSignalSnapshot } from "../signal-weights.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
 
 
@@ -54,6 +55,10 @@ export async function discoverPools({
     const p = normalizeCandidateForUi(candidate);
     if (isBlacklisted(p.base?.mint)) {
       log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
+      return false;
+    }
+    // Deploys fund the Y side with SOL, so only SOL-quoted pools are usable.
+    if (p.quote?.mint && p.quote.mint !== WSOL_MINT) {
       return false;
     }
     if (p.volatility != null && p.volatility > s.maxVolatility) {
