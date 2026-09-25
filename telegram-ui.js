@@ -471,22 +471,142 @@ export function renderStatus(info, now = Date.now()) {
   return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard: [backRow("st")] };
 }
 
-export function renderWallet(wallet, { config, usdcMode }) {
-  if (!wallet || wallet.error) {
-    return { text: `💰 <b>Wallet</b>\n⚠️ Could not read balances: ${escapeHtml(wallet?.error ?? "unknown error")}`, keyboard: [backRow("wa")] };
+// ─── Wallet: true total (wallet + DLMM positions) ────────────────
+export const WALLET_DUST_USD = 0.10;
+export const WALLET_MAX_TOKENS = 12;
+export const WALLET_MAX_POSITIONS = 15;
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+const finitePos = (v) => { const n = Number(v); return v != null && Number.isFinite(n) && n > 0 ? n : null; };
+
+/**
+ * Read-only totals from data the bot already has: getWalletBalances() (Helius
+ * balances with per-token USD) and getMyPositions() (LP Agent / Meteora
+ * position value, composition and unclaimed fees). A position whose value is
+ * unknown (missing or 0) is excluded from the subtotal and flagged, never
+ * counted as 0. Returns plain numbers; renderWallet formats them.
+ *
+ * Fees are added on top of total_value_usd because both sources exclude them:
+ * LP Agent `value` reconciles as value + collectedFee + unCollectedFee −
+ * inputValue = pnl.value, and Meteora's UnrealizedPnL.balances is the token X +
+ * Y balance with unclaimed fees reported separately (dlmm.datapi OpenAPI).
+ */
+export function computeWalletTotals(wallet, positionsResult = null) {
+  const posList = Array.isArray(positionsResult?.positions) ? positionsResult.positions : [];
+  const price = finitePos(wallet?.sol_price) ?? finitePos(posList.find((p) => finitePos(p.sol_price))?.sol_price);
+  const toSol = (usd) => (price && usd != null ? usd / price : null);
+
+  // ── In wallet ──
+  const walletItems = [];
+  const sol = Number(wallet?.sol) || 0;
+  const solUsd = Number.isFinite(Number(wallet?.sol_usd)) && Number(wallet.sol_usd) > 0 ? Number(wallet.sol_usd) : (price ? sol * price : 0);
+  walletItems.push({ symbol: "SOL", amount: sol, usd: solUsd, kind: "sol" });
+  const tokens = Array.isArray(wallet?.tokens) ? wallet.tokens : [];
+  const isSol = (t) => t.mint === SOL_MINT || t.symbol === "SOL";
+  const isUsdc = (t) => t.mint === USDC_MINT || t.symbol === "USDC";
+  const usdcAmt = Number(wallet?.usdc) || 0;
+  if (usdcAmt > 0) {
+    const entry = tokens.find(isUsdc);
+    walletItems.push({ symbol: "USDC", amount: usdcAmt, usd: finitePos(entry?.usd) ?? usdcAmt, kind: "usdc" });
   }
+  const others = [];
+  let dustUsd = 0;
+  let dustCount = 0;
+  let unpriced = 0;
+  for (const t of tokens) {
+    if (isSol(t) || isUsdc(t)) continue;
+    const usd = t.usd == null ? null : Number(t.usd);
+    if (usd == null || !Number.isFinite(usd)) { if (Number(t.balance) > 0) unpriced++; continue; }
+    if (usd > WALLET_DUST_USD) others.push({ symbol: t.symbol || shortAddr(t.mint), amount: Number(t.balance), usd, kind: "token" });
+    else if (usd > 0) { dustUsd += usd; dustCount++; }
+  }
+  others.sort((a, b) => b.usd - a.usd);
+  walletItems.push(...others);
+  const walletUsd = walletItems.reduce((a, x) => a + x.usd, 0) + dustUsd;
+
+  // ── In DLMM positions ──
+  const positions = posList.map((p) => {
+    const valueUsd = finitePos(p.total_value_usd) ?? (price && finitePos(p.total_value_sol) ? finitePos(p.total_value_sol) * price : null);
+    const feesUsd = Number.isFinite(Number(p.unclaimed_fees_usd)) && Number(p.unclaimed_fees_usd) > 0 ? Number(p.unclaimed_fees_usd) : 0;
+    const c = p.composition || null;
+    return {
+      position: p.position,
+      pair: p.pair ?? shortAddr(p.position),
+      known: valueUsd != null,
+      valueUsd,
+      feesUsd,
+      totalUsd: valueUsd != null ? valueUsd + feesUsd : null,
+      solSide: c && Number.isFinite(Number(c.sol_amount)) ? { sol: Number(c.sol_amount), usd: Number(c.sol_usd) || (price ? Number(c.sol_amount) * price : null) } : null,
+      tokenSide: c && Number.isFinite(Number(c.token_usd)) ? { amount: Number(c.token_amount), usd: Number(c.token_usd), sol: toSol(Number(c.token_usd)) } : null,
+    };
+  });
+  const dlmmUsd = positions.reduce((a, x) => a + (x.known ? x.totalUsd : 0), 0);
+  const unknownCount = positions.filter((x) => !x.known).length;
+  const totalUsd = walletUsd + dlmmUsd;
+  return {
+    price,
+    walletItems, dustUsd, dustCount, unpriced, walletUsd, walletSol: toSol(walletUsd),
+    positions, positionsError: positionsResult?.error ?? (positionsResult ? null : "not loaded"),
+    dlmmUsd, dlmmSol: toSol(dlmmUsd), unknownCount,
+    totalUsd, totalSol: toSol(totalUsd),
+  };
+}
+
+const usdStr = (v) => (v == null ? "?" : `$${Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+const solStr = (v) => (v == null ? "? SOL" : `${fmtNum(v, 4)} SOL`);
+const amtStr = (v) => (Number(v) >= 1000 ? Math.round(Number(v)).toLocaleString("en-US") : fmtNum(v, 4));
+
+export function renderWallet(wallet, { config, usdcMode, positions = null } = {}) {
+  const keyboard = [[btn("🔄 Refresh", "wa:r"), btn("⬅ Menu", "m")]];
+  if (!wallet || wallet.error) {
+    return { text: `💰 <b>Wallet</b>\n⚠️ Could not read balances: ${escapeHtml(wallet?.error ?? "unknown error")}`, keyboard };
+  }
+  const t = computeWalletTotals(wallet, positions);
   const reserve = usdcMode ? config.usdc?.gasReserveSol : (config.management?.gasReserve ?? 0.2);
-  const lines = [
-    `💰 <b>Wallet</b> <code>${escapeHtml(shortAddr(wallet.wallet))}</code>`,
-    `SOL: <b>${fmtNum(wallet.sol, 4)}</b> ($${fmtNum(wallet.sol_usd, 2)}) @ $${fmtNum(wallet.sol_price, 2)}`,
-    `USDC: <b>$${fmtNum(wallet.usdc, 2)}</b>`,
-    `Gas reserve: ${fmtNum(reserve, 4)} SOL${usdcMode ? " (USDC mode, warn-only)" : ""}`,
-    `Total: $${fmtNum(wallet.total_usd, 2)}`,
-  ];
+  const lines = [`💰 <b>Wallet</b> <code>${escapeHtml(shortAddr(wallet.wallet))}</code>`];
+
+  // Total first so it survives any clipping.
+  lines.push(`<b>Total: ${solStr(t.totalSol)} (${usdStr(t.totalUsd)})</b>`);
+  lines.push(`= wallet ${usdStr(t.walletUsd)} + DLMM ${usdStr(t.dlmmUsd)}${t.price ? ` · SOL price used: $${fmtNum(t.price, 2)}` : " · ⚠️ SOL price unknown, SOL totals not shown"}`);
+  if (t.positionsError) lines.push(`⚠️ DLMM positions not included: ${escapeHtml(clipText(String(t.positionsError), 120))}`);
+  if (t.unknownCount) lines.push(`⚠️ ${t.unknownCount} position${t.unknownCount === 1 ? "" : "s"} with unknown value not included.`);
+
+  lines.push("", `<b>In wallet</b> (${usdStr(t.walletUsd)})`);
+  const shown = t.walletItems.slice(0, WALLET_MAX_TOKENS);
+  for (const x of shown) {
+    if (x.kind === "sol") lines.push(`SOL: <b>${fmtNum(x.amount, 4)}</b> (${usdStr(x.usd)})`);
+    else if (x.kind === "usdc") lines.push(`USDC: <b>$${fmtNum(x.amount, 2)}</b>${Math.abs(x.usd - x.amount) > 0.01 ? ` (${usdStr(x.usd)})` : ""}`);
+    else lines.push(`${escapeHtml(clipText(String(x.symbol), 16))}: ${amtStr(x.amount)} (${usdStr(x.usd)})`);
+  }
+  const hidden = t.walletItems.slice(WALLET_MAX_TOKENS);
+  if (hidden.length) lines.push(`+ ${hidden.length} more token${hidden.length === 1 ? "" : "s"} (${usdStr(hidden.reduce((a, x) => a + x.usd, 0))})`);
+  if (t.dustCount) lines.push(`+ ${t.dustCount} balance${t.dustCount === 1 ? "" : "s"} under $${WALLET_DUST_USD.toFixed(2)} (${usdStr(t.dustUsd)})`);
+  if (t.unpriced) lines.push(`${t.unpriced} unpriced token${t.unpriced === 1 ? "" : "s"} not counted.`);
+  lines.push(`Gas reserve: ${fmtNum(reserve, 4)} SOL${usdcMode ? " (USDC mode, warn-only)" : ""}`);
   if (Number(wallet.sol) < Number(reserve)) lines.push("⚠️ SOL is below the gas reserve.");
-  const keyboard = [backRow("wa")];
+
+  if (!t.positionsError) {
+    lines.push("", `<b>In DLMM positions</b> (${usdStr(t.dlmmUsd)}${t.dlmmSol != null ? ` · ${solStr(t.dlmmSol)}` : ""}; value + unclaimed fees)`);
+    if (!t.positions.length) lines.push("No open positions.");
+    t.positions.slice(0, WALLET_MAX_POSITIONS).forEach((x, i) => {
+      const head = `${i + 1}. <b>${escapeHtml(clipText(String(x.pair), 24))}</b>`;
+      if (!x.known) {
+        lines.push(`${head}: value unknown (not counted)`);
+        return;
+      }
+      const parts = [`${solStr(t.price ? x.totalUsd / t.price : null)} (${usdStr(x.totalUsd)})`];
+      if (x.solSide) parts.push(`SOL side ${solStr(x.solSide.sol)}`);
+      if (x.tokenSide) parts.push(`token side ${solStr(x.tokenSide.sol)} (${usdStr(x.tokenSide.usd)})`);
+      parts.push(`fees ${solStr(t.price ? x.feesUsd / t.price : null)} (${usdStr(x.feesUsd)})`);
+      lines.push(`${head}: ${parts.join(" · ")}`);
+    });
+    const more = t.positions.slice(WALLET_MAX_POSITIONS);
+    if (more.length) lines.push(`+ ${more.length} more position${more.length === 1 ? "" : "s"} (${usdStr(more.reduce((a, x) => a + (x.known ? x.totalUsd : 0), 0))})`);
+    if (t.positions.length) lines.push("Excludes position rent (refunded on close).");
+  }
   if (wallet.wallet) keyboard.unshift([urlBtn("Solscan ↗", solscanAccountUrl(wallet.wallet))]);
-  return { text: lines.join("\n"), keyboard };
+  return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard, totals: t };
 }
 
 function positionBlock(p, i, unit) {
@@ -1452,9 +1572,14 @@ export function createTelegramUI(deps) {
           await show(ctx, renderStatus(await statusInfo(), now()), opts);
           return;
         case "wa": {
-          await answer();
-          const wallet = await deps.getWalletBalances().catch((e) => ({ error: e.message }));
-          await show(ctx, renderWallet(wallet, { config: deps.config, usdcMode: !!deps.usdcModeEnabled?.() }), opts);
+          // Read-only. Refresh (wa:r) forces a fresh position scan; the first
+          // open reuses the positions cache.
+          await answer(arg === "r" ? "Refreshing…" : "");
+          const [wallet, positions] = await Promise.all([
+            deps.getWalletBalances().catch((e) => ({ error: e.message })),
+            deps.getMyPositions ? deps.getMyPositions(arg === "r" ? { force: true } : {}).catch((e) => ({ error: e.message })) : null,
+          ]);
+          await show(ctx, renderWallet(wallet, { config: deps.config, usdcMode: !!deps.usdcModeEnabled?.(), positions }), opts);
           return;
         }
         case "po": {
