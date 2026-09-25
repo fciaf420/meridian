@@ -29,7 +29,7 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw } from "./close-swap.js";
-import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS } from "../runtime-helpers.js";
+import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS, fitDeployAmount } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
 import { getDepthForDeploy } from "./ohlcv.js";
 import {
@@ -902,6 +902,28 @@ export async function deployPosition({
   if (tokenYMint !== WSOL_MINT) {
     log("deploy", `Refusing deploy into ${pool_address}: token Y is ${tokenYMint}, not SOL`);
     return { success: false, error: `Pool ${pool_address} is not SOL-quoted (token Y ${tokenYMint}); only SOL pools are supported.` };
+  }
+
+  // ─── Rent guard: deposit + position rent + fees must leave the gas reserve ───
+  // A wide position's account rent grows with its bins (~0.095 SOL at 162 bins)
+  // and comes out of free SOL on top of the deposit. With the exact bin count
+  // known, shrink a SOL-only deposit that would dip into gasReserve.
+  if (totalSolAmount > 0 && !((amount_x ?? 0) > 0) && !needsAutoSwap) {
+    try {
+      const freeSol = (await getConnection().getBalance(wallet.publicKey, "confirmed")) / 1e9;
+      const reserve = Number(config.management.gasReserve ?? 0.2);
+      const fit = fitDeployAmount({ freeSol, reserve, amount: totalSolAmount, totalBins });
+      if (fit.shrunk) {
+        if (fit.amount < 0.1) {
+          return { success: false, error: `Deploy skipped — ${freeSol.toFixed(4)} SOL free can't cover ${totalSolAmount} SOL + ~${fit.overhead.toFixed(4)} SOL position rent/fees and keep the ${reserve} SOL gas reserve.` };
+        }
+        log("deploy", `Rent guard: ${totalSolAmount} SOL + ~${fit.overhead.toFixed(4)} rent/fees (${totalBins} bins) would dip into the ${reserve} SOL gas reserve (free ${freeSol.toFixed(4)}); deploying ${fit.amount} SOL instead`);
+        totalSolAmount = fit.amount;
+        amount_y = fit.amount;
+      }
+    } catch (e) {
+      log("deploy_warn", `Rent guard skipped (balance read failed: ${e.message}); sizing already reserved worst-case rent`);
+    }
   }
   // ─── Entry-safety hard checks (config.entryFilters) ───────────
   // Before any swap or tx is built, on every deploy path (screener, agent,
