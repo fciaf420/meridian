@@ -27,7 +27,12 @@ import {
 } from "./llm-provider.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const AUTORESEARCH_FILE = path.join(__dirname, "autoresearch.json");
+// MERIDIAN_AUTORESEARCH_FILE lets tests point at a scratch copy instead of the repo file.
+const AUTORESEARCH_FILE = process.env.MERIDIAN_AUTORESEARCH_FILE || path.join(__dirname, "autoresearch.json");
+
+// Hard cap on one generator call (HTTP or CLI). Autoresearch never runs on the close
+// path, but a hung call would still hold the single-experiment lock forever.
+export const AUTORESEARCH_LLM_TIMEOUT_MS = 60_000;
 
 // ─── Persistence ─────────────────────────────────────────────
 
@@ -172,13 +177,41 @@ try {
 
 // ─── Main Entry Point ────────────────────────────────────────
 
-/**
- * Called from recordPerformance after each close.
- * Evaluates an active experiment or starts a new one.
- */
-export async function maybeRunAutoresearch(perfData, lessons, cfg) {
-  if (cfg.autoresearch?.enabled !== true) return;
+// In-process single-flight lock. Two closes arriving while the generator is
+// thinking must never both see active=null and start two experiments (M3).
+let _running = null;
 
+/**
+ * Called (fire-and-forget) after each close is recorded. Evaluates the active
+ * experiment or starts a new one. Never awaited by the close path: the returned
+ * promise exists for tests and always resolves (errors are logged, not thrown).
+ */
+export function maybeRunAutoresearch(perfData, lessons, cfg) {
+  if (cfg?.autoresearch?.enabled !== true) return Promise.resolve({ skipped: "disabled" });
+  if (_running) {
+    log("autoresearch", "Previous autoresearch run still in progress — skipping this close (the next close re-evaluates)");
+    return Promise.resolve({ skipped: "busy" });
+  }
+  _running = (async () => {
+    try {
+      await runAutoresearchOnce(perfData, lessons, cfg);
+      return { ran: true };
+    } catch (e) {
+      log("autoresearch", `Error: ${e.message}`);
+      return { error: e.message };
+    } finally {
+      _running = null;
+    }
+  })();
+  return _running;
+}
+
+/** True while a run holds the lock (for tests and status output). */
+export function isAutoresearchRunning() {
+  return _running !== null;
+}
+
+async function runAutoresearchOnce(perfData, lessons, cfg) {
   const state = loadAutoresearch();
 
   if (state.active) {
@@ -323,7 +356,7 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
   let hypothesis, modifiedText;
 
   try {
-    const result = await callLLM(llmModel, worstSection, worstCount, currentText, failureDesc + kbContext);
+    const result = await _generator(llmModel, worstSection, worstCount, currentText, failureDesc + kbContext);
     hypothesis = result.hypothesis;
     modifiedText = result.modifiedText;
   } catch (e) {
@@ -379,8 +412,16 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
     experiment.weights_at_start = null;
   }
 
-  state.active = experiment;
-  saveAutoresearch(state);
+  // Re-check the persisted state after the (slow) generator call: another run
+  // or an operator command may have changed it meanwhile. Never start a second
+  // experiment, and never overwrite newer state with the pre-LLM snapshot.
+  const fresh = loadAutoresearch();
+  if (fresh.active) {
+    log("autoresearch", `Experiment ${fresh.active.id} became active while generating — discarding this candidate`);
+    return;
+  }
+  fresh.active = experiment;
+  saveAutoresearch(fresh);
 
   // 7. Activate the override
   setPromptSectionOverride(worstSection, modifiedText);
@@ -613,6 +654,7 @@ Return a JSON object: {"hypothesis": one sentence on what you changed and why, "
     const schemaPath = path.join(os.tmpdir(), `meridian-autoresearch-${process.pid}.schema.json`);
     fs.writeFileSync(schemaPath, JSON.stringify(schema));
     const content = await runCodexExec(model, `${systemMsg}\n\n${userMsg}`, {
+      timeoutMs: AUTORESEARCH_LLM_TIMEOUT_MS,
       cwd: process.cwd(),
       sandbox: "read-only",
       skipGitRepoCheck: true,
@@ -631,6 +673,7 @@ Return a JSON object: {"hypothesis": one sentence on what you changed and why, "
     const { runClaudeCli } = await import("./llm-provider.js");
 
     const content = await runClaudeCli(model, userMsg, {
+      timeoutMs: AUTORESEARCH_LLM_TIMEOUT_MS,
       effort: "high",
       systemPrompt: systemMsg,
       jsonSchema: schema,
@@ -661,26 +704,46 @@ Return a JSON object: {"hypothesis": one sentence on what you changed and why, "
     body.reasoning_split = true;
   }
 
-  const response = await fetch(baseURL, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AUTORESEARCH_LLM_TIMEOUT_MS);
+  let data;
+  try {
+    const response = await fetch(baseURL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
 
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "unknown");
-    throw new Error(`LLM provider returned ${response.status}: ${errText}`);
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "unknown");
+      throw new Error(`LLM provider returned ${response.status}: ${errText}`);
+    }
+
+    data = await response.json();
+  } catch (e) {
+    if (controller.signal.aborted) throw new Error(`autoresearch LLM call timed out after ${AUTORESEARCH_LLM_TIMEOUT_MS / 1000}s`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-
-  const data = await response.json();
   const message = data.choices?.[0]?.message;
   const content = message?.content;
   if (!content) throw new Error("Empty response from LLM");
 
   return toResult(content);
+}
+
+// The generator is swappable so tests can mock it (no LLM or network in tests).
+let _generator = callLLM;
+export function __setAutoresearchGeneratorForTests(fn) {
+  _generator = typeof fn === "function" ? fn : callLLM;
+}
+export function __resetAutoresearchLockForTests() {
+  _running = null;
 }
 
 // ─── Public Accessors ────────────────────────────────────────

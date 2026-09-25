@@ -248,14 +248,15 @@ export async function recordPerformance(perf) {
     }
   }
 
-  // Autoresearch: evaluate or start experiment
+  // Autoresearch: evaluate or start an experiment. Fire-and-forget: the close
+  // path (and pnl-watcher's sequential stop-loss closes) must never wait on an
+  // LLM. autoresearch.js serializes itself and times out its own calls.
   if (config.autoresearch?.enabled) {
-    try {
-      const { maybeRunAutoresearch } = await import("./autoresearch.js");
-      await maybeRunAutoresearch(data.performance, data.lessons, config);
-    } catch (e) {
-      log("autoresearch", `Error: ${e.message}`);
-    }
+    const perfSnapshot = data.performance.slice();
+    const lessonsSnapshot = (data.lessons || []).slice();
+    import("./autoresearch.js")
+      .then(({ maybeRunAutoresearch }) => maybeRunAutoresearch(perfSnapshot, lessonsSnapshot, config))
+      .catch((e) => log("autoresearch", `Error: ${e.message}`));
   }
 }
 
