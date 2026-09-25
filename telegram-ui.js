@@ -17,6 +17,11 @@ import fs from "fs";
 import path from "path";
 import { escapeHtml, clipText, CALLBACK_DATA_MAX_BYTES } from "./telegram.js";
 import { calculateBinsForPriceRange, MIN_RANGE_PCT, MIN_BINS } from "./runtime-helpers.js";
+import {
+  TRADING_PRESETS, DEPLOY_SIZE_MIN_SOL, DEPLOY_SIZE_MAX_SOL, readTradingSettings, fmtTradingValue,
+  encodePresetValue, decodePreset, planTradingChange, riskIncreases, describeChanges,
+  parseCustomDeploySize, stopLossOff,
+} from "./trading-settings.js";
 
 export const MENU_BUTTON_TEXT = "🏠 Menu";
 export const CONFIRM_TTL_MS = 60_000;
@@ -439,6 +444,7 @@ export function renderMainMenu({ header = "" } = {}) {
       [btn("📈 Status", "st"), btn("📊 Positions", "po:0")],
       [btn("🔍 Candidates", "ca:0"), btn("💰 Wallet", "wa")],
       [btn("⚙️ Settings", "se:0"), btn("🎛 Bot controls", "bc")],
+      [btn("⚙️ Trading settings", "ts")],
     ],
   };
 }
@@ -758,6 +764,66 @@ export function renderEntryFilters(filters = {}, { note = null } = {}) {
   return { text: lines.join("\n"), keyboard };
 }
 
+// ─── Trading settings (Settings / Menu → ⚙️ Trading settings) ────
+// Callback data: ts (view), tv:<code>:<value> (preset, codes in
+// TRADING_PRESETS), tc (custom deploy size), tq (cancel custom input).
+// Risk-increasing presets render a y:/n: nonce confirm card like fund moves.
+
+const presetLabel = (key, v) => {
+  if (key === "stopLossPct") return stopLossOff(v) ? "Off" : `${v}%`;
+  if (key === "trailingTakeProfit") return v ? "On" : "Off";
+  if (key === "outOfRangeWaitMinutes") return `${v}m`;
+  if (key === "pnlWatcherIntervalSec") return `${v}s`;
+  if (key === "deployAmountSol" || key === "maxPositions") return `${v}`;
+  return `${v}%`;
+};
+
+function presetSelected(key, v, cur) {
+  if (key === "stopLossPct") return stopLossOff(v) ? stopLossOff(cur.stopLossPct) : Number(cur.stopLossPct) === v;
+  if (key === "deployAmountSol") return Number(cur.deployAmountSol) === v && Number(cur.maxDeployAmount) === v;
+  if (key === "trailingTakeProfit") return !!cur.trailingTakeProfit === v;
+  return Number(cur[key]) === v;
+}
+
+export function renderTradingSettings(config, { note = null, usdcMode = false, customPending = false } = {}) {
+  const cur = readTradingSettings(config);
+  const f = (k) => escapeHtml(fmtTradingValue(k, cur[k]));
+  const fixed = Number(cur.deployAmountSol) === Number(cur.maxDeployAmount);
+  const lines = [
+    "⚙️ <b>Trading settings</b>",
+    "Taps save to user-config.json and apply now. ✅ = current. Risk-raising changes (stop loss off/wider, bigger deploy size, more positions, trailing TP off) ask for a second tap.",
+    "",
+    `Take profit: <b>${f("takeProfitFeePct")}</b> · Stop loss: <b>${f("stopLossPct")}</b>`,
+    `Trailing TP: <b>${cur.trailingTakeProfit ? "on" : "off"}</b> · trigger ${f("trailingTriggerPct")} · drop ${f("trailingDropPct")}`,
+    `Out-of-range wait: <b>${f("outOfRangeWaitMinutes")}</b>`,
+    `Deploy size: <b>${fixed ? f("deployAmountSol") : `${f("deployAmountSol")} – ${f("maxDeployAmount")}`}</b>${fixed ? " (fixed)" : " (floor – ceiling)"} · min SOL to open ${f("minSolToOpen")}`,
+    `Max positions: <b>${f("maxPositions")}</b> · PnL watcher: every <b>${f("pnlWatcherIntervalSec")}</b>`,
+  ];
+  if (usdcMode) lines.push("💵 USDC mode is on: deploys use usdc.deployAmountUsd, not the SOL deploy size.");
+  if (cur.trailingTakeProfit && Number(cur.trailingDropPct) >= Number(cur.trailingTriggerPct)) {
+    lines.push(`⚠️ Trailing drop ${f("trailingDropPct")} ≥ trigger ${f("trailingTriggerPct")}: a trailing exit can land at or below break-even.`);
+  }
+  if (customPending) lines.push("", `✏️ <b>Send the deploy size in SOL</b> (${DEPLOY_SIZE_MIN_SOL}–${DEPLOY_SIZE_MAX_SOL}) as your next message, e.g. <code>1.3</code>.`);
+  if (note) lines.push("", note);
+
+  const keyboard = [];
+  const row = (code) => {
+    const p = TRADING_PRESETS[code];
+    return p.values.map((v) => btn(`${presetSelected(p.key, v, cur) ? "✅ " : ""}${presetLabel(p.key, v)}`, `tv:${code}:${encodePresetValue(v)}`));
+  };
+  const label = (text) => [btn(text, "ts")];
+  keyboard.push(label("Take profit (%)"), row("tp"));
+  keyboard.push(label("Stop loss (%)"), row("sl"));
+  keyboard.push(label("Trailing TP · trigger % · drop %"), row("tt"), row("tg"), row("td"));
+  keyboard.push(label("Out-of-range wait"), row("oo"));
+  keyboard.push(label("Deploy size (SOL, floor = ceiling)"), [...row("ds"), btn("Custom…", "tc")]);
+  keyboard.push(label("Max positions"), row("mp"));
+  keyboard.push(label("PnL watcher interval"), row("pw"));
+  if (customPending) keyboard.push([btn("✖ Cancel custom size", "tq")]);
+  keyboard.push([btn("⚙️ Settings", "se:0"), btn("⬅ Menu", "m")]);
+  return { text: lines.join("\n"), keyboard };
+}
+
 export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = {}) {
   return {
     text: [
@@ -887,6 +953,7 @@ export function renderExecResult(action, label, result) {
  *   getStatusInfo()                       — timers, models, busy flags
  *   buildSettingsReport(), handleAutoresearchCommand(args), readRecentErrors()
  *   setEntryFilter(key, value)            — → { ok, text, loosened } | { ok: false, error } (entry-safety.js)
+ *   applyTradingSettings(changes)         — → { ok, text, changes, rescheduled } | { ok: false, error } (trading-settings.js)
  *   entryPreview(candidate, { strategy }) — read-only pool status / fee mode / TWAP for the confirm card
  *   log(category, msg), now(), ttlMs
  */
@@ -903,6 +970,7 @@ export function createTelegramUI(deps) {
     candidatesAt: null,
     lastManagement: null,
     lastScreening: null,
+    customDeploy: null, // { chatId, expiresAt } while waiting for a "Custom…" deploy size
   };
   const isDryRun = () => process.env.DRY_RUN === "true";
   const unit = () => deps.config.management?.pnlUnit || "sol";
@@ -1127,6 +1195,83 @@ export function createTelegramUI(deps) {
     return msg;
   }
 
+  // ── trading settings ──
+  function customPending(chatId = null) {
+    const c = state.customDeploy;
+    if (!c) return null;
+    if (c.expiresAt <= now()) { state.customDeploy = null; return null; }
+    if (chatId != null && c.chatId != null && String(chatId) !== c.chatId) return null;
+    return c;
+  }
+
+  const tradingView = (extra = {}) => renderTradingSettings(deps.config, {
+    usdcMode: !!deps.usdcModeEnabled?.(),
+    customPending: !!customPending(),
+    ...extra,
+  });
+
+  /** Apply a planned change set through deps.applyTradingSettings; returns the card note. */
+  function applyTrading(changes, { notes = [], warnings = [] } = {}) {
+    if (!deps.applyTradingSettings) return { ok: false, error: "not available", note: "⚠️ Trading settings can't be changed here." };
+    const r = deps.applyTradingSettings(changes);
+    if (!r?.ok) {
+      logf("telegram_warn", `Trading settings change failed: ${r?.error}`);
+      return { ok: false, error: r?.error ?? "error", note: `⚠️ Not changed: ${escapeHtml(r?.error ?? "error")}` };
+    }
+    logf("telegram", `Trading settings changed from Telegram: ${r.text}`);
+    const out = [`✅ Saved: ${escapeHtml(r.text)}`];
+    for (const n of notes) out.push(`ℹ️ ${escapeHtml(n)}`);
+    if (r.rescheduled) out.push(`⏱ PnL watcher rescheduled to every ${escapeHtml(r.changes?.pnlWatcherIntervalSec ?? "?")}s.`);
+    for (const w of warnings) out.push(`⚠️ ${escapeHtml(w)}`);
+    return { ok: true, text: r.text, note: out.join("\n") };
+  }
+
+  /**
+   * One preset tap (or a custom deploy size). Risk-reducing changes apply at
+   * once; risk-increasing ones get a nonce confirm card (60s, single use).
+   */
+  async function tradingChange(key, value, ctx, answer, opts = {}) {
+    const current = readTradingSettings(deps.config);
+    const plan = planTradingChange(key, value, current);
+    if (plan.error) {
+      await answer(`Not changed: ${plan.error}`.slice(0, 180), true);
+      return show(ctx, tradingView({ note: `⚠️ Not changed: ${escapeHtml(plan.error)}` }), opts);
+    }
+    const changed = Object.fromEntries(Object.entries(plan.changes).filter(([k, v]) => {
+      if (k === "stopLossPct") return stopLossOff(v) ? !stopLossOff(current[k]) : v !== Number(current[k]);
+      if (k === "trailingTakeProfit") return v !== !!current[k];
+      return v !== Number(current[k]);
+    }));
+    if (!Object.keys(changed).length) {
+      await answer("Already set.");
+      return show(ctx, tradingView(), opts);
+    }
+    const risk = riskIncreases(changed, current);
+    const lines = describeChanges(changed, current);
+    if (risk.length) {
+      await answer();
+      const nonce = nonces.put("trade_set", { changes: changed, notes: plan.notes, warnings: plan.warnings, label: lines.join("; ") });
+      logf("telegram", `Trading settings confirm requested: ${lines.join("; ")} (${risk.join(", ")})`);
+      const text = [
+        "⚠️ <b>Raise risk?</b>",
+        ...lines.map((l) => `<b>${escapeHtml(l)}</b>`),
+        "",
+        `This ${escapeHtml(risk.join(" and "))}.`,
+        ...plan.notes.map((n) => `ℹ️ ${escapeHtml(n)}`),
+        ...plan.warnings.map((w) => `⚠️ ${escapeHtml(w)}`),
+        "",
+        `Saves to user-config.json and applies to the running bot. Expires in ${Math.round((deps.ttlMs ?? CONFIRM_TTL_MS) / 1000)}s.`,
+      ].join("\n");
+      return presentConfirm(ctx, {
+        nonce,
+        view: { text, keyboard: [[btn("✅ Confirm change", `y:${nonce}`), btn("✖ Cancel", `n:${nonce}`)]] },
+      }, opts);
+    }
+    const r = applyTrading(changed, plan);
+    await answer(r.ok ? `Saved: ${r.text}`.slice(0, 180) : `Not changed: ${r.error}`.slice(0, 180), !r.ok);
+    return show(ctx, tradingView({ note: r.note }), opts);
+  }
+
   // ── execution (Confirm tap) ──
   async function execute(entry, ctx) {
     const edit = (text, keyboard = [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]]) =>
@@ -1181,6 +1326,11 @@ export function createTelegramUI(deps) {
       return edit(`🔍 <b>Screening cycle finished</b>\n${escapeHtml(clipText(String(report ?? "no report"), 1500))}`, [[btn("📊 Positions", "po:0"), btn("⬅ Menu", "m")]]);
     }
 
+    if (action === "trade_set") {
+      const r = applyTrading(params.changes, params);
+      return show(ctx, tradingView({ note: r.note }));
+    }
+
     if (action === "ar_approve" || action === "ar_reject") {
       const out = deps.handleAutoresearchCommand(action === "ar_approve" ? "approve" : "reject");
       return edit(`🧪 ${escapeHtml(out)}`, [[btn("🧪 Autoresearch", "ar"), btn("⬅ Menu", "m")]]);
@@ -1216,6 +1366,21 @@ export function createTelegramUI(deps) {
         return true;
       }
       await show(null, candidatesView(0), { fresh: true });
+      return true;
+    }
+
+    // "Custom…" deploy size: the owner's next numeric message sets it.
+    if (customPending(ctx.chatId) && /^\s*[\d.,]+\s*(?:sol)?\s*$/i.test(text)) {
+      const parsed = parseCustomDeploySize(text);
+      if (parsed.error) {
+        logf("telegram_warn", `Custom deploy size refused: ${parsed.error}`);
+        await deps.tg.sendHTML(`⚠️ ${escapeHtml(parsed.error)}. Send a size between ${DEPLOY_SIZE_MIN_SOL} and ${DEPLOY_SIZE_MAX_SOL} SOL, or tap Cancel.`, {
+          reply_markup: { inline_keyboard: [[btn("✖ Cancel custom size", "tq"), btn("⚙️ Trading settings", "ts")]] },
+        });
+        return true;
+      }
+      state.customDeploy = null; // single use
+      await tradingChange("deployAmountSol", parsed.value, { chatId: ctx.chatId }, async () => {}, { fresh: true });
       return true;
     }
 
@@ -1317,7 +1482,9 @@ export function createTelegramUI(deps) {
           await answer();
           const report = deps.buildSettingsReport();
           const view = renderTextPages("⚙️ <b>Settings</b>", report, { page: Number(arg) || 0, prefix: "se" });
-          if (deps.setEntryFilter) view.keyboard.push([btn("🛡 Entry filters", "ef")]);
+          const extraRow = [btn("⚙️ Trading settings", "ts")];
+          if (deps.setEntryFilter) extraRow.unshift(btn("🛡 Entry filters", "ef"));
+          view.keyboard.push(extraRow);
           view.keyboard.push(backRow(`se:${view.page}`));
           await show(ctx, view, opts);
           return;
@@ -1364,6 +1531,32 @@ export function createTelegramUI(deps) {
           await show(ctx, renderEntryFilters(deps.config.entryFilters, { note: `✅ Saved: ${escapeHtml(r.text)}${r.loosened ? " (loosened)" : ""}` }), opts);
           return;
         }
+        case "ts":
+          await answer();
+          await show(ctx, tradingView(), opts);
+          return;
+        case "tv": {
+          // Owner-only (transport), edited in place. Risk-raising presets go
+          // through the nonce confirm; the rest apply in one tap. All logged.
+          const preset = decodePreset(arg, sub);
+          if (!preset) {
+            logf("telegram_warn", `Unknown trading preset: ${d.slice(0, 20)}`);
+            await answer("Unknown preset.", true);
+            return;
+          }
+          await tradingChange(preset.key, preset.value, ctx, answer, opts);
+          return;
+        }
+        case "tc":
+          state.customDeploy = { chatId: ctx.chatId != null ? String(ctx.chatId) : null, expiresAt: now() + (deps.ttlMs ?? CONFIRM_TTL_MS) };
+          await answer("Send the size in SOL");
+          await show(ctx, tradingView(), opts);
+          return;
+        case "tq":
+          state.customDeploy = null;
+          await answer("Cancelled");
+          await show(ctx, tradingView({ note: "✖ Custom size cancelled. Nothing was changed." }), opts);
+          return;
         case "sp": {
           const pause = arg === "1";
           deps.setScreeningPaused(pause);
@@ -1507,7 +1700,9 @@ export function createTelegramUI(deps) {
         case "n": {
           const r = nonces.take(arg);
           await answer(r.entry ? "Cancelled" : "Nothing to cancel");
-          await show(ctx, { text: "✖ Cancelled. Nothing was done.", keyboard: [[btn("⬅ Menu", "m")]] });
+          if (r.entry?.action === "trade_set") logf("telegram", `Trading settings change cancelled: ${r.entry.params.label}`);
+          const back = r.entry?.action === "trade_set" ? [[btn("⚙️ Trading settings", "ts"), btn("⬅ Menu", "m")]] : [[btn("⬅ Menu", "m")]];
+          await show(ctx, { text: "✖ Cancelled. Nothing was done.", keyboard: back });
           return;
         }
         default:
