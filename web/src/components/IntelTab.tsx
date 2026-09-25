@@ -162,7 +162,7 @@ export default function IntelTab() {
                 Intelligence Layer
               </div>
               <div className="text-xl font-semibold tracking-tight text-cream">
-                Lessons, memory, Darwin weights, and autoresearch state.
+                Lessons, Darwin weights, and autoresearch state.
               </div>
               <div className="flex flex-wrap gap-2 text-xs text-ash/60">
                 <Badge variant="outline">{data?.lessons.total ?? 0} lessons</Badge>
