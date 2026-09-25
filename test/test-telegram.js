@@ -858,6 +858,7 @@ function lookupDeps(over = {}) {
     gmgnSignal: async () => ({ smart_money_count_30m: 3, kol_count_30m: 2 }),
     isBlacklisted: () => false,
     readMint: async () => null, // hermetic: no mint RPC (entry-safety lines show ❔)
+    poolEntryState: async () => null, // hermetic: no pool RPC
     ...over,
   };
 }

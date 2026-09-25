@@ -579,6 +579,19 @@ function fmtPct(v) {
   return v == null || !Number.isFinite(n) ? "?" : `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
 }
 
+/**
+ * Entry-state lines for a pool (lookup + confirm cards): pool status and, when
+ * known, fee mode and TWAP. Plain text; the caller escapes.
+ */
+export function entryStateLines(c) {
+  const st = c?.entry_state;
+  const out = [];
+  if (st?.status) out.push(`${st.status.pass ? "✅" : "⛔"} Pool status: ${st.status.pass ? st.status.text : st.status.reasons.join("; ")}`);
+  else if (c?.is_blacklisted === true) out.push("⛔ Pool status: Meteora API flags the pool as blacklisted");
+  else if (st?.error) out.push(`❔ Pool status: unknown (${clipText(String(st.error), 60)})`);
+  return out;
+}
+
 /** `pools[i].ref` = the Deploy button's ref (absent when deploy is not offered). */
 export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora" } = {}) {
   const top = r.pools?.[0] || null;
@@ -629,6 +642,7 @@ export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora"
       lines.push("", candidateBlock(c, i, source));
       const pc = c.checks?.pool || [];
       if (pc.length) lines.push(escapeHtml(pc.map((ch) => `${checkMark(ch)} ${ch.text}`).join(" · ")));
+      lines.push(...entryStateLines(c).map((l) => escapeHtml(l)));
     });
   }
 

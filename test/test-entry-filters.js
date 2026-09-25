@@ -209,6 +209,8 @@ function mockPool(over = {}) {
   return pool;
 }
 
+es._setApiRowFetcherForTest(async () => ({ is_blacklisted: false }));
+
 async function deployInto(pool, args = {}) {
   const addr = `Pool${Math.random().toString(36).slice(2, 10)}`;
   dlmm._setPoolForTest(addr, pool);
@@ -263,6 +265,7 @@ function lookupDeps(over = {}) {
     gmgnSignal: async () => null,
     isBlacklisted: () => false,
     readMint: async () => es.mintFactsFromSdkReserve(reserve({ tlv: [hookTlv(), transferFeeTlv(30)] })),
+    poolEntryState: async () => null,
     ...over,
   };
 }
@@ -285,4 +288,70 @@ test("token lookup: a failed mint read falls back to the API's token_program/aut
   const card = ui.renderTokenCard(r, { tokenRef: "t1" }).text;
   assert.match(card, /✅ Freeze authority: none/);
   assert.match(card, /❔ Transfer hook: unknown \(mint not read\)/);
+});
+
+// ─── 2. Pool status guard (always on) ────────────────────────────
+test("pool status: disabled, future activation (timestamp and slot), blacklist refuse; unknown blacklist allows with a note", () => {
+  const now = 1_800_000_000;
+  const base = { status: 0, pairType: 3, activationType: 1, activationPoint: new BN(0) };
+  const clock = { slot: new BN(5_000), unixTimestamp: new BN(now - 30) };
+  assert.equal(es.evaluatePoolStatus({ lbPair: base, clock, nowSec: now, apiBlacklisted: false }).pass, true);
+  const dis = es.evaluatePoolStatus({ lbPair: { ...base, status: 1 }, clock, nowSec: now, apiBlacklisted: false });
+  assert.equal(dis.pass, false);
+  assert.match(dis.reasons[0], /pair status is Disabled/);
+  // PermissionlessV2 with a future timestamp activation: the SDK's isSwapDisabled would say false.
+  const fut = es.evaluatePoolStatus({ lbPair: { ...base, activationPoint: new BN(now + 600) }, clock, nowSec: now, apiBlacklisted: false });
+  assert.equal(fut.pass, false);
+  assert.match(fut.reasons[0], /activation time .* is in the future \(in 10 min\)/);
+  assert.equal(es.evaluatePoolStatus({ lbPair: { ...base, activationPoint: new BN(now - 600) }, clock, nowSec: now, apiBlacklisted: false }).pass, true);
+  const slot = es.evaluatePoolStatus({ lbPair: { ...base, activationType: 0, activationPoint: new BN(6_000) }, clock, nowSec: now, apiBlacklisted: false });
+  assert.match(slot.reasons[0], /activation slot 6000 is in the future \(current slot 5000\)/);
+  const bl = es.evaluatePoolStatus({ lbPair: base, clock, nowSec: now, apiBlacklisted: true });
+  assert.match(bl.reasons[0], /blacklisted/);
+  const unk = es.evaluatePoolStatus({ lbPair: base, clock, nowSec: now, apiBlacklisted: null });
+  assert.equal(unk.pass, true);
+  assert.match(unk.notes[0], /blacklist flag unknown/);
+  assert.equal(es.evaluatePoolStatus({ lbPair: null }).pass, false, "no pool state fails closed");
+});
+
+test("deploy: pool status refuses before any tx (disabled, future activation, API blacklist)", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const dis = mockPool({ lbPair: { status: 1 } });
+  const r1 = await deployInto(dis);
+  assert.equal(r1.blocked_by, "entry_filter");
+  assert.match(r1.error, /^Pool status: pair status is Disabled/);
+  assert.deepEqual(dis.calls, []);
+  const fut = mockPool({ lbPair: { activationPoint: new BN(now + 3600) } });
+  const r2 = await deployInto(fut);
+  assert.match(r2.error, /^Pool status: activation time .* in the future/);
+  assert.deepEqual(fut.calls, []);
+  es._setApiRowFetcherForTest(async () => ({ is_blacklisted: true }));
+  const r3 = await deployInto(mockPool());
+  assert.match(r3.error, /Meteora API flags the pool as blacklisted/);
+  es._setApiRowFetcherForTest(async () => null); // API down → allowed (on-chain checks still ran)
+  await assert.rejects(deployInto(mockPool()), /PAST_ENTRY_CHECKS/);
+  es._setApiRowFetcherForTest(async () => ({ is_blacklisted: false }));
+});
+
+test("screening: API-blacklisted pools are dropped; lookup card shows the pool status line", async () => {
+  const { kept, dropped } = await es.screenEntryCandidates(
+    [{ pool: "A", name: "A", is_blacklisted: true, base: { mint: "M", token_program: es.TOKEN_PROGRAM_ID } },
+      { pool: "B", name: "B", is_blacklisted: false, base: { mint: "N", token_program: es.TOKEN_PROGRAM_ID } }],
+    { filters: es.ENTRY_FILTER_DEFAULTS, readMints: async () => new Map() },
+  );
+  assert.deepEqual(kept.map((p) => p.pool), ["B"]);
+  assert.match(dropped[0].reasons[0], /blacklisted/);
+
+  const now = Math.floor(Date.now() / 1000);
+  const r = await lookupMod.lookupToken(LOOKUP_MINT, {
+    deps: lookupDeps({ poolEntryState: async (_p, opts) => es.describePoolEntryState(mockPool({ lbPair: { activationPoint: new BN(now + 1200) } }), opts) }),
+    entryFilters: es.ENTRY_FILTER_DEFAULTS,
+  });
+  const card = ui.renderTokenCard(r, { tokenRef: "t1" }).text;
+  assert.match(card, /⛔ Pool status: activation time .* in the future \(in 20 min\)/);
+  const ok = await lookupMod.lookupToken(LOOKUP_MINT, {
+    deps: lookupDeps({ poolEntryState: async (_p, opts) => es.describePoolEntryState(mockPool(), opts) }),
+    entryFilters: es.ENTRY_FILTER_DEFAULTS,
+  });
+  assert.match(ui.renderTokenCard(ok, { tokenRef: "t1" }).text, /✅ Pool status: enabled · active · not blacklisted/);
 });

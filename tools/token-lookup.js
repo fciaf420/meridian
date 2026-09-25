@@ -126,6 +126,12 @@ async function defaultReadMint(mint) {
   return info?.value ? mintFactsFromParsed(info.value, mint) : null;
 }
 
+/** On-chain entry state (pool status, …) of one pool; see entry-safety.js. */
+async function defaultPoolEntryState(poolAddress, opts) {
+  const { readPoolEntryState } = await import("./entry-safety.js");
+  return readPoolEntryState(poolAddress, opts);
+}
+
 async function defaultIsBlacklisted(mint) {
   const { isBlacklisted } = await import("../token-blacklist.js");
   return isBlacklisted(mint);
@@ -182,6 +188,7 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
     compare = null,
     score = defaultScore,
     readMint = defaultReadMint,
+    poolEntryState = defaultPoolEntryState,
   } = deps;
   const started = now();
   const remaining = () => Math.max(0, timeoutMs - (now() - started));
@@ -258,6 +265,15 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
       rsi: price.candles.rsi_2 ?? null,
     } : null,
   }));
+  // Pool status (disabled / not yet active / blacklisted) per shown pool, read
+  // on-chain in parallel; a failed read leaves the API blacklist flag alone.
+  const states = await Promise.all(enriched.map((c) => withTimeout(
+    Promise.resolve().then(() => poolEntryState(c.pool, { apiBlacklisted: c.is_blacklisted ?? null })),
+    remaining(),
+    "Pool state",
+  ).catch((e) => ({ error: e.message }))));
+  enriched.forEach((c, i) => { c.entry_state = states[i] || null; });
+
   let darwin = new Map();
   try {
     darwin = new Map((await score(enriched)).map((c) => [c.pool, c.darwin_score ?? null]));

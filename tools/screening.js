@@ -21,6 +21,7 @@ export async function discoverPools({
     "quote_token_has_critical_warnings=false",
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
+    "is_blacklisted=false",
     `base_token_market_cap>=${s.minMcap}`,
     `base_token_market_cap<=${s.maxMcap}`,
     `base_token_holders>=${s.minHolders}`,
@@ -338,6 +339,7 @@ export function condensePool(p) {
       mint: p.token_y?.address,
     },
     pool_type: p.pool_type,
+    is_blacklisted: p.is_blacklisted ?? null,
     bin_step: p.dlmm_params?.bin_step || null,
     fee_pct: p.fee_pct,
 

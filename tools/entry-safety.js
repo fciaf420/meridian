@@ -342,6 +342,100 @@ function short(a) {
   return s.length > 12 ? `${s.slice(0, 4)}…${s.slice(-4)}` : s;
 }
 
+/* ============================== pool status ============================== */
+
+const num = (v) => {
+  if (v == null) return null;
+  const n = typeof v === "object" && typeof v.toNumber === "function" ? Number(v.toString()) : Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * Pool status guard (always on). Refuses when the pair is Disabled, its
+ * activation point is still in the future (checked against the clock directly:
+ * the SDK's isSwapDisabled only checks activation for Permissioned and
+ * CustomizablePermissionless pairs, and live pools are PermissionlessV2), the
+ * SDK reports swaps disabled, or the Meteora API flags the pool as blacklisted.
+ *   lbPair: pool.lbPair; clock: pool.clock ({ slot, unixTimestamp });
+ *   nowSec: wall clock (the later of it and clock.unixTimestamp is used);
+ *   apiBlacklisted: true | false | null (unknown → allowed with a note).
+ * Returns { pass, reasons, notes, text }.
+ */
+export function evaluatePoolStatus({ lbPair, clock = null, nowSec = Math.floor(Date.now() / 1000), apiBlacklisted = null, swapDisabled = false } = {}) {
+  const reasons = [];
+  const notes = [];
+  if (!lbPair) return { pass: false, reasons: ["pool state unavailable"], notes, text: "unknown (pool not read)" };
+  const status = num(lbPair.status);
+  if (status !== 0) reasons.push(`pair status is ${status === 1 ? "Disabled" : `unknown (${status})`}`);
+  const point = num(lbPair.activationPoint) ?? 0;
+  const bySlot = num(lbPair.activationType) === 0;
+  let activationText = "active";
+  if (point > 0) {
+    if (bySlot) {
+      const slot = num(clock?.slot);
+      if (slot == null) reasons.push(`activation slot ${point} can't be checked (no clock)`);
+      else if (point > slot) {
+        reasons.push(`activation slot ${point} is in the future (current slot ${slot})`);
+        activationText = `activates at slot ${point} (now ${slot})`;
+      }
+    } else {
+      const now = Math.max(nowSec, num(clock?.unixTimestamp) ?? 0);
+      if (point > now) {
+        const mins = Math.ceil((point - now) / 60);
+        reasons.push(`activation time ${new Date(point * 1000).toISOString()} is in the future (in ${mins} min)`);
+        activationText = `activates in ${mins} min`;
+      }
+    }
+  }
+  if (swapDisabled && status === 0 && !reasons.length) reasons.push("SDK reports swaps disabled for this pair");
+  if (apiBlacklisted === true) reasons.push("Meteora API flags the pool as blacklisted");
+  else if (apiBlacklisted == null) notes.push("Meteora blacklist flag unknown (API unavailable)");
+  const text = reasons.length ? `⛔ ${reasons.join("; ")}` : `enabled · ${activationText}${apiBlacklisted === false ? " · not blacklisted" : ""}`;
+  return { pass: reasons.length === 0, reasons, notes, text };
+}
+
+const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+
+/** The pool-discovery row for one pool (is_blacklisted, collect_fee_mode, token_x…), or null. */
+export async function fetchPoolApiRow(poolAddress, { timeoutMs = 5000 } = {}) {
+  const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return (data?.data || [])[0] || null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Entry state of a loaded DLMM pool for display (lookup / confirm cards) and
+ * the re-center shadow log. Read-only.
+ */
+export async function describePoolEntryState(pool, { apiBlacklisted = null, nowSec = Math.floor(Date.now() / 1000) } = {}) {
+  const status = evaluatePoolStatus({ lbPair: pool?.lbPair, clock: pool?.clock, nowSec, apiBlacklisted });
+  return { status };
+}
+
+let _stateConn = null;
+/** DLMM.create + describePoolEntryState for one pool address. */
+export async function readPoolEntryState(poolAddress, opts = {}) {
+  const { Connection, PublicKey } = await import("@solana/web3.js");
+  const { default: DLMM } = await import("@meteora-ag/dlmm");
+  if (!_stateConn) _stateConn = new Connection(process.env.RPC_URL, "confirmed");
+  const pool = await DLMM.create(_stateConn, new PublicKey(poolAddress));
+  return describePoolEntryState(pool, opts);
+}
+
+let _apiRowFetcher = (poolAddress) => fetchPoolApiRow(poolAddress);
+/** Test hook: replace the pool-discovery row fetcher used by deploy checks. */
+export function _setApiRowFetcherForTest(fn) { _apiRowFetcher = fn || ((a) => fetchPoolApiRow(a)); }
+
 /* ============================== screening ============================== */
 
 let _screenConn = null;
@@ -417,17 +511,50 @@ export function deployTokenCheck(pool, filters = currentEntryFilters()) {
  * (Pool-level filters are added alongside the token guards.)
  */
 export async function screenEntryCandidates(pools, opts = {}) {
-  return screenTokenGuards(pools, opts);
+  const dropped = [];
+  const live = [];
+  for (const p of pools) {
+    if (p.is_blacklisted === true) {
+      dropped.push({ pool: p.pool, name: p.name, reasons: ["Meteora API flags the pool as blacklisted"] });
+      log("screening", `Entry filter dropped ${p.name ?? p.pool}: Meteora API flags the pool as blacklisted`);
+      continue;
+    }
+    live.push(p);
+  }
+  const tok = await screenTokenGuards(live, opts);
+  return { kept: tok.kept, dropped: [...dropped, ...tok.dropped] };
 }
 
 /**
  * Every deploy-time hard check, run by deployPosition after the pool is loaded
  * and before any swap or transaction. Returns { pass, reason, notes, token }.
  */
-export async function runDeployEntryChecks({ pool, filters = currentEntryFilters() } = {}) {
+export async function runDeployEntryChecks({
+  pool,
+  pool_address = null,
+  wallet = null,
+  filters = currentEntryFilters(),
+  apiRow = undefined, // injectable; undefined = fetch the pool-discovery row
+  nowSec = Math.floor(Date.now() / 1000),
+} = {}) {
   const notes = [];
   const token = deployTokenCheck(pool, filters);
   if (!token.pass) return { pass: false, reason: token.reason, notes, token };
   if (token.facts?.transferFee) notes.push(`transfer fee ${token.facts.transferFee.pct}% (limit ${filters.blockTransferFeeAbovePct ?? "off"})`);
-  return { pass: true, reason: null, notes, token };
+
+  // Pool status (always on).
+  const row = apiRow !== undefined ? apiRow : (pool_address ? await _apiRowFetcher(pool_address) : null);
+  let swapDisabled = false;
+  try { swapDisabled = wallet && typeof pool?.isSwapDisabled === "function" ? !!pool.isSwapDisabled(wallet) : false; } catch { /* informational */ }
+  const status = evaluatePoolStatus({
+    lbPair: pool?.lbPair,
+    clock: pool?.clock,
+    nowSec,
+    apiBlacklisted: row ? !!row.is_blacklisted : null,
+    swapDisabled,
+  });
+  notes.push(...status.notes);
+  if (!status.pass) return { pass: false, reason: `Pool status: ${status.reasons.join("; ")}`, notes, token, status };
+
+  return { pass: true, reason: null, notes, token, status };
 }
