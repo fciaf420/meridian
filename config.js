@@ -227,6 +227,7 @@ export const config = {
   llm: {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
+    deepseekFallbackModel: u.deepseekFallbackModel ?? "deepseek-flash", // DeepSeek V4.1 Flash; used when the primary provider fails
     maxSteps: u.maxSteps ?? 20,
     managementModel: u.managementModel ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,
     screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,

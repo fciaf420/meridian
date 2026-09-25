@@ -483,13 +483,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       // If primary provider exhausted all retries, fall back to DeepSeek
       if (!msg) {
-        const DEEPSEEK_FALLBACK_MODELS = {
-          SCREENER: "deepseek-reasoner",
-          MANAGER: "deepseek-chat",
-          GENERAL: "deepseek-chat",
-          AUTORESEARCH: "deepseek-reasoner",
-        };
-        const dsModel = DEEPSEEK_FALLBACK_MODELS[agentType] || "deepseek-chat";
+        // One model for every role (default deepseek-flash = DeepSeek V4.1 Flash);
+        // the legacy deepseek-chat / deepseek-reasoner names are aliases on the API.
+        const dsModel = config.llm.deepseekFallbackModel || "deepseek-flash";
 
         const fallbackKey = process.env.DEEPSEEK_API_KEY;
         let fallbackNote = null;
@@ -509,8 +505,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
               tools: toolsForRole(agentType),
               tool_choice: "auto",
               temperature: config.llm.temperature,
-              // deepseek-reasoner counts its chain of thought toward max_tokens.
-              max_tokens: dsModel === "deepseek-reasoner" ? Math.max(config.llm.maxTokens, 32768) : config.llm.maxTokens,
+              max_tokens: Math.max(config.llm.maxTokens, 16384), // V4 models think; reasoning counts toward max_tokens
             });
             if (dsResponse?.choices?.length) {
               msg = dsResponse.choices[0].message;
