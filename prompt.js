@@ -212,10 +212,10 @@ function _defaultScreenerCriteria() {
 function _defaultManagerLogic() {
   return `Decision Factors for Closing (no exit rule triggered):
 - Yield Health: Call get_position_pnl. Is the current Fee/TVL still one of the best available?
-- Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back?
-- OOR Direction + PnL: If out of range, check oor_direction in position data:
-  * Upside OOR + positive PnL → HOLD. SOL idle, no IL, fees earned. Price may return.
-  * Upside OOR + negative PnL → HOLD. Still safe, SOL idle. Negative PnL is from fees/slippage.
+- Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back? (Only matters BEFORE the OOR timeout — see below.)
+- OOR Timeout (hard rule, BOTH directions): once minutes_out_of_range >= outOfRangeWaitMinutes, CLOSE — upside or downside, positive or negative PnL. Nothing below extends that wait.
+- OOR Direction + PnL: If out of range and still UNDER the timeout, check oor_direction in position data:
+  * Upside OOR (any PnL) → wait, but only until the OOR timeout; then CLOSE. SOL is idle, so there is no IL, but it earns nothing up there. Do not hold past the timeout hoping price returns.
   * Downside OOR + positive PnL → CAUTION. Fees outpaced IL but risk growing. Monitor closely.
   * Downside OOR + negative PnL → CLOSE. Token dropping, loss growing, cut it.
   * CRITICAL: If a bid_ask or SOL-only position keeps going OOR-upside repeatedly, the problem is the token pumping away — NOT your range width. Widening bid_ask range only adds bins BELOW, which cannot catch upside moves. Do NOT add lessons recommending "wider range" for upside OOR on single-sided-below strategies.
