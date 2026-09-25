@@ -330,18 +330,67 @@ function derivLesson(perf) {
  * @param {Object} [opts.lessonsData] - Pre-loaded lessons.json data (avoids extra load/save)
  * @returns {{ changes: Object, rationale: Object, userConfig: Object } | null}
  */
+export const OHLCV_BUFFER_MIN = 1.0;
+export const OHLCV_BUFFER_MAX = 1.8;
+export const OHLCV_BUFFER_STEP = 0.1;
+const OHLCV_BUFFER_MIN_CLOSES = 5;
+
+/**
+ * Evolve strategy.ohlcvBufferMult (candle range depth = drawdown × buffer) from
+ * how positions deployed with the CURRENT buffer ended:
+ *  - downside OOR or stop-loss closes >= 40% → +0.1 (ranges too shallow)
+ *  - those <= 20% and the median depth actually used < 50% → -0.1 (unused depth)
+ * Upside OOR is ignored: depth below the price cannot fix a pump. One step per
+ * evolution, clamped to 1.0–1.8. Returns { value, rationale } or null.
+ */
+export function evolveOhlcvBuffer(perfData, config) {
+  if (config?.strategy?.rangeDepthMode !== "ohlcv") return null;
+  const current = Number(config.strategy.ohlcvBufferMult ?? 1.3);
+  if (!Number.isFinite(current)) return null;
+  // Only closes deployed with the current buffer count as evidence for moving it.
+  const sample = (perfData || []).filter((p) =>
+    p.range_depth_mode === "ohlcv" && Number(p.ohlcv_buffer_mult) === current);
+  if (sample.length < OHLCV_BUFFER_MIN_CLOSES) return null;
+
+  const adverse = sample.filter((p) => p.oor_direction_at_close === "downside" || p.stop_loss_close === true);
+  const adverseRate = adverse.length / sample.length;
+  const used = sample.map((p) => p.deepest_bin_reached_pct).filter(isFiniteNum);
+  const medianUsed = used.length >= 3 ? percentile(used, 50) : null;
+
+  let next = current;
+  let why = null;
+  if (adverseRate >= 0.4) {
+    next = current + OHLCV_BUFFER_STEP;
+    why = `${adverse.length}/${sample.length} closes at buffer ${current} were downside OOR or stop loss — ranges too shallow`;
+  } else if (adverseRate <= 0.2 && medianUsed != null && medianUsed < 50) {
+    next = current - OHLCV_BUFFER_STEP;
+    why = `only ${adverse.length}/${sample.length} downside/stop-loss closes and median depth used ${medianUsed.toFixed(0)}% — ranges deeper than needed`;
+  }
+  next = Number(clamp(next, OHLCV_BUFFER_MIN, OHLCV_BUFFER_MAX).toFixed(1));
+  if (next === current || !why) return null;
+  return { value: next, rationale: `${why}: ohlcvBufferMult ${current} → ${next}` };
+}
+
 export function evolveThresholds(perfData, config, { userConfig, lessonsData } = {}) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
   const winners = perfData.filter((p) => p.pnl_pct > 0);
   const losers  = perfData.filter((p) => p.pnl_pct < -5);
 
+  // The depth buffer learns from how positions ended, not from win/loss PnL,
+  // so it is evaluated even when the PnL signal below is too thin.
+  const bufferEvo = evolveOhlcvBuffer(perfData, config);
+
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
-  if (!hasSignal) return null;
+  if (!hasSignal && !bufferEvo) return null;
 
   const changes   = {};
   const rationale = {};
+  if (bufferEvo) {
+    changes.ohlcvBufferMult = bufferEvo.value;
+    rationale.ohlcvBufferMult = bufferEvo.rationale;
+  }
 
   // ── 1. maxVolatility ─────────────────────────────────────────
   // If losers tend to cluster at higher volatility → tighten the ceiling.
@@ -601,6 +650,7 @@ export function evolveThresholds(perfData, config, { userConfig, lessonsData } =
   if (changes.takeProfitFeePct     != null) m.takeProfitFeePct     = changes.takeProfitFeePct;
   if (changes.outOfRangeWaitMinutes != null) m.outOfRangeWaitMinutes = changes.outOfRangeWaitMinutes;
   if (changes.athTopThresholdPct != null) s.athTopThresholdPct = changes.athTopThresholdPct;
+  if (changes.ohlcvBufferMult != null && config.strategy) config.strategy.ohlcvBufferMult = changes.ohlcvBufferMult;
 
   // Log a lesson summarizing the evolution
   const ld = lessonsData || load();
