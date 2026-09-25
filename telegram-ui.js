@@ -996,7 +996,7 @@ export function renderTradingSettings(config, { note = null, usdcMode = false, c
   if (cur.trailingTakeProfit && Number(cur.trailingDropPct) >= Number(cur.trailingTriggerPct)) {
     lines.push(`⚠️ Trailing drop ${f("trailingDropPct")} ≥ trigger ${f("trailingTriggerPct")}: a trailing exit can land at or below break-even.`);
   }
-  if (customPending) lines.push("", `✏️ <b>Send the deploy size in SOL</b> (${DEPLOY_SIZE_MIN_SOL}–${DEPLOY_SIZE_MAX_SOL}) as your next message, e.g. <code>1.3</code>.`);
+  if (customPending) lines.push("", `✏️ <b>Send the deploy size in SOL</b> (at least ${DEPLOY_SIZE_MIN_SOL}) as your next message, e.g. <code>1.3</code>.`);
   if (note) lines.push("", note);
 
   const keyboard = [];
@@ -1793,7 +1793,7 @@ export function createTelegramUI(deps) {
       const parsed = parseCustomDeploySize(text);
       if (parsed.error) {
         logf("telegram_warn", `Custom deploy size refused: ${parsed.error}`);
-        await deps.tg.sendHTML(`⚠️ ${escapeHtml(parsed.error)}. Send a size between ${DEPLOY_SIZE_MIN_SOL} and ${DEPLOY_SIZE_MAX_SOL} SOL, or tap Cancel.`, {
+        await deps.tg.sendHTML(`⚠️ ${escapeHtml(parsed.error)}. Send a size of at least ${DEPLOY_SIZE_MIN_SOL} SOL, or tap Cancel.`, {
           reply_markup: { inline_keyboard: [[btn("✖ Cancel custom size", "tq"), btn("⚙️ Trading settings", "ts")]] },
         });
         return true;

@@ -269,12 +269,12 @@ test("deploy size: sets floor AND ceiling, bumps minSolToOpen to size + gasReser
 test("custom deploy size: next numeric owner message sets it; range and format are checked", async () => {
   const { u, persisted, calls, config, advance } = makeUI();
   await u.handleCallback("tc", ctx());
-  assert.match(calls.at(-1).text, /Send the deploy size in SOL<\/b> \(0\.1–10\)/);
+  assert.match(calls.at(-1).text, /Send the deploy size in SOL<\/b> \(at least 0\.1\)/);
   assert.ok(datas(kb(calls.at(-1))).includes("tq"));
 
-  for (const bad of ["0.05", "12", "10.5"]) {
+  for (const bad of ["0.05", "0.01"]) {
     assert.equal(await u.handleMessage(bad, { chatId: OWNER }), true, bad);
-    assert.match(calls.at(-1).text, /outside 0\.1–10 SOL/);
+    assert.match(calls.at(-1).text, /below the 0\.1 SOL minimum/);
   }
   assert.equal(persisted.length, 0);
   // Non-numeric text is not consumed (falls through to the normal handlers).
@@ -327,7 +327,7 @@ test("validation: SL ≤ 0 or Off, TP > 0, sane ranges; drop ≥ trigger only wa
   assert.ok(ts.validateTradingValue("maxPositions", 1.5).error);
   assert.ok(ts.validateTradingValue("pnlWatcherIntervalSec", 2).error);
   assert.ok(ts.validateTradingValue("outOfRangeWaitMinutes", 0).error);
-  assert.ok(ts.validateTradingValue("deployAmountSol", 11).error);
+  assert.ok(ts.validateTradingValue("deployAmountSol", 0.05).error);
   assert.ok(ts.validateTradingValue("trailingDropPct", 0).error);
   assert.ok(ts.applyTradingSettings({ walletKey: "x" }, { config: mockConfig(), persistUserConfig: () => {} }).error);
   assert.ok(ts.applyTradingSettings({ stopLossPct: 3 }, { config: mockConfig(), persistUserConfig: () => { throw new Error("must not write"); } }).error);
