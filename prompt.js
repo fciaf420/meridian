@@ -115,7 +115,7 @@ function _defaultScreenerCriteria() {
      * GOOD narrative: specific origin (real event, viral moment, named entity, active community actions)
      * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
      * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
-5. DEPLOY: get_active_bin then deploy_position.
+5. DEPLOY: deploy_position (it reads the active bin itself).
    - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
    - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
    - Focus on one high-conviction deployment per cycle.

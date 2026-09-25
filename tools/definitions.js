@@ -106,7 +106,7 @@ This is an on-chain call via the SDK. Returns:
 - price: human-readable price (token X per token Y)
 - pricePerLamport: raw price in lamports
 
-Always call this before deploying a position to get the freshest price.`,
+deploy_position reads the active bin itself, so this is not a prerequisite for deploying; use it when you need the current price or bin for analysis or a report.`,
       parameters: {
         type: "object",
         properties: {

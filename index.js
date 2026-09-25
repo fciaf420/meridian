@@ -979,7 +979,7 @@ async function handleTelegramCommand(rawText) {
       const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
       await tgSend(`🚀 Deploying ${amt} SOL into ${pool.name}…`);
       const { content } = await screenerLoop(
-        `Deploy ${amt} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+        `Deploy ${amt} SOL into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
         config.llm.maxSteps,
       );
       launchCron({ announce: true });
@@ -997,7 +997,7 @@ async function handleTelegramCommand(rawText) {
       const balance = await getWalletBalances().catch(() => null);
       const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
       const { content } = await screenerLoop(
-        `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${amt} SOL. Execute now, don't ask.`,
+        `get_top_candidates, pick the best one, deploy_position with ${amt} SOL. Execute now, don't ask.`,
         config.llm.maxSteps,
       );
       launchCron({ announce: true });
@@ -1219,7 +1219,7 @@ Commands:
         const amtPhrase = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${deployAmount} SOL`;
         console.log(`\nDeploying ${amtPhrase} into ${pool.name}...\n`);
         const { content: reply } = await screenerLoop(
-          `Deploy ${amtPhrase} into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+          `Deploy ${amtPhrase} into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
           config.llm.maxSteps
         );
         console.log(`\n${reply}\n`);
@@ -1236,7 +1236,7 @@ Commands:
         const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : DEPLOY;
         const amtPhrase = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${deployAmount} SOL`;
         const { content: reply } = await screenerLoop(
-          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${amtPhrase}. Execute now, don't ask.`,
+          `get_top_candidates, pick the best one, deploy_position with ${amtPhrase}. Execute now, don't ask.`,
           config.llm.maxSteps
         );
         console.log(`\n${reply}\n`);
