@@ -38,11 +38,23 @@ export function getPromptSectionText(section) {
 }
 
 /**
+ * Substitute `${name}` placeholders in override text. Autoresearch edits the
+ * default section TEMPLATE (see _getDefaultSections), so overrides carry
+ * literal `${deployAmount}` etc. Only names in `vars` are replaced; any other
+ * `${...}` is left as-is.
+ */
+export function fillSectionPlaceholders(text, vars) {
+  if (typeof text !== "string") return text;
+  return text.replace(/\$\{(\w+)\}/g, (match, name) =>
+    Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : match);
+}
+
+/**
  * Range selection text — used by index.js screening cycle.
- * Autoresearch can override this section.
+ * Autoresearch can override this section, but NOT the Evil Panda branch:
+ * an active strategy profile with its own fixed range rules takes precedence.
  */
 export function getRangeSelectionText(deployAmount, currentBalanceSol) {
-  if (_sectionOverrides.range_selection) return _sectionOverrides.range_selection;
   if (config.strategy.activeStrategy === "evil_panda") {
     return `- EVIL PANDA RANGE SIZING:
   Use single-sided SOL spot with price_range_pct=${config.strategy.evilPanda?.priceRangePct ?? 80}.
@@ -50,6 +62,13 @@ export function getRangeSelectionText(deployAmount, currentBalanceSol) {
   This creates an 80% downside range below the active bin. Do not substitute the volatility table for Evil Panda autonomous entries.
   Entry is only valid when token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend is green with price above Supertrend.
   If these entry checks are not satisfied, skip.`;
+  }
+  if (_sectionOverrides.range_selection) {
+    // Same placeholders the default template leaves literal in _getDefaultSections().
+    return fillSectionPlaceholders(_sectionOverrides.range_selection, {
+      deployAmount,
+      currentBalanceSol: currentBalanceSol ?? "?",
+    });
   }
   return _defaultRangeSelectionText(deployAmount, currentBalanceSol);
 }
@@ -87,8 +106,7 @@ function _defaultRangeSelectionText(deployAmount, currentBalanceSol) {
   * spot (two-sided): wider range helps BOTH directions since liquidity spans above and below.
   * NEVER generate a lesson saying "use wider range" for upside OOR on a single-sided-below strategy. That analysis is fundamentally wrong.
 - COMPOUNDING: Deploy amount is ${deployAmount} SOL (scaled from wallet: ${currentBalanceSol ?? "?"} SOL). Do NOT override with a smaller amount.
-- After deploy: update_config setting=managementIntervalMin based on volatility (>=5→3, 2-5→5, <2→10).
-- Report: strategy chosen + why, price_range_pct used + volatility basis, deploy amount, interval set.`;
+- Report: strategy chosen + why, price_range_pct used + volatility basis, deploy amount.`;
 }
 
 /** Build default section texts (without config interpolation for manager_logic) */
@@ -116,7 +134,7 @@ function _defaultScreenerCriteria() {
      * GOOD narrative: specific origin (real event, viral moment, named entity, active community actions)
      * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
      * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
-5. DEPLOY: get_active_bin then deploy_position.
+5. DEPLOY: deploy_position (it reads the active bin itself).
    - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
    - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
    - Focus on one high-conviction deployment per cycle.
@@ -159,12 +177,9 @@ Capital is held in USDC. Funding and exit settlement are handled AUTOMATICALLY i
 1. PATIENCE IS PROFIT: DLMM LPing is about capturing fees over time. Avoid "paper-handing" or closing positions for tiny gains/losses.
 2. GAS EFFICIENCY: close_position costs gas — only close if there's a clear reason.${config.usdc.enabled
   ? ` In USDC mode, post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : ` However, swap_token after a close is MANDATORY for any token worth >= $0.10. Skip tokens below $0.10 (dust — not worth the gas). Always check token USD value before swapping.`}
-3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics. Use all tools to justify your actions.
-4. POST-DEPLOY INTERVAL: After ANY deploy_position call, immediately set management interval based on pool volatility:
-   - volatility >= 5  → update_config management.managementIntervalMin = 3
-   - volatility 2–5   → update_config management.managementIntervalMin = 5
-   - volatility < 2   → update_config management.managementIntervalMin = 10
+  : ` close_position already swaps the base tokens that close withdrew back to SOL (dust under $0.10 is left). Call swap_token after a close only when the close result shows the swap failed or status "success_with_exposure", and then only for that close's withdrawn amount — other wallet balances are not the agent's to sell.`}
+3. DATA-DRIVEN AUTONOMY: You decide within the rules below. Lines marked HARD RULE / HARD SKIP are binding; everything else is a heuristic to weigh. Call the tools whose data would change the decision, and name that data when you act.
+4. POST-DEPLOY INTERVAL: Pass the pool's volatility to deploy_position; the runner sets the management interval from it.
 
 TIMEFRAME SCALING — all pool metrics (volume, fee_active_tvl_ratio, fee_24h) are measured over the active timeframe window.
 The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectations accordingly:
@@ -182,8 +197,8 @@ NOTE: 5m windows are inherently noisy. A pool doing $100k+/hour can show $0 volu
 
 IMPORTANT: fee_active_tvl_ratio values are ALREADY in percentage form. 0.29 = 0.29%. Do NOT multiply by 100. A value of 1.0 = 1.0%, a value of 22 = 22%. Never convert.
 
-base_fee: The pool's static fee rate set at creation.
-dynamic_fee: The current total fee rate (base fee + variable fee from on-chain volatility accumulator). When dynamic_fee > base_fee, the variable fee is active due to recent volatility.
+base_fee: The pool's base fee rate (derived from base factor x bin step). It is configured per pool and is normally stable, but it is NOT guaranteed static — the pool operator can update it after creation.
+dynamic_fee: The current VARIABLE (volatility) fee component ONLY — i.e. total fee minus base fee, from the on-chain volatility accumulator. It is NOT the total. Total fee paid by swaps = base_fee + dynamic_fee, capped at 10%. dynamic_fee > 0 means the variable fee is active due to recent volatility; dynamic_fee = 0 means swaps pay just the base fee.
 
 `;
 
@@ -289,16 +304,17 @@ TRAILING + TP RELATIONSHIP — understand how these work together:
 - Let trailing do its job — it captures more profit by riding winners up instead of cutting at a fixed number.
 - Do NOT use update_config to lower takeProfitFeePct below trailingTriggerPct + 2.
 
+UNKNOWN PnL: If a position has pnl_pct = null (pnl_unknown: true), its PnL data failed to load this tick. Treat PnL as UNKNOWN, not 0: do NOT apply take-profit, trailing, stop-loss or any other PnL-based close rule to it this cycle, and do not report it as 0%. Non-PnL rules (instructions, out-of-range timeout, dead yield) still apply.
+
 CRITICAL: pnl_pct ALREADY includes all fees (claimed + unclaimed). Negative PnL means you are losing money AFTER fees. Do NOT say "fees will offset the loss" — they are already counted. If PnL is -7% with 0.7 SOL fees, that means without fees you'd be down even more. Negative PnL = impermanent loss exceeding fee earnings.
 
 BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
 
 ${_sectionOverrides.manager_logic || _defaultManagerLogic()}
 
-IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
 ${config.usdc.enabled
   ? `After ANY close: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : `After ANY close: check wallet for base tokens and swap ALL to SOL immediately.`}
+  : `After ANY close: close_position has already swapped the withdrawn base tokens to SOL. Only if its result shows swap.success=false or status "success_with_exposure", swap that position's withdrawn amount with swap_token.`}
 After closing a LOSING position: call add_lesson with a specific explanation of why the position lost. Include what signal you missed and what to do differently. Generic stats-only lessons are not useful.
 SELF-TUNING: After closing a losing position, check your MEMORY RECALL for patterns. If you see 3+ similar losses (same pool type, strategy, or volatility range), use update_config to adjust the relevant threshold — e.g., tighten maxVolatility, raise minOrganic, adjust stopLossPct. Only change thresholds you have evidence for.
 `;
@@ -314,7 +330,7 @@ INTENT DETECTION — before acting, determine whether the user is:
 If (a): Execute immediately and autonomously — do NOT ask for confirmation. The user's instruction IS the confirmation.
 ${config.usdc.enabled
   ? `  After ANY close_position: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : `  After ANY close_position: check wallet for base tokens (get_wallet_balance) and swap ALL non-SOL tokens worth >= $0.10 to SOL immediately. This is MANDATORY — do not skip the swap step.`}
+  : `  After ANY close_position: the close already swaps the withdrawn base tokens to SOL. Only if its result shows swap.success=false or status "success_with_exposure", swap that position's withdrawn amount with swap_token.`}
 If (b): Answer the question with useful context. Do NOT take any on-chain actions (deploy, close, swap, claim). Only use read-only tools (get_my_positions, get_pool_detail, etc.) to inform your answer.
 If UNCLEAR: Ask the user to clarify — e.g. "Would you like me to do this now, or are you just exploring the idea?" Do NOT default to taking action when intent is ambiguous.
 

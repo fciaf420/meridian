@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "child_process";
-import { existsSync, readFileSync } from "fs";
-import { homedir } from "os";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import { homedir, tmpdir } from "os";
 import path from "path";
 import OpenAI from "openai";
 import { log } from "./logger.js";
@@ -451,6 +451,7 @@ export function runClaudeCli(model, prompt, {
   timeoutMs = 180000,
   systemPrompt = null,
   effort = null,
+  jsonSchema = null,
 } = {}) {
   // Skip if rate limited — caller should fall back to DeepSeek
   if (isClaudeRateLimited()) {
@@ -466,15 +467,36 @@ export function runClaudeCli(model, prompt, {
       "--output-format", "json",
       "--model", model,
       "--no-session-persistence",
+      // The runner executes tools itself. Disable the CLI's built-in tools (Read, Bash, ...)
+      // and ignore the user's MCP servers / claude.ai connectors, which --tools "" does not
+      // cover, so a trading prompt can never reach an outside tool from the bot's cwd.
+      "--tools", "",
+      "--strict-mcp-config",
     ];
 
     if (effort) {
       args.push("--effort", effort);
     }
 
-    // Note: --system-prompt can't be used for large prompts (ENAMETOOLONG).
-    // Instead, prepend system prompt to stdin content for KV cache benefits.
-    // claude -p still caches the prefix of stdin within its TTL window.
+    // The CLI validates the final answer against this schema and returns the object
+    // in the result's structured_output field.
+    if (jsonSchema) {
+      args.push("--json-schema", JSON.stringify(jsonSchema));
+    }
+
+    // A file sidesteps ENAMETOOLONG and makes the app prompt the real system prompt
+    // instead of a user-turn prefix under the CLI's default coding-agent prompt.
+    let systemPromptPath = null;
+    if (systemPrompt) {
+      systemPromptPath = path.join(tmpdir(), `meridian-system-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+      writeFileSync(systemPromptPath, systemPrompt, "utf8");
+      args.push("--system-prompt-file", systemPromptPath);
+    }
+    const cleanupSystemPrompt = () => {
+      if (!systemPromptPath) return;
+      try { unlinkSync(systemPromptPath); } catch { /* already gone */ }
+      systemPromptPath = null;
+    };
 
     const spawnCommand = viaCmd ? (process.env.ComSpec || "cmd.exe") : command;
     const spawnArgs = viaCmd ? ["/d", "/c", command, ...args] : args;
@@ -483,10 +505,7 @@ export function runClaudeCli(model, prompt, {
       windowsHide: true,
     });
 
-    // Prepend system prompt to stdin for KV cache — claude -p caches the
-    // prefix of stdin within its TTL. Stable system prompt = cache hits.
-    const fullPrompt = systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
-    child.stdin.end(fullPrompt, "utf8");
+    child.stdin.end(prompt, "utf8");
 
     let killed = false;
     const killTimer = setTimeout(() => {
@@ -500,6 +519,7 @@ export function runClaudeCli(model, prompt, {
 
     child.on("close", (code) => {
       clearTimeout(killTimer);
+      cleanupSystemPrompt();
       if (killed) return;
 
       const output = stdoutChunks.join("");
@@ -521,20 +541,21 @@ export function runClaudeCli(model, prompt, {
           }
           reject(new Error(msg || "Claude CLI returned an error"));
         } else if (parsed.type === "result") {
-          resolve(typeof parsed.result === "string" ? parsed.result.trim() : "");
+          if (jsonSchema && parsed.structured_output != null) resolve(parsed.structured_output);
+          else resolve(typeof parsed.result === "string" ? parsed.result.trim() : "");
         } else {
           reject(new Error(`Unexpected Claude CLI response: ${JSON.stringify(parsed).slice(0, 300)}`));
         }
-      } catch {
-        // If JSON parsing fails, return the raw output as a fallback.
-        if (output.trim()) {
-          resolve(output.trim());
-        } else {
-          reject(new Error(stderr || "Claude CLI returned empty output"));
-        }
+      } catch (err) {
+        // --output-format json always emits a JSON envelope; anything else is a CLI failure.
+        reject(new Error(`Claude CLI returned unparseable output: ${err.message}; ${(stderr || output).slice(0, 300)}`));
       }
     });
 
-    child.on("error", (err) => reject(err));
+    child.on("error", (err) => {
+      clearTimeout(killTimer);
+      cleanupSystemPrompt();
+      reject(err);
+    });
   });
 }

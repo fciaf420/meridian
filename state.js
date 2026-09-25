@@ -171,6 +171,19 @@ function pushEvent(state, event) {
 }
 
 /**
+ * Patch fields on an existing tracked position (e.g. partial deploy amounts)
+ * and optionally append a note. No-op if the position is not tracked.
+ */
+export function updateTrackedPosition(position_address, patch = {}, note = null) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos) return;
+  Object.assign(pos, patch);
+  if (note) pos.notes.push(note);
+  save(state);
+}
+
+/**
  * Mark a position as closed.
  */
 export function recordClose(position_address, reason) {
@@ -226,6 +239,11 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config) 
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
+
+  // Unknown PnL (null/NaN from a failed PnL fetch) → take no exit action and
+  // leave peak/trailing state untouched this tick.
+  if (currentPnlPct == null || !Number.isFinite(Number(currentPnlPct))) return null;
+  currentPnlPct = Number(currentPnlPct);
 
   const mgmt = config.management;
   let action = null;

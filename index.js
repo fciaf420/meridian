@@ -7,17 +7,17 @@ import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./age
 import { log } from "./logger.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates, rankCandidatesByDarwin } from "./tools/screening.js";
+import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
-import { registerCronRestarter } from "./tools/executor.js";
+import { registerCronRestarter, executeTool } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, isEnabled as telegramEnabled } from "./telegram.js";
 import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot, maybePromote, checkCapacity } from "./memory.js";
-import { updatePnlAndCheckExits } from "./state.js";
+import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
 import { emit } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
@@ -175,6 +175,21 @@ function stopCronJobs() {
   stopPnlWatcher();
 }
 
+// With no open positions, management relaxes to the idle cadence (10 min). This used
+// to be a MANDATORY prompt step after every close; it is a fixed rule, so run it here.
+const IDLE_MANAGEMENT_INTERVAL_MIN = 10;
+async function resetIdleManagementInterval() {
+  if (config.schedule.managementIntervalMin === IDLE_MANAGEMENT_INTERVAL_MIN) return;
+  // Re-read uncached so a stale positions cache can't relax cadence while a position is open.
+  const fresh = await getMyPositions({ force: true }).catch(() => null);
+  if (!fresh || fresh.error || fresh.positions?.length) return;
+  await executeTool("update_config", {
+    setting: "managementIntervalMin",
+    value: IDLE_MANAGEMENT_INTERVAL_MIN,
+    reason: "no open positions",
+  });
+}
+
 function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
 
@@ -201,6 +216,7 @@ function startCronJobs() {
       const preCheck = await getMyPositions();
       if (!preCheck?.positions?.length) {
         log("cron", "Management skipped — no open positions");
+        if (!preCheck?.error) await resetIdleManagementInterval().catch(() => {});
         timers.managementLastRun = Date.now();
         setManagementBusy(false);
         return;
@@ -213,6 +229,9 @@ function startCronJobs() {
       // Targeted recall + trailing TP / stop loss pre-check
       let memoryHints = "";
       let exitAlerts = "";
+      // Set only when the exit pre-check below ran to completion; the code-side
+      // HOLD gate further down requires it so a partial pre-check never skips the LLM.
+      let precheckedPositions = null;
       try {
         const pos = await getMyPositions();
         const recalls = [];
@@ -290,6 +309,7 @@ function startCronJobs() {
             memoryHints += `\n\nDYNAMIC FEES (current):\n${feeLines.join("\n")}\n`;
           }
         } catch { /* best-effort */ }
+        precheckedPositions = pos.positions || [];
       } catch { /* best-effort */ }
 
       // Inject recent auto-closes from PnL watcher so LLM knows what happened
@@ -313,6 +333,37 @@ function startCronJobs() {
         if (kbHints) kbContext = `\n\n${kbHints}`;
       } catch { /* best-effort */ }
 
+      // Hard-close rules 2-6 are threshold checks on data already in hand. Evaluate them
+      // here and start a model session only when a position carries a free-text
+      // instruction, a rule fired, a rule could not be evaluated, or there are exit
+      // alerts. All-HOLD cycles skip the LLM call. This only gates the LLM: nothing is
+      // closed in code here, and the PnL watcher's own exits are unaffected.
+      if (precheckedPositions?.length && !exitAlerts) {
+        const m = config.management;
+        const ruleHits = [];
+        for (const p of precheckedPositions) {
+          if (getTrackedPosition(p.position)?.instruction) ruleHits.push(`${p.pair}: instruction`);
+          else if (p.pnl_pct == null) ruleHits.push(`${p.pair}: pnl unknown`);
+          else if (p.pnl_pct >= m.takeProfitFeePct) ruleHits.push(`${p.pair}: rule 3`);
+          else if ((p.minutes_out_of_range ?? 0) >= m.outOfRangeWaitMinutes) ruleHits.push(`${p.pair}: rule 4`);
+          else if (p.pnl_pct <= m.emergencyPriceDropPct) ruleHits.push(`${p.pair}: rule 6`);
+          else if (!p.pool) ruleHits.push(`${p.pair}: pool unknown`);
+          else {
+            const d = await getPoolDetail({ pool_address: p.pool, timeframe: config.screening.timeframe || "5m" }).catch(() => null);
+            if (!d || !Number.isFinite(d.fee_active_tvl_ratio) || !Number.isFinite(d.volume)) ruleHits.push(`${p.pair}: rule 5 unverified`);
+            else if (d.fee_active_tvl_ratio < config.screening.minFeeActiveTvlRatio && d.volume < config.screening.minVolume) {
+              ruleHits.push(`${p.pair}: rule 5`);
+            }
+          }
+        }
+        if (ruleHits.length === 0) {
+          log("cron", `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD (LLM skipped)`);
+          mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD.`;
+          return; // finally{} still releases the lock and emits the report
+        }
+        log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
+      }
+
       const pnlUnit = config.management.pnlUnit?.toUpperCase() || "SOL";
       const { content } = await agentLoop(`
 MANAGEMENT CYCLE${memoryHints}${exitAlerts}${autoCloseInfo}${kbContext}
@@ -325,6 +376,8 @@ HARD CLOSE RULES (check in order — close immediately on first match, no furthe
 5. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio}% AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
 6. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (emergency stop)
 
+If a position's pnl_pct is null (pnl_unknown: true), its PnL is UNKNOWN this tick (data fetch failed), NOT 0 — skip rules 3 and 6 for it and do not close it on PnL grounds this cycle.
+
 These rules come from user-config. They are not suggestions. Do not override them.
 If NO rule triggers → HOLD. Do not close for any other reason.
 
@@ -336,11 +389,8 @@ STEPS:
    - If no rule triggers: HOLD.
 3. If closing: ${usdcModeEnabled()
     ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
-    : `swap base tokens to SOL immediately after.`}
-4. After any close — recalibrate management interval (MANDATORY):
-   - No positions remaining → update_config setting=managementIntervalMin value=10
-   - Positions still open → keep current interval
-5. After closing a LOSING position — check MEMORY RECALL for patterns:
+    : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result reports a failed swap or status "success_with_exposure".`}
+4. After closing a LOSING position — check MEMORY RECALL for patterns:
    - If 3+ similar losses (same pool type, volatility range, or strategy) → use update_config to adjust the threshold that would have prevented it
    - Examples: tighten maxVolatility, raise minOrganic, adjust stopLossPct, raise minVolume
 
@@ -352,12 +402,7 @@ REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values)
 **Decision:** [STAY/CLOSE]
 **Reason:** [1 short sentence — if PnL is negative, say IL exceeds fees]
 
-FAILURE ANALYSIS: When closing a LOSING position (negative PnL), you MUST call add_lesson with a specific, actionable lesson that explains:
-- What went wrong (entered during pump reversal? too volatile for the range? held too long for a scalper pool?)
-- What signal you missed or should have weighted differently
-- What you would do differently next time
-Do NOT write generic "FAILED: pool X with stats Y" — explain the WHY.
-Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is high. Top LPers hold 0.2h in this pool but we held 3.8h. Next time: match scalper cadence or skip pumping tokens."
+FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesson with one lesson that names what went wrong, the signal that was missed or under-weighted, and what to do differently next time. The runner already records the raw stats of every close, so the lesson is only useful for the why.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel);
       mgmtReport = content;
     } catch (error) {
@@ -373,6 +418,7 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
             emit("out_of_range", { pair: p.pair, minutesOOR: p.minutes_out_of_range });
           }
         }
+        if (pos && !pos.error && !pos.positions?.length) await resetIdleManagementInterval();
       } catch { /* best-effort */ }
       // Promote high-hit nugget facts to MEMORY.md
       maybePromote();
@@ -445,41 +491,9 @@ Example: "AVOID: Entering NOTHING-SOL during 4h +70% pump — reversal risk is h
 
       // Load saved strategies for reference (LLM picks per token)
       const activeStrategy = getActiveStrategy();
-      const strategyBlock = `
-STRATEGY SELECTION — choose per token based on its profile:
-
-  Token Profile                         │ Strategy  │ Range       │ Reasoning
-  ──────────────────────────────────────┼───────────┼─────────────┼──────────────────────────
-  New memecoin, < 24h, high volatility  │ bid_ask   │ 25–35%      │ Single-sided SOL only = no bag risk
-  Pumping token, price up > 50% recent  │ bid_ask   │ 35–50%      │ Catch sell pressure safely
-  Proven token, organic > 80, ranging   │ spot      │ 35–50%      │ Two-sided = max fee capture
-  High vol, stable, large bin_step      │ spot      │ 50–70%      │ Wide range, ride the trend
-  High volume, stable, range-bound      │ spot      │ 30–40%      │ Both sides earn, low IL risk
-  Cautious on decent token              │ spot      │ 25–35%      │ Single-sided spot (SOL side only)
-  Unknown/uncertain                     │ bid_ask   │ 30–40%      │ Safe default
-
-Range = % price drop from entry (active bin at deploy time).
-Convert to bins using: bins = ceil(abs(log(1 - pct) / log(1 + bin_step/10000)))
-Examples at different bin steps:
-  25% range → 37 bins at 80bps, 24 bins at 125bps
-  35% range → 55 bins at 80bps, 35 bins at 125bps
-  50% range → 87 bins at 80bps, 56 bins at 125bps
-  70% range → 152 bins at 80bps, 97 bins at 125bps
-Always compute bins from the pool's actual bin_step — never use raw bin counts from this table.
-
-Strategy types:
-- bid_ask: Always single-sided (SOL only). Safest — no token exposure.
-- spot: Can be EITHER two-sided or single-sided depending on bin placement.
-  * Two-sided spot: bins above AND below active bin → earns fees on both sides, but holds token.
-  * Single-sided spot (SOL only): all bins BELOW active bin → earns fees when price drops into range, no bag risk.
-  * Use single-sided spot when you like the pool but want safety. Use two-sided spot only for high-conviction tokens.
-
-Rules:
-- Default to bid_ask or single-sided spot when unsure — always the safer choice.
-- Only use two-sided spot if organic score > 80, holders > 1000, and price is stable/ranging.
-- Wide ranges (>69 bins) are supported — the deploy tool handles multi-tx automatically.
-- Report which strategy you chose, single vs two-sided, bin count, and the % range it covers.
-${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrategy.name} — ${activeStrategy.lp_strategy}, best for: ${activeStrategy.best_for}` : ""}`;
+      const strategyBlock = activeStrategy
+        ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrategy.name} — ${activeStrategy.lp_strategy}, best for: ${activeStrategy.best_for}`
+        : "";
 
       // Targeted recall: recall strategy memories for common bin steps
       let memoryHints = "";
@@ -504,6 +518,7 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
       // Pre-load top 3 candidates with recon data in parallel
       let candidateBlocks = "";
       let loadedCandidates = [];
+      const hardSkipped = [];
       try {
         const result = await getTopCandidates({ limit: 5 });
         const candidates = result?.candidates || [];
@@ -538,6 +553,8 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
           const tokenData = infoResult?.results?.[0];
           const smartWalletCount = swResult?.in_pool?.length || 0;
           c._smartWalletCount = smartWalletCount;
+          c._globalFeesSol = holdResult?.global_fees_sol ?? null;
+          c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
 
           let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
 
@@ -567,6 +584,7 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
               const epPass = gmgnResult.volume_24h >= (config.strategy.evilPanda?.minTokenVolume24h ?? 750000)
                 && gmgnResult.market_cap >= (config.strategy.evilPanda?.minMcap ?? 200000)
                 && gmgnResult.candles.evil_panda_entry_ok;
+              c._evilPandaPass = !!epPass;
               block += `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, mcap>=${config.strategy.evilPanda?.minMcap ?? 200000}, 5m Supertrend green/price above`;
               block += ` | supertrend=${gmgnResult.candles.supertrend_direction ?? "?"}/${gmgnResult.candles.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${gmgnResult.candles.rsi_2 ?? "?"}`;
             }
@@ -589,7 +607,23 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
             .filter((b) => b.status === "fulfilled")
             .map((b) => [b.value.pool, b.value.block])
         );
-        const validBlocks = rankedCandidates
+        // Hard skips are threshold checks on pre-loaded data: drop failing candidates in
+        // code so the model only judges the survivors (narrative, momentum, pick-or-skip).
+        // Unknown values (null) never cause a skip here; the model still sees them.
+        const hardSkipReason = (c) => {
+          if (c._globalFeesSol != null && c._globalFeesSol < config.screening.minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${config.screening.minTokenFeesSol}`;
+          if (Number.isFinite(c._top10Pct) && c._top10Pct > 60) return `top10 ${c._top10Pct}% > 60%`;
+          if (config.strategy.activeStrategy === "evil_panda" && c._evilPandaPass === false) return "Evil Panda entry FAIL";
+          return null;
+        };
+        const survivors = [];
+        for (const c of rankedCandidates) {
+          const reason = hardSkipReason(c);
+          if (reason) hardSkipped.push(`${c.name}: ${reason}`);
+          else survivors.push(c);
+        }
+        if (hardSkipped.length > 0) log("cron", `Screening hard-skipped in code: ${hardSkipped.join("; ")}`);
+        const validBlocks = survivors
           .map((c) => blockMap.get(c.pool))
           .filter(Boolean);
         if (validBlocks.length > 0) {
@@ -630,6 +664,13 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
         }
       } catch (e) {
         log("cron", `Pre-load failed (${e.message}), agent will fetch manually`);
+      }
+
+      // Every pre-loaded candidate failed a hard skip: nothing is left to judge, and the
+      // no-preload fallback would only re-fetch the same shortlist. Skip the LLM call.
+      if (loadedCandidates.length > 0 && hardSkipped.length >= loadedCandidates.length) {
+        screenReport = `Screening: all ${loadedCandidates.length} candidate(s) failed hard-skip rules in code — no deploy.\n${hardSkipped.map((s) => `- ${s}`).join("\n")}`;
+        return; // finally{} still releases the screening lock and emits the report
       }
 
       // Inject Darwinian signal weights if available
@@ -897,8 +938,8 @@ async function handleTelegramCommand(rawText) {
       for (const p of positions.positions) {
         const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
-        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
-        lines.push(`• ${p.pair}  ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
+        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
+        lines.push(`• ${p.pair}  ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
       }
       await tgSend(lines.join("\n"));
     });
@@ -935,7 +976,7 @@ async function handleTelegramCommand(rawText) {
       const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
       await tgSend(`🚀 Deploying ${amt} SOL into ${pool.name}…`);
       const { content } = await screenerLoop(
-        `Deploy ${amt} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+        `Deploy ${amt} SOL into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
         config.llm.maxSteps,
       );
       launchCron({ announce: true });
@@ -953,7 +994,7 @@ async function handleTelegramCommand(rawText) {
       const balance = await getWalletBalances().catch(() => null);
       const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
       const { content } = await screenerLoop(
-        `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${amt} SOL. Execute now, don't ask.`,
+        `get_top_candidates, pick the best one, deploy_position with ${amt} SOL. Execute now, don't ask.`,
         config.llm.maxSteps,
       );
       launchCron({ announce: true });
@@ -1122,8 +1163,8 @@ if (runtimeMode.interactive) {
       for (const p of positions.positions) {
         const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
-        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
-        console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
+        const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
+        console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
       }
       console.log();
     }
@@ -1175,7 +1216,7 @@ Commands:
         const amtPhrase = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${deployAmount} SOL`;
         console.log(`\nDeploying ${amtPhrase} into ${pool.name}...\n`);
         const { content: reply } = await screenerLoop(
-          `Deploy ${amtPhrase} into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+          `Deploy ${amtPhrase} into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
           config.llm.maxSteps
         );
         console.log(`\n${reply}\n`);
@@ -1192,7 +1233,7 @@ Commands:
         const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : DEPLOY;
         const amtPhrase = usdcModeEnabled() ? `$${config.usdc.deployAmountUsd} (USDC mode — auto-funded from USDC)` : `${deployAmount} SOL`;
         const { content: reply } = await screenerLoop(
-          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${amtPhrase}. Execute now, don't ask.`,
+          `get_top_candidates, pick the best one, deploy_position with ${amtPhrase}. Execute now, don't ask.`,
           config.llm.maxSteps
         );
         console.log(`\n${reply}\n`);
@@ -1223,8 +1264,8 @@ Commands:
         for (const p of positions.positions) {
           const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
           const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
-          const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
-          console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct}%)`);
+          const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
+          console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
         }
         console.log();
       });

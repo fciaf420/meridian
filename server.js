@@ -550,8 +550,8 @@ export function startServer(timersFn) {
           for (const p of positions.positions || []) {
             const status = p.in_range ? "in-range" : "OUT OF RANGE";
             const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
-            const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
-            lines.push(`  ${p.pair} — ${status} | fees: ${fees} | pnl: ${pnl} (${p.pnl_pct}%)`);
+            const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
+            lines.push(`  ${p.pair} — ${status} | fees: ${fees} | pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
           }
           wsSend(ws, {
             type: "chat:response",
@@ -668,7 +668,7 @@ export function startServer(timersFn) {
             const currentBalance = await getWalletBalances().catch(() => null);
             const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
             const { content } = await screenerLoop(
-              `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${deployAmount} SOL. Execute now, don't ask.`,
+              `get_top_candidates, pick the best one, deploy_position with ${deployAmount} SOL. Execute now, don't ask.`,
               config.llm.maxSteps, [],
             );
             appendHistory("auto", content);
@@ -708,7 +708,7 @@ export function startServer(timersFn) {
               const currentBalance = await getWalletBalances().catch(() => null);
               const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
               const { content } = await screenerLoop(
-                `Deploy ${deployAmount} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+                `Deploy ${deployAmount} SOL into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
                 config.llm.maxSteps, [],
               );
               appendHistory(`deploy #${pick} ${pool.name}`, content);

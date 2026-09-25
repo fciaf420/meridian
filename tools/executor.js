@@ -25,7 +25,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { execSync, spawn } from "child_process";
-import { CONFIG_KEY_MAP, getRequiredSolBalance } from "../runtime-helpers.js";
+import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } from "../runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
@@ -79,18 +79,20 @@ const toolMap = {
     const stepPct = bin_step / 10000; // e.g. 100 → 0.01 (1%)
     if (price_range_pct != null) {
       // Convert % range to bin count
-      const pct = Math.abs(price_range_pct) / 100;
-      const bins = Math.abs(Math.ceil(Math.log(1 - pct) / Math.log(1 + stepPct)));
+      const rangePct = Math.abs(Number(price_range_pct));
+      if (!(rangePct > 0) || rangePct >= 100) return { error: "price_range_pct must be > 0 and < 100" };
+      const bins = calculateBinsForPriceRange(bin_step, rangePct);
       const actualPct = (1 - Math.pow(1 + stepPct, -bins)) * 100;
-      return { bin_step, price_range_pct: Math.abs(price_range_pct), bins_needed: bins, actual_range_pct: Math.round(actualPct * 100) / 100, wide_range: bins > 69, per_bin_pct: Math.round(stepPct * 10000) / 100 };
+      return { bin_step, price_range_pct: rangePct, bins_needed: bins, actual_range_pct: Math.round(actualPct * 100) / 100, wide_range: bins > 69, per_bin_pct: Math.round(stepPct * 10000) / 100 };
     }
     if (bin_count != null) {
+      if (!Number.isInteger(Number(bin_count)) || Number(bin_count) <= 0) return { error: "bin_count must be a positive integer" };
       // Convert bin count to % range
       const pct = (1 - Math.pow(1 + stepPct, -bin_count)) * 100;
       return { bin_step, bin_count, range_pct: Math.round(pct * 100) / 100, wide_range: bin_count > 69, per_bin_pct: Math.round(stepPct * 10000) / 100 };
     }
     // Just show per-bin info
-    return { bin_step, per_bin_pct: Math.round(stepPct * 10000) / 100, example_50pct_bins: Math.ceil(Math.log(0.5) / Math.log(1 + stepPct)) };
+    return { bin_step, per_bin_pct: Math.round(stepPct * 10000) / 100, example_50pct_bins: calculateBinsForPriceRange(bin_step, 50) };
   },
   pin_lesson: ({ id }) => pinLesson(id),
   unpin_lesson: ({ id }) => unpinLesson(id),
@@ -248,7 +250,9 @@ const WRITE_TOOLS = new Set([
 const RISK_CONFIG_BOUNDS = {
   maxDeployAmount: { min: 0, max: 100 },        // SOL per position
   maxPositions: { min: 1, max: 50, integer: true },
-  stopLossPct: { min: 0, max: 100 },            // percent loss
+  // Stop loss is a PnL threshold, so it is negative (state.js closes when pnl <= stopLossPct;
+  // 0 disables it). A positive value would close every position below that profit.
+  stopLossPct: { min: -100, max: 0, hint: "use a negative PnL percent, e.g. -20" },
   trailingTriggerPct: { min: 0, max: 1000 },    // percent gain to arm trailing
   trailingDropPct: { min: 0, max: 100 },        // percent drop from peak to exit
   managementIntervalMin: { min: 1, max: 1440, integer: true },
@@ -287,7 +291,7 @@ function validateConfigUpdate(args) {
       return { pass: false, reason: `update_config rejected: ${key} must be an integer, got ${val}.` };
     }
     if (val < bounds.min || val > bounds.max) {
-      return { pass: false, reason: `update_config rejected: ${key}=${val} is outside the allowed range [${bounds.min}-${bounds.max}].` };
+      return { pass: false, reason: `update_config rejected: ${key}=${val} is outside the allowed range [${bounds.min}, ${bounds.max}]${bounds.hint ? ` (${bounds.hint})` : ""}.` };
     }
   }
   return { pass: true };
@@ -363,8 +367,25 @@ export async function executeTool(name, args) {
     if (success) {
       if (name === "deploy_position") {
         emit("deploy", { pair: args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, amountUsd: usdcModeEnabled() ? (args.initial_value_usd ?? null) : null, position: result.position, tx: result.tx });
+        // Post-deploy management cadence is a fixed mapping from pool volatility.
+        // Falls back to the pool's current volatility when the model did not pass it.
+        // Best-effort: a failure here must never turn a landed deploy into an error.
+        try {
+          let vol = args.volatility == null ? NaN : Number(args.volatility);
+          if (!Number.isFinite(vol) && args.pool_address) {
+            const detail = await getPoolDetail({ pool_address: args.pool_address }).catch(() => null);
+            vol = detail?.volatility == null ? NaN : Number(detail.volatility);
+          }
+          if (Number.isFinite(vol)) {
+            const interval = vol >= 5 ? 3 : vol >= 2 ? 5 : 10;
+            const cadence = toolMap.update_config({ setting: "managementIntervalMin", value: interval, reason: `post-deploy cadence for volatility ${vol}` });
+            result.management_interval_min = cadence?.applied?.managementIntervalMin ?? null;
+          }
+        } catch (e) {
+          log("config", `Post-deploy cadence update failed: ${e.message}`);
+        }
       } else if (name === "close_position") {
-        emit("close", { pair: args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? 0 });
+        emit("close", { pair: args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? null });
         // USDC mode: auto-settle recovered base token + surplus SOL back to USDC.
         if (usdcModeEnabled()) {
           try {

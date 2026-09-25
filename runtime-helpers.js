@@ -55,7 +55,12 @@ export function calculateBinsForPriceRange(binStep, priceRangePct) {
 
   const stepPct = binStep / 10000;
   const pct = Math.abs(priceRangePct) / 100;
-  return Math.abs(Math.ceil(Math.log(1 - pct) / Math.log(1 + stepPct)));
+  // Round the MAGNITUDE up so the range covers at least priceRangePct.
+  // (Math.abs(Math.ceil(x)) with x < 0 is floor(|x|): one bin short.)
+  // The tiny epsilon keeps float noise on an exact integer (e.g. 69.0000000001)
+  // from adding a spurious extra bin.
+  const exact = Math.abs(Math.log(1 - pct) / Math.log(1 + stepPct));
+  return Math.max(1, Math.ceil(exact - 1e-9));
 }
 
 export function splitRangeBins(totalBins, solSplitPct) {

@@ -3,18 +3,20 @@ import {
   ComputeBudgetProgram,
   Keypair,
   PublicKey,
-  sendAndConfirmTransaction,
+  SendTransactionError,
 } from "@solana/web3.js";
 import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { emit } from "../notifier.js";
 import {
   trackPosition,
   markOutOfRange,
   markInRange,
   recordClaim,
   recordClose,
+  updateTrackedPosition,
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
@@ -142,8 +144,9 @@ async function applyPriorityFee(tx, feePayer, label) {
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports })
   );
 
-  const { blockhash } = await getConnection().getLatestBlockhash("confirmed");
+  const { blockhash, lastValidBlockHeight } = await getConnection().getLatestBlockhash("confirmed");
   tx.recentBlockhash = blockhash;
+  tx.lastValidBlockHeight = lastValidBlockHeight;
   tx.feePayer = feePayer;
   return tx;
 }
@@ -174,34 +177,52 @@ async function sendManagedTransaction(tx, signers, label) {
             log("tx_retry", `${label}: could not verify prior tx status (${statusErr?.message || statusErr}); resubmitting`);
           }
         } else {
-          // sendAndConfirmTransaction did not surface a signature on throw, so we
-          // cannot confirm whether the prior tx landed. Add a short delay before
-          // resubmit to reduce (not eliminate) the double-submit window.
+          // No signature was captured for the prior attempt (it failed before
+          // signing), so we cannot confirm whether it landed. Add a short delay
+          // before resubmit to reduce (not eliminate) the double-submit window.
           // LIMITATION: a silently-landed prior tx could still be resubmitted here.
           await new Promise((r) => setTimeout(r, 1500));
         }
 
-        const { blockhash } = await getConnection().getLatestBlockhash("confirmed");
-        tx.recentBlockhash = blockhash;
-        tx.feePayer ??= feePayer;
         lastSig = null;
       }
 
-      // Capture the signature for this attempt so a later expiry retry can check
-      // whether it landed before resubmitting. signTransaction is idempotent and
-      // does not broadcast; it just lets us derive the signature up-front.
-      try {
-        tx.partialSign?.(...signers);
-        const sig = tx.signature ? bs58.encode(tx.signature) : null;
-        if (sig) lastSig = sig;
-      } catch { /* best-effort sig capture; not fatal */ }
+      // Sign ONCE here and send the exact signed bytes. Do NOT use
+      // sendAndConfirmTransaction / connection.sendTransaction(tx, signers):
+      // for legacy txs web3.js overwrites recentBlockhash with its own cached
+      // blockhash and re-signs, so the signature that goes on the wire differs
+      // from one derived beforehand — and the double-submit guard above would
+      // check the wrong signature.
+      const connection = getConnection();
+      if (attempt > 0 || !tx.recentBlockhash || tx.lastValidBlockHeight == null) {
+        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+        tx.recentBlockhash = blockhash;
+        tx.lastValidBlockHeight = lastValidBlockHeight;
+      }
+      tx.feePayer ??= feePayer;
+      tx.sign(...signers);
+      if (!tx.signature) throw new Error(`${label}: transaction has no fee-payer signature after signing`);
+      const signature = bs58.encode(tx.signature);
+      lastSig = signature;
 
-      return await sendAndConfirmTransaction(getConnection(), tx, signers, {
+      await connection.sendRawTransaction(tx.serialize(), {
         skipPreflight: true,
         preflightCommitment: "confirmed",
-        commitment: "confirmed",
         maxRetries: 3,
       });
+      const status = (await connection.confirmTransaction({
+        signature,
+        blockhash: tx.recentBlockhash,
+        lastValidBlockHeight: tx.lastValidBlockHeight,
+      }, "confirmed")).value;
+      if (status?.err) {
+        throw new SendTransactionError({
+          action: "send",
+          signature,
+          transactionMessage: `Status: (${JSON.stringify(status)})`,
+        });
+      }
+      return signature;
     } catch (error) {
       lastError = error;
       const message = error?.message || String(error);
@@ -252,6 +273,30 @@ export async function getActiveBin({ pool_address }) {
     price: pool.fromPricePerLamport(Number(activeBin.price)),
     pricePerLamport: activeBin.price.toString(),
   };
+}
+
+/**
+ * Re-read a position's token amounts on-chain. Returns
+ * { rawX, rawY, empty } (raw base-unit strings), or null when the read fails
+ * (caller must treat null as "possibly funded").
+ */
+async function readPositionAmounts(pool, positionPubKey) {
+  try {
+    try { await pool.refetchStates(); } catch { /* best-effort */ }
+    const pd = (await pool.getPosition(positionPubKey))?.positionData;
+    if (!pd) return null;
+    const big = (v) => { try { return BigInt(String(v ?? "0").split(".")[0] || "0"); } catch { return null; } };
+    const rawX = big(pd.totalXAmount);
+    const rawY = big(pd.totalYAmount);
+    if (rawX == null || rawY == null) return null;
+    const binLiquidity = (pd.positionBinData || []).some(
+      (b) => Number(b.positionXAmount || 0) > 0 || Number(b.positionYAmount || 0) > 0,
+    );
+    return { rawX: rawX.toString(), rawY: rawY.toString(), empty: rawX === 0n && rawY === 0n && !binLiquidity };
+  } catch (e) {
+    log("deploy_warn", `Could not read position ${positionPubKey.toString().slice(0, 8)} on-chain: ${e.message}`);
+    return null;
+  }
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
@@ -566,7 +611,7 @@ export async function deployPosition({
   if (totalBins < MIN_BINS) {
     return {
       success: false,
-      error: `Rejected: total bins = ${totalBins}, minimum is ${MIN_BINS}. At bin_step ${resolvedBinStep || "?"}, ${MIN_BINS} bins ≈ ${resolvedBinStep ? (MIN_BINS * (resolvedBinStep / 10000) * 100).toFixed(0) : "?"}% range. Use calculate_bins with a target range of 25-50% and pass that bin count to bins_below.`,
+      error: `Rejected: total bins = ${totalBins}, minimum is ${MIN_BINS}. At bin_step ${resolvedBinStep || "?"}, ${MIN_BINS} bins ≈ ${resolvedBinStep ? (MIN_BINS * (resolvedBinStep / 10000) * 100).toFixed(0) : "?"}% range. Pass price_range_pct (for example 25-50) instead of a bin count; bins are computed from the pool's bin_step.`,
     };
   }
 
@@ -807,14 +852,68 @@ export async function deployPosition({
           log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
         }
       } catch (liqErr) {
-        // Liquidity add failed — position exists on-chain but is empty.
-        // Mark it as closed so it doesn't count toward maxPositions or get managed.
+        // Liquidity add failed partway. Earlier chunks may already have landed
+        // real liquidity, so re-read the position on-chain before deciding.
+        // Only a VERIFIED-empty position is marked closed; a funded or
+        // unverifiable one stays tracked as open so management / close logic
+        // picks it up (a closed tracked entry is never auto-adopted, which
+        // would orphan the funds). No retry here: resending chunks could
+        // double-deploy.
         log("deploy_error", `Phase 2 (add liquidity) failed for ${posAddr.slice(0, 8)}: ${liqErr.message}`);
-        recordClose(posAddr, "deploy failed (liquidity add error)");
+        const onchain = await readPositionAmounts(pool, newPosition.publicKey);
+
+        if (onchain && onchain.empty) {
+          recordClose(posAddr, "deploy failed (liquidity add error, verified empty on-chain)");
+          return {
+            success: false,
+            error: `Position created on-chain but liquidity add failed: ${liqErr.message}. Position ${posAddr.slice(0, 8)} verified empty on-chain and marked closed.`,
+            position: posAddr,
+            txs: txHashes,
+          };
+        }
+
+        // Funded (partial) or unknown → keep it open with whatever landed.
+        let partialX = null;
+        let partialY = null;
+        if (onchain) {
+          try {
+            const [xDec, yDec] = await Promise.all([
+              getMintDecimals(pool.lbPair.tokenXMint),
+              getMintDecimals(pool.lbPair.tokenYMint),
+            ]);
+            if (xDec != null) partialX = Number(onchain.rawX) / 10 ** xDec;
+            if (yDec != null) partialY = Number(onchain.rawY) / 10 ** yDec;
+          } catch { /* amounts stay null — still keep the position open */ }
+        }
+        // Pro-rate the planned USD value by the share of the planned deposit that landed.
+        let partialUsd = null;
+        if (onchain && initial_value_usd > 0) {
+          const plannedY = Number(totalYLamports.toString());
+          const plannedX = Number(totalXLamports.toString());
+          const frac = plannedY > 0 ? Number(onchain.rawY) / plannedY
+            : plannedX > 0 ? Number(onchain.rawX) / plannedX : null;
+          if (frac != null && Number.isFinite(frac)) partialUsd = Math.round(initial_value_usd * Math.min(frac, 1) * 100) / 100;
+        }
+        const status = onchain ? "PARTIALLY FUNDED" : "UNVERIFIED (on-chain read failed)";
+        const note = `Deploy liquidity add failed after ${txHashes.length} tx(s): ${liqErr.message}. On-chain: ${status}` +
+          (onchain ? ` (X=${partialX ?? onchain.rawX}, Y=${partialY ?? onchain.rawY})` : "") +
+          ". Left OPEN for management/close.";
+        updateTrackedPosition(posAddr, {
+          ...(partialY != null && { amount_sol: partialY }),
+          ...(partialX != null && { amount_x: partialX }),
+          ...(partialUsd != null && { initial_value_usd: partialUsd }),
+          partial_deploy: true,
+        }, note);
+        _positionsCacheAt = 0;
+        log("deploy_warn", `Position ${posAddr.slice(0, 8)} is ${status} — kept open for management/close. ${note}`);
+        emit("deploy_partial", { pair: pool_name || pool_address.slice(0, 8), position: posAddr, status, amountX: partialX, amountY: partialY, error: liqErr.message });
         return {
           success: false,
-          error: `Position created on-chain but liquidity add failed: ${liqErr.message}. Empty position ${posAddr.slice(0, 8)} marked closed.`,
+          partial: true,
+          error: `Position created on-chain but liquidity add failed partway: ${liqErr.message}. Position ${posAddr.slice(0, 8)} is ${status} and has been kept OPEN — manage or close it; do NOT redeploy to "retry".`,
           position: posAddr,
+          amount_x: partialX,
+          amount_y: partialY,
           txs: txHashes,
         };
       }
@@ -883,7 +982,7 @@ let _positionsInflight = null; // deduplicates concurrent calls
 
 // ─── Fetch DLMM PnL API for all positions in a pool ────────────
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
-  const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
+  const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&page_size=100&page=1`; // snake_case: `pageSize` is ignored (API default 20)
   try {
     const res = await fetch(url);
     if (!res.ok) {
@@ -893,6 +992,9 @@ async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
     }
     const data = await res.json();
     const positions = data.positions || data.data || [];
+    if (data.hasNext) {
+      log("pnl_api", `Pool ${poolAddress.slice(0, 8)} has more than ${positions.length} open positions for this wallet — only the first page was read`);
+    }
     if (positions.length === 0) {
       log("pnl_api", `No positions returned for pool ${poolAddress.slice(0, 8)} — keys: ${Object.keys(data).join(", ")}`);
     }
@@ -992,8 +1094,8 @@ function normalizeLpAgentPosition(lpa) {
     poolActiveBinId: null, // LP Agent doesn't provide active bin
     isOutOfRange: lpa.inRange === false,
     pnlUsd: lpa.pnl?.value ?? 0,
-    pnlPctChange: lpa.pnl?.percent ?? 0,
-    pnlSolPctChange: lpa.pnl?.percentNative ?? 0,
+    pnlPctChange: lpa.pnl?.percent ?? null,
+    pnlSolPctChange: lpa.pnl?.percentNative ?? null,
     createdAt: lpa.createdAt
       ? (typeof lpa.createdAt === "number" ? lpa.createdAt : new Date(lpa.createdAt).getTime() / 1000)
       : null,
@@ -1026,6 +1128,19 @@ function normalizeLpAgentPosition(lpa) {
   };
 }
 
+/**
+ * PnL % from a PnL record (Meteora or normalized LP Agent), or null when it is
+ * unknown (no record, missing or non-numeric field). NEVER coerce missing data
+ * to 0: a fake 0% can fire a trailing TP on an API hiccup and hides stop-loss.
+ */
+function readPnlPct(p) {
+  if (!p) return null;
+  const raw = config.management.pnlUnit === "sol" ? p.pnlSolPctChange : p.pnlPctChange;
+  if (raw == null || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
+}
+
 // ─── Get Position PnL (LP Agent primary, Meteora fallback) ──────
 export async function getPositionPnl({ pool_address, position_address }) {
   pool_address = normalizeMint(pool_address);
@@ -1055,7 +1170,9 @@ export async function getPositionPnl({ pool_address, position_address }) {
 
     const unclaimedUsd    = parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0);
     const currentValueUsd = parseFloat(p.unrealizedPnl?.balances || 0);
-    const pnlUsdVal       = Math.round((p.pnlUsd ?? 0) * 100) / 100;
+    const pnlPct          = readPnlPct(p);
+    const pnlUnknown      = pnlPct == null;
+    const pnlUsdVal       = pnlUnknown ? null : Math.round(Number(p.pnlUsd ?? 0) * 100) / 100;
     const allTimeFeesUsd  = Math.round(parseFloat(p.allTimeFees?.total?.usd || 0) * 100) / 100;
 
     // Get accurate active bin from Meteora (LP Agent doesn't provide it)
@@ -1085,8 +1202,9 @@ export async function getPositionPnl({ pool_address, position_address }) {
 
     return {
       pnl_usd:           pnlUsdVal,
-      pnl_sol:           toSol(pnlUsdVal),
-      pnl_pct:           Math.round(((config.management.pnlUnit === "sol" ? p.pnlSolPctChange : p.pnlPctChange) ?? 0) * 100) / 100,
+      pnl_sol:           pnlUnknown ? null : toSol(pnlUsdVal),
+      pnl_pct:           pnlPct,
+      ...(pnlUnknown && { pnl_unknown: true, pnl_error: "PnL % missing from PnL API response" }),
       current_value_usd: Math.round(currentValueUsd * 100) / 100,
       current_value_sol: toSol(currentValueUsd),
       unclaimed_fee_usd: Math.round(unclaimedUsd * 100) / 100,
@@ -1250,8 +1368,14 @@ export async function getMyPositions({ force = false } = {}) {
       const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
       const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
       const collectedFees = p ? parseFloat(p.allTimeFees?.total?.usd || 0) : 0;
-      const pnlUsd        = p?.pnlUsd       ?? 0;
-      const pnlPct        = (config.management.pnlUnit === "sol" ? p?.pnlSolPctChange : p?.pnlPctChange) ?? 0;
+      // null = unknown (PnL APIs failed / not indexed yet). Consumers must take
+      // no PnL-based exit action on a null tick.
+      const pnlPct        = readPnlPct(p);
+      const pnlUnknown    = pnlPct == null;
+      const pnlUsd        = pnlUnknown ? null : Number(p?.pnlUsd ?? 0);
+      if (pnlUnknown) {
+        log("pnl_api", `PnL unknown for ${r.position.slice(0, 8)} (${p ? "no pnl % in response" : "no PnL data from LP Agent or Meteora"}) — reporting pnl_pct=null`);
+      }
 
       const tracked = getTrackedPosition(r.position);
 
@@ -1333,7 +1457,7 @@ export async function getMyPositions({ force = false } = {}) {
         : null;
       const ageMinutes = Math.max(ageFromPnlApi ?? 0, ageFromState ?? 0) || null;
 
-      const pnlUsdRounded = Math.round(pnlUsd * 100) / 100;
+      const pnlUsdRounded = pnlUnknown ? null : Math.round(pnlUsd * 100) / 100;
       const unclaimedRounded = Math.round(unclaimedFees * 100) / 100;
       const totalValRounded = Math.round(totalValue * 100) / 100;
       const collectedRounded = Math.round(collectedFees * 100) / 100;
@@ -1382,8 +1506,9 @@ export async function getMyPositions({ force = false } = {}) {
         collected_fees_usd: collectedRounded,
         collected_fees_sol: toSol(collectedRounded),
         pnl_usd: pnlUsdRounded,
-        pnl_sol: toSol(pnlUsdRounded),
-        pnl_pct: Math.round(pnlPct * 100) / 100,
+        pnl_sol: pnlUnknown ? null : toSol(pnlUsdRounded),
+        pnl_pct: pnlPct,
+        ...(pnlUnknown && { pnl_unknown: true, pnl_error: p ? "PnL % missing from PnL API response" : "PnL data unavailable (LP Agent + Meteora PnL API)" }),
         sol_price: solPrice,
         pnl_unit: config.management.pnlUnit,
         age_minutes: ageMinutes,
@@ -1453,8 +1578,9 @@ export async function getWalletPositions({ wallet_address }) {
         in_range:           inRange,
         unclaimed_fees_usd: Math.round((p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0) * 100) / 100,
         total_value_usd:    Math.round((p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0) * 100) / 100,
-        pnl_usd:            Math.round((p?.pnlUsd ?? 0) * 100) / 100,
-        pnl_pct:            Math.round(((config.management.pnlUnit === "sol" ? p?.pnlSolPctChange : p?.pnlPctChange) ?? 0) * 100) / 100,
+        pnl_usd:            readPnlPct(p) == null ? null : Math.round(Number(p.pnlUsd ?? 0) * 100) / 100,
+        pnl_pct:            readPnlPct(p),
+        ...(readPnlPct(p) == null && { pnl_unknown: true }),
         age_minutes:        p?.createdAt ? Math.floor((Date.now() - p.createdAt * 1000) / 60000) : null,
       };
     });
@@ -1468,23 +1594,30 @@ export async function getWalletPositions({ wallet_address }) {
 
 // ─── Search Pools by Query ─────────────────────────────────────
 export async function searchPools({ query, limit = 10 }) {
-  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(query)}`;
+  const pageSize = Math.min(Math.max(1, Math.floor(Number(limit) || 10)), 1000);
+  const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(query)}&page_size=${pageSize}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Pool search API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
-  const pools = (Array.isArray(data) ? data : data.data || []).slice(0, limit);
+  const pools = (Array.isArray(data) ? data : data.data || []).slice(0, pageSize);
+  const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+  // Field names per the Data API PoolResponse schema (dlmm.datapi.meteora.ag
+  // OpenAPI): pool_config.{bin_step,base_fee_pct}, tvl, volume["24h"], and
+  // token_x/token_y objects. The legacy names (bin_step, liquidity,
+  // trade_volume_24h, mint_x...) no longer exist and came back null.
   return {
     query,
-    total: pools.length,
+    total: data.total ?? pools.length,
     pools: pools.map((p) => ({
-      pool: p.address || p.pool_address,
+      pool: p.address,
       name: p.name,
-      bin_step: p.bin_step ?? p.dlmm_params?.bin_step,
-      fee_pct: p.base_fee_percentage ?? p.fee_pct,
-      tvl: p.liquidity,
-      volume_24h: p.trade_volume_24h,
-      token_x: { symbol: p.mint_x_symbol ?? p.token_x?.symbol, mint: p.mint_x ?? p.token_x?.address },
-      token_y: { symbol: p.mint_y_symbol ?? p.token_y?.symbol, mint: p.mint_y ?? p.token_y?.address },
+      bin_step: num(p.pool_config?.bin_step),
+      fee_pct: num(p.pool_config?.base_fee_pct),
+      tvl: num(p.tvl),
+      volume_24h: num(p.volume?.["24h"]),
+      fee_tvl_ratio_24h: num(p.fee_tvl_ratio?.["24h"]), // % of TVL, already net of protocol fee
+      token_x: { symbol: p.token_x?.symbol ?? null, mint: p.token_x?.address ?? null },
+      token_y: { symbol: p.token_y?.symbol ?? null, mint: p.token_y?.address ?? null },
     })),
   };
 }
@@ -1576,8 +1709,9 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     // ─── Snapshot PnL BEFORE closing (position is still on-chain) ───
     // If PnL watcher provided an override (the value that triggered the close), trust it
     // over the cache which may have been refreshed with stale/wrong API data
-    let pnlUsd = _pnlOverride?.pnl_usd ?? 0;
-    let pnlPct = _pnlOverride?.pnl_pct ?? 0;
+    // pnlPct/pnlUsd stay null when PnL is unknown — never record a fake 0%.
+    let pnlUsd = _pnlOverride?.pnl_usd ?? null;
+    let pnlPct = _pnlOverride?.pnl_pct ?? null;
     let finalValueUsd = _pnlOverride?.total_value_usd ?? 0;
     let feesUsd = 0;
     const trackedPre = getTrackedPosition(position_address);
@@ -1591,17 +1725,18 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
       // No override — snapshot from cache or fresh API
       const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
       if (cachedPos) {
-        pnlUsd        = cachedPos.pnl_usd   ?? 0;
-        pnlPct        = cachedPos.pnl_pct   ?? 0;
+        pnlUsd        = cachedPos.pnl_usd   ?? null;
+        pnlPct        = cachedPos.pnl_pct   ?? null;
         finalValueUsd = cachedPos.total_value_usd ?? 0;
         feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
-      } else {
-      // No cache — fetch fresh from API while position is still open
+      }
+      if (pnlPct == null) {
+      // No cache, or cached PnL was unknown — fetch fresh from API while position is still open
       try {
         const freshPnl = await getPositionPnl({ pool_address: poolAddress, position_address });
-        if (freshPnl && !freshPnl.error) {
-          pnlUsd        = freshPnl.pnl_usd   ?? 0;
-          pnlPct        = freshPnl.pnl_pct   ?? 0;
+        if (freshPnl && !freshPnl.error && freshPnl.pnl_pct != null) {
+          pnlUsd        = freshPnl.pnl_usd   ?? null;
+          pnlPct        = freshPnl.pnl_pct;
           finalValueUsd = freshPnl.current_value_usd ?? 0;
           feesUsd       = (freshPnl.all_time_fees_usd || 0) + (freshPnl.unclaimed_fee_usd || 0);
         }
@@ -1755,6 +1890,15 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         log("close", `initial_value_usd missing for ${position_address}, using finalValueUsd ($${finalValueUsd}) as fallback`);
       }
 
+      // Unknown PnL: let recordPerformance derive it from final vs initial value
+      // when we have a real final value; otherwise record 0 but flag it, so the
+      // record isn't mistaken for a measured break-even (and never -100%).
+      const pnlUnknownAtClose = pnlPct == null;
+      const canDerivePnl = pnlUnknownAtClose && finalValueUsd > 0 && initialUsd > 0;
+      if (pnlUnknownAtClose) {
+        log("close_warn", `PnL unknown at close for ${position_address.slice(0, 8)} — ${canDerivePnl ? "deriving from final/initial value" : "recording 0 with pnl_unknown flag"}`);
+      }
+
       await recordPerformance({
         position: position_address,
         pool: poolAddress,
@@ -1771,8 +1915,9 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         fees_earned_usd: feesUsd,
         final_value_usd: finalValueUsd,
         initial_value_usd: initialUsd,
-        actual_pnl_usd: pnlUsd,
-        actual_pnl_pct: pnlPct,
+        actual_pnl_usd: pnlUnknownAtClose ? (canDerivePnl ? null : 0) : (pnlUsd ?? 0),
+        actual_pnl_pct: pnlUnknownAtClose ? (canDerivePnl ? null : 0) : pnlPct,
+        ...(pnlUnknownAtClose && { pnl_unknown: true }),
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: closeReason,
