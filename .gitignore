@@ -46,3 +46,7 @@ gmgn-config.json
 
 # runtime state (regenerated)
 signal-weights.json
+
+# Claude Code per-user state
+.claude/worktrees/
+.claude/settings.local.json
