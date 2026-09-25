@@ -370,8 +370,11 @@ Everything in `user-config.json` is optional, but these are the main knobs.
 
 ### Screening
 
+`screeningSource` picks where candidates come from: `"meteora"` (default, Meteora pool discovery with the thresholds below), `"gmgn"` (GMGN token pipeline, filters in `gmgn-config.json`), or `"both"`. With `"both"`, the two run in parallel and the bot keeps going on one if the other fails. Results are deduped to one pool per token (higher fee/active-TVL, then higher TVL). GMGN-only pools must also pass `minBinStep`/`maxBinStep`, `minTvl`/`maxTvl` and `maxVolatility`, and pools found by both sources rank first. Invalid values fall back to `"meteora"`.
+
 | Field | Meaning |
 | --- | --- |
+| `screeningSource` | `meteora`, `gmgn`, or `both` |
 | `minFeeActiveTvlRatio` | minimum fee / active TVL |
 | `minTvl`, `maxTvl` | TVL bounds |
 | `minVolume` | minimum pool volume |

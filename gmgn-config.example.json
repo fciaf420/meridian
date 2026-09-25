@@ -1,5 +1,5 @@
 {
-  "_comment": "GMGN screening filters. Active only when user-config.json screeningSource = \"gmgn\". Copy to gmgn-config.json and fill in. apiKey is optional here if GMGN_API_KEY is in .env. (You can also set any of these in user-config.json with a gmgn* prefix, e.g. gmgnMinMcap.)",
+  "_comment": "GMGN screening filters. Active only when user-config.json screeningSource = \"gmgn\" or \"both\". Copy to gmgn-config.json and fill in. apiKey is optional here if GMGN_API_KEY is in .env. (You can also set any of these in user-config.json with a gmgn* prefix, e.g. gmgnMinMcap.)",
   "apiKey": "",
 
   "interval": "5m",
