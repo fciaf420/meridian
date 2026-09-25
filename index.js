@@ -543,6 +543,11 @@ function startCronJobs() {
         for (const p of pos.positions || []) {
           // Store mid-position snapshot in pool-memory (keyed by pool address)
           if (p.pool) recordPoolSnapshot(p.pool, p);
+          // Re-center shadow log (read-only, not awaited): what an in-place
+          // re-center would do for an upside-OOR position. Close rules unchanged.
+          if (!p.in_range && p.oor_direction === "upside") {
+            import("./tools/recenter-shadow.js").then((m) => m.logRecenterShadow(p)).catch(() => {});
+          }
 
           // Trailing TP / stop loss check
           if (p.pnl_pct != null) {
@@ -948,6 +953,16 @@ const tgUI = createTelegramUI({
   getWalletBalances,
   getTopCandidates,
   lookupToken: (mint) => lookupToken(mint), // read-only; deploys still go through the picker + executeTool
+  // Settings → 🛡 Entry filters: user changes, persisted like update_config.
+  setEntryFilter: async (key, value) => {
+    const { applyEntryFilterChange } = await import("./tools/entry-safety.js");
+    return applyEntryFilterChange(key, value, { source: "telegram" });
+  },
+  // Read-only pool status / fee mode / TWAP for the deploy confirm card.
+  entryPreview: async (c, opts) => {
+    const { readPoolEntryState } = await import("./tools/entry-safety.js");
+    return readPoolEntryState(c.pool, { apiBlacklisted: c.is_blacklisted ?? null, ...opts });
+  },
   parseMint,
   executeTool,
   runExclusive: tryExclusive,

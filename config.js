@@ -5,7 +5,8 @@ import { getEffectiveMinSolToOpen, normalizeScreeningSource } from "./runtime-he
 import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+// MERIDIAN_USER_CONFIG_PATH lets tests point every reader/writer at a temp file.
+export const USER_CONFIG_PATH = process.env.MERIDIAN_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
 const GMGN_CONFIG_PATH = path.join(__dirname, "gmgn-config.json");
 
 function readJsonIfExists(filePath) {
@@ -48,6 +49,9 @@ function gmgnArray(key, legacyKey, fallback) {
 }
 
 const DEFAULT_MODEL = getDefaultModelForProvider(getLlmProvider());
+
+// Numeric keys where an explicit null disables the guard (so `??` can't be used).
+const nullable = (key, fallback) => (u[key] !== undefined ? u[key] : fallback);
 
 export const config = {
   // ─── Risk Limits ─────────────────────────
@@ -159,6 +163,25 @@ export const config = {
     positionSizePct:       u.positionSizePct   ?? 0.35,  // % of deployable capital per position
     pnlUnit:               u.pnlUnit           ?? "sol", // "sol" or "usd" — how PnL is displayed
     priorityFeeLevel:      u.priorityFeeLevel  ?? "Medium",
+  },
+
+  // ─── Entry-safety filters ───────────────
+  // Hard entry guards applied in screening, the token lookup card and
+  // deployPosition. The user loosens them (Telegram "🛡 Entry filters" or this
+  // file); the LLM's update_config may only tighten them.
+  entryFilters: {
+    blockTransferFeeAbovePct: nullable("blockTransferFeeAbovePct", 1.0), // Token-2022 transfer fee %, null = off
+    blockTransferHook:        u.blockTransferHook        ?? true,
+    blockPermanentDelegate:   u.blockPermanentDelegate   ?? true,
+    blockFreezeAuthority:     u.blockFreezeAuthority     ?? true, // also default-account-state frozen
+    blockMintAuthority:       u.blockMintAuthority       ?? false,
+    blockPausable:            u.blockPausable            ?? true,
+    blockNonTransferable:     u.blockNonTransferable     ?? true,
+    // Only enter pools whose CollectFeeMode pays LP fees in SOL (OnlyY, SOL = token Y).
+    solFeePoolsOnly:          u.solFeePoolsOnly          ?? false,
+    // Don't open bid_ask when price is > N% above the on-chain oracle TWAP; null = off.
+    twapSpikeMaxPct:          nullable("twapSpikeMaxPct", 15),
+    twapWindowMinutes:        u.twapWindowMinutes        ?? 60,
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -322,6 +345,21 @@ function findSection(key) {
     if (keys.has(key)) return name;
   }
   return null;
+}
+
+/**
+ * Merge `changes` into user-config.json (read, Object.assign, write with
+ * 2-space JSON), keeping every other key. The one write path shared by
+ * update_config and the Telegram entry-filter toggles. Throws on failure.
+ */
+export function persistUserConfig(changes, extra = {}) {
+  let userConfig = {};
+  if (fs.existsSync(USER_CONFIG_PATH)) {
+    try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /**/ }
+  }
+  Object.assign(userConfig, changes, extra);
+  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+  return userConfig;
 }
 
 /**
