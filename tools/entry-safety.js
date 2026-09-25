@@ -46,6 +46,7 @@ export const ENTRY_FILTER_DEFAULTS = Object.freeze({
   blockMintAuthority: false,
   blockPausable: true,
   blockNonTransferable: true,
+  solFeePoolsOnly: false,
 });
 
 export const TOKEN_GUARD_BOOL_KEYS = [
@@ -342,13 +343,48 @@ function short(a) {
   return s.length > 12 ? `${s.slice(0, 4)}…${s.slice(-4)}` : s;
 }
 
-/* ============================== pool status ============================== */
-
 const num = (v) => {
   if (v == null) return null;
   const n = typeof v === "object" && typeof v.toNumber === "function" ? Number(v.toString()) : Number(v);
   return Number.isFinite(n) ? n : null;
 };
+
+/* ============================== fee mode ============================== */
+
+export const WSOL_MINT = "So11111111111111111111111111111111111111112";
+const FEE_MODE_LABEL = {
+  OnlyY: "fees in SOL (OnlyY)",
+  InputOnly: "fees in the input token (InputOnly: sellers pay in the token)",
+  unknown: "fee mode unknown",
+};
+
+/**
+ * CollectFeeMode from on-chain state: lbPair.parameters.collectFeeMode
+ * (SDK 1.9.14 enum CollectFeeMode { InputOnly = 0, OnlyY = 1 }). `solFees` is
+ * true only for OnlyY with wrapped SOL as token Y.
+ */
+export function feeModeFromLbPair(lbPair) {
+  const raw = num(lbPair?.parameters?.collectFeeMode);
+  const mode = raw === 1 ? "OnlyY" : raw === 0 ? "InputOnly" : "unknown";
+  const tokenY = b58(lbPair?.tokenYMint);
+  const solFees = mode === "OnlyY" && tokenY === WSOL_MINT;
+  return { mode, solFees, source: "chain", label: FEE_MODE_LABEL[mode] };
+}
+
+/** Pool-discovery API dlmm_params.collect_fee_mode: "quote" = OnlyY, "both" = InputOnly. */
+export function feeModeFromApi(value, quoteMint = WSOL_MINT) {
+  const v = value == null ? null : String(value).toLowerCase();
+  const mode = v === "quote" || v === "only_y" || v === "onlyy" ? "OnlyY" : v === "both" || v === "input_only" || v === "inputonly" ? "InputOnly" : "unknown";
+  return { mode, solFees: mode === "OnlyY" && quoteMint === WSOL_MINT, source: "api", label: FEE_MODE_LABEL[mode] };
+}
+
+/** Short tag for candidate cards. */
+export function feeModeTag(fm) {
+  if (!fm || fm.mode === "unknown") return "fees ?";
+  return fm.solFees ? "fees SOL" : fm.mode === "OnlyY" ? "fees Y" : "fees token";
+}
+
+/* ============================== pool status ============================== */
 
 /**
  * Pool status guard (always on). Refuses when the pair is Disabled, its
@@ -419,7 +455,8 @@ export async function fetchPoolApiRow(poolAddress, { timeoutMs = 5000 } = {}) {
  */
 export async function describePoolEntryState(pool, { apiBlacklisted = null, nowSec = Math.floor(Date.now() / 1000) } = {}) {
   const status = evaluatePoolStatus({ lbPair: pool?.lbPair, clock: pool?.clock, nowSec, apiBlacklisted });
-  return { status };
+  const feeMode = feeModeFromLbPair(pool?.lbPair);
+  return { status, feeMode };
 }
 
 let _stateConn = null;
@@ -521,7 +558,21 @@ export async function screenEntryCandidates(pools, opts = {}) {
     }
     live.push(p);
   }
-  const tok = await screenTokenGuards(live, opts);
+  // Fee mode from the API row; solFeePoolsOnly drops known non-SOL-fee pools
+  // (unknown mode is kept and tagged — deployPosition checks on-chain).
+  const filters = { ...ENTRY_FILTER_DEFAULTS, ...(opts.filters || currentEntryFilters()) };
+  const feeOk = [];
+  for (const p of live) {
+    const fm = p.fee_mode?.mode ? p.fee_mode : feeModeFromApi(p.collect_fee_mode, p.quote?.mint ?? WSOL_MINT);
+    const tagged = { ...p, fee_mode: fm };
+    if (filters.solFeePoolsOnly && fm.mode !== "unknown" && !fm.solFees) {
+      dropped.push({ pool: p.pool, name: p.name, reasons: [`fees not paid in SOL (CollectFeeMode ${fm.mode}) (solFeePoolsOnly)`] });
+      log("screening", `Entry filter dropped ${p.name ?? p.pool}: fee mode ${fm.mode} (solFeePoolsOnly)`);
+      continue;
+    }
+    feeOk.push(tagged);
+  }
+  const tok = await screenTokenGuards(feeOk, opts);
   return { kept: tok.kept, dropped: [...dropped, ...tok.dropped] };
 }
 
@@ -556,5 +607,12 @@ export async function runDeployEntryChecks({
   notes.push(...status.notes);
   if (!status.pass) return { pass: false, reason: `Pool status: ${status.reasons.join("; ")}`, notes, token, status };
 
-  return { pass: true, reason: null, notes, token, status };
+  // SOL-fee-only pools (solFeePoolsOnly).
+  const feeMode = feeModeFromLbPair(pool?.lbPair);
+  if (filters.solFeePoolsOnly && !feeMode.solFees) {
+    return { pass: false, reason: `Fee mode: pool pays LP fees ${feeMode.mode === "unknown" ? "in an unknown mode" : `in the input token (CollectFeeMode ${feeMode.mode})`}, not SOL (solFeePoolsOnly)`, notes, token, status, feeMode };
+  }
+  notes.push(feeMode.label);
+
+  return { pass: true, reason: null, notes, token, status, feeMode };
 }

@@ -341,6 +341,7 @@ export function condensePool(p) {
     pool_type: p.pool_type,
     is_blacklisted: p.is_blacklisted ?? null,
     bin_step: p.dlmm_params?.bin_step || null,
+    collect_fee_mode: p.dlmm_params?.collect_fee_mode ?? null, // "quote" = OnlyY (fees in SOL), "both" = InputOnly
     fee_pct: p.fee_pct,
 
     // Core metrics

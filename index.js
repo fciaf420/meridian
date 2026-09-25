@@ -948,6 +948,11 @@ const tgUI = createTelegramUI({
   getWalletBalances,
   getTopCandidates,
   lookupToken: (mint) => lookupToken(mint), // read-only; deploys still go through the picker + executeTool
+  // Read-only pool status / fee mode / TWAP for the deploy confirm card.
+  entryPreview: async (c, opts) => {
+    const { readPoolEntryState } = await import("./tools/entry-safety.js");
+    return readPoolEntryState(c.pool, { apiBlacklisted: c.is_blacklisted ?? null, ...opts });
+  },
   parseMint,
   executeTool,
   runExclusive: tryExclusive,

@@ -154,6 +154,7 @@ export function buildSettingsReport({ color = false } = {}) {
   row("mint authority", onOff(ef.blockMintAuthority), "blockMintAuthority");
   row("pausable", onOff(ef.blockPausable), "blockPausable");
   row("non-transferable", onOff(ef.blockNonTransferable), "blockNonTransferable");
+  row("SOL-fee pools only", ef.solFeePoolsOnly ? C.green("on") : "off", "solFeePoolsOnly (CollectFeeMode OnlyY)");
 
   // ── screening (active source(s) only) ──
   if (srcSource === "both") {

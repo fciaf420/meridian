@@ -177,6 +177,8 @@ export const config = {
     blockMintAuthority:       u.blockMintAuthority       ?? false,
     blockPausable:            u.blockPausable            ?? true,
     blockNonTransferable:     u.blockNonTransferable     ?? true,
+    // Only enter pools whose CollectFeeMode pays LP fees in SOL (OnlyY, SOL = token Y).
+    solFeePoolsOnly:          u.solFeePoolsOnly          ?? false,
   },
 
   // ─── Strategy Mapping ───────────────────

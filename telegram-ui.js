@@ -23,6 +23,7 @@ export const CONFIRM_TTL_MS = 60_000;
 export const PAGE_CHAR_BUDGET = 3500; // leaves headroom under Telegram's 4096 cap
 export const POSITIONS_PER_PAGE = 5;
 export const CANDIDATES_PER_PAGE = 5;
+export const ENTRY_PREVIEW_TIMEOUT_MS = 8_000;
 
 export const BOT_COMMANDS = [
   { command: "menu", description: "Main menu" },
@@ -518,6 +519,21 @@ export function renderPositions(result, { page = 0, refs, unit = "sol" } = {}) {
   return { text, keyboard, page: pg, pages: pages.length };
 }
 
+/** Fee mode of a candidate: on-chain entry state, else the screening tag, else the API string. */
+function feeModeOf(c) {
+  const fm = c?.entry_state?.feeMode || c?.fee_mode;
+  if (fm?.mode) return fm;
+  const v = c?.collect_fee_mode == null ? null : String(c.collect_fee_mode).toLowerCase();
+  if (v === "quote") return { mode: "OnlyY", solFees: true };
+  if (v === "both") return { mode: "InputOnly", solFees: false };
+  return null;
+}
+
+const FEE_MODE_TEXT = {
+  OnlyY: "LP fees paid in SOL (OnlyY)",
+  InputOnly: "LP fees paid in the input token (InputOnly): sellers pay you in the token",
+};
+
 function candidateBlock(c, i, fallbackSource) {
   const vol = c.volume ?? c.volume_window ?? c.volume_24h;
   const metrics = [
@@ -529,6 +545,8 @@ function candidateBlock(c, i, fallbackSource) {
     `bin ${c.bin_step ?? "?"}`,
   ];
   if (c.holders != null) metrics.push(`holders ${c.holders}`);
+  const fm = feeModeOf(c);
+  if (fm) metrics.push(fm.solFees ? "fees SOL" : fm.mode === "InputOnly" ? "fees token" : "fees ?");
   return `<b>${i + 1}. ${escapeHtml(c.name ?? shortAddr(c.pool))}</b> [${escapeHtml(candidateSourceTag(c, fallbackSource))}]\n${escapeHtml(metrics.join(" · "))}`;
 }
 
@@ -583,17 +601,19 @@ function fmtPct(v) {
  * Entry-state lines for a pool (lookup + confirm cards): pool status and, when
  * known, fee mode and TWAP. Plain text; the caller escapes.
  */
-export function entryStateLines(c) {
+export function entryStateLines(c, filters = null) {
   const st = c?.entry_state;
   const out = [];
   if (st?.status) out.push(`${st.status.pass ? "✅" : "⛔"} Pool status: ${st.status.pass ? st.status.text : st.status.reasons.join("; ")}`);
   else if (c?.is_blacklisted === true) out.push("⛔ Pool status: Meteora API flags the pool as blacklisted");
   else if (st?.error) out.push(`❔ Pool status: unknown (${clipText(String(st.error), 60)})`);
+  const fm = feeModeOf(c);
+  out.push(`💸 Fee mode: ${fm ? FEE_MODE_TEXT[fm.mode] ?? "unknown" : "unknown"}${fm && !fm.solFees && filters?.solFeePoolsOnly ? " — ⛔ solFeePoolsOnly is on" : ""}`);
   return out;
 }
 
 /** `pools[i].ref` = the Deploy button's ref (absent when deploy is not offered). */
-export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora" } = {}) {
+export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora", entryFilters = null } = {}) {
   const top = r.pools?.[0] || null;
   const sym = r.symbol || top?.base?.symbol || shortAddr(r.mint);
   const lines = [`🔎 <b>${escapeHtml(sym)}</b> token lookup`, `<code>${escapeHtml(r.mint)}</code>`];
@@ -642,7 +662,7 @@ export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora"
       lines.push("", candidateBlock(c, i, source));
       const pc = c.checks?.pool || [];
       if (pc.length) lines.push(escapeHtml(pc.map((ch) => `${checkMark(ch)} ${ch.text}`).join(" · ")));
-      lines.push(...entryStateLines(c).map((l) => escapeHtml(l)));
+      lines.push(...entryStateLines(c, entryFilters).map((l) => escapeHtml(l)));
     });
   }
 
@@ -703,7 +723,7 @@ export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = 
   };
 }
 
-export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora", warnings = [], ttlMs = CONFIRM_TTL_MS } = {}) {
+export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora", warnings = [], ttlMs = CONFIRM_TTL_MS, entryState = null, entryFilters = null } = {}) {
   const strategy = plan.evil ? escapeHtml(plan.strategyLabel) : `<b>${STRATEGY_LABELS[plan.args.strategy] ?? escapeHtml(plan.args.strategy)}</b>`;
   const lines = [
     `🚀 <b>Deploy into this pool?</b>${dryRun ? " (DRY RUN)" : ""}`,
@@ -715,6 +735,7 @@ export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "
     `bin step ${c.bin_step ?? "?"} · volatility ${c.volatility ?? "?"} · fee/aTVL ${c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? "?"}%`,
   ];
   if (plan.range.tooFewBins) lines.push(`⚠️ Under ${MIN_BINS} bins: deploy_position will reject this.`);
+  lines.push(...entryStateLines({ ...c, entry_state: entryState ?? c.entry_state }, entryFilters).map((l) => escapeHtml(l)));
   if (warnings.length) lines.push("", "⚠️ <b>Outside your screening filters:</b>", ...warnings.map((w) => escapeHtml(w)));
   lines.push("", `Runs the normal deploy_position safety checks. Expires in ${Math.round(ttlMs / 1000)}s.`);
   return {
@@ -886,8 +907,17 @@ export function createTelegramUI(deps) {
       wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, usdcMode, strategy, priceRangePct,
     });
     if (plan.error) return { view: { text: `⚠️ ${escapeHtml(plan.error)}`, keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] } };
+    // Read-only entry preview (pool status, fee mode, TWAP) for the card; best
+    // effort — deploy_position re-runs every check as a hard gate.
+    let entryState = null;
+    if (deps.entryPreview) {
+      entryState = await Promise.race([
+        Promise.resolve().then(() => deps.entryPreview(candidate, { strategy: plan.args.strategy })),
+        new Promise((resolve) => setTimeout(() => resolve({ error: "preview timed out" }), ENTRY_PREVIEW_TIMEOUT_MS).unref?.()),
+      ]).catch((e) => ({ error: e.message }));
+    }
     const nonce = nonces.put("deploy", { args: plan.args, label: candidate.name || shortAddr(candidate.pool) });
-    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source(), warnings, ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS }) };
+    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source(), warnings, ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, entryState, entryFilters: deps.config.entryFilters || null }) };
   }
 
   // ── deploy picker (strategy → range → confirm) ──
@@ -1002,7 +1032,7 @@ export function createTelegramUI(deps) {
       if (r.blacklisted || c.quote?.mint !== WSOL_MINT) return null;
       return refs.put({ kind: "token_pool", tokenRef, candidate: c, warnings: failedFilterLines(c) }, `tp:${c.pool}`);
     });
-    return renderTokenCard(r, { tokenRef, poolRefs, source: source() });
+    return renderTokenCard(r, { tokenRef, poolRefs, source: source(), entryFilters: deps.config.entryFilters || null });
   }
 
   /** Look a mint up, editing a "Looking up…" message in place with the card. */

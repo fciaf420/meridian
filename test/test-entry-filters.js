@@ -355,3 +355,64 @@ test("screening: API-blacklisted pools are dropped; lookup card shows the pool s
   });
   assert.match(ui.renderTokenCard(ok, { tokenRef: "t1" }).text, /✅ Pool status: enabled · active · not blacklisted/);
 });
+
+// ─── 3. SOL-fee-only pools ───────────────────────────────────────
+test("fee mode: on-chain CollectFeeMode and the API string map to the same modes", () => {
+  assert.deepEqual(es.feeModeFromLbPair({ parameters: { collectFeeMode: 1 }, tokenYMint: pk(WSOL) }).solFees, true);
+  assert.equal(es.feeModeFromLbPair({ parameters: { collectFeeMode: 1 }, tokenYMint: pk("UsdcMint") }).solFees, false, "OnlyY but Y isn't SOL");
+  assert.equal(es.feeModeFromLbPair({ parameters: { collectFeeMode: 0 }, tokenYMint: pk(WSOL) }).mode, "InputOnly");
+  assert.equal(es.feeModeFromLbPair({ parameters: {} }).mode, "unknown");
+  assert.equal(es.feeModeFromApi("quote").solFees, true);
+  assert.equal(es.feeModeFromApi("both").mode, "InputOnly");
+  assert.equal(es.feeModeFromApi(null).mode, "unknown");
+});
+
+test("screening: solFeePoolsOnly drops InputOnly pools, keeps OnlyY and unknown (tagged); off keeps all", async () => {
+  const pools = [
+    { pool: "Q", name: "QUOTE", collect_fee_mode: "quote", base: { mint: "M1", token_program: es.TOKEN_PROGRAM_ID } },
+    { pool: "B", name: "BOTH", collect_fee_mode: "both", base: { mint: "M2", token_program: es.TOKEN_PROGRAM_ID } },
+    { pool: "U", name: "UNKNOWN", base: { mint: "M3", token_program: es.TOKEN_PROGRAM_ID } },
+  ];
+  const on = await es.screenEntryCandidates(pools, { filters: { ...es.ENTRY_FILTER_DEFAULTS, solFeePoolsOnly: true }, readMints: async () => new Map() });
+  assert.deepEqual(on.kept.map((p) => p.name), ["QUOTE", "UNKNOWN"]);
+  assert.match(on.dropped[0].reasons[0], /CollectFeeMode InputOnly\) \(solFeePoolsOnly\)/);
+  assert.equal(on.kept[1].fee_mode.mode, "unknown");
+  const off = await es.screenEntryCandidates(pools, { filters: es.ENTRY_FILTER_DEFAULTS, readMints: async () => new Map() });
+  assert.equal(off.kept.length, 3);
+  assert.equal(off.kept[1].fee_mode.mode, "InputOnly", "tagged even when the filter is off");
+});
+
+test("deploy: solFeePoolsOnly refuses an InputOnly pool before any tx; OnlyY passes; off allows InputOnly", async () => {
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, solFeePoolsOnly: true };
+  const inputOnly = mockPool({ lbPair: { parameters: { collectFeeMode: 0 } } });
+  const r = await deployInto(inputOnly);
+  assert.equal(r.blocked_by, "entry_filter");
+  assert.match(r.error, /^Fee mode: pool pays LP fees in the input token \(CollectFeeMode InputOnly\), not SOL \(solFeePoolsOnly\)$/);
+  assert.deepEqual(inputOnly.calls, []);
+  await assert.rejects(deployInto(mockPool({ lbPair: { parameters: { collectFeeMode: 1 } } })), /PAST_ENTRY_CHECKS/);
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, solFeePoolsOnly: false };
+  await assert.rejects(deployInto(mockPool({ lbPair: { parameters: { collectFeeMode: 0 } } })), /PAST_ENTRY_CHECKS/);
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+});
+
+test("cards: fee mode on candidate, lookup and confirm cards", async () => {
+  const cands = ui.renderCandidates([
+    { pool: "CandPool1111111111111111111111111111111111111", name: "AAA-SOL", bin_step: 100, collect_fee_mode: "quote" },
+    { pool: "CandPool2222222222222222222222222222222222222", name: "BBB-SOL", bin_step: 100, fee_mode: { mode: "InputOnly", solFees: false } },
+  ], { refs: ui.createRefMap() }).text;
+  assert.match(cands, /AAA-SOL.*\n.*fees SOL/);
+  assert.match(cands, /BBB-SOL.*\n.*fees token/);
+
+  const r = await lookupMod.lookupToken(LOOKUP_MINT, { deps: lookupDeps(), entryFilters: es.ENTRY_FILTER_DEFAULTS });
+  assert.match(ui.renderTokenCard(r, { tokenRef: "t" }).text, /💸 Fee mode: LP fees paid in SOL \(OnlyY\)/);
+
+  const c = { pool: "CandPool2222222222222222222222222222222222222", name: "BBB-SOL", bin_step: 100 };
+  const plan = { args: { strategy: "bid_ask" }, range: ui.rangeInfo(50, 100), amountLabel: "0.5 SOL" };
+  const card = ui.renderDeployConfirm(c, plan, "n1", {
+    entryState: await es.describePoolEntryState(mockPool({ lbPair: { parameters: { collectFeeMode: 0 } } }), { apiBlacklisted: false }),
+    entryFilters: { solFeePoolsOnly: true },
+  });
+  const text = card.text;
+  assert.match(text, /✅ Pool status: enabled/);
+  assert.match(text, /💸 Fee mode: LP fees paid in the input token \(InputOnly\).*⛔ solFeePoolsOnly is on/);
+});
