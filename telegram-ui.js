@@ -23,6 +23,7 @@ export const CONFIRM_TTL_MS = 60_000;
 export const PAGE_CHAR_BUDGET = 3500; // leaves headroom under Telegram's 4096 cap
 export const POSITIONS_PER_PAGE = 5;
 export const CANDIDATES_PER_PAGE = 5;
+export const ENTRY_PREVIEW_TIMEOUT_MS = 8_000;
 
 export const BOT_COMMANDS = [
   { command: "menu", description: "Main menu" },
@@ -518,6 +519,21 @@ export function renderPositions(result, { page = 0, refs, unit = "sol" } = {}) {
   return { text, keyboard, page: pg, pages: pages.length };
 }
 
+/** Fee mode of a candidate: on-chain entry state, else the screening tag, else the API string. */
+function feeModeOf(c) {
+  const fm = c?.entry_state?.feeMode || c?.fee_mode;
+  if (fm?.mode) return fm;
+  const v = c?.collect_fee_mode == null ? null : String(c.collect_fee_mode).toLowerCase();
+  if (v === "quote") return { mode: "OnlyY", solFees: true };
+  if (v === "both") return { mode: "InputOnly", solFees: false };
+  return null;
+}
+
+const FEE_MODE_TEXT = {
+  OnlyY: "LP fees paid in SOL (OnlyY)",
+  InputOnly: "LP fees paid in the input token (InputOnly): sellers pay you in the token",
+};
+
 function candidateBlock(c, i, fallbackSource) {
   const vol = c.volume ?? c.volume_window ?? c.volume_24h;
   const metrics = [
@@ -529,6 +545,8 @@ function candidateBlock(c, i, fallbackSource) {
     `bin ${c.bin_step ?? "?"}`,
   ];
   if (c.holders != null) metrics.push(`holders ${c.holders}`);
+  const fm = feeModeOf(c);
+  if (fm) metrics.push(fm.solFees ? "fees SOL" : fm.mode === "InputOnly" ? "fees token" : "fees ?");
   return `<b>${i + 1}. ${escapeHtml(c.name ?? shortAddr(c.pool))}</b> [${escapeHtml(candidateSourceTag(c, fallbackSource))}]\n${escapeHtml(metrics.join(" · "))}`;
 }
 
@@ -561,7 +579,7 @@ export const WSOL_MINT = "So11111111111111111111111111111111111111112";
 export const gmgnTokenUrl = (mint) => `https://gmgn.ai/sol/token/${mint}`;
 export const solscanTokenUrl = (mint) => `https://solscan.io/token/${mint}`;
 
-const checkMark = (ch) => (ch.pass === true ? "✅" : ch.pass === false ? "❌" : "❔");
+const checkMark = (ch) => (ch.pass === false ? "❌" : ch.off ? "➖" : ch.pass === true ? "✅" : "❔");
 
 /**
  * ❌ lines for the confirmation card: the token's and the chosen pool's failed
@@ -569,7 +587,7 @@ const checkMark = (ch) => (ch.pass === true ? "✅" : ch.pass === false ? "❌" 
  * hard block, so it says so.
  */
 export function failedFilterLines(c) {
-  return [...(c?.checks?.token || []), ...(c?.checks?.pool || [])]
+  return [...(c?.checks?.token || []), ...(c?.checks?.pool || []), ...(c?.checks?.safety || [])]
     .filter((ch) => ch.pass === false)
     .map((ch) => `❌ ${ch.text}${ch.key === "bin_step" ? " (deploy_position blocks bin steps outside this range)" : ""}`);
 }
@@ -579,8 +597,32 @@ function fmtPct(v) {
   return v == null || !Number.isFinite(n) ? "?" : `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
 }
 
+/**
+ * Entry-state lines for a pool (lookup + confirm cards): pool status and, when
+ * known, fee mode and TWAP. Plain text; the caller escapes.
+ */
+export function entryStateLines(c, filters = null) {
+  const st = c?.entry_state;
+  const out = [];
+  if (st?.status) out.push(`${st.status.pass ? "✅" : "⛔"} Pool status: ${st.status.pass ? st.status.text : st.status.reasons.join("; ")}`);
+  else if (c?.is_blacklisted === true) out.push("⛔ Pool status: Meteora API flags the pool as blacklisted");
+  else if (st?.error) out.push(`❔ Pool status: unknown (${clipText(String(st.error), 60)})`);
+  const tw = st?.twap;
+  if (tw) {
+    const g = st.twapGuard;
+    const head = tw.known
+      ? `price ${tw.devPct >= 0 ? "+" : ""}${Number(tw.devPct).toFixed(1)}% vs ${tw.windowMinutes}-min on-chain TWAP (${tw.devBins > 0 ? "+" : ""}${tw.devBins} bins)`
+      : `unknown (${tw.note ?? "no oracle data"})`;
+    const tail = g?.pass === false ? ` — ⛔ above the ${filters?.twapSpikeMaxPct ?? "?"}% limit for bid_ask` : !tw.known ? " — allowed" : "";
+    out.push(`${g?.pass === false ? "⛔" : tw.known ? "📈" : "❔"} TWAP: ${head}${tail}`);
+  }
+  const fm = feeModeOf(c);
+  out.push(`💸 Fee mode: ${fm ? FEE_MODE_TEXT[fm.mode] ?? "unknown" : "unknown"}${fm && !fm.solFees && filters?.solFeePoolsOnly ? " — ⛔ solFeePoolsOnly is on" : ""}`);
+  return out;
+}
+
 /** `pools[i].ref` = the Deploy button's ref (absent when deploy is not offered). */
-export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora" } = {}) {
+export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora", entryFilters = null } = {}) {
   const top = r.pools?.[0] || null;
   const sym = r.symbol || top?.base?.symbol || shortAddr(r.mint);
   const lines = [`🔎 <b>${escapeHtml(sym)}</b> token lookup`, `<code>${escapeHtml(r.mint)}</code>`];
@@ -611,6 +653,13 @@ export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora"
     lines.push("", "<b>Your screening filters</b> (token):", ...tokenChecks.map((ch) => `${checkMark(ch)} ${escapeHtml(ch.text)}`));
   }
 
+  const ts = r.token_safety;
+  if (ts?.checks?.length) {
+    lines.push("", `<b>Entry filters</b> (token)${ts.pass ? "" : " — ⛔ deploy_position will refuse"}:`, ...ts.checks.map((ch) => `${checkMark(ch)} ${escapeHtml(ch.text)}`));
+  } else if (r.token_safety_error) {
+    lines.push("", `⚠️ Token safety unknown (${escapeHtml(clipText(String(r.token_safety_error), 80))})`);
+  }
+
   const pools = r.pools || [];
   lines.push("");
   if (r.error) lines.push(`⚠️ Meteora lookup failed: ${escapeHtml(clipText(String(r.error), 120))}`);
@@ -622,6 +671,7 @@ export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora"
       lines.push("", candidateBlock(c, i, source));
       const pc = c.checks?.pool || [];
       if (pc.length) lines.push(escapeHtml(pc.map((ch) => `${checkMark(ch)} ${ch.text}`).join(" · ")));
+      lines.push(...entryStateLines(c, entryFilters).map((l) => escapeHtml(l)));
     });
   }
 
@@ -661,9 +711,51 @@ export function renderControls(info) {
       [info.paused ? btn("▶️ Resume screening", "sp:0") : btn("⏸ Pause screening", "sp:1")],
       [btn("🔍 Run screening now", "sn")],
       [btn("🧪 Autoresearch", "ar"), btn("🧯 Recent errors", "er")],
+      [btn("🛡 Entry filters", "ef")],
       [btn("⬅ Menu", "m")],
     ],
   };
+}
+
+// ─── Entry filters (Settings → 🛡 Entry filters) ─────────────────
+// Callback data: ef (view), et:<code> (toggle a boolean), ev:<code>:<value>
+// (preset). Codes keep every callback_data far under 64 bytes.
+export const ENTRY_TOGGLES = [
+  ["fh", "blockTransferHook", "Transfer hook"],
+  ["fd", "blockPermanentDelegate", "Permanent delegate"],
+  ["fz", "blockFreezeAuthority", "Freeze authority"],
+  ["fm", "blockMintAuthority", "Mint authority"],
+  ["fp", "blockPausable", "Pausable"],
+  ["fn", "blockNonTransferable", "Non-transferable"],
+  ["fs", "solFeePoolsOnly", "SOL-fee pools only"],
+];
+export const ENTRY_PRESETS = {
+  tf: { key: "blockTransferFeeAbovePct", label: "Transfer fee >", values: [null, 0.5, 1, 2, 5] },
+  tw: { key: "twapSpikeMaxPct", label: "TWAP spike >", values: [null, 10, 15, 25] },
+};
+
+export function renderEntryFilters(filters = {}, { note = null } = {}) {
+  const f = filters || {};
+  const pct = (v) => (v == null ? "off" : `${v}%`);
+  const lines = [
+    "🛡 <b>Entry filters</b>",
+    "Checked in screening, on the token lookup card and as a hard check in deploy_position (every deploy path).",
+    "✅ = guard on (blocks), ❌ = off. Changes save to user-config.json and apply now. The agent can only tighten these.",
+    "",
+    `Transfer fee limit: <b>${pct(f.blockTransferFeeAbovePct)}</b> · TWAP spike limit: <b>${pct(f.twapSpikeMaxPct)}</b> over ${escapeHtml(f.twapWindowMinutes ?? 60)} min (bid_ask)`,
+    "Pool status (disabled / not yet active / blacklisted) is always checked.",
+  ];
+  if (note) lines.push("", note);
+  const keyboard = [];
+  for (let i = 0; i < ENTRY_TOGGLES.length; i += 2) {
+    keyboard.push(ENTRY_TOGGLES.slice(i, i + 2).map(([code, key, label]) => btn(`${f[key] ? "✅" : "❌"} ${label}`, `et:${code}`)));
+  }
+  for (const [code, p] of Object.entries(ENTRY_PRESETS)) {
+    keyboard.push([{ text: `${p.label}`, callback_data: cb("ef") }]);
+    keyboard.push(p.values.map((v) => btn(`${f[p.key] === v ? "● " : ""}${v == null ? "Off" : `${v}%`}`, `ev:${code}:${v == null ? "off" : v}`)));
+  }
+  keyboard.push([btn("⚙️ Settings", "se:0"), btn("⬅ Menu", "m")]);
+  return { text: lines.join("\n"), keyboard };
 }
 
 export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = {}) {
@@ -682,7 +774,7 @@ export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = 
   };
 }
 
-export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora", warnings = [], ttlMs = CONFIRM_TTL_MS } = {}) {
+export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora", warnings = [], ttlMs = CONFIRM_TTL_MS, entryState = null, entryFilters = null } = {}) {
   const strategy = plan.evil ? escapeHtml(plan.strategyLabel) : `<b>${STRATEGY_LABELS[plan.args.strategy] ?? escapeHtml(plan.args.strategy)}</b>`;
   const lines = [
     `🚀 <b>Deploy into this pool?</b>${dryRun ? " (DRY RUN)" : ""}`,
@@ -694,6 +786,7 @@ export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "
     `bin step ${c.bin_step ?? "?"} · volatility ${c.volatility ?? "?"} · fee/aTVL ${c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? "?"}%`,
   ];
   if (plan.range.tooFewBins) lines.push(`⚠️ Under ${MIN_BINS} bins: deploy_position will reject this.`);
+  lines.push(...entryStateLines({ ...c, entry_state: entryState ?? c.entry_state }, entryFilters).map((l) => escapeHtml(l)));
   if (warnings.length) lines.push("", "⚠️ <b>Outside your screening filters:</b>", ...warnings.map((w) => escapeHtml(w)));
   lines.push("", `Runs the normal deploy_position safety checks. Expires in ${Math.round(ttlMs / 1000)}s.`);
   return {
@@ -793,6 +886,8 @@ export function renderExecResult(action, label, result) {
  *   isScreeningPaused(), setScreeningPaused(bool)
  *   getStatusInfo()                       — timers, models, busy flags
  *   buildSettingsReport(), handleAutoresearchCommand(args), readRecentErrors()
+ *   setEntryFilter(key, value)            — → { ok, text, loosened } | { ok: false, error } (entry-safety.js)
+ *   entryPreview(candidate, { strategy }) — read-only pool status / fee mode / TWAP for the confirm card
  *   log(category, msg), now(), ttlMs
  */
 export function createTelegramUI(deps) {
@@ -865,8 +960,17 @@ export function createTelegramUI(deps) {
       wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, usdcMode, strategy, priceRangePct,
     });
     if (plan.error) return { view: { text: `⚠️ ${escapeHtml(plan.error)}`, keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] } };
+    // Read-only entry preview (pool status, fee mode, TWAP) for the card; best
+    // effort — deploy_position re-runs every check as a hard gate.
+    let entryState = null;
+    if (deps.entryPreview) {
+      entryState = await Promise.race([
+        Promise.resolve().then(() => deps.entryPreview(candidate, { strategy: plan.args.strategy })),
+        new Promise((resolve) => setTimeout(() => resolve({ error: "preview timed out" }), ENTRY_PREVIEW_TIMEOUT_MS).unref?.()),
+      ]).catch((e) => ({ error: e.message }));
+    }
     const nonce = nonces.put("deploy", { args: plan.args, label: candidate.name || shortAddr(candidate.pool) });
-    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source(), warnings, ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS }) };
+    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source(), warnings, ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, entryState, entryFilters: deps.config.entryFilters || null }) };
   }
 
   // ── deploy picker (strategy → range → confirm) ──
@@ -981,7 +1085,7 @@ export function createTelegramUI(deps) {
       if (r.blacklisted || c.quote?.mint !== WSOL_MINT) return null;
       return refs.put({ kind: "token_pool", tokenRef, candidate: c, warnings: failedFilterLines(c) }, `tp:${c.pool}`);
     });
-    return renderTokenCard(r, { tokenRef, poolRefs, source: source() });
+    return renderTokenCard(r, { tokenRef, poolRefs, source: source(), entryFilters: deps.config.entryFilters || null });
   }
 
   /** Look a mint up, editing a "Looking up…" message in place with the card. */
@@ -1213,6 +1317,7 @@ export function createTelegramUI(deps) {
           await answer();
           const report = deps.buildSettingsReport();
           const view = renderTextPages("⚙️ <b>Settings</b>", report, { page: Number(arg) || 0, prefix: "se" });
+          if (deps.setEntryFilter) view.keyboard.push([btn("🛡 Entry filters", "ef")]);
           view.keyboard.push(backRow(`se:${view.page}`));
           await show(ctx, view, opts);
           return;
@@ -1221,6 +1326,44 @@ export function createTelegramUI(deps) {
           await answer();
           await show(ctx, renderControls(await statusInfo()), opts);
           return;
+        case "ef":
+          await answer();
+          await show(ctx, renderEntryFilters(deps.config.entryFilters), opts);
+          return;
+        case "et":
+        case "ev": {
+          // Owner-only (transport), edited in place, no 2-tap confirm: these
+          // tighten/loosen filters and never move funds. Every change is logged.
+          if (!deps.setEntryFilter) {
+            await answer("Entry filters can't be changed here.", true);
+            return;
+          }
+          let key;
+          let value;
+          if (head === "et") {
+            key = ENTRY_TOGGLES.find(([code]) => code === arg)?.[1];
+            if (key) value = !deps.config.entryFilters?.[key];
+          } else {
+            const p = ENTRY_PRESETS[arg];
+            const v = sub === "off" ? null : Number(sub);
+            if (p && p.values.includes(v)) { key = p.key; value = v; }
+          }
+          if (!key) {
+            await answer("Unknown filter.", true);
+            return;
+          }
+          const r = await deps.setEntryFilter(key, value);
+          if (!r?.ok) {
+            logf("telegram_warn", `Entry filter ${key} change failed: ${r?.error}`);
+            await answer(`Not changed: ${r?.error ?? "error"}`.slice(0, 180), true);
+            await show(ctx, renderEntryFilters(deps.config.entryFilters, { note: `⚠️ Not changed: ${escapeHtml(r?.error ?? "error")}` }), opts);
+            return;
+          }
+          logf("telegram", `Entry filter changed from Telegram: ${r.text}`);
+          await answer(`Saved: ${r.text}`.slice(0, 180));
+          await show(ctx, renderEntryFilters(deps.config.entryFilters, { note: `✅ Saved: ${escapeHtml(r.text)}${r.loosened ? " (loosened)" : ""}` }), opts);
+          return;
+        }
         case "sp": {
           const pause = arg === "1";
           deps.setScreeningPaused(pause);

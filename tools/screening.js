@@ -21,6 +21,7 @@ export async function discoverPools({
     "quote_token_has_critical_warnings=false",
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
+    "is_blacklisted=false",
     `base_token_market_cap>=${s.minMcap}`,
     `base_token_market_cap<=${s.maxMcap}`,
     `base_token_holders>=${s.minHolders}`,
@@ -116,6 +117,13 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     ({ pools } = await discoverPools({ page_size: 50 }));
   }
 
+  // Entry-safety filters (config.entryFilters): token guards from the API
+  // fields, with one batched mint read for Token-2022 / unknown mints.
+  const screenedCount = (pools || []).length;
+  const { screenEntryCandidates } = await import("./entry-safety.js");
+  const entry = await screenEntryCandidates(pools || []);
+  pools = entry.kept;
+
   // Exclude pools where the wallet already has an open position
   const { getMyPositions } = await import("./dlmm.js");
   const { positions } = await getMyPositions();
@@ -129,7 +137,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   return {
     candidates: eligible.slice(0, limit).map(normalizeCandidateForUi),
     total_eligible: eligible.length,
-    total_screened: pools.length,
+    total_screened: screenedCount,
+    entry_filtered: entry.dropped.length,
   };
 }
 
@@ -320,13 +329,19 @@ export function condensePool(p) {
       mint: p.token_x?.address,
       organic: Math.round(p.token_x?.organic_score || 0),
       warnings: p.token_x?.warnings?.length || 0,
+      // Entry-safety inputs (tools/entry-safety.js): no RPC needed for legacy SPL mints.
+      token_program: p.token_x?.token_program ?? null,
+      has_freeze_authority: p.token_x?.has_freeze_authority ?? null,
+      has_mint_authority: p.token_x?.has_mint_authority ?? null,
     },
     quote: {
       symbol: p.token_y?.symbol,
       mint: p.token_y?.address,
     },
     pool_type: p.pool_type,
+    is_blacklisted: p.is_blacklisted ?? null,
     bin_step: p.dlmm_params?.bin_step || null,
+    collect_fee_mode: p.dlmm_params?.collect_fee_mode ?? null, // "quote" = OnlyY (fees in SOL), "both" = InputOnly
     fee_pct: p.fee_pct,
 
     // Core metrics

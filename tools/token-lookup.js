@@ -116,6 +116,22 @@ async function defaultGmgnSignal(mint) {
   return fetchGmgnSignal(mint);
 }
 
+let _lookupConn = null;
+/** One jsonParsed mint read for the lookup card's token-safety lines. */
+async function defaultReadMint(mint) {
+  const { Connection, PublicKey } = await import("@solana/web3.js");
+  const { mintFactsFromParsed } = await import("./entry-safety.js");
+  if (!_lookupConn) _lookupConn = new Connection(process.env.RPC_URL, "confirmed");
+  const info = await _lookupConn.getParsedAccountInfo(new PublicKey(mint));
+  return info?.value ? mintFactsFromParsed(info.value, mint) : null;
+}
+
+/** On-chain entry state (pool status, …) of one pool; see entry-safety.js. */
+async function defaultPoolEntryState(poolAddress, opts) {
+  const { readPoolEntryState } = await import("./entry-safety.js");
+  return readPoolEntryState(poolAddress, opts);
+}
+
 async function defaultIsBlacklisted(mint) {
   const { isBlacklisted } = await import("../token-blacklist.js");
   return isBlacklisted(mint);
@@ -155,12 +171,13 @@ function candidateFromSearchRow(row) {
 
 /**
  * Look up a token. Returns
- *   { mint, symbol, blacklisted, pools, total_pools, gmgn, gmgn_error, checks, error }
+ *   { mint, symbol, blacklisted, pools, total_pools, gmgn, gmgn_error, checks, token_safety, error }
+ * `token_safety` = evaluateTokenGuards() ({ pass, reasons, checks, unknown }).
  * `pools` (≤ 5) are SOL-quoted DLMM candidates sorted by fee/active-TVL then
  * TVL, each with `checks` ({ pool, token }). `error` is set when the Meteora
  * lookup itself failed (GMGN failures only set `gmgn_error`).
  */
-export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_MS, screening = config.screening, now = () => Date.now() } = {}) {
+export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_MS, screening = config.screening, entryFilters = null, now = () => Date.now() } = {}) {
   const {
     searchPools = defaultSearchPools,
     poolDetail = defaultPoolDetail,
@@ -170,6 +187,8 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
     isBlacklisted = defaultIsBlacklisted,
     compare = null,
     score = defaultScore,
+    readMint = defaultReadMint,
+    poolEntryState = defaultPoolEntryState,
   } = deps;
   const started = now();
   const remaining = () => Math.max(0, timeoutMs - (now() - started));
@@ -215,7 +234,14 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
     return [];
   });
 
-  const [pools, gmgn] = await Promise.all([meteoraTask, gmgnTask]);
+  // Token-2022 extensions / authorities for the entry-safety lines (one mint read).
+  const mintTask = withTimeout(Promise.resolve().then(() => readMint(mint)), remaining(), "Mint read")
+    .catch((e) => {
+      out.token_safety_error = e.message;
+      return null;
+    });
+
+  const [pools, gmgn, mintFacts] = await Promise.all([meteoraTask, gmgnTask, mintTask]);
   out.gmgn = gmgn;
 
   const cmp = compare || (await defaultCompare());
@@ -239,6 +265,15 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
       rsi: price.candles.rsi_2 ?? null,
     } : null,
   }));
+  // Pool status (disabled / not yet active / blacklisted) per shown pool, read
+  // on-chain in parallel; a failed read leaves the API blacklist flag alone.
+  const states = await Promise.all(enriched.map((c) => withTimeout(
+    Promise.resolve().then(() => poolEntryState(c.pool, { apiBlacklisted: c.is_blacklisted ?? null })),
+    remaining(),
+    "Pool state",
+  ).catch((e) => ({ error: e.message }))));
+  enriched.forEach((c, i) => { c.entry_state = states[i] || null; });
+
   let darwin = new Map();
   try {
     darwin = new Map((await score(enriched)).map((c) => [c.pool, c.darwin_score ?? null]));
@@ -249,6 +284,16 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
     checks: screeningFilterChecks(c, screening),
   }));
   out.symbol = out.pools[0]?.base?.symbol ?? sorted[0]?.base?.symbol ?? null;
+
+  // Entry-safety token guards (config.entryFilters): the mint read, else the
+  // pool-discovery API's token_program / authority flags. deployPosition
+  // re-checks from the pool's own mint, so this is display + early warning.
+  {
+    const { evaluateTokenGuards, mintFactsFromApi, currentEntryFilters } = await import("./entry-safety.js");
+    const facts = mintFacts || mintFactsFromApi(sorted[0]?.base, mint);
+    out.token_safety = evaluateTokenGuards(facts, entryFilters || currentEntryFilters());
+    for (const p of out.pools) p.checks = { ...p.checks, safety: out.token_safety.checks };
+  }
 
   // Token-level checks even with no pool (mcap/holders/age from GMGN).
   out.checks = out.pools[0]?.checks ?? screeningFilterChecks({
