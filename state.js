@@ -251,6 +251,31 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config) 
   const mgmt = config.management;
   let action = null;
 
+  // Warm-up spike guard. For the first minutes after a (chunked) deploy the PnL
+  // sources can report nonsense before every deposit is indexed — seen live: +48.6%
+  // 20s after deploy armed trailing TP and the next normal reading closed the position.
+  // An extreme reading on a young position is held as pending and acted on only if the
+  // next reading roughly agrees, so a real crash still exits one tick later.
+  const warmupMin = mgmt.pnlWarmupMinutes ?? 15;
+  const extremeAbsPct = mgmt.pnlWarmupMaxAbsPct ?? 25;
+  const ageMs = pos.deployed_at ? Date.now() - new Date(pos.deployed_at).getTime() : Infinity;
+  if (ageMs < warmupMin * 60_000 && Math.abs(currentPnlPct) > extremeAbsPct) {
+    const pending = pos._pnl_pending_extreme;
+    const agrees = pending
+      && Math.sign(pending.pct) === Math.sign(currentPnlPct)
+      && Math.abs(pending.pct - currentPnlPct) <= Math.max(5, Math.abs(pending.pct) * 0.25);
+    if (!agrees) {
+      pos._pnl_pending_extreme = { pct: currentPnlPct, at: new Date().toISOString() };
+      save(state);
+      log("state", `Position ${position_address} PnL ${currentPnlPct.toFixed(1)}% looks like a warm-up spike (age ${Math.round(ageMs / 60000)}m) — waiting for confirmation`);
+      return null;
+    }
+  }
+  if (pos._pnl_pending_extreme) {
+    delete pos._pnl_pending_extreme; // a stale pending must not "confirm" a later spike
+    save(state);
+  }
+
   // Hard stop loss
   if (mgmt.stopLossPct && currentPnlPct <= mgmt.stopLossPct) {
     action = `STOP_LOSS: PnL ${currentPnlPct.toFixed(1)}% hit stop loss (${mgmt.stopLossPct}%)`;
