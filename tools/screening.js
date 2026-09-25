@@ -311,7 +311,7 @@ async function fetchOhlcvSummary(poolAddress, timeframe = "5m") {
  * Condense a pool object for LLM consumption.
  * Raw API returns ~100+ fields per pool. The LLM only needs ~20.
  */
-function condensePool(p) {
+export function condensePool(p) {
   return {
     pool: p.pool_address,
     name: p.name,

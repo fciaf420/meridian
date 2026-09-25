@@ -25,7 +25,7 @@ import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
-import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd } from "../runtime-helpers.js";
+import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
@@ -561,7 +561,7 @@ export async function deployPosition({
   if (bins_below > 0 && resolvedBinStep) {
     const stepPct = resolvedBinStep / 10000;
     const actualRangePct = (1 - Math.pow(1 + stepPct, -bins_below)) * 100;
-    const MIN_RANGE_PCT = 35; // absolute floor — no position should be narrower
+    // MIN_RANGE_PCT (runtime-helpers.js): absolute floor — no position should be narrower
 
     // If price_range_pct was also provided, use the larger of the two
     if (price_range_pct > 0) {
@@ -622,7 +622,7 @@ export async function deployPosition({
   let activeBinsAbove = bins_above ?? 0;
 
   // Safety: reject tiny deploys (wastes gas, barely earns fees)
-  const MIN_BINS = 20;
+  // MIN_BINS (runtime-helpers.js)
   let totalBins = activeBinsBelow + activeBinsAbove;
   if (totalBins < MIN_BINS) {
     return {

@@ -586,3 +586,419 @@ test("nonce store: TTL, single use, unknown ids", () => {
   assert.equal(s.take(id2).error, "expired");
   assert.equal(s.take("nope").error, "unknown");
 });
+
+// ─── Deploy picker (strategy → range → confirm) ──────────────────
+const customCfg = (over = {}) => baseConfig({ strategy: { activeStrategy: "custom", strategy: "bid_ask" }, ...over });
+const CAND1 = "CandPool1111111111111111111111111111111111111";
+
+/** Open the picker for candidate #n from the Candidates view; returns the resulting edit. */
+async function openPicker(u, t, n = 1, messageId = 50) {
+  await u.handleCallback("ca:0", ctxFor(messageId));
+  const dp = allCallbackData(lastMarkup(t.edits().at(-1))).filter((d) => d.startsWith("dp:"))[n - 1];
+  await u.handleCallback(dp, ctxFor(messageId));
+  return t.edits().at(-1);
+}
+const buttonByText = (call, re) => lastMarkup(call).flat().find((b) => re.test(b.text));
+const stepIdOf = (call) => allCallbackData(lastMarkup(call)).find((d) => /^d[srbx]:/.test(d)).split(":")[1];
+
+test("picker: Evil Panda skips the picker and keeps its fixed spot plan", async () => {
+  const { u, t } = makeUI(); // baseConfig is evil_panda
+  const card = await openPicker(u, t);
+  assert.match(card.text, /Deploy into this pool\?/);
+  assert.match(card.text, /Evil Panda/);
+  assert.ok(!findData(lastMarkup(card), "ds:"), "no strategy step");
+  assert.equal(u.steps.size(), 0);
+});
+
+test("picker: strategy step offers Bid-Ask and Spot, marks the default, no two-sided option", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  const step = await openPicker(u, t);
+  assert.match(step.text, /How do you want to deploy AAA-SOL\?/);
+  const labels = lastMarkup(step).flat().map((b) => b.text);
+  assert.deepEqual(labels, ["Bid-Ask ✓", "Spot", "✖ Cancel"], "default bid_ask marked; nothing two-sided");
+  assert.ok(!/two-sided|sol_split/i.test(step.text));
+  assert.equal(step.messageId, 50, "edits the Candidates message in place");
+  assert.equal(exec.length, 0);
+
+  const spotDefault = makeUI({ config: baseConfig({ strategy: { activeStrategy: "custom", strategy: "spot" } }) });
+  const s2 = await openPicker(spotDefault.u, spotDefault.t);
+  assert.deepEqual(lastMarkup(s2).flat().map((b) => b.text).slice(0, 2), ["Bid-Ask", "Spot ✓"]);
+});
+
+test("picker: USDC mode skips to the range step with Bid-Ask only", async () => {
+  const { u, t, exec } = makeUI({ config: baseConfig({ strategy: { activeStrategy: "custom", strategy: "spot" } }), usdcModeEnabled: () => true });
+  const step = await openPicker(u, t);
+  assert.ok(!findData(lastMarkup(step), "ds:"), "no strategy buttons");
+  assert.match(step.text, /Bid-Ask/);
+  assert.match(step.text, /USDC mode is on: only Bid-Ask/);
+  const id = stepIdOf(step);
+  await u.handleCallback(`ds:${id}:s`, ctxFor(50)); // forged Spot tap is refused
+  assert.ok(t.answers().some((a) => a.alert && /isn't available/.test(a.text)));
+  await u.handleCallback(buttonByText(step, /^Auto/).callback_data, ctxFor(50));
+  const card = t.edits().at(-1);
+  await u.handleCallback(findData(lastMarkup(card), "y:"), ctxFor(50));
+  const d = exec.find((e) => e.name === "deploy_position");
+  assert.equal(d.args.strategy, "bid_ask");
+  assert.equal(d.args.amount_usd, 50);
+  assert.equal(d.args.price_range_pct, 55, "auto bid_ask for volatility 3.2");
+  assert.ok(!("sol_split_pct" in d.args) && !("amount_x" in d.args));
+  // Back leaves the picker (there is no strategy step) and returns to Candidates.
+  const again = await openPicker(u, t);
+  await u.handleCallback(findData(lastMarkup(again), "db:"), ctxFor(50));
+  assert.match(t.edits().at(-1).text, /Candidates/);
+});
+
+test("picker: every strategy × range yields the exact single-sided deploy args", async () => {
+  const expectedAuto = { bid_ask: ui.rangeForVolatility(3.2, "bid_ask"), spot: ui.rangeForVolatility(3.2, "spot") };
+  assert.deepEqual(expectedAuto, { bid_ask: 55, spot: 65 });
+  for (const [key, strategy] of [["b", "bid_ask"], ["s", "spot"]]) {
+    for (const [range, pct] of [["a", expectedAuto[strategy]], ["25", 25], ["50", 50], ["80", 80]]) {
+      const { u, t, exec } = makeUI({ config: customCfg() });
+      const id = stepIdOf(await openPicker(u, t));
+      await u.handleCallback(`ds:${id}:${key}`, ctxFor(50));
+      if (range === "a") assert.ok(buttonByText(t.edits().at(-1), new RegExp(`^Auto \\(${pct}%\\)$`)), "Auto shows the computed %");
+      await u.handleCallback(`dr:${id}:${range}`, ctxFor(50));
+      const card = t.edits().at(-1);
+      assert.equal(card.messageId, 50, "same message through every step");
+      assert.match(card.text, new RegExp(`Strategy: <b>${strategy === "spot" ? "Spot" : "Bid-Ask"}</b> · single-sided SOL`));
+      assert.match(card.text, /Amount: <b>1\.4 SOL/);
+      assert.match(card.text, /Expires in 60s/);
+      assert.equal(exec.length, 0, "no deploy before Confirm");
+      await u.handleCallback(findData(lastMarkup(card), "y:"), ctxFor(50));
+      const deploys = exec.filter((e) => e.name === "deploy_position");
+      assert.equal(deploys.length, 1);
+      assert.deepEqual(deploys[0].args, {
+        pool_address: CAND1, pool_name: "AAA-SOL", base_mint: "MintA", bin_step: 100, volatility: 3.2,
+        fee_tvl_ratio: 1.2, organic_score: 80, strategy, price_range_pct: pct, bins_above: 0, amount_y: 1.4,
+      }, `${strategy} ${range}`);
+    }
+  }
+});
+
+test("picker: card shows the bin count; presets under the 35% floor are labelled and widened by deploy", async () => {
+  const { u, t } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  const rangeStep = t.edits().at(-1);
+  assert.deepEqual(lastMarkup(rangeStep).flat().map((b) => b.text), ["Auto (55%)", "25% → 35% min", "50%", "80%", "⬅ Back", "✖ Cancel"]);
+  assert.match(rangeStep.text, /35% minimum/);
+  await u.handleCallback(`dr:${id}:50`, ctxFor(50));
+  assert.match(t.edits().at(-1).text, /Range: 50% \(~70 bins at bin step 100\)/);
+
+  const again = makeUI({ config: customCfg() });
+  const id2 = stepIdOf(await openPicker(again.u, again.t));
+  await again.u.handleCallback(`ds:${id2}:s`, ctxFor(50));
+  await again.u.handleCallback(`dr:${id2}:25`, ctxFor(50));
+  const card = again.t.edits().at(-1);
+  assert.match(card.text, /25% requested → deploy widens it to the 35% minimum \(~44 bins at bin step 100\)/);
+  await again.u.handleCallback(findData(lastMarkup(card), "y:"), ctxFor(50));
+  assert.equal(again.exec.find((e) => e.name === "deploy_position").args.price_range_pct, 25, "deploy_position does the widening");
+
+  // A wide bin step where the 35% floor is under MIN_BINS: that preset is hidden.
+  const wide = { ...candidates().candidates[0], bin_step: 250 };
+  assert.deepEqual(ui.rangeOptions(wide, "spot").map((o) => o.key), ["a", "50", "80"], "25% (→35% = 18 bins at bs250) hidden");
+  assert.equal(ui.rangeInfo(25, 250).tooFewBins, true);
+  assert.equal(ui.rangeInfo(50, 250).tooFewBins, false);
+  const w = makeUI({ config: customCfg(), getTopCandidates: async () => ({ candidates: [wide] }) });
+  const wid = stepIdOf(await openPicker(w.u, w.t));
+  await w.u.handleCallback(`ds:${wid}:s`, ctxFor(50));
+  assert.match(w.t.edits().at(-1).text, /hidden/);
+  await w.u.handleCallback(`dr:${wid}:25`, ctxFor(50)); // forged hidden preset
+  assert.ok(w.t.answers().some((a) => a.alert && /isn't available/.test(a.text)));
+  assert.equal(w.exec.length, 0);
+});
+
+test("picker: Back returns to the strategy step; Cancel ends it; nothing executes", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  await u.handleCallback(`ds:${id}:s`, ctxFor(50));
+  await u.handleCallback(`db:${id}`, ctxFor(50));
+  assert.match(t.edits().at(-1).text, /How do you want to deploy/);
+  await u.handleCallback(`dr:${id}:50`, ctxFor(50)); // range without a strategy after Back
+  assert.ok(t.answers().some((a) => /Pick a strategy first/.test(a.text)));
+  await u.handleCallback(`dx:${id}`, ctxFor(50));
+  assert.match(t.edits().at(-1).text, /Cancelled\. Nothing was done/);
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  assert.match(t.edits().at(-1).text, /This menu expired, tap Candidates again/);
+  assert.equal(exec.length, 0);
+  assert.equal(u.nonces.size(), 0, "no confirmation nonce was ever created");
+});
+
+test("picker: expired or unknown step ids are refused", async () => {
+  const { u, t, exec, advance } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  advance(ui.CONFIRM_TTL_MS + 1);
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  assert.ok(t.answers().some((a) => a.alert && a.text === "This menu expired, tap Candidates again."));
+  assert.match(t.edits().at(-1).text, /This menu expired, tap Candidates again/);
+  await u.handleCallback("dr:nope:50", ctxFor(50));
+  assert.match(t.edits().at(-1).text, /expired/);
+  assert.equal(exec.length, 0);
+});
+
+test("picker: wrong-chat and wrong-message step callbacks are refused", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  const editsBefore = t.edits().length;
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50, { chatId: "222" }));
+  await u.handleCallback(`ds:${id}:b`, ctxFor(77));
+  await u.handleCallback(`dx:${id}`, ctxFor(50, { chatId: "222" }));
+  assert.equal(t.edits().length, editsBefore, "refusals don't touch the message");
+  assert.ok(t.answers().some((a) => /different chat/.test(a.text)));
+  assert.ok(t.answers().some((a) => /different message/.test(a.text)));
+  // The owner's own taps still work (the refusals didn't consume the step).
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  await u.handleCallback(`dr:${id}:50`, ctxFor(50));
+  await u.handleCallback(findData(lastMarkup(t.edits().at(-1)), "y:"), ctxFor(50, { chatId: "222" }));
+  assert.equal(exec.length, 0, "wrong-chat confirm refused");
+});
+
+test("picker: confirm executes exactly once; replays and a double range tap are refused", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  await u.handleCallback(`ds:${id}:b`, ctxFor(50));
+  await Promise.all([u.handleCallback(`dr:${id}:80`, ctxFor(50)), u.handleCallback(`dr:${id}:50`, ctxFor(50))]);
+  assert.equal(u.nonces.size(), 1, "one confirmation card from a double tap");
+  const yes = findData(lastMarkup(t.edits().filter((e) => /Deploy into this pool/.test(e.text)).at(-1)), "y:");
+  await Promise.all([u.handleCallback(yes, ctxFor(50)), u.handleCallback(yes, ctxFor(50))]);
+  await u.handleCallback(yes, ctxFor(50));
+  assert.equal(exec.filter((e) => e.name === "deploy_position").length, 1);
+  assert.ok(t.answers().some((a) => a.alert && /already used/i.test(a.text)));
+  await u.handleCallback(`dr:${id}:50`, ctxFor(50)); // step replay after confirm
+  assert.equal(exec.filter((e) => e.name === "deploy_position").length, 1);
+});
+
+test("picker: the number reply after /candidates goes through the picker", async () => {
+  const { u, t, exec } = makeUI({ config: customCfg() });
+  await u.handleMessage("/candidates", { chatId: OWNER });
+  await u.handleMessage("2", { chatId: OWNER });
+  const stepMsg = t.sends().at(-1);
+  assert.match(stepMsg.text, /How do you want to deploy BBB-SOL\?/);
+  assert.equal(exec.length, 0);
+  const msgId = 500 + t.sends().length; // mock message ids are sequential
+  const id = stepIdOf(stepMsg);
+  await u.handleCallback(`ds:${id}:s`, ctxFor(msgId + 1)); // different message: refused
+  assert.ok(t.answers().some((a) => /different message/.test(a.text)));
+  await u.handleCallback(`ds:${id}:s`, ctxFor(msgId));
+  assert.ok(buttonByText(t.edits().at(-1), /^Auto \(85%\)$/), "volatility 9 → spot auto 85%");
+  await u.handleCallback(`dr:${id}:a`, ctxFor(msgId));
+  const card = t.edits().at(-1);
+  assert.equal(card.messageId, msgId);
+  await u.handleCallback(findData(lastMarkup(card), "y:"), ctxFor(msgId));
+  const d = exec.find((e) => e.name === "deploy_position");
+  assert.equal(d.args.pool_address, "CandPool2222222222222222222222222222222222222");
+  assert.equal(d.args.strategy, "spot");
+  assert.equal(d.args.price_range_pct, 85);
+  assert.equal(d.args.bins_above, 0);
+});
+
+test("picker: every callback_data across the picker is ≤ 64 bytes", async () => {
+  const { u, t } = makeUI({ config: customCfg() });
+  const id = stepIdOf(await openPicker(u, t));
+  await u.handleCallback(`ds:${id}:s`, ctxFor(50));
+  await u.handleCallback(`dr:${id}:80`, ctxFor(50));
+  const usdc = makeUI({ config: customCfg(), usdcModeEnabled: () => true });
+  await openPicker(usdc.u, usdc.t);
+  const all = [...t.calls, ...usdc.t.calls].flatMap((c) => allCallbackData(lastMarkup(c)));
+  for (const prefix of ["ds:", "dr:", "db:", "dx:", "y:", "n:"]) assert.ok(all.some((d) => d.startsWith(prefix)), prefix);
+  for (const d of all) assert.ok(Buffer.byteLength(d, "utf8") <= 64, d);
+});
+
+// ─── Token lookup (paste a mint) ─────────────────────────────────
+const lookupMod = await import("../tools/token-lookup.js");
+const MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+const WSOL = "So11111111111111111111111111111111111111112";
+const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SCREENING = {
+  minBinStep: 80, maxBinStep: 125, minTvl: 10_000, maxTvl: 150_000, maxVolatility: 8, minFeeActiveTvlRatio: 0.05,
+  minMcap: 150_000, maxMcap: 10_000_000, minHolders: 500, minOrganic: 60, minTokenAgeHours: 2, maxTokenAgeHours: null,
+};
+const searchRow = (pool, { quote = WSOL, quoteSymbol = "SOL", bs = 100, tvl = 20_000 } = {}) => ({
+  address: pool, name: `TOK-${quoteSymbol}`, token_x: { symbol: "TOK", address: MINT }, token_y: { symbol: quoteSymbol, address: quote }, pool_config: { bin_step: bs }, tvl,
+});
+// Raw pool-discovery rows, run through the real condensePool().
+const detailRow = (pool, { bs = 100, tvl = 20_000, fee = 0.5, vol = 3, organic = 80, holders = 900, mcap = 2_000_000 } = {}) => ({
+  pool_address: pool, name: "TOK-SOL", pool_type: "dlmm",
+  token_x: { symbol: "TOK", address: MINT, organic_score: organic, market_cap: mcap },
+  token_y: { symbol: "SOL", address: WSOL },
+  dlmm_params: { bin_step: bs }, tvl, active_tvl: tvl, volume: 50_000, fee: 100, fee_active_tvl_ratio: fee, volatility: vol, base_token_holders: holders,
+});
+const POOLS = {
+  PoolLowFee111111111111111111111111111111111: detailRow("PoolLowFee111111111111111111111111111111111", { fee: 0.5, tvl: 20_000 }),
+  PoolHiFeeSmall1111111111111111111111111111: detailRow("PoolHiFeeSmall1111111111111111111111111111", { fee: 1.5, tvl: 15_000, bs: 150 }),
+  PoolHiFeeBig11111111111111111111111111111111: detailRow("PoolHiFeeBig11111111111111111111111111111111", { fee: 1.5, tvl: 40_000, vol: 9 }),
+};
+function lookupDeps(over = {}) {
+  return {
+    searchPools: async () => [
+      ...Object.keys(POOLS).map((p) => searchRow(p)),
+      searchRow("PoolUsdc11111111111111111111111111111111111", { quote: USDC, quoteSymbol: "USDC" }),
+      searchRow("PoolFakeSol111111111111111111111111111111111", { quote: "FakeSoLMint1111111111111111111111111111111", quoteSymbol: "SOL" }),
+    ],
+    poolDetail: async (p) => POOLS[p] ?? null,
+    gmgnPriceInfo: async () => ({ token_age_hours: 1.5, change_1h: 4.2, change_24h: -12.5, market_cap: 2_100_000, holders: 950, candles: { supertrend_direction: "green", rsi_2: 44.4 } }),
+    gmgnSignal: async () => ({ smart_money_count_30m: 3, kol_count_30m: 2 }),
+    isBlacklisted: () => false,
+    ...over,
+  };
+}
+const lookupFor = (over = {}, opts = {}) => (mint) => lookupMod.lookupToken(mint, { deps: lookupDeps(over), screening: SCREENING, ...opts });
+const makeLookupUI = (over = {}, uiOver = {}) => makeUI({ config: customCfg(), lookupToken: lookupFor(over), parseMint: lookupMod.parseMint, ...uiOver });
+
+test("token lookup: a pasted mint (or /token) opens the card; garbage text still goes to chat", async () => {
+  const { u, t } = makeLookupUI();
+  for (const text of ["hello there", "gm", "1111111111111111111111111111111111111111111", `${MINT} please`, "0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl"]) {
+    assert.equal(await u.handleMessage(text, { chatId: OWNER }), false, `"${text}" is not a lookup`);
+  }
+  assert.equal(t.calls.length, 0);
+  assert.equal(await lookupMod.parseMint(MINT), MINT);
+
+  assert.equal(await u.handleMessage(MINT, { chatId: OWNER }), true);
+  const loading = t.sends().at(-1);
+  assert.match(loading.text, /Looking up/);
+  const card = t.edits().at(-1);
+  assert.equal(card.messageId, 500 + t.sends().length, "the Looking up… message is edited in place");
+  assert.match(card.text, /TOK<\/b> token lookup/);
+  assert.match(card.text, /smart money 3 · KOL 2 · supertrend green · RSI\(2\) 44\.4/);
+  assert.match(card.text, /1h \+4\.2% · 24h -12\.5%/);
+
+  assert.equal(await u.handleMessage(`/token ${MINT}`, { chatId: OWNER }), true);
+  assert.match(t.edits().at(-1).text, /token lookup/);
+  assert.equal(await u.handleMessage("/lookup nope", { chatId: OWNER }), true);
+  assert.match(t.sends().at(-1).text, /Usage: <code>\/token/);
+  assert.ok(ui.BOT_COMMANDS.some((c) => c.command === "token"), "/token registered in setMyCommands");
+});
+
+test("token lookup: SOL pools only, sorted by fee/aTVL then TVL, with filter ✅/❌ from the config", async () => {
+  const r = await lookupFor()(MINT);
+  assert.deepEqual(r.pools.map((p) => p.pool), [
+    "PoolHiFeeBig11111111111111111111111111111111", "PoolHiFeeSmall1111111111111111111111111111", "PoolLowFee111111111111111111111111111111111",
+  ], "USDC and fake-SOL (symbol only) pools are excluded");
+  assert.ok(r.pools.every((p) => p.quote.mint === WSOL));
+  const byKey = (checks) => Object.fromEntries(checks.map((c) => [c.key, c.pass]));
+  assert.deepEqual(byKey(r.pools[0].checks.pool), { bin_step: true, tvl: true, volatility: false, fee_tvl: true });
+  assert.deepEqual(byKey(r.pools[1].checks.pool), { bin_step: false, tvl: true, volatility: true, fee_tvl: true });
+  assert.deepEqual(byKey(r.checks.token), { mcap: true, holders: true, organic: true, age: false }, "age 1.5h < minTokenAgeHours 2");
+  const loose = lookupMod.screeningFilterChecks(r.pools[0], { ...SCREENING, maxVolatility: 10, minTokenAgeHours: null });
+  assert.ok(!loose.token.some((c) => c.key === "age"), "an unset age filter is not shown");
+  assert.equal(loose.pool.find((c) => c.key === "volatility").pass, true, "thresholds come from the config passed in");
+
+  const { u, t } = makeLookupUI();
+  await u.handleMessage(MINT, { chatId: OWNER });
+  const card = t.edits().at(-1).text;
+  assert.match(card, /❌ age 1\.5h \(≥ 2h\)/);
+  assert.match(card, /✅ holders 900 \(≥ 500\)/);
+  assert.match(card, /❌ volatility 9 \(≤ 8\)/);
+  assert.match(card, /❌ bin step 150 \(80–125\)/);
+  assert.match(card, /1\. TOK-SOL<\/b> \[meteora\]/, "same block as the Candidates view");
+  const kb = lastMarkup(t.edits().at(-1));
+  assert.equal(allCallbackData(kb).filter((d) => d.startsWith("tp:")).length, 3);
+  assert.ok(findData(kb, "tr:"), "Refresh button");
+  const urls = kb.flat().filter((b) => b.url).map((b) => b.url);
+  assert.ok(urls.includes(`https://gmgn.ai/sol/token/${MINT}`));
+  assert.ok(urls.includes(`https://solscan.io/token/${MINT}`));
+  assert.ok(urls.includes("https://app.meteora.ag/dlmm/PoolHiFeeBig11111111111111111111111111111111"));
+});
+
+test("token lookup: no SOL pool, blacklisted token (no Deploy), Meteora failure", async () => {
+  const none = makeLookupUI({ searchPools: async () => [searchRow("PoolUsdc11111111111111111111111111111111111", { quote: USDC, quoteSymbol: "USDC" })] });
+  await none.u.handleMessage(MINT, { chatId: OWNER });
+  const c1 = none.t.edits().at(-1);
+  assert.match(c1.text, /No SOL-quoted Meteora DLMM pool/);
+  assert.ok(!findData(lastMarkup(c1), "tp:"));
+  assert.ok(findData(lastMarkup(c1), "tr:"), "Refresh still offered");
+
+  const bl = makeLookupUI({ isBlacklisted: (m) => m === MINT });
+  await bl.u.handleMessage(MINT, { chatId: OWNER });
+  const c2 = bl.t.edits().at(-1);
+  assert.match(c2.text, /Blacklisted token/);
+  assert.ok(!findData(lastMarkup(c2), "tp:"), "no deploy button for a blacklisted token");
+  assert.match(c2.text, /TOK-SOL/, "pools are still shown");
+
+  const down = makeLookupUI({ searchPools: async () => { throw new Error("Meteora pool search 503"); } });
+  await down.u.handleMessage(MINT, { chatId: OWNER });
+  assert.match(down.t.edits().at(-1).text, /Meteora lookup failed: Meteora pool search 503/);
+});
+
+test("token lookup: GMGN failure or timeout still renders the card with entry", async () => {
+  const failing = makeLookupUI({ gmgnPriceInfo: async () => { throw new Error("429 rate limited"); }, gmgnSignal: async () => null });
+  await failing.u.handleMessage(MINT, { chatId: OWNER });
+  const c1 = failing.t.edits().at(-1);
+  assert.match(c1.text, /GMGN data unavailable \(429 rate limited\)/);
+  assert.equal(allCallbackData(lastMarkup(c1)).filter((d) => d.startsWith("tp:")).length, 3, "entry still offered");
+
+  const started = Date.now();
+  const slow = await lookupMod.lookupToken(MINT, {
+    deps: lookupDeps({ gmgnPriceInfo: () => new Promise(() => {}), gmgnSignal: () => new Promise(() => {}) }),
+    screening: SCREENING, timeoutMs: 80,
+  });
+  assert.ok(Date.now() - started < 2000, "the lookup is capped");
+  assert.equal(slow.gmgn, null);
+  assert.match(slow.gmgn_error, /timed out/);
+  assert.equal(slow.pools.length, 3, "pool data survives a GMGN timeout");
+});
+
+test("token lookup: Deploy → picker → confirm deploys the chosen SOL pool single-sided, with the ❌ warnings", async () => {
+  const { u, t, exec } = makeLookupUI();
+  await u.handleMessage(MINT, { chatId: OWNER });
+  const cardMsgId = 500 + t.sends().length;
+  const tps = allCallbackData(lastMarkup(t.edits().at(-1))).filter((d) => d.startsWith("tp:"));
+  await u.handleCallback(tps[1], ctxFor(cardMsgId)); // 2nd row: PoolHiFeeSmall (bin step 150)
+  const step = t.edits().at(-1);
+  assert.match(step.text, /How do you want to deploy TOK-SOL\?/);
+  assert.equal(step.messageId, cardMsgId);
+  const id = stepIdOf(step);
+  await u.handleCallback(`ds:${id}:s`, ctxFor(cardMsgId));
+  await u.handleCallback(`dr:${id}:50`, ctxFor(cardMsgId));
+  const confirm = t.edits().at(-1);
+  assert.match(confirm.text, /Outside your screening filters/);
+  assert.match(confirm.text, /❌ bin step 150 \(80–125\) \(deploy_position blocks bin steps outside this range\)/);
+  assert.match(confirm.text, /❌ age 1\.5h/);
+  await u.handleCallback(findData(lastMarkup(confirm), "y:"), ctxFor(cardMsgId));
+  const d = exec.filter((e) => e.name === "deploy_position");
+  assert.equal(d.length, 1);
+  assert.equal(d[0].args.pool_address, "PoolHiFeeSmall1111111111111111111111111111");
+  assert.equal(d[0].args.base_mint, MINT);
+  assert.equal(d[0].args.strategy, "spot");
+  assert.equal(d[0].args.price_range_pct, 50);
+  assert.equal(d[0].args.bins_above, 0);
+  assert.equal(d[0].args.bin_step, 150, "the executor's bin-step check sees the real bin step");
+  assert.ok(!("sol_split_pct" in d[0].args) && !("amount_x" in d[0].args));
+
+  // A blocked deploy (e.g. max positions) surfaces the executor's own text.
+  const blocked = makeLookupUI({}, { executeTool: async () => ({ blocked: true, reason: "Max positions (3) reached. Close a position first." }) });
+  await blocked.u.handleMessage(MINT, { chatId: OWNER });
+  const mid = 500 + blocked.t.sends().length;
+  await blocked.u.handleCallback(findData(lastMarkup(blocked.t.edits().at(-1)), "tp:"), ctxFor(mid));
+  const bid = stepIdOf(blocked.t.edits().at(-1));
+  await blocked.u.handleCallback(`ds:${bid}:b`, ctxFor(mid));
+  await blocked.u.handleCallback(`dr:${bid}:a`, ctxFor(mid));
+  await blocked.u.handleCallback(findData(lastMarkup(blocked.t.edits().at(-1)), "y:"), ctxFor(mid));
+  assert.match(blocked.t.edits().at(-1).text, /Deploy blocked.*\n.*Max positions \(3\) reached/);
+});
+
+test("token lookup: Refresh re-runs in place; wrong chat refused; callback_data ≤ 64 bytes", async () => {
+  let calls = 0;
+  const { u, t, exec } = makeLookupUI({ searchPools: async () => { calls++; return Object.keys(POOLS).map((p) => searchRow(p)); } });
+  await u.handleMessage(MINT, { chatId: OWNER });
+  const mid = 500 + t.sends().length;
+  const kb = lastMarkup(t.edits().at(-1));
+  await u.handleCallback(findData(kb, "tr:"), ctxFor(mid));
+  assert.equal(calls, 2);
+  assert.ok(t.edits().slice(-2).every((e) => e.messageId === mid), "Refresh edits the same message");
+
+  // Picker steps opened from the card refuse another chat.
+  await u.handleCallback(findData(lastMarkup(t.edits().at(-1)), "tp:"), ctxFor(mid));
+  const id = stepIdOf(t.edits().at(-1));
+  await u.handleCallback(`ds:${id}:b`, ctxFor(mid, { chatId: "222" }));
+  assert.ok(t.answers().some((a) => /different chat/.test(a.text)));
+  // A stranger pasting a mint never reaches the UI (transport owner check).
+  tg.__setTelegramTestHooks({ token: "TEST", fetch: mockFetch(), owner: OWNER });
+  const res = await tg.processUpdate(msgUpdate("222", "222", MINT), { onMessage: (text, ctx) => u.handleMessage(text, ctx) });
+  assert.equal(res.handled, false);
+  assert.equal(exec.length, 0);
+
+  const all = t.calls.flatMap((c) => allCallbackData(lastMarkup(c)));
+  assert.ok(all.some((d) => d.startsWith("tp:")) && all.some((d) => d.startsWith("tr:")));
+  for (const d of all) assert.ok(Buffer.byteLength(d, "utf8") <= 64, d);
+});
