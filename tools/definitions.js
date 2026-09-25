@@ -74,7 +74,7 @@ Use this during management to check current pool health (volume, fees, organic s
 Default timeframe is 5m for real-time accuracy during position management.
 Use a longer timeframe (1h, 4h) only when screening for new deployments.
 
-IMPORTANT: Only call this with a real pool address from get_my_positions or get_top_candidates. Never guess or construct a pool address.`,
+Pass a pool address taken from get_my_positions, get_top_candidates or another tool result, never a guessed or constructed one.`,
       parameters: {
         type: "object",
         properties: {
@@ -130,7 +130,7 @@ For two-sided spot: just pass your total SOL as amount_y + sol_split_pct. The ex
 
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
-2. No user spec → use active strategy. Current default is Evil Panda: single-sided SOL spot, price_range_pct=80, token-level GMGN volume24H >= $750k, marketCap >= $200k, and 5m Supertrend green/price above.
+2. No user spec → use the configured strategy (config activeStrategy). Under "classic" that is bid_ask unless the two-sided spot conditions in your instructions are met. Under "evil_panda" it is single-sided SOL spot at the Evil Panda price_range_pct, entered only when token-level GMGN volume24H, marketCap and 5m Supertrend checks pass; this tool enforces that shape and rejects amount_x or sol_split_pct below 100.
 
 STRATEGIES:
 - 'bid_ask': Single-sided SOL below active bin. You only deposit SOL. bins_below = your range, bins_above = 0. As price drops, your SOL buys the base token bin by bin. You are NOT holding the token upfront — safer if it dumps.
@@ -138,16 +138,16 @@ STRATEGIES:
   (a) SOL-only spot: Only provide amount_y (SOL), no amount_x. Bins go BELOW active bin only (bins_below = range, bins_above = 0). Same direction as bid_ask but spot distribution instead of bid_ask curve.
   (b) Token-only spot: Only provide amount_x (base token), no amount_y. Bins go ABOVE active bin only (bins_below = 0, bins_above = range). You are selling the token as price rises.
   (c) Two-sided spot: Just provide total SOL as amount_y + sol_split_pct. Token is auto-swapped. The executor swaps the token portion via Jupiter and deploys with both sides. sol_split_pct controls conviction: 100 = pure SOL, 80 = mostly SOL / 20% token, 50 = equal, 25 = mostly token (bullish).
-- Never use 'curve'.
+Only 'bid_ask' and 'spot' are accepted; any other strategy is rejected.
 
-SPOT BIN DIRECTION — CRITICAL:
+SPOT BIN DIRECTION:
 - SOL (quote token / Y) fills bins BELOW the active bin (active_bin minus N)
 - Base token (X) fills bins ABOVE the active bin (active_bin plus N)
 - If you only deposit SOL on spot → bins_below = range, bins_above = 0
 - If you only deposit token on spot → bins_below = 0, bins_above = range
 - If two-sided spot → just pass sol_split_pct + total SOL as amount_y. Bins are split automatically based on sol_split_pct.
 
-SINGLE-SIDED (bid_ask) vs TWO-SIDED (spot) — CRITICAL:
+SINGLE-SIDED (bid_ask) vs TWO-SIDED (spot):
 - Single-sided = you do NOT hold the base token. SOL sits below price, only converts as price drops into your range. Safe default.
 - Two-sided = the executor auto-swaps part of your SOL into the base token. If token dumps, your position loses more because you had exposure from the start. Requires conviction the token will hold or go up.
 - bid_ask = concentrated bid curve below price. SOL converts to token as price drops into range. Ideal for earning fees on sell pressure.
@@ -166,7 +166,9 @@ HARD RULES:
 
 RANGE: Pass price_range_pct, the % price move the range covers from the active bin (80 = liquidity reaching down to 80% below the current price on a SOL-only position). The tool converts it to a bin count from the pool's bin_step, so the same % means the same coverage on any bin step; how wide to go is set by the range rules in your instructions. Positions wider than 69 bins are deployed over several transactions automatically; positions under 20 bins in total are rejected. Pass bins_below / bins_above only when you need an exact bin count.
 
-WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
+Two-sided spot is checked before anything is sent (smart wallets on the pool, top-LPer win rate, 1h price stability, profitable prior spot deploys in pool memory); if any check fails the deploy is blocked with the reason. A second position in a pool already held is also blocked, as is a second pool on a base token already held when base_mint is passed.
+
+This sends a real on-chain transaction unless the runner is in DRY_RUN mode.`,
       parameters: {
         type: "object",
         properties: {
@@ -201,7 +203,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           price_range_pct: {
             type: "number",
-            description: "PREFERRED: Target price range in % (e.g. 80 for Evil Panda's 80% downside range). Bins are auto-calculated from the pool's bin_step."
+            description: "Preferred way to size the range: the % price move it covers from the active bin (downside for SOL-only positions), chosen by the range rules in your instructions. Bins are auto-calculated from the pool's bin_step."
           },
           sol_split_pct: {
             type: "number",
@@ -358,12 +360,10 @@ Use to check available capital before deploying positions.`,
     type: "function",
     function: {
       name: "swap_token",
-      description: `Swap tokens via Jupiter aggregator.
-Use when you need to rebalance wallet holdings, e.g.:
-- Convert claimed fee tokens back to SOL/USDC
-- Prepare token pair before deploying a position
-
-WARNING: This executes a real on-chain transaction.`,
+      description: `Swap tokens via the Jupiter aggregator (real on-chain transaction).
+Use it when the user asks for a swap, or after close_position when that close's result shows swap.success=false or status "success_with_exposure": then swap only the amount that close withdrew. Other wallet balances are not the agent's to sell.
+Not needed around deploys or normal closes: deploy_position swaps the token side of two-sided spot itself, close_position already swaps its withdrawn base tokens back to SOL, and in USDC mode the runner settles to USDC automatically.
+Returns success, the tx signature and the amounts in and out. A SOL swap that would leave less than the gas reserve is refused.`,
       parameters: {
         type: "object",
         properties: {
@@ -397,25 +397,13 @@ Changes persist to user-config.json and take effect immediately — no restart n
 
 You can change anything: screening thresholds, management rules, deploy amounts, cron intervals, strategy params, LLM settings.
 
-Examples:
-- { takeProfitFeePct: 8 }        — raise take profit target for hot markets
-- { maxVolatility: 6 }           — accept higher volatility pools
-- { managementIntervalMin: 5 }   — check positions more frequently
-- { deployAmountSol: 0.5 }       — deploy more per position
-- { timeframe: "1h" }            — switch screening timeframe
-- { maxTvl: 50000 }              — tighter TVL cap
-- { binsBelow: 50 }              — narrower bin range
-- { maxPositions: 5 }            — allow more concurrent positions
-- { managementModel: "gpt-4o" }               — switch management cycle model (also: "openai/gpt-5.4-nano")
-- { screeningModel: "gpt-4o" }                — switch screening cycle model (also: "openai/gpt-5.4-nano")
-- { stopLossPct: -15 }                  — close position if PnL drops below -15%
-- { minTokenFeesSol: 20 }             — lower global fees gate
-- { gasReserve: 0.3 }                 — keep more SOL for gas
-- { positionSizePct: 0.25 }           — smaller positions per deploy
-- { trailingTakeProfit: true }           — enable/disable trailing take profit
-- { trailingTriggerPct: 5 }             — activate trailing TP when PnL hits +5%
-- { trailingDropPct: 2 }                — close when PnL drops 2% from peak
-- { ohlcvBufferMult: 1.4 }             — deeper candle-based ranges (1.0–1.8; raise after downside OOR / stop losses, lower when the deep part of ranges goes unused)
+Common keys (pass one as setting, with value and reason):
+- takeProfitFeePct, stopLossPct (a negative PnL %, e.g. -15), trailingTakeProfit, trailingTriggerPct, trailingDropPct — exit thresholds
+- maxVolatility, maxTvl, minTokenFeesSol, timeframe — screening filters
+- managementIntervalMin, maxPositions, deployAmountSol, positionSizePct, gasReserve — cadence and sizing
+- ohlcvBufferMult — candle-based range depth (1.0–1.8; raise after downside OOR / stop losses, lower when the deep part of ranges goes unused)
+- managementModel, screeningModel — the LLM model for that cycle
+Risk-relevant numeric keys are bounds-checked and out-of-range values are refused.
 
 Entry-safety filters (blockTransferFeeAbovePct, blockTransferHook, blockPermanentDelegate,
 blockFreezeAuthority, blockMintAuthority, blockPausable, blockNonTransferable, solFeePoolsOnly,
@@ -548,8 +536,7 @@ Each holder includes: address, amount, % of supply, SOL balance, tags (Pool/AMM/
 is_pool=true means it's a liquidity pool address, not a real holder — filter these out when analyzing concentration.
 
 Also returns global_fees_sol — total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees).
-This is a key signal: low global_fees_sol means transactions are bundled or the token is a scam.
-HARD GATE: if global_fees_sol < config.screening.minTokenFeesSol (default 30), do NOT deploy.
+This is a key signal: low global_fees_sol means transactions are bundled or the token is a scam, which is why it is a hard deploy gate: below config.screening.minTokenFeesSol (default 30), do not deploy.
 
 NOTE: Requires mint address. If you only have a symbol/name, call get_token_info first to resolve the mint.`,
       parameters: {
