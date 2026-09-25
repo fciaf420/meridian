@@ -13,6 +13,7 @@ import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./l
 import { registerCronRestarter, executeTool } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, editHTML, answerCallback, setMyCommands, isEnabled as telegramEnabled } from "./telegram.js";
 import { createTelegramUI, BOT_COMMANDS, readRecentErrors } from "./telegram-ui.js";
+import { lookupToken, parseMint } from "./tools/token-lookup.js";
 import { isScreeningPaused, setScreeningPaused } from "./state.js";
 import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing } from "./briefing.js";
@@ -874,7 +875,8 @@ const TELEGRAM_HELP = [
   "/settings — effective config + which file each setting lives in",
   "/usdc [on|off] — show or toggle USDC mode",
   "/candidates — refresh top pools (then reply a number to deploy)",
-  "1 / 2 / 3 … — deploy into that pool (asks for confirmation)",
+  "1 / 2 / 3 … — deploy into that pool: pick Bid-Ask or Spot (single-sided SOL) and a range (Auto/25/50/80%), then confirm",
+  "/token <mint> (or just paste a mint) — SOL DLMM pools, token signals and your screening filters (✅/❌), with Deploy via the same picker",
   "auto — agent picks the best pool and deploys (asks for confirmation)",
   "go — start autonomous cycles",
   "/briefing — last-24h briefing",
@@ -945,6 +947,8 @@ const tgUI = createTelegramUI({
   getMyPositions,
   getWalletBalances,
   getTopCandidates,
+  lookupToken: (mint) => lookupToken(mint), // read-only; deploys still go through the picker + executeTool
+  parseMint,
   executeTool,
   runExclusive: tryExclusive,
   autoDeploy: autoDeployViaAgent,

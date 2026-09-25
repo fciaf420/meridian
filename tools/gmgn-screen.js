@@ -306,7 +306,7 @@ function analyzeHoldersAndTraders(holders = [], traders = []) {
  * (pool-discovery-api `filter_by` has no per-mint field — only this search works.)
  * DLMM is inferred from the presence of pool_config.bin_step.
  */
-async function fetchTopMeteoraDlmmPoolsForMint(mint, minTvl = 0, limit = 2) {
+export async function fetchTopMeteoraDlmmPoolsForMint(mint, minTvl = 0, limit = 2) {
   const filterBy = minTvl > 0 ? `&filter_by=${encodeURIComponent(`tvl>${minTvl}`)}` : "";
   const url = `${METEORA_DLMM_API}/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}${filterBy}`;
   const res = await fetch(url);
@@ -329,7 +329,7 @@ async function fetchTopMeteoraDlmmPoolsForMint(mint, minTvl = 0, limit = 2) {
  * Enrich a single pool via the pool-discovery-api (active_tvl, fee_active_tvl_ratio,
  * volatility, active_positions_pct, base_token_holders, pool_price, ...). null on non-200.
  */
-async function fetchPoolDetailDirect(poolAddress) {
+export async function fetchPoolDetailDirect(poolAddress) {
   const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}&timeframe=5m`;
   const res = await fetch(url);
   if (!res.ok) return null;

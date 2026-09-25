@@ -16,6 +16,7 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { escapeHtml, clipText, CALLBACK_DATA_MAX_BYTES } from "./telegram.js";
+import { calculateBinsForPriceRange, MIN_RANGE_PCT, MIN_BINS } from "./runtime-helpers.js";
 
 export const MENU_BUTTON_TEXT = "🏠 Menu";
 export const CONFIRM_TTL_MS = 60_000;
@@ -26,7 +27,8 @@ export const CANDIDATES_PER_PAGE = 5;
 export const BOT_COMMANDS = [
   { command: "menu", description: "Main menu" },
   { command: "status", description: "Wallet + open positions" },
-  { command: "candidates", description: "Top pools (reply a number to deploy)" },
+  { command: "candidates", description: "Top pools (Deploy → strategy + range → confirm)" },
+  { command: "token", description: "Look up a token mint (SOL DLMM pools, filters, deploy)" },
   { command: "settings", description: "Effective config and where it comes from" },
   { command: "usdc", description: "Show or toggle USDC mode (on|off)" },
   { command: "autoresearch", description: "Prompt overrides: status, list, approve, reject" },
@@ -221,6 +223,11 @@ export function createNonceStore({ ttlMs = CONFIRM_TTL_MS, now = () => Date.now(
       if (r.entry) map.delete(id);
       return r;
     },
+    /** Restart the TTL of a live entry (multi-step menus). */
+    touch(id) {
+      const e = map.get(id);
+      if (e && e.expiresAt > now()) e.expiresAt = now() + ttlMs;
+    },
     size() { sweep(); return map.size; },
   };
 }
@@ -326,21 +333,43 @@ export function rangeForVolatility(volatility, strategy) {
   return spot ? 50 : 45;
 }
 
+/** Range presets offered by the Telegram picker (besides Auto). */
+export const RANGE_PRESETS = [25, 50, 80];
+
+export const STRATEGY_LABELS = { bid_ask: "Bid-Ask", spot: "Spot" };
+
+/** The strategy the bot would use on its own (the picker marks it as default). */
+export function defaultPickerStrategy(config, usdcMode = false) {
+  if (usdcMode) return "bid_ask";
+  return config.strategy?.strategy === "bid_ask" ? "bid_ask" : "spot";
+}
+
 /**
  * Exact deploy_position arguments for a candidate. The confirmation card shows
  * these and the Confirm tap executes exactly these. Returns { error } when the
  * amount can't be determined (no silent fallback amount for real funds).
+ *
+ * `strategy` / `priceRangePct` are the picker's choices; without them the
+ * configured default applies. Evil Panda ignores both (its own spot plan).
+ * Always single-sided SOL: bins_above 0, never sol_split_pct or amount_x.
  */
-export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount, usdcMode = false }) {
+export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount, usdcMode = false, strategy: chosen = null, priceRangePct = null }) {
   if (!candidate?.pool) return { error: "Candidate has no pool address." };
   const evil = config.strategy?.activeStrategy === "evil_panda";
   let strategy;
   if (evil) strategy = "spot";
-  else if (usdcMode) strategy = "bid_ask"; // executor forces this in USDC mode
-  else strategy = config.strategy?.strategy === "bid_ask" ? "bid_ask" : "spot";
-  const price_range_pct = evil
-    ? (config.strategy?.evilPanda?.priceRangePct ?? 80)
-    : rangeForVolatility(candidate.volatility, strategy);
+  else if (chosen != null) {
+    if (chosen !== "bid_ask" && chosen !== "spot") return { error: `Unknown strategy ${chosen}.` };
+    if (usdcMode && chosen !== "bid_ask") return { error: "USDC mode only supports Bid-Ask." };
+    strategy = chosen;
+  } else strategy = defaultPickerStrategy(config, usdcMode); // executor forces bid_ask in USDC mode
+  let price_range_pct;
+  if (evil) price_range_pct = config.strategy?.evilPanda?.priceRangePct ?? 80;
+  else if (priceRangePct != null) {
+    const r = Number(priceRangePct);
+    if (!(r > 0 && r < 100)) return { error: `Invalid range ${priceRangePct}%.` };
+    price_range_pct = r;
+  } else price_range_pct = rangeForVolatility(candidate.volatility, strategy);
 
   const args = {
     pool_address: candidate.pool,
@@ -372,7 +401,33 @@ export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount
     amountLabel = `${amt} SOL`;
   }
   const strategyLabel = evil ? `Evil Panda (single-sided SOL spot, ${price_range_pct}% range)` : `${strategy}, single-sided SOL, ${price_range_pct}% range`;
-  return { args, amountLabel, strategyLabel };
+  return { args, amountLabel, strategyLabel, evil, range: rangeInfo(price_range_pct, candidate.bin_step) };
+}
+
+/**
+ * What deploy_position will actually do with a requested range: below
+ * MIN_RANGE_PCT it widens to the floor (tools/dlmm.js). `bins` is the approximate
+ * bin count at the pool's bin_step (null when the bin_step is unknown).
+ */
+export function rangeInfo(requestedPct, binStep) {
+  const effectivePct = Math.max(Number(requestedPct), MIN_RANGE_PCT);
+  const bs = Number(binStep);
+  const bins = bs > 0 ? calculateBinsForPriceRange(bs, effectivePct) : null;
+  return {
+    requestedPct: Number(requestedPct),
+    effectivePct,
+    widened: effectivePct > Number(requestedPct),
+    bins,
+    tooFewBins: bins != null && bins < MIN_BINS, // deploy_position would reject it
+  };
+}
+
+/** "35% (~44 bins at bin step 100)" or with the widening note. */
+function fmtRange(r, binStep) {
+  const bins = r.bins != null ? ` (~${r.bins} bins at bin step ${binStep})` : " (bins computed at deploy from the pool's bin step)";
+  return r.widened
+    ? `${r.requestedPct}% requested → deploy widens it to the ${MIN_RANGE_PCT}% minimum${bins}`
+    : `${r.effectivePct}%${bins}`;
 }
 
 // ─── Views (pure renderers) ──────────────────────────────────────
@@ -497,8 +552,92 @@ export function renderCandidates(list, { page = 0, refs, source = "meteora", fet
   const pager = pagerRow("ca", pg, pages.length);
   if (pager) keyboard.push(pager);
   keyboard.push([btn("🔍 Screen now", "cs"), btn("⬅ Menu", "m")]);
-  const text = `${header}\n\n${pages[pg].map((i) => blocks[i]).join("\n\n")}\n\nDeploy asks for confirmation first. You can also reply with a number.`;
+  const text = `${header}\n\n${pages[pg].map((i) => blocks[i]).join("\n\n")}\n\nDeploy lets you pick the strategy and range, then asks for confirmation. You can also reply with a number.`;
   return { text, keyboard, page: pg, pages: pages.length };
+}
+
+// ─── Token lookup card (paste a mint) ────────────────────────────
+export const WSOL_MINT = "So11111111111111111111111111111111111111112";
+export const gmgnTokenUrl = (mint) => `https://gmgn.ai/sol/token/${mint}`;
+export const solscanTokenUrl = (mint) => `https://solscan.io/token/${mint}`;
+
+const checkMark = (ch) => (ch.pass === true ? "✅" : ch.pass === false ? "❌" : "❔");
+
+/**
+ * ❌ lines for the confirmation card: the token's and the chosen pool's failed
+ * screening filters. A bin step outside the range is also a deploy_position
+ * hard block, so it says so.
+ */
+export function failedFilterLines(c) {
+  return [...(c?.checks?.token || []), ...(c?.checks?.pool || [])]
+    .filter((ch) => ch.pass === false)
+    .map((ch) => `❌ ${ch.text}${ch.key === "bin_step" ? " (deploy_position blocks bin steps outside this range)" : ""}`);
+}
+
+function fmtPct(v) {
+  const n = Number(v);
+  return v == null || !Number.isFinite(n) ? "?" : `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
+}
+
+/** `pools[i].ref` = the Deploy button's ref (absent when deploy is not offered). */
+export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora" } = {}) {
+  const top = r.pools?.[0] || null;
+  const sym = r.symbol || top?.base?.symbol || shortAddr(r.mint);
+  const lines = [`🔎 <b>${escapeHtml(sym)}</b> token lookup`, `<code>${escapeHtml(r.mint)}</code>`];
+  if (r.blacklisted) lines.push("⛔ <b>Blacklisted token</b>: deploy is disabled.");
+
+  const price = r.gmgn?.price || null;
+  const signal = r.gmgn?.signal || null;
+  const tokenFacts = [
+    `mcap ${fmtUsdCompact(top?.mcap ?? price?.market_cap)}`,
+    `holders ${top?.holders ?? price?.holders ?? "?"}`,
+    `age ${price?.token_age_hours != null ? fmtAge(price.token_age_hours * 60) : "?"}`,
+    `1h ${fmtPct(price?.change_1h)}`,
+    `24h ${fmtPct(price?.change_24h)}`,
+  ];
+  lines.push(`Token: ${escapeHtml(tokenFacts.join(" · "))}`);
+  if (r.gmgn) {
+    const g = [];
+    if (signal) g.push(`smart money ${signal.smart_money_count_30m ?? 0}`, `KOL ${signal.kol_count_30m ?? 0}`);
+    if (price?.candles?.supertrend_direction) g.push(`supertrend ${price.candles.supertrend_direction}`);
+    if (price?.candles?.rsi_2 != null) g.push(`RSI(2) ${Math.round(price.candles.rsi_2 * 10) / 10}`);
+    lines.push(`GMGN: ${escapeHtml(g.join(" · ") || "no signals")}`);
+  } else {
+    lines.push(`⚠️ GMGN data unavailable${r.gmgn_error ? ` (${escapeHtml(clipText(String(r.gmgn_error), 80))})` : ""}`);
+  }
+
+  const tokenChecks = r.checks?.token || [];
+  if (tokenChecks.length) {
+    lines.push("", "<b>Your screening filters</b> (token):", ...tokenChecks.map((ch) => `${checkMark(ch)} ${escapeHtml(ch.text)}`));
+  }
+
+  const pools = r.pools || [];
+  lines.push("");
+  if (r.error) lines.push(`⚠️ Meteora lookup failed: ${escapeHtml(clipText(String(r.error), 120))}`);
+  if (!pools.length) {
+    if (!r.error) lines.push("No SOL-quoted Meteora DLMM pool found for this token. (If this is a wallet address, ask in chat instead.)");
+  } else {
+    lines.push(`<b>SOL DLMM pools</b> (${pools.length}${r.total_pools > pools.length ? ` of ${r.total_pools}` : ""}, by fee/aTVL then TVL):`);
+    pools.forEach((c, i) => {
+      lines.push("", candidateBlock(c, i, source));
+      const pc = c.checks?.pool || [];
+      if (pc.length) lines.push(escapeHtml(pc.map((ch) => `${checkMark(ch)} ${ch.text}`).join(" · ")));
+    });
+  }
+
+  const keyboard = [];
+  pools.forEach((c, i) => {
+    const row = [];
+    if (poolRefs[i]) row.push(btn(`🚀 Deploy ${i + 1}`, `tp:${poolRefs[i]}`));
+    row.push(urlBtn(`Meteora ${i + 1} ↗`, meteoraPoolUrl(c.pool)));
+    keyboard.push(row);
+  });
+  keyboard.push([btn("🔄 Refresh", `tr:${tokenRef}`), btn("⬅ Menu", "m")]);
+  const links = [];
+  if (top) links.push(urlBtn("Meteora ↗", meteoraPoolUrl(top.pool)));
+  links.push(urlBtn("GMGN ↗", gmgnTokenUrl(r.mint)), urlBtn("Solscan ↗", solscanTokenUrl(r.mint)));
+  keyboard.push(links);
+  return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard };
 }
 
 export function renderTextPages(title, body, { page = 0, prefix, extraRows = [] } = {}) {
@@ -543,20 +682,77 @@ export function renderCloseConfirm(p, nonce, { unit = "sol", dryRun = false } = 
   };
 }
 
-export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora" } = {}) {
+export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora", warnings = [], ttlMs = CONFIRM_TTL_MS } = {}) {
+  const strategy = plan.evil ? escapeHtml(plan.strategyLabel) : `<b>${STRATEGY_LABELS[plan.args.strategy] ?? escapeHtml(plan.args.strategy)}</b>`;
+  const lines = [
+    `🚀 <b>Deploy into this pool?</b>${dryRun ? " (DRY RUN)" : ""}`,
+    `<b>${escapeHtml(c.name ?? "?")}</b> [${escapeHtml(candidateSourceTag(c, source))}]`,
+    `Pool: <code>${escapeHtml(c.pool)}</code>`,
+    `Strategy: ${strategy} · single-sided SOL (no token side)`,
+    `Range: ${escapeHtml(fmtRange(plan.range, c.bin_step))}`,
+    `Amount: <b>${escapeHtml(plan.amountLabel)}</b>`,
+    `bin step ${c.bin_step ?? "?"} · volatility ${c.volatility ?? "?"} · fee/aTVL ${c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? "?"}%`,
+  ];
+  if (plan.range.tooFewBins) lines.push(`⚠️ Under ${MIN_BINS} bins: deploy_position will reject this.`);
+  if (warnings.length) lines.push("", "⚠️ <b>Outside your screening filters:</b>", ...warnings.map((w) => escapeHtml(w)));
+  lines.push("", `Runs the normal deploy_position safety checks. Expires in ${Math.round(ttlMs / 1000)}s.`);
   return {
-    text: [
-      `🚀 <b>Deploy into this pool?</b>${dryRun ? " (DRY RUN)" : ""}`,
-      `<b>${escapeHtml(c.name ?? "?")}</b> [${escapeHtml(candidateSourceTag(c, source))}]`,
-      `Pool: <code>${escapeHtml(c.pool)}</code>`,
-      `Amount: <b>${escapeHtml(plan.amountLabel)}</b>`,
-      `Strategy: ${escapeHtml(plan.strategyLabel)}`,
-      `bin step ${c.bin_step ?? "?"} · volatility ${c.volatility ?? "?"} · fee/aTVL ${c.fee_active_tvl_ratio ?? "?"}%`,
-      "",
-      `Runs the normal deploy_position safety checks. Expires in ${Math.round(CONFIRM_TTL_MS / 1000)}s.`,
-    ].join("\n"),
+    text: lines.join("\n"),
     keyboard: [[btn("✅ Confirm deploy", `y:${nonce}`), btn("✖ Cancel", `n:${nonce}`)], [urlBtn("Meteora ↗", meteoraPoolUrl(c.pool))]],
   };
+}
+
+// ─── Deploy picker (strategy → range → confirmation card) ────────
+// Callback data: ds:<id>:b|s (strategy), dr:<id>:a|<pct> (range),
+// db:<id> (back to strategy), dx:<id> (cancel). <id> is a short server-side
+// step id; the candidate and the choices live in the step store, never in the data.
+
+export function renderStrategyStep(c, stepId, { defaultStrategy } = {}) {
+  const mark = (s) => (s === defaultStrategy ? " ✓" : "");
+  return {
+    text: [
+      `🚀 <b>How do you want to deploy ${escapeHtml(c.name ?? shortAddr(c.pool))}?</b>`,
+      `bin step ${c.bin_step ?? "?"} · volatility ${c.volatility ?? "?"} · fee/aTVL ${c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? "?"}%`,
+      "",
+      "Both are single-sided SOL (liquidity below the price, no token needed):",
+      "• <b>Bid-Ask</b>: more SOL further below the price; buys dips.",
+      "• <b>Spot</b>: SOL spread evenly across the range.",
+      `✓ = your configured default (${STRATEGY_LABELS[defaultStrategy]}).`,
+    ].join("\n"),
+    keyboard: [
+      [btn(`Bid-Ask${mark("bid_ask")}`, `ds:${stepId}:b`), btn(`Spot${mark("spot")}`, `ds:${stepId}:s`)],
+      [btn("✖ Cancel", `dx:${stepId}`)],
+    ],
+  };
+}
+
+/** Range options for a strategy: Auto + presets, minus any that deploy would reject. */
+export function rangeOptions(c, strategy) {
+  const auto = rangeForVolatility(c.volatility, strategy);
+  const opts = [{ key: "a", pct: auto, label: `Auto (${auto}%)` }, ...RANGE_PRESETS.map((p) => ({ key: String(p), pct: p, label: `${p}%` }))];
+  return opts
+    .map((o) => ({ ...o, range: rangeInfo(o.pct, c.bin_step) }))
+    .filter((o) => !o.range.tooFewBins)
+    .map((o) => ({ ...o, label: o.range.widened ? `${o.label} → ${MIN_RANGE_PCT}% min` : o.label }));
+}
+
+export function renderRangeStep(c, stepId, strategy, { usdcMode = false } = {}) {
+  const opts = rangeOptions(c, strategy);
+  const lines = [`🚀 <b>${escapeHtml(c.name ?? shortAddr(c.pool))}</b> · <b>${STRATEGY_LABELS[strategy]}</b> (single-sided SOL)`];
+  if (usdcMode) lines.push("💵 USDC mode is on: only Bid-Ask is available (the executor forces it).");
+  lines.push(
+    "",
+    "<b>Pick a range</b> (how far below the current price the SOL goes):",
+    `Auto is set from volatility ${c.volatility ?? "?"}.`,
+    `deploy_position enforces a ${MIN_RANGE_PCT}% minimum, so narrower presets get widened to it.`,
+  );
+  if (opts.length < RANGE_PRESETS.length + 1) lines.push(`Ranges under ${MIN_BINS} bins at bin step ${c.bin_step} are hidden (deploy rejects them).`);
+  if (!opts.length) lines.push("⚠️ No range reaches the bin minimum for this pool.");
+  const rangeBtns = opts.map((o) => btn(o.label, `dr:${stepId}:${o.key}`));
+  const keyboard = [];
+  for (let i = 0; i < rangeBtns.length; i += 2) keyboard.push(rangeBtns.slice(i, i + 2));
+  keyboard.push([btn("⬅ Back", `db:${stepId}`), btn("✖ Cancel", `dx:${stepId}`)]);
+  return { text: lines.join("\n"), keyboard };
 }
 
 function txLinks(txs) {
@@ -603,6 +799,7 @@ export function createTelegramUI(deps) {
   const now = deps.now || (() => Date.now());
   const logf = deps.log || (() => {});
   const nonces = createNonceStore({ ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, now });
+  const steps = createNonceStore({ ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, now }); // deploy picker state
   const refs = createRefMap();
   const limiter = createAlertLimiter({ now });
   const state = {
@@ -660,13 +857,153 @@ export function createTelegramUI(deps) {
     return { nonce, view: renderCloseConfirm(p, nonce, { unit: unit(), dryRun: isDryRun() }) };
   }
 
-  async function deployRequest(candidate) {
-    const usdcMode = !!deps.usdcModeEnabled?.();
+  /** Confirmation card for the final plan. `choice` = the picker's { strategy, priceRangePct }. */
+  async function deployRequest(candidate, { strategy = null, priceRangePct = null, warnings = [] } = {}) {
+    const usdcMode = !!deps.usdcModeEnabled?.(); // re-read: the mode may have changed mid-picker
     const wallet = usdcMode ? null : await deps.getWalletBalances().catch((e) => ({ error: e.message }));
-    const plan = buildDeployPlan(candidate, { wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, usdcMode });
+    const plan = buildDeployPlan(candidate, {
+      wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, usdcMode, strategy, priceRangePct,
+    });
     if (plan.error) return { view: { text: `⚠️ ${escapeHtml(plan.error)}`, keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] } };
     const nonce = nonces.put("deploy", { args: plan.args, label: candidate.name || shortAddr(candidate.pool) });
-    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source() }) };
+    return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source(), warnings, ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS }) };
+  }
+
+  // ── deploy picker (strategy → range → confirm) ──
+  /**
+   * Entry point for every manual candidate deploy. Evil Panda keeps its fixed
+   * plan (straight to the confirmation card); USDC mode skips the strategy step
+   * (Bid-Ask only). `origin` is where Back leads when there is no strategy step.
+   */
+  async function startPicker(candidate, ctx, opts = {}, { origin = "ca", warnings = [] } = {}) {
+    if (deps.config.strategy?.activeStrategy === "evil_panda") {
+      return presentConfirm(ctx, await deployRequest(candidate, { warnings }), opts);
+    }
+    const usdcMode = !!deps.usdcModeEnabled?.();
+    const id = steps.put("pick", { candidate, usdcMode, strategy: usdcMode ? "bid_ask" : null, origin, warnings });
+    const view = usdcMode
+      ? renderRangeStep(candidate, id, "bid_ask", { usdcMode: true })
+      : renderStrategyStep(candidate, id, { defaultStrategy: defaultPickerStrategy(deps.config) });
+    const msg = await show(ctx, view, opts);
+    steps.bind(id, msg?.message_id ?? null, ctx?.chatId ?? msg?.chat?.id ?? null);
+    return msg;
+  }
+
+  /** Validate a step callback (live id, same chat, same message). Returns the entry or null. */
+  async function stepEntry(id, ctx, answer) {
+    const r = steps.peek(id);
+    if (r.error) {
+      logf("telegram_warn", `Refused picker step ${String(id).slice(0, 12)}: ${r.error}`);
+      await answer("This menu expired, tap Candidates again.", true);
+      if (ctx.messageId != null) {
+        await show(ctx, { text: "⌛ This menu expired, tap Candidates again. Nothing was done.", keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] });
+      }
+      return null;
+    }
+    const e = r.entry;
+    if (e.chatId != null && ctx.chatId != null && String(ctx.chatId) !== e.chatId) {
+      logf("telegram_warn", `Refused picker step ${id}: chat mismatch`);
+      await answer("This menu belongs to a different chat.", true);
+      return null;
+    }
+    if (e.messageId != null && ctx.messageId !== e.messageId) {
+      logf("telegram_warn", `Refused picker step ${id}: message mismatch`);
+      await answer("This menu belongs to a different message.", true);
+      return null;
+    }
+    steps.touch(id);
+    return e;
+  }
+
+  async function pickerCallback(head, id, choice, ctx, answer) {
+    const e = await stepEntry(id, ctx, answer);
+    if (!e) return;
+    const p = e.params;
+    const c = p.candidate;
+
+    if (head === "dx") {
+      steps.take(id);
+      await answer("Cancelled");
+      await show(ctx, { text: "✖ Cancelled. Nothing was done.", keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] });
+      return;
+    }
+
+    if (head === "db") {
+      await answer();
+      if (p.usdcMode) { // no strategy step in USDC mode: Back leaves the picker
+        steps.take(id);
+        await show(ctx, await originView(p.origin));
+        return;
+      }
+      p.strategy = null;
+      await show(ctx, renderStrategyStep(c, id, { defaultStrategy: defaultPickerStrategy(deps.config) }));
+      return;
+    }
+
+    if (head === "ds") {
+      const strategy = choice === "b" ? "bid_ask" : choice === "s" ? "spot" : null;
+      if (!strategy || (p.usdcMode && strategy !== "bid_ask")) {
+        await answer("That strategy isn't available here.", true);
+        return;
+      }
+      p.strategy = strategy;
+      await answer(STRATEGY_LABELS[strategy]);
+      await show(ctx, renderRangeStep(c, id, strategy, { usdcMode: p.usdcMode }));
+      return;
+    }
+
+    // head === "dr": the range tap builds the confirmation card.
+    if (!p.strategy) {
+      await answer("Pick a strategy first.", true);
+      return;
+    }
+    const opt = rangeOptions(c, p.strategy).find((o) => o.key === choice);
+    if (!opt) {
+      await answer("That range isn't available for this pool.", true);
+      return;
+    }
+    if (!steps.take(id).entry) { // single use: a double tap can't build two cards
+      await answer("Already used.", true);
+      return;
+    }
+    await answer();
+    await presentConfirm(ctx, await deployRequest(c, { strategy: p.strategy, priceRangePct: opt.pct, warnings: p.warnings }));
+  }
+
+  // ── token lookup (paste a mint) ──
+  /** Card for a cached lookup; registers a Deploy ref per deployable pool. */
+  function tokenCardView(tokenRef) {
+    const entry = refs.get(tokenRef);
+    if (!entry?.result) return { text: "⌛ This lookup expired. Paste the mint again.", keyboard: [[btn("⬅ Menu", "m")]] };
+    const r = entry.result;
+    const poolRefs = (r.pools || []).map((c) => {
+      // Never deployable: blacklisted tokens, pools not quoted in SOL.
+      if (r.blacklisted || c.quote?.mint !== WSOL_MINT) return null;
+      return refs.put({ kind: "token_pool", tokenRef, candidate: c, warnings: failedFilterLines(c) }, `tp:${c.pool}`);
+    });
+    return renderTokenCard(r, { tokenRef, poolRefs, source: source() });
+  }
+
+  /** Look a mint up, editing a "Looking up…" message in place with the card. */
+  async function tokenLookup(mint, ctx, opts = {}) {
+    const loading = { text: `🔎 Looking up <code>${escapeHtml(mint)}</code>…`, keyboard: [] };
+    const msg = await show(ctx, loading, opts);
+    const target = { ...ctx, messageId: msg?.message_id ?? ctx?.messageId ?? null };
+    let result;
+    try {
+      result = await deps.lookupToken(mint);
+    } catch (e) {
+      logf("telegram_error", `Token lookup ${mint.slice(0, 8)} failed: ${e.message}`);
+      result = { mint, pools: [], total_pools: 0, gmgn: null, error: e.message, checks: { token: [], pool: [] } };
+    }
+    const tokenRef = refs.put({ kind: "token", mint, result }, `tok:${mint}`);
+    return show(target, tokenCardView(tokenRef));
+  }
+
+  /** The view Back returns to when a picker has no strategy step. */
+  async function originView(origin) {
+    if (typeof origin === "function") return origin();
+    return candidatesView(0);
   }
 
   function simpleConfirm(action, params, text, confirmLabel) {
@@ -768,8 +1105,27 @@ export function createTelegramUI(deps) {
         await deps.tg.sendHTML(`No pool #${pick} in the current list. Send /candidates first.`);
         return true;
       }
-      await presentConfirm({ chatId: ctx.chatId }, await deployRequest(c), { fresh: true });
+      await startPicker(c, { chatId: ctx.chatId }, { fresh: true });
       return true;
+    }
+
+    // Token lookup: "/token <mint>", "/lookup <mint>", or a bare mint.
+    const tokenCmd = /^\/(?:token|lookup)(?:@\w+)?(?:\s+(.*))?$/i.exec(text);
+    if (tokenCmd && deps.lookupToken) {
+      const mint = tokenCmd[1] ? await deps.parseMint(tokenCmd[1].trim()) : null;
+      if (!mint) {
+        await deps.tg.sendHTML("Usage: <code>/token &lt;mint&gt;</code> (a Solana token address). You can also just paste the mint.");
+        return true;
+      }
+      await tokenLookup(mint, { chatId: ctx.chatId }, { fresh: true });
+      return true;
+    }
+    if (deps.lookupToken && deps.parseMint && !/\s/.test(text)) {
+      const mint = await deps.parseMint(text);
+      if (mint) {
+        await tokenLookup(mint, { chatId: ctx.chatId }, { fresh: true });
+        return true;
+      }
     }
 
     if (lower === "auto") {
@@ -790,7 +1146,7 @@ export function createTelegramUI(deps) {
   async function handleCallback(data, ctx = {}) {
     const fresh = data.endsWith("!");
     const d = fresh ? data.slice(0, -1) : data;
-    const [head, arg] = d.split(":");
+    const [head, arg, sub] = d.split(":");
     const opts = { fresh };
     let answered = false;
     const answer = async (text = "", alert = false) => {
@@ -919,9 +1275,40 @@ export function createTelegramUI(deps) {
             return;
           }
           await answer();
-          await presentConfirm(ctx, await deployRequest(c), opts);
+          await startPicker(c, ctx, opts);
           return;
         }
+        case "tr": {
+          const entry = refs.get(arg);
+          if (entry?.kind !== "token") {
+            await answer("That button is stale — paste the mint again.", true);
+            return;
+          }
+          await answer("Refreshing…");
+          await tokenLookup(entry.mint, ctx, opts);
+          return;
+        }
+        case "tp": {
+          const entry = refs.get(arg);
+          if (entry?.kind !== "token_pool") {
+            await answer("That button is stale — paste the mint again.", true);
+            return;
+          }
+          const token = refs.get(entry.tokenRef);
+          if (token?.result?.blacklisted || entry.candidate.quote?.mint !== WSOL_MINT) {
+            await answer("This pool can't be deployed into (blacklisted or not SOL-quoted).", true);
+            return;
+          }
+          await answer();
+          await startPicker(entry.candidate, ctx, opts, { origin: () => tokenCardView(entry.tokenRef), warnings: entry.warnings });
+          return;
+        }
+        case "ds":
+        case "dr":
+        case "db":
+        case "dx":
+          await pickerCallback(head, arg, sub, ctx, answer);
+          return;
         case "y": {
           const peek = nonces.peek(arg);
           if (peek.error) {
@@ -1077,6 +1464,7 @@ export function createTelegramUI(deps) {
     attachAlerts,
     alerts: handlers,
     nonces,
+    steps,
     refs,
     state,
     loadCandidates,
