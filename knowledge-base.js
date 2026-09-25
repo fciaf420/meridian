@@ -5,7 +5,7 @@
  * strategies, market regimes, and pool behaviors. Auto-maintained INDEX.md
  * and CONCEPTS.md replace the need for RAG at this scale.
  *
- * Existing JSON systems (lessons.json, pool-memory.json, nuggets) remain
+ * Existing JSON systems (lessons.json, pool-memory.json) remain
  * the structured data sources. The KB is a synthesis layer on top.
  */
 
@@ -478,21 +478,23 @@ export async function migrateFromJson() {
         const fullPerfPath = path.join(kbDir, perfPath);
 
         if (!fs.existsSync(fullPerfPath)) {
-          const wins = perf.filter(p => (p.pnl_pct ?? 0) >= 0);
-          const losses = perf.filter(p => (p.pnl_pct ?? 0) < 0);
-          const avgPnl = perf.reduce((s, p) => s + (p.pnl_pct ?? 0), 0) / perf.length;
+          // Unknown-PnL closes carry a placeholder 0; keep them out of win/loss stats.
+          const known = perf.filter(p => !p.pnl_unknown);
+          const wins = known.filter(p => (p.pnl_pct ?? 0) >= 0);
+          const losses = known.filter(p => (p.pnl_pct ?? 0) < 0);
+          const avgPnl = known.length ? known.reduce((s, p) => s + (p.pnl_pct ?? 0), 0) / known.length : 0;
 
           let content = `# Historical Performance Summary\n\n`;
           content += `*Migrated from lessons.json — ${perf.length} closed positions*\n\n`;
           content += `## Overview\n\n`;
           content += `- Total positions: ${perf.length}\n`;
-          content += `- Wins: ${wins.length} (${((wins.length / perf.length) * 100).toFixed(0)}%)\n`;
+          content += `- Wins: ${wins.length} (${known.length ? ((wins.length / known.length) * 100).toFixed(0) : 0}% of ${known.length} with known PnL)\n`;
           content += `- Losses: ${losses.length}\n`;
           content += `- Average PnL: ${avgPnl.toFixed(2)}%\n\n`;
 
           content += `## Recent Closes\n\n`;
           for (const p of perf.slice(-10)) {
-            content += `- ${p.pool_name || p.pool || "unknown"}: ${(p.pnl_pct ?? 0).toFixed(1)}% PnL, ${p.close_reason || "manual"}\n`;
+            content += `- ${p.pool_name || p.pool || "unknown"}: ${p.pnl_unknown ? "unknown" : `${(p.pnl_pct ?? 0).toFixed(1)}%`} PnL, ${p.close_reason || "manual"}\n`;
           }
 
           const perfResult = writeArticle(perfPath, content);
@@ -550,41 +552,7 @@ export async function migrateFromJson() {
     log("kb", `Pool memory migration error: ${e.message}`);
   }
 
-  // 3. Migrate nuggets facts → knowledge/strategies/ and knowledge/patterns/
-  try {
-    const { getShelf } = await import("./memory.js");
-    const shelf = getShelf();
-
-    for (const nuggetName of ["strategies", "patterns"]) {
-      try {
-        const nugget = shelf.get(nuggetName);
-        if (!nugget) continue;
-        const facts = nugget.facts();
-        if (facts.length === 0) continue;
-
-        const articlePath = `${nuggetName}/compiled-from-nuggets.md`;
-        const fullPath = path.join(kbDir, articlePath);
-
-        if (fs.existsSync(fullPath)) { skipped++; continue; }
-
-        let content = `# ${nuggetName.charAt(0).toUpperCase() + nuggetName.slice(1)}: Compiled from Memory\n\n`;
-        content += `*Migrated from Nuggets holographic memory — ${facts.length} facts*\n\n`;
-
-        for (const f of facts) {
-          content += `- **${f.key}**: ${f.value}`;
-          if (f.hits > 1) content += ` *(recalled ${f.hits}x)*`;
-          content += `\n`;
-        }
-
-        const nuggetResult = writeArticle(articlePath, content);
-        if (nuggetResult.success) created++; else skipped++;
-      } catch { /* nugget may not exist */ }
-    }
-  } catch (e) {
-    log("kb", `Nuggets migration error: ${e.message}`);
-  }
-
-  // 4. Rebuild indexes
+  // 3. Rebuild indexes
   rebuildIndex();
   rebuildConcepts();
 
@@ -865,8 +833,11 @@ export function filePositionClose(perf) {
     const articlePath = `pools/${slug}.md`;
     const fullPath = path.join(kbDir, articlePath);
 
-    const pnl = perf.pnl_pct ?? perf.actual_pnl_pct ?? 0;
-    const outcome = pnl >= 0 ? "WIN" : "LOSS";
+    // Unknown PnL (PR #9 flag) is a placeholder 0, not a break-even: label it.
+    const pnlUnknown = perf.pnl_unknown === true;
+    const pnl = pnlUnknown ? null : (perf.pnl_pct ?? perf.actual_pnl_pct ?? 0);
+    const outcome = pnlUnknown ? "UNKNOWN" : pnl >= 0 ? "WIN" : "LOSS";
+    const pnlText = pnlUnknown ? "PnL unknown" : `PnL ${pnl.toFixed(1)}%`;
     const now = new Date().toISOString().slice(0, 16);
     const strategy = perf.strategy || "unknown";
     const reason = perf.close_reason || "manual";
@@ -876,7 +847,7 @@ export function filePositionClose(perf) {
       ? ((perf.minutes_in_range / perf.minutes_held) * 100).toFixed(0)
       : "?";
 
-    const closeLine = `- **${outcome}** ${now}: PnL ${pnl.toFixed(1)}%, held ${held}min, strategy: ${strategy}, range_eff: ${rangeEff}%, vol: ${vol}, reason: ${reason}`;
+    const closeLine = `- **${outcome}** ${now}: ${pnlText}, held ${held}min, strategy: ${strategy}, range_eff: ${rangeEff}%, vol: ${vol}, reason: ${reason}`;
 
     if (fs.existsSync(fullPath)) {
       // Append to existing pool article under Deploy History section
@@ -894,18 +865,18 @@ export function filePositionClose(perf) {
       writeArticle(articlePath, content);
     }
 
-    log("kb", `Filed position close: ${name} (${outcome}, ${pnl.toFixed(1)}%)`);
+    log("kb", `Filed position close: ${name} (${outcome}, ${pnlText})`);
 
     // ─── Richer ingest: update concept articles touched by this close ───
     try {
-      _updateConceptArticles(perf, outcome, pnl, name, strategy, reason, vol, rangeEff, held);
+      _updateConceptArticles(perf, outcome, pnlText, name, strategy, reason, vol, rangeEff, held);
     } catch (e) {
       log("kb", `Concept article update failed (non-fatal): ${e.message}`);
     }
 
     // ─── Log the change ───
     try {
-      _appendLog(`CLOSE ${outcome}: ${name} PnL ${pnl.toFixed(1)}%, strategy=${strategy}, held=${held}min, reason=${reason}`);
+      _appendLog(`CLOSE ${outcome}: ${name} ${pnlText}, strategy=${strategy}, held=${held}min, reason=${reason}`);
     } catch { /* best-effort */ }
 
   } catch (e) {
@@ -914,10 +885,10 @@ export function filePositionClose(perf) {
 }
 
 // ─── Richer Ingest: concept article updates ──────────────────────
-function _updateConceptArticles(perf, outcome, pnl, name, strategy, reason, vol, rangeEff, held) {
+function _updateConceptArticles(perf, outcome, pnlText, name, strategy, reason, vol, rangeEff, held) {
   const kbDir = getKbDir();
   const now = new Date().toISOString().slice(0, 16);
-  const line = `- ${now} ${name}: ${outcome} ${pnl.toFixed(1)}%, held ${held}min, vol=${vol}, range_eff=${rangeEff}%`;
+  const line = `- ${now} ${name}: ${outcome === "UNKNOWN" ? "UNKNOWN PnL" : `${outcome} ${pnlText.replace(/^PnL /, "")}`}, held ${held}min, vol=${vol}, range_eff=${rangeEff}%`;
 
   // 1. Strategy pattern article (e.g. lessons/bid-ask-patterns.md)
   const stratSlug = (strategy || "unknown").replace(/[^a-z0-9]+/gi, "-").toLowerCase();

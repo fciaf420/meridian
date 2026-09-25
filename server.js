@@ -33,9 +33,9 @@ export function setStartupCache({ wallet, positions, candidates, lpOverview }) {
   _startupCache = { wallet, positions, candidates, lpOverview, ts: Date.now() };
 }
 import { getPerformanceSummary, getPerformanceHistory, listLessons, evolveThresholds } from "./lessons.js";
-import { getMemoryDashboardData } from "./memory.js";
+import { buildUnifiedMemoryBrief } from "./unified-memory.js";
 import { loadWeights } from "./signal-weights.js";
-import { getActiveExperiment, loadAutoresearch } from "./autoresearch.js";
+import { getActiveExperiment, loadAutoresearch, describeOverrides } from "./autoresearch.js";
 import { buildKnowledgeGraph } from "./tools/knowledge-graph.js";
 import { log } from "./logger.js";
 import { getScreeningThresholdSummary, normalizeCandidatesPayload } from "./runtime-helpers.js";
@@ -111,6 +111,8 @@ function buildAutoresearchPayload() {
           started_at: experiment.started_at,
           baseline: experiment.baseline ?? null,
           trial: experiment.trial ?? null,
+          result: experiment.result ?? null, // A/B verdict: delta_pct, ci95, n per arm
+          decision: experiment.decision ?? null,
         }))
     : [];
 
@@ -130,6 +132,8 @@ function buildAutoresearchPayload() {
         }
       : null,
     keptOverrideSections: Object.keys(state.kept_overrides || {}),
+    // Text + diff vs the prompt.js default + stale warnings, not just names.
+    overrides: describeOverrides(state, config),
     recentExperiments,
     recentLessons: listLessons({ tag: "autoresearch", limit: 20 }).lessons,
   };
@@ -138,7 +142,6 @@ function buildAutoresearchPayload() {
 function buildInsightsPayload() {
   return {
     lessons: listLessons({ limit: 30 }),
-    memory: getMemoryDashboardData(),
     darwin: buildDarwinPayload(),
     autoresearch: buildAutoresearchPayload(),
   };
@@ -759,7 +762,7 @@ export function startServer(timersFn) {
           break;
         }
         case "memory": {
-          data = getMemoryDashboardData();
+          data = buildUnifiedMemoryBrief("GENERAL");
           break;
         }
         case "darwin-weights": {

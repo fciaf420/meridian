@@ -97,8 +97,6 @@ npm install
 cd web && npm install && npm run build && cd ..
 ```
 
-Nuggets (holographic memory) is bundled in `packages/nuggets/` — no separate repo needed.
-
 ### Provider Setup
 
 Choose your provider:
@@ -262,13 +260,12 @@ It simply skips the REPL prompt.
 On launch Meridian typically:
 
 1. loads env and config
-2. initializes Nuggets memory
-3. deduplicates lessons
-4. restores any active autoresearch experiment
-5. starts the web server
-6. starts Telegram polling if configured
-7. starts the PnL watcher
-8. starts management and screening cron cycles
+2. deduplicates lessons
+3. restores any active autoresearch experiment
+4. starts the web server
+5. starts Telegram polling if configured
+6. starts the PnL watcher
+7. starts management and screening cron cycles
 
 ## Scheduler and Concurrency Rules
 
@@ -438,9 +435,11 @@ Everything in `user-config.json` is optional, but these are the main knobs.
 | `autoresearch` | enable prompt experiments |
 | `autoresearchModel` | model used for prompt edits |
 | `autoresearchReasoningEffort` | Codex reasoning effort for autoresearch |
-| `autoresearchMinCloses` | closes required per trial |
-| `autoresearchImprovementPct` | keep threshold |
-| `autoresearchDeclinePct` | revert threshold |
+| `autoresearchMinClosesPerArm` | closes needed in each A/B arm before a verdict (default 100) |
+| `autoresearchMinEffectPct` | minimum size-weighted mean PnL gain, in pp, to pass (default 1.5) |
+| `autoresearchMaxExperimentDays` | time cap; at the cap the result is inconclusive and the candidate is discarded (default 14) |
+| `autoresearchAutoKeep` | keep a passing candidate without operator approval (default false) |
+| `autoresearchMaxDiffPct` | reject candidates that change more than this % of the section's lines (default 30) |
 | `autoresearchCooldownCloses` | cooldown between experiments |
 
 ### Darwinian Weighting
@@ -467,11 +466,11 @@ Prompt budget shape:
 - role-matched lessons up to 15
 - recent lessons fill the remaining budget up to 35 total
 
-### Nuggets Memory
+### Pool Memory
 
-Nuggets provides persistent cross-session memory in `data/nuggets/`. Meridian uses multiple recall channels during management context building, including pool name, strategy plus bin step, strategy only, volatility bucket, and general lesson recall.
+`pool-memory.json` records every deploy and close per pool **address** (PnL, range efficiency, strategy, close reason, win rate) plus mid-position snapshots. Management and screening prompts get it as `POOL CONTEXT`; the agent can read it with `get_pool_memory` and annotate a pool with `add_pool_note`.
 
-High-hit facts can be promoted into longer-lived memory context. The dashboard also exposes structured nugget stats so the memory system is inspectable, not opaque.
+The earlier Nuggets memory layer was removed. If an older install still has `data/nuggets/`, it is ignored and can be deleted.
 
 ### Threshold Evolution
 
@@ -479,30 +478,21 @@ Meridian can evolve screening thresholds from real performance and lesson histor
 
 ### Autoresearch
 
-Autoresearch is prompt optimization driven by real closes.
+Autoresearch is prompt optimization driven by real closes, inspired by karpathy/autoresearch. Live PnL is a noisy, non-stationary metric, so it runs as a concurrent A/B test and a human approves any change.
 
 It:
 
-1. waits until there is enough close history
-2. identifies the weakest prompt section
-3. proposes one targeted prompt change
-4. runs that change over later closes
-5. keeps, reverts, or discards it based on trial performance
+1. waits until there is enough close history, off the close path (never blocks a close)
+2. attributes recent losses to a prompt section that is active for the current strategy
+3. asks the generator for one small change, steered by the human-edited `autoresearch-program.md`
+4. rejects candidates that touch HARD RULE / HARD SKIP / MUST / NEVER lines or change too much
+5. alternates screener runs between the control text and the candidate, tagging each deploy with its arm
+6. after `autoresearchMinClosesPerArm` closes per arm, passes only if the bootstrap 95% CI of the size-weighted mean PnL difference is above 0 and the gain is at least `autoresearchMinEffectPct`
+7. turns a pass into a pending proposal for the operator (`/autoresearch approve | reject`), unless `autoresearchAutoKeep` is on
 
-Current section targets:
+Section targets: `screener_criteria`, plus `range_selection` when the strategy isn't `evil_panda`. `manager_logic` can't be split into concurrent arms, so it isn't targeted.
 
-- `screener_criteria`
-- `manager_logic`
-- `range_selection`
-
-Important safeguards:
-
-- it requires a minimum data gate before starting
-- if the first 3 trial closes are all losses, it reverts early
-- keep / revert uses a composite score based on win rate and average PnL
-- kept overrides persist across restarts in `autoresearch.json`
-
-Autoresearch is experimental. Results can be confounded if other adaptive systems, such as Darwinian weighting, also change behavior during the same evaluation window.
+Kept overrides persist in `autoresearch.json` and are applied only while autoresearch is enabled. `/autoresearch list | show | revert | restore` manage them from Telegram or the REPL. The legacy overrides from the pre-A/B loop are quarantined there.
 
 ## LP Agent and External Data
 
@@ -525,7 +515,8 @@ meridian/
   state.js
   lessons.js
   autoresearch.js
-  memory.js
+  pool-memory.js
+  unified-memory.js
   server.js
   telegram.js
   llm-provider.js

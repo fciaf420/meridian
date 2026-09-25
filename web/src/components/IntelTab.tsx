@@ -47,34 +47,27 @@ type ExperimentSummary = {
   } | null;
 };
 
+type OverrideView = {
+  section: string;
+  status: string;
+  applied: boolean;
+  text: string;
+  summary: string;
+  added: string[];
+  removed: string[];
+  stale: string[];
+  experiment_id?: string | null;
+  reason?: string | null;
+};
+
 type AutoresearchPayload = {
   enabled: boolean;
   cooldownRemaining: number;
   active: ExperimentSummary | null;
   keptOverrideSections: string[];
+  overrides?: { kept: OverrideView[]; quarantined: OverrideView[]; pending?: OverrideView | null };
   recentExperiments: ExperimentSummary[];
   recentLessons: LessonItem[];
-};
-
-type MemoryFact = {
-  key: string;
-  value: string;
-  hits: number;
-};
-
-type MemoryNugget = {
-  name: string;
-  fact_count: number;
-  capacity_used_pct?: number | null;
-  facts: MemoryFact[];
-};
-
-type MemoryPayload = {
-  total_nuggets: number;
-  total_facts: number;
-  recalled_facts: number;
-  context: string | null;
-  nuggets: MemoryNugget[];
 };
 
 type InsightsPayload = {
@@ -82,7 +75,6 @@ type InsightsPayload = {
     total: number;
     lessons: LessonItem[];
   };
-  memory: MemoryPayload | null;
   darwin: DarwinPayload;
   autoresearch: AutoresearchPayload;
 };
@@ -184,7 +176,7 @@ export default function IntelTab() {
                 Intelligence Layer
               </div>
               <div className="text-xl font-semibold tracking-tight text-cream">
-                Lessons, memory, Darwin weights, and autoresearch state.
+                Lessons, Darwin weights, and autoresearch state.
               </div>
               <div className="flex flex-wrap gap-2 text-xs text-ash/60">
                 <Badge variant="outline">{data?.lessons.total ?? 0} lessons</Badge>
@@ -250,63 +242,6 @@ export default function IntelTab() {
 
         <Card>
           <CardContent className="p-4">
-            <div className="mb-3">
-              <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-amber-200/66">Memory</div>
-              <div className="mt-1 text-base font-medium tracking-tight text-cream">Prompt-injected nuggets</div>
-            </div>
-
-            {data?.memory ? (
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-wrap gap-2 text-xs text-ash/60">
-                  <Badge variant="outline">{data.memory.total_nuggets} nuggets</Badge>
-                  <Badge variant="secondary">{data.memory.total_facts} facts</Badge>
-                  <Badge variant="secondary">{data.memory.recalled_facts} recalled</Badge>
-                </div>
-
-                {data.memory.context ? (
-                  <pre className="whitespace-pre-wrap break-words rounded-2xl border border-white/8 bg-white/4 px-4 py-3 font-mono text-[11px] leading-relaxed text-cream/85">
-                    {data.memory.context}
-                  </pre>
-                ) : null}
-
-                <div className="grid gap-3 lg:grid-cols-2">
-                  {data.memory.nuggets.map((nugget) => (
-                    <div key={nugget.name} className="rounded-2xl border border-white/8 bg-white/4 px-4 py-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-ash/60">{nugget.name}</div>
-                          <div className="mt-1 text-sm text-cream/86">{nugget.fact_count} facts</div>
-                        </div>
-                        {nugget.capacity_used_pct != null ? (
-                          <Badge variant="outline">{fmtPct(nugget.capacity_used_pct)}</Badge>
-                        ) : null}
-                      </div>
-
-                      <div className="mt-3 flex flex-col gap-2">
-                        {nugget.facts.length ? (
-                          nugget.facts.map((fact) => (
-                            <div key={`${nugget.name}-${fact.key}`} className="rounded-xl border border-white/6 bg-black/10 px-3 py-2">
-                              <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-ash/56">{fact.key}</div>
-                              <div className="mt-1 text-sm text-cream/84">{fact.value}</div>
-                              <div className="mt-1 text-[10px] text-ash/52">hits: {fact.hits}</div>
-                            </div>
-                          ))
-                        ) : (
-                          <div className="text-sm text-ash/46">No facts stored.</div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <div className="text-sm text-ash/46">No promoted memory facts yet.</div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
             <div className="mb-3 flex items-center justify-between gap-3">
               <div>
                 <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-amber-200/66">Darwin Weights</div>
@@ -358,6 +293,24 @@ export default function IntelTab() {
                 <div className="mt-3 space-y-2 text-sm text-cream/84">
                   <div>Cooldown remaining: {data?.autoresearch.cooldownRemaining ?? 0}</div>
                   <div>Kept overrides: {(data?.autoresearch.keptOverrideSections || []).join(", ") || "none"}</div>
+                  {[...(data?.autoresearch.overrides?.pending ? [data.autoresearch.overrides.pending] : []), ...(data?.autoresearch.overrides?.kept || []), ...(data?.autoresearch.overrides?.quarantined || [])].map((o) => (
+                    <details key={`${o.status}-${o.section}`} className="rounded-xl border border-white/6 bg-black/10 px-3 py-2">
+                      <summary className="cursor-pointer text-sm">
+                        <span className="font-medium text-cream">{o.section}</span>{" "}
+                        <span className="text-ash/60">
+                          {o.status}
+                          {o.status === "kept" ? (o.applied ? " (applied)" : " (inactive)") : ""} · {o.summary}
+                        </span>
+                      </summary>
+                      {o.stale.length ? <div className="mt-2 text-xs text-amber-200/80">Stale: {o.stale.join("; ")}</div> : null}
+                      {o.reason ? <div className="mt-2 text-xs text-ash/60">{o.reason}</div> : null}
+                      <div className="mt-2 font-mono text-[11px] leading-5">
+                        {o.removed.map((l, i) => <div key={`r${i}`} className="text-red-300/80">- {l}</div>)}
+                        {o.added.map((l, i) => <div key={`a${i}`} className="text-emerald-300/80">+ {l}</div>)}
+                      </div>
+                      <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-[11px] text-cream/70">{o.text}</pre>
+                    </details>
+                  ))}
                   {data?.autoresearch.active ? (
                     <>
                       <Separator className="my-3" />

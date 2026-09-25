@@ -16,7 +16,6 @@ import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot, maybePromote, checkCapacity } from "./memory.js";
 import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
 import { emit } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -33,6 +32,7 @@ import {
   isScreeningBusy, setScreeningBusy,
 } from "./session.js";
 import { startServer } from "./server.js";
+import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
 import { getScreeningThresholdSummary, getStartupMode } from "./runtime-helpers.js";
 import { getRangeSelectionText } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
@@ -40,9 +40,6 @@ import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreeni
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${config.llm.managementModel} (provider: ${process.env.LLM_PROVIDER || "openrouter"})`);
-
-// Initialize holographic memory at startup
-initMemory();
 
 // One-time lesson dedup on startup
 deduplicateLessons();
@@ -226,7 +223,7 @@ function startCronJobs() {
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
     let mgmtReport = null;
     try {
-      // Targeted recall + trailing TP / stop loss pre-check
+      // Pool context + trailing TP / stop loss pre-check
       let memoryHints = "";
       let exitAlerts = "";
       // Set only when the exit pre-check below ran to completion; the code-side
@@ -234,17 +231,10 @@ function startCronJobs() {
       let precheckedPositions = null;
       try {
         const pos = await getMyPositions();
-        const recalls = [];
         const exits = [];
         const holdTimeHints = [];
         for (const p of pos.positions || []) {
-          // Memory recall
-          const hits = recallForManagement(p);
-          for (const h of hits) {
-            recalls.push(`[${h.source}] ${h.key}: ${h.answer} (confidence: ${(h.confidence * 100).toFixed(0)}%)`);
-          }
-          // Store mid-position snapshot in nuggets + pool-memory
-          rememberPositionSnapshot(p);
+          // Store mid-position snapshot in pool-memory (keyed by pool address)
           if (p.pool) recordPoolSnapshot(p.pool, p);
 
           // Trailing TP / stop loss check
@@ -276,9 +266,6 @@ function startCronJobs() {
               }
             } catch { /* GMGN exit context is best-effort */ }
           }
-        }
-        if (recalls.length > 0) {
-          memoryHints = `\n\nMEMORY RECALL (from past sessions):\n${recalls.join("\n")}\n`;
         }
         if (exits.length > 0) {
           exitAlerts = `\n\nEXIT ALERTS (CLOSE THESE IMMEDIATELY):\n${exits.join("\n")}\n`;
@@ -390,7 +377,7 @@ STEPS:
 3. If closing: ${usdcModeEnabled()
     ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
     : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result reports a failed swap or status "success_with_exposure".`}
-4. After closing a LOSING position — check MEMORY RECALL for patterns:
+4. After closing a LOSING position — check POOL CONTEXT and the lessons in your memory brief for patterns:
    - If 3+ similar losses (same pool type, volatility range, or strategy) → use update_config to adjust the threshold that would have prevented it
    - Examples: tighten maxVolatility, raise minOrganic, adjust stopLossPct, raise minVolume
 
@@ -420,9 +407,6 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
         }
         if (pos && !pos.error && !pos.positions?.length) await resetIdleManagementInterval();
       } catch { /* best-effort */ }
-      // Promote high-hit nugget facts to MEMORY.md
-      maybePromote();
-      checkCapacity();
       // Pattern synthesis to knowledge base (throttled, max once/hour, only when recent closes exist)
       try {
         const kbGoal = shouldFileObservations();
@@ -494,26 +478,6 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
       const strategyBlock = activeStrategy
         ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrategy.name} — ${activeStrategy.lp_strategy}, best for: ${activeStrategy.best_for}`
         : "";
-
-      // Targeted recall: recall strategy memories for common bin steps
-      let memoryHints = "";
-      try {
-        const recalls = [];
-        for (const bs of [80, 100, 125]) {
-          const hits = recallForScreening({ bin_step: bs });
-          for (const h of hits) recalls.push(h);
-        }
-        const recentPos = await getMyPositions();
-        for (const p of recentPos.positions || []) {
-          const hits = recallForScreening({ name: p.pair });
-          for (const h of hits) {
-            if (!recalls.some(x => x.key === h.key)) recalls.push(h);
-          }
-        }
-        if (recalls.length > 0) {
-          memoryHints = `\n\nMEMORY RECALL (from past sessions):\n${recalls.map(h => `[${h.source}] ${h.key}: ${h.answer}`).join("\n")}\n`;
-        }
-      } catch { /* memory recall is best-effort */ }
 
       // Pre-load top 3 candidates with recon data in parallel
       let candidateBlocks = "";
@@ -694,7 +658,7 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
         : "";
 
       const { content } = await screenerLoop(`
-SCREENING CYCLE — DEPLOY ONLY${memoryHints}${signalWeightsBlock}${kbScreenContext}${candidateBlocks}${gmgnSignalGuide}
+SCREENING CYCLE — DEPLOY ONLY${signalWeightsBlock}${kbScreenContext}${candidateBlocks}${gmgnSignalGuide}
 ${strategyBlock}
 ${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and GMGN signal data.
 Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
@@ -858,6 +822,7 @@ const TELEGRAM_HELP = [
   "DLMM LP Agent — Telegram control",
   "",
   "/status — wallet + open positions",
+  "/settings — effective config + which file each setting lives in",
   "/usdc [on|off] — show or toggle USDC mode",
   "/candidates — refresh top pools (then reply a number to deploy)",
   "1 / 2 / 3 … — deploy into that pool",
@@ -867,6 +832,7 @@ const TELEGRAM_HELP = [
   "/thresholds — screening thresholds + performance",
   "/learn [pool] — study top LPers (all top pools, or one address)",
   "/evolve — evolve thresholds from performance",
+  "/autoresearch [list|show|revert|restore …] — prompt overrides (operator only)",
   "/stop — shut the agent down",
   "/help — this list",
   "",
@@ -943,6 +909,12 @@ async function handleTelegramCommand(rawText) {
       }
       await tgSend(lines.join("\n"));
     });
+  }
+
+  // ── Settings (effective config + which file each value lives in) ──
+  if (text === "/settings" || text === "/config") {
+    const { buildSettingsReport } = await import("./settings-report.js");
+    return tgSend(buildSettingsReport({ color: false }));
   }
 
   // ── USDC mode (show/toggle) — terminal-parity with the CLI /usdc command ──
@@ -1072,6 +1044,12 @@ async function handleTelegramCommand(rawText) {
     });
   }
 
+  // ── Autoresearch overrides (operator path; logic lives in autoresearch.js) ──
+  if (lower === "/autoresearch" || lower.startsWith("/autoresearch ")) {
+    for (const chunk of autoresearchTelegramChunks(handleAutoresearchCommand(text.slice(13)))) await sendMessage(chunk);
+    return;
+  }
+
   // ── Free-form chat ──
   return runRemote(async () => {
     const { content } = await lightChat(text, sessionHistory, config.llm.generalModel);
@@ -1197,6 +1175,7 @@ Commands:
   /learn <addr>  Study top LPers from a specific pool address
   /thresholds    Show current screening thresholds + performance stats
   /evolve        Manually trigger threshold evolution from performance data
+  /autoresearch  Prompt overrides: list | show | revert | restore <section>
   /stop          Shut down
 `);
 
@@ -1390,6 +1369,12 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
           console.log("\nSaved to user-config.json. Applied immediately.\n");
         }
       });
+      return;
+    }
+
+    if (input === "/autoresearch" || input.toLowerCase().startsWith("/autoresearch ")) {
+      console.log(`\n${handleAutoresearchCommand(input.slice(13))}\n`);
+      rl.prompt();
       return;
     }
 

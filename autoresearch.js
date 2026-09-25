@@ -1,21 +1,34 @@
 /**
- * Autoresearch — automated prompt optimization system inspired by ATLAS.
+ * Autoresearch — automated prompt optimization, inspired by karpathy/autoresearch
+ * (an agent edits one thing, a fixed budget scores it, keep or discard, and a
+ * human-written program.md sets the direction).
  *
- * Identifies the worst-performing prompt section, generates a targeted
- * modification via a cheap LLM, tests it over N real closes, and
- * keeps/reverts based on actual PnL improvement.
+ * How it differs: live PnL is a noisy, non-stationary metric, not a fixed
+ * validation score, so each candidate runs as a concurrent A/B test against
+ * the current text and a human approves any winner.
+ *
+ * Flow: attribute recent losses to a prompt section that is active for the
+ * current strategy, ask the generator (steered by autoresearch-program.md) for
+ * one small edit, reject edits that touch protected lines or change too much,
+ * alternate screener runs between control and candidate, and after enough
+ * closes per arm, propose the candidate only if the bootstrap CI of the
+ * size-weighted PnL difference clears zero and the minimum effect.
  */
 
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { config } from "./config.js";
 import {
   getPromptSectionText,
+  getDefaultPromptSectionText,
   setPromptSectionOverride,
   clearPromptSectionOverride,
+  setExperimentCandidate,
+  clearExperimentCandidate,
 } from "./prompt.js";
 import { loadWeights, getWeightsSummary } from "./signal-weights.js";
 import {
@@ -27,7 +40,12 @@ import {
 } from "./llm-provider.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const AUTORESEARCH_FILE = path.join(__dirname, "autoresearch.json");
+// MERIDIAN_AUTORESEARCH_FILE lets tests point at a scratch copy instead of the repo file.
+const AUTORESEARCH_FILE = process.env.MERIDIAN_AUTORESEARCH_FILE || path.join(__dirname, "autoresearch.json");
+
+// Hard cap on one generator call (HTTP or CLI). Autoresearch never runs on the close
+// path, but a hung call would still hold the single-experiment lock forever.
+export const AUTORESEARCH_LLM_TIMEOUT_MS = 60_000;
 
 // ─── Persistence ─────────────────────────────────────────────
 
@@ -37,20 +55,31 @@ const DEFAULTS = {
   active: null,          // currently running experiment (or null)
   cooldownRemaining: 0,  // closes remaining before next experiment
   kept_overrides: {},    // section → text for permanently kept experiment overrides
+  kept_meta: {},         // section → { experiment_id, kept_at, strategy, default_hash }
+  pending_proposal: null,    // A/B winner awaiting operator approve/reject
+  quarantined_overrides: {}, // section → { text, reason, quarantined_at, strategy, ... } (never applied)
+  reverted_overrides: [],    // operator-reverted kept overrides, newest last
 };
 
-function readUserConfigSnapshot() {
-  const userConfigPath = path.join(__dirname, "user-config.json");
-  try {
-    if (!fs.existsSync(userConfigPath)) return {};
-    return JSON.parse(fs.readFileSync(userConfigPath, "utf8"));
-  } catch {
-    return {};
-  }
+const freshDefaults = () => structuredClone(DEFAULTS);
+
+const MANAGEMENT_THRESHOLD_KEYS = ["stopLossPct", "takeProfitFeePct", "trailingTriggerPct", "trailingDropPct"];
+
+/**
+ * Fingerprint of the threshold VALUES that shape which pools get deployed and
+ * when they exit. evolveThresholds rewrites _lastEvolved/_positionsAtEvolution
+ * every 5 closes even when it changes nothing (lessons.js "Always update the
+ * counter"), so those counters must not be what invalidates an experiment.
+ */
+export function thresholdFingerprint(cfg = config) {
+  const screening = cfg.screening || {};
+  const management = cfg.management || {};
+  const sorted = Object.fromEntries(Object.keys(screening).sort().map((k) => [k, screening[k] ?? null]));
+  const mgmt = Object.fromEntries(MANAGEMENT_THRESHOLD_KEYS.map((k) => [k, management[k] ?? null]));
+  return JSON.stringify({ screening: sorted, management: mgmt, activeStrategy: cfg.strategy?.activeStrategy ?? null });
 }
 
-function getEnvironmentSnapshot() {
-  const userConfig = readUserConfigSnapshot();
+export function getEnvironmentSnapshot(cfg = config) {
   let weightsMeta = {};
   try {
     const weights = loadWeights();
@@ -66,59 +95,62 @@ function getEnvironmentSnapshot() {
   }
 
   return {
-    thresholds_last_evolved: userConfig._lastEvolved ?? null,
-    thresholds_positions_at_evolution: userConfig._positionsAtEvolution ?? 0,
+    thresholds_fingerprint: thresholdFingerprint(cfg),
+    // Darwin metadata is recorded for the audit trail only; weight recalcs
+    // change prompt summary text, not hard filters, so they don't invalidate.
     darwin_last_recalc: weightsMeta.last_recalc,
     darwin_recalc_count: weightsMeta.recalc_count,
   };
 }
 
-function environmentChangedSince(snapshot = {}) {
-  const current = getEnvironmentSnapshot();
-  // Only invalidate on threshold evolution (changes hard screening filters).
-  // Darwin weight recalcs only affect prompt summary text, not hard filters —
-  // they shouldn't invalidate experiments since the actual screening behavior
-  // doesn't change. This was causing 50%+ of experiments to be invalidated
-  // before completing the 7-close minimum.
-  return (
-    current.thresholds_last_evolved !== (snapshot.thresholds_last_evolved ?? null) ||
-    current.thresholds_positions_at_evolution !== (snapshot.thresholds_positions_at_evolution ?? 0)
-  );
-}
-
-function getTrialPositionsForExperiment(experiment, perfData) {
-  if (!experiment) return [];
-
-  if (experiment.section === "manager_logic") {
-    return perfData.filter((p) => {
-      const closedAt = p.recorded_at || p.closed_at;
-      return closedAt ? closedAt >= experiment.started_at : false;
-    });
-  }
-
-  return perfData.slice(experiment.started_at_position)
-    .filter((p) => {
-      const deployedAt = p.deployed_at;
-      if (deployedAt) return deployedAt >= experiment.started_at;
-      const closedAt = p.recorded_at || p.closed_at;
-      return closedAt ? closedAt >= experiment.started_at : true;
-    });
+/**
+ * True only when a threshold VALUE changed since the snapshot was taken.
+ * Legacy snapshots (evolution counters, no fingerprint) never invalidate.
+ */
+export function environmentChangedSince(snapshot = {}, cfg = config) {
+  if (snapshot?.thresholds_fingerprint == null) return false;
+  return thresholdFingerprint(cfg) !== snapshot.thresholds_fingerprint;
 }
 
 // Set when autoresearch.json is present but unparseable. While degraded we
-// refuse to overwrite the (recoverable) bad file with defaults.
+// refuse to overwrite the (recoverable) bad file. The flag clears as soon as
+// the file parses again (an operator fixed or restored it), without a restart.
 let _autoresearchDegraded = false;
+let _corruptBackupPath = null;
+
+function fileParses() {
+  try {
+    JSON.parse(fs.readFileSync(AUTORESEARCH_FILE, "utf8"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearDegraded() {
+  if (!_autoresearchDegraded) return;
+  _autoresearchDegraded = false;
+  _corruptBackupPath = null;
+  log("autoresearch", `${AUTORESEARCH_FILE} parses again — leaving degraded mode, saves re-enabled`);
+}
+
+export function isAutoresearchDegraded() {
+  return _autoresearchDegraded;
+}
 
 export function loadAutoresearch() {
   if (!fs.existsSync(AUTORESEARCH_FILE)) {
     // File absent — safe to create fresh defaults.
-    saveAutoresearch(DEFAULTS);
-    return { ...DEFAULTS };
+    clearDegraded();
+    saveAutoresearch(freshDefaults());
+    return freshDefaults();
   }
   try {
     const data = JSON.parse(fs.readFileSync(AUTORESEARCH_FILE, "utf8"));
-    // Merge with DEFAULTS so existing files gain new fields (e.g. kept_overrides)
-    return { ...DEFAULTS, ...data };
+    clearDegraded();
+    // Merge with (fresh copies of) DEFAULTS so existing files gain new fields
+    // without later mutations leaking into the shared DEFAULTS object.
+    return { ...freshDefaults(), ...data };
   } catch (err) {
     // File PRESENT but corrupt: do NOT silently fall back to DEFAULTS (a later
     // save would wipe experiment history and kept overrides). Preserve the bad
@@ -127,62 +159,433 @@ export function loadAutoresearch() {
       try {
         const backup = `${AUTORESEARCH_FILE}.corrupt-${Date.now()}`;
         fs.copyFileSync(AUTORESEARCH_FILE, backup);
-        log("autoresearch", `autoresearch.json is corrupt (${err.message}); preserved as ${backup}. Refusing to overwrite until recovered.`);
+        _corruptBackupPath = backup;
+        log("autoresearch", `${AUTORESEARCH_FILE} is corrupt (${err.message}); a copy was preserved as ${backup}. Saves are disabled until ${AUTORESEARCH_FILE} itself is fixed or replaced.`);
       } catch (backupErr) {
-        log("autoresearch", `autoresearch.json is corrupt (${err.message}) and backup failed: ${backupErr.message}. Refusing to overwrite until recovered.`);
+        log("autoresearch", `${AUTORESEARCH_FILE} is corrupt (${err.message}) and backup failed: ${backupErr.message}. Saves are disabled until ${AUTORESEARCH_FILE} itself is fixed or replaced.`);
       }
     }
     _autoresearchDegraded = true;
-    throw new Error(`autoresearch.json is corrupt and was preserved for recovery: ${err.message}`);
+    throw new Error(`autoresearch.json is corrupt and was preserved for recovery: ${err.message}`, { cause: err });
   }
 }
 
 export function saveAutoresearch(data) {
   // Never persist over a corrupt-but-present file; that would destroy
-  // recoverable history. Skip saves until the file is restored.
+  // recoverable history. Once the file parses again the save goes through.
   if (_autoresearchDegraded) {
-    log("autoresearch", "Skipping autoresearch.json save: file is in degraded (corrupt) state. Restore or remove the corrupt backup to re-enable saves.");
-    return;
+    if (fs.existsSync(AUTORESEARCH_FILE) && !fileParses()) {
+      log("autoresearch", `Skipping save: ${AUTORESEARCH_FILE} is corrupt. Fix or replace that file (not the backup${_corruptBackupPath ? ` ${_corruptBackupPath}` : ""}); saves resume once it parses.`);
+      return;
+    }
+    clearDegraded();
   }
-  fs.writeFileSync(AUTORESEARCH_FILE, JSON.stringify(data, null, 2));
+  // Atomic: write a temp file in the same directory, then rename over the
+  // original, so a crash mid-write can't leave a truncated autoresearch.json.
+  const tmp = `${AUTORESEARCH_FILE}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, serializeAutoresearch(data));
+    fs.renameSync(tmp, AUTORESEARCH_FILE);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+    throw e;
+  }
+}
+
+/**
+ * 2-space JSON with non-ASCII escaped as \uXXXX. That is the format the
+ * tracked file has always used, so rewriting it leaves the experiment history
+ * byte-identical.
+ */
+export function serializeAutoresearch(data) {
+  return JSON.stringify(data, null, 2)
+    .replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+// ─── Override provenance, staleness and migration ────────────
+
+const LEGACY_QUARANTINE_MIGRATION = "quarantine_legacy_kept_overrides_v1";
+const LEGACY_QUARANTINE_REASON =
+  "Kept by the pre-A/B loop: each verdict compared one 7-close window against a different 7-close window " +
+  "with no concurrent control (a placebo is 'kept' ~45% of the time), all 32 experiments ran 2026-03-27..04-04 " +
+  "under the bid_ask default, and the text was hand-edited after it was tested. Quarantined: inactive until an " +
+  "operator restores it (/autoresearch restore <section>).";
+
+export function hashText(text) {
+  return createHash("sha256").update(String(text ?? "")).digest("hex").slice(0, 16);
+}
+
+/** Current default-template fingerprint for a section (detects later prompt.js edits). */
+export function defaultSectionHash(section) {
+  const text = getDefaultPromptSectionText(section);
+  return text == null ? null : hashText(text);
+}
+
+/**
+ * One-time migration: move the legacy kept_overrides into quarantined_overrides
+ * and close any legacy (pre-A/B) active experiment. Mutates `state`; returns
+ * true when something changed. Idempotent: a marker in state.migrations
+ * makes every later call a no-op. Experiments are never rewritten.
+ */
+export function migrateAutoresearchState(state, now = new Date()) {
+  if (!state || typeof state !== "object") return false;
+  state.migrations = state.migrations || {};
+  if (state.migrations[LEGACY_QUARANTINE_MIGRATION]) return false;
+  const at = now.toISOString();
+  const kept = state.kept_overrides || {};
+  state.quarantined_overrides = state.quarantined_overrides || {};
+  const experiments = Array.isArray(state.experiments) ? state.experiments : [];
+  for (const [section, text] of Object.entries(kept)) {
+    state.quarantined_overrides[section] = {
+      text,
+      reason: LEGACY_QUARANTINE_REASON,
+      quarantined_at: at,
+      source: "kept_overrides",
+      strategy: "bid_ask",
+      default_hash: null,
+      experiment_ids: experiments.filter((e) => e?.section === section && e?.status === "kept").map((e) => e.id),
+    };
+  }
+  state.kept_overrides = {};
+  state.kept_meta = {};
+  state.migrations[LEGACY_QUARANTINE_MIGRATION] = at;
+  return true;
+}
+
+/**
+ * Reasons an override may no longer fit the running bot (empty = fresh).
+ * `meta` is the provenance recorded when it was kept: { strategy, default_hash }.
+ */
+export function overrideStaleness(section, meta, cfg = config) {
+  const reasons = [];
+  const current = cfg.strategy?.activeStrategy ?? null;
+  if (!meta) {
+    reasons.push("no provenance recorded (legacy override)");
+  } else {
+    if (meta.strategy && current && meta.strategy !== current) {
+      reasons.push(`generated under ${meta.strategy}, current strategy is ${current}`);
+    }
+    if (meta.default_hash && meta.default_hash !== defaultSectionHash(section)) {
+      reasons.push("the prompt.js default for this section changed after it was kept");
+    } else if (!meta.default_hash) {
+      reasons.push("no default fingerprint recorded, so later prompt.js edits can't be detected");
+    }
+  }
+  if (section === "range_selection" && current === "evil_panda") {
+    reasons.push("inert under evil_panda (the Evil Panda range text takes precedence)");
+  }
+  return reasons;
+}
+
+/** Set-based line diff: lines only in `before` (removed) and only in `after` (added). */
+export function lineDiff(before, after) {
+  const norm = (t) => String(t ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const a = norm(before);
+  const b = norm(after);
+  const aSet = new Set(a);
+  const bSet = new Set(b);
+  return {
+    removed: a.filter((l) => !bSet.has(l)),
+    added: b.filter((l) => !aSet.has(l)),
+    total: a.length,
+  };
+}
+
+function diffSummary(section, text) {
+  const d = lineDiff(getDefaultPromptSectionText(section), text);
+  return { added: d.added, removed: d.removed, summary: `+${d.added.length} / -${d.removed.length} lines vs default` };
 }
 
 // ─── Startup Restoration ─────────────────────────────────────
 
 /**
- * On module load, restore any active experiment's override into memory.
- * Without this, a restart would lose the in-memory override while
- * autoresearch.json still shows an active experiment.
+ * Apply persisted overrides to the in-memory prompt. Overrides are inert
+ * unless autoresearch is enabled: with it off, the bot runs on the prompt.js
+ * defaults and nothing in autoresearch.json reaches the agent.
  */
+export function applyStartupOverrides(state, cfg = config) {
+  const applied = [];
+  if (cfg?.autoresearch?.enabled !== true) {
+    const n = Object.keys(state?.kept_overrides || {}).length;
+    if (n || state?.active) {
+      log("autoresearch", `Autoresearch disabled — ${n} kept override(s)${state?.active ? " and the active experiment" : ""} left inactive`);
+    }
+    return applied;
+  }
+  for (const [section, text] of Object.entries(state.kept_overrides || {})) {
+    setPromptSectionOverride(section, text);
+    applied.push(section);
+    const stale = overrideStaleness(section, state.kept_meta?.[section], cfg);
+    log("autoresearch", `Restored kept override: ${section}${stale.length ? ` — WARNING stale: ${stale.join("; ")}` : ""}`);
+  }
+  // The active experiment's candidate is served to its A/B arm only; it never
+  // replaces the control text. Legacy (pre-A/B) experiments aren't restored:
+  // the next evaluation closes them as abandoned.
+  if (state.active?.design === "ab" && state.active?.modified_text && state.active?.section) {
+    setExperimentCandidate({ id: state.active.id, section: state.active.section, text: state.active.modified_text });
+    applied.push(`candidate:${state.active.section}`);
+    log("autoresearch", `Restored active A/B experiment: ${state.active.id} (${state.active.section})`);
+  }
+  return applied;
+}
+
 try {
   const state = loadAutoresearch();
-  // First restore all kept overrides so they survive restarts
-  if (state.kept_overrides) {
-    for (const [section, text] of Object.entries(state.kept_overrides)) {
-      setPromptSectionOverride(section, text);
-      log("autoresearch", `Restored kept override: ${section}`);
-    }
+  if (migrateAutoresearchState(state)) {
+    saveAutoresearch(state);
+    const q = Object.keys(state.quarantined_overrides || {});
+    log("autoresearch", `Migrated autoresearch.json: legacy kept overrides quarantined (${q.join(", ") || "none"})`);
   }
-  // Then restore the active experiment (overrides the kept one for that section)
-  if (state.active?.modified_text && state.active?.section) {
-    setPromptSectionOverride(state.active.section, state.active.modified_text);
-    log("autoresearch", `Restored active experiment override: ${state.active.id} (${state.active.section})`);
-  }
+  applyStartupOverrides(state, config);
 } catch { /* ignore on first load if file doesn't exist yet */ }
+
+// ─── Operator commands (Telegram + REPL: /autoresearch …) ────
+
+const SECTIONS = ["screener_criteria", "manager_logic", "range_selection"];
+
+function fmtOverrideBlock(section, text, meta, cfg, { full = false } = {}) {
+  const d = diffSummary(section, text);
+  const stale = overrideStaleness(section, meta, cfg);
+  const lines = [`• ${section}: ${d.summary}${meta?.experiment_id ? ` (from ${meta.experiment_id})` : ""}`];
+  if (stale.length) lines.push(`  ⚠ stale: ${stale.join("; ")}`);
+  const cap = full ? Infinity : 6;
+  for (const l of d.removed.slice(0, cap)) lines.push(`  - ${l}`);
+  for (const l of d.added.slice(0, cap)) lines.push(`  + ${l}`);
+  if (!full && (d.removed.length > cap || d.added.length > cap)) lines.push(`  … /autoresearch show ${section} for the full text`);
+  if (full) lines.push("", "Full text:", text);
+  return lines.join("\n");
+}
+
+const AUTORESEARCH_HELP = [
+  "/autoresearch — status",
+  "/autoresearch list — kept and quarantined overrides with a diff vs the default",
+  "/autoresearch show <section> — full text + diff (kept, else quarantined)",
+  "/autoresearch revert <section> — deactivate a kept override (kept in reverted history)",
+  "/autoresearch restore <section> — re-keep the latest reverted or quarantined text",
+  "/autoresearch approve — keep the pending proposal (an A/B winner)",
+  "/autoresearch reject — discard the pending proposal",
+  "/autoresearch abort — stop the active experiment (candidate discarded)",
+].join("\n");
+
+/**
+ * Operator path for overrides. Returns plain text (callers escape for
+ * Telegram HTML). Not exposed as an LLM tool on purpose.
+ */
+export function handleAutoresearchCommand(argString = "", cfg = config) {
+  const [sub = "status", sectionArg] = String(argString).trim().split(/\s+/).filter(Boolean);
+  const cmd = sub.toLowerCase();
+  let state;
+  try {
+    state = loadAutoresearch();
+  } catch (e) {
+    return `autoresearch.json is unreadable: ${e.message}`;
+  }
+  const enabled = cfg?.autoresearch?.enabled === true;
+  const kept = state.kept_overrides || {};
+  const quarantined = state.quarantined_overrides || {};
+  const needSection = () => (SECTIONS.includes(sectionArg) ? null : `Unknown or missing section. Use one of: ${SECTIONS.join(", ")}`);
+
+  if (cmd === "help") return AUTORESEARCH_HELP;
+
+  if (cmd === "status") {
+    const lines = [
+      `Autoresearch: ${enabled ? "enabled" : "disabled (overrides inactive)"} | strategy: ${cfg.strategy?.activeStrategy ?? "?"}`,
+      `Kept overrides: ${Object.keys(kept).join(", ") || "none"}`,
+      `Quarantined: ${Object.keys(quarantined).join(", ") || "none"}`,
+      `Active experiment: ${state.active
+        ? `${state.active.id} (${state.active.section}) — closes control ${state.active.trial?.control ?? 0} / candidate ${state.active.trial?.candidate ?? 0} of ${cfg.autoresearch?.minClosesPerArm ?? 100} per arm`
+        : "none"}`,
+      `Pending proposal: ${state.pending_proposal
+        ? `${state.pending_proposal.experiment_id} (${state.pending_proposal.section}) Δ ${state.pending_proposal.result?.delta_pct} pp, 95% CI ${state.pending_proposal.result?.ci95?.join("..")}`
+        : "none"}`,
+      `Experiments recorded: ${(state.experiments || []).length}`,
+      "",
+      AUTORESEARCH_HELP,
+    ];
+    return lines.join("\n");
+  }
+
+  if (cmd === "list") {
+    const lines = [`Kept overrides (${enabled ? "applied" : "inactive while autoresearch is disabled"}):`];
+    if (!Object.keys(kept).length) lines.push("  none");
+    for (const [section, text] of Object.entries(kept)) lines.push(fmtOverrideBlock(section, text, state.kept_meta?.[section], cfg));
+    lines.push("", "Quarantined (never applied):");
+    if (!Object.keys(quarantined).length) lines.push("  none");
+    for (const [section, q] of Object.entries(quarantined)) {
+      lines.push(fmtOverrideBlock(section, q.text, q, cfg));
+      lines.push(`  quarantined ${q.quarantined_at}: ${q.reason}`);
+    }
+    return lines.join("\n");
+  }
+
+  if (cmd === "show") {
+    const bad = needSection();
+    if (bad) return bad;
+    if (kept[sectionArg]) return `Kept override\n${fmtOverrideBlock(sectionArg, kept[sectionArg], state.kept_meta?.[sectionArg], cfg, { full: true })}`;
+    if (quarantined[sectionArg]) return `Quarantined override\n${fmtOverrideBlock(sectionArg, quarantined[sectionArg].text, quarantined[sectionArg], cfg, { full: true })}`;
+    return `No kept or quarantined override for ${sectionArg}; the prompt.js default is in use.`;
+  }
+
+  if (cmd === "revert") {
+    const bad = needSection();
+    if (bad) return bad;
+    if (!kept[sectionArg]) return `No kept override for ${sectionArg}.`;
+    state.reverted_overrides = Array.isArray(state.reverted_overrides) ? state.reverted_overrides : [];
+    state.reverted_overrides.push({
+      section: sectionArg,
+      text: kept[sectionArg],
+      meta: state.kept_meta?.[sectionArg] ?? null,
+      reverted_at: new Date().toISOString(),
+    });
+    delete state.kept_overrides[sectionArg];
+    if (state.kept_meta) delete state.kept_meta[sectionArg];
+    saveAutoresearch(state);
+    clearPromptSectionOverride(sectionArg);
+    return `Reverted ${sectionArg}: the prompt.js default is live again. /autoresearch restore ${sectionArg} undoes this.`;
+  }
+
+  if (cmd === "restore") {
+    const bad = needSection();
+    if (bad) return bad;
+    if (kept[sectionArg]) return `${sectionArg} already has a kept override; /autoresearch revert ${sectionArg} first.`;
+    const reverted = (state.reverted_overrides || []).filter((r) => r.section === sectionArg);
+    let text, meta, from;
+    if (reverted.length) {
+      const last = reverted[reverted.length - 1];
+      text = last.text;
+      meta = last.meta;
+      from = "reverted history";
+      state.reverted_overrides = state.reverted_overrides.filter((r) => r !== last);
+    } else if (quarantined[sectionArg]) {
+      const q = quarantined[sectionArg];
+      text = q.text;
+      meta = { strategy: q.strategy ?? null, default_hash: q.default_hash ?? null, experiment_id: q.experiment_ids?.at(-1) ?? null, restored_from: "quarantine" };
+      from = "quarantine";
+      delete state.quarantined_overrides[sectionArg];
+    } else {
+      return `Nothing to restore for ${sectionArg}.`;
+    }
+    state.kept_overrides = { ...(state.kept_overrides || {}), [sectionArg]: text };
+    state.kept_meta = { ...(state.kept_meta || {}), [sectionArg]: { ...(meta || {}), restored_at: new Date().toISOString() } };
+    saveAutoresearch(state);
+    if (enabled) setPromptSectionOverride(sectionArg, text);
+    const stale = overrideStaleness(sectionArg, state.kept_meta[sectionArg], cfg);
+    return [
+      `Restored ${sectionArg} from ${from}. ${enabled ? "Applied now." : "Inactive until autoresearch is enabled."}`,
+      stale.length ? `⚠ stale: ${stale.join("; ")}` : null,
+    ].filter(Boolean).join("\n");
+  }
+
+  if (cmd === "approve" || cmd === "reject") {
+    const p = state.pending_proposal;
+    if (!p) return "No pending proposal.";
+    const at = new Date().toISOString();
+    const exp = (state.experiments || []).findLast?.((e) => e.id === p.experiment_id);
+    if (exp) exp.decision = { action: cmd === "approve" ? "approved" : "rejected", at };
+    if (cmd === "approve") {
+      if (kept[p.section]) {
+        state.reverted_overrides = Array.isArray(state.reverted_overrides) ? state.reverted_overrides : [];
+        state.reverted_overrides.push({ section: p.section, text: kept[p.section], meta: state.kept_meta?.[p.section] ?? null, reverted_at: at, replaced_by: p.experiment_id });
+      }
+      keepOverride(state, p.section, p.text, p.experiment_id, cfg);
+    }
+    state.pending_proposal = null;
+    saveAutoresearch(state);
+    return cmd === "approve"
+      ? `Approved ${p.experiment_id}: ${p.section} kept. ${enabled ? "Applied now." : "Inactive until autoresearch is enabled."} /autoresearch revert ${p.section} undoes this.`
+      : `Rejected ${p.experiment_id}; the current ${p.section} text stays.`;
+  }
+
+  if (cmd === "abort") {
+    if (!state.active) return "No active experiment.";
+    const id = state.active.id;
+    finishExperiment(state, "aborted_by_operator", cfg.autoresearch?.cooldownCloses ?? 5);
+    return `Aborted ${id}; its candidate is no longer served.`;
+  }
+
+  return `Unknown subcommand "${sub}".\n${AUTORESEARCH_HELP}`;
+}
+
+/** Dashboard view of kept/quarantined overrides: text, diff vs default, staleness. */
+export function describeOverrides(state, cfg = config) {
+  const enabled = cfg?.autoresearch?.enabled === true;
+  const describe = (section, text, meta, status) => {
+    const d = diffSummary(section, text);
+    return {
+      section,
+      status,
+      applied: status === "kept" && enabled,
+      text,
+      summary: d.summary,
+      added: d.added,
+      removed: d.removed,
+      stale: overrideStaleness(section, meta, cfg),
+      experiment_id: meta?.experiment_id ?? meta?.experiment_ids?.at?.(-1) ?? null,
+      reason: meta?.reason ?? null,
+    };
+  };
+  const p = state?.pending_proposal;
+  return {
+    kept: Object.entries(state?.kept_overrides || {}).map(([s, t]) => describe(s, t, state.kept_meta?.[s], "kept")),
+    quarantined: Object.entries(state?.quarantined_overrides || {}).map(([s, q]) => describe(s, q.text, q, "quarantined")),
+    pending: p ? { ...describe(p.section, p.text, p, "pending"), hypothesis: p.hypothesis, result: p.result, proposed_at: p.proposed_at } : null,
+  };
+}
+
+/** Escape for Telegram's HTML parse mode and split under its 4096-char cap. */
+export function autoresearchTelegramChunks(text, size = 3500) {
+  const s = String(text ?? "");
+  const out = [];
+  for (let i = 0; i < s.length; i += size) {
+    out.push(s.slice(i, i + size).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  }
+  return out;
+}
 
 // ─── Main Entry Point ────────────────────────────────────────
 
-/**
- * Called from recordPerformance after each close.
- * Evaluates an active experiment or starts a new one.
- */
-export async function maybeRunAutoresearch(perfData, lessons, cfg) {
-  if (cfg.autoresearch?.enabled !== true) return;
+// In-process single-flight lock. Two closes arriving while the generator is
+// thinking must never both see active=null and start two experiments (M3).
+let _running = null;
 
+/**
+ * Called (fire-and-forget) after each close is recorded. Evaluates the active
+ * experiment or starts a new one. Never awaited by the close path: the returned
+ * promise exists for tests and always resolves (errors are logged, not thrown).
+ */
+export function maybeRunAutoresearch(perfData, lessons, cfg) {
+  if (cfg?.autoresearch?.enabled !== true) return Promise.resolve({ skipped: "disabled" });
+  if (_running) {
+    log("autoresearch", "Previous autoresearch run still in progress — skipping this close (the next close re-evaluates)");
+    return Promise.resolve({ skipped: "busy" });
+  }
+  _running = (async () => {
+    try {
+      await runAutoresearchOnce(perfData, lessons, cfg);
+      return { ran: true };
+    } catch (e) {
+      log("autoresearch", `Error: ${e.message}`);
+      return { error: e.message };
+    } finally {
+      _running = null;
+    }
+  })();
+  return _running;
+}
+
+/** True while a run holds the lock (for tests and status output). */
+export function isAutoresearchRunning() {
+  return _running !== null;
+}
+
+async function runAutoresearchOnce(perfData, lessons, cfg) {
   const state = loadAutoresearch();
 
   if (state.active) {
     await evaluateExperiment(perfData, cfg, state);
+  } else if (state.pending_proposal) {
+    // One change at a time: wait for the operator to approve or reject.
+    log("autoresearch", `Proposal from ${state.pending_proposal.experiment_id} awaits operator review (/autoresearch approve | reject) — not starting a new experiment`);
   } else {
     // Decrement cooldown
     if (state.cooldownRemaining > 0) {
@@ -197,52 +600,106 @@ export async function maybeRunAutoresearch(perfData, lessons, cfg) {
 
 // ─── Analyze + Generate Experiment ───────────────────────────
 
-async function analyzeAndGenerate(perfData, lessons, cfg, state) {
-  const minCloses = cfg.autoresearch?.minClosesPerTrial ?? 7;
+/**
+ * Sections an experiment may target under the current strategy. Under
+ * evil_panda, getRangeSelectionText returns the fixed Evil Panda text before
+ * it looks at any override (PR #9), so a range_selection edit would be a
+ * placebo that silently activates if the strategy is ever switched back.
+ *
+ * manager_logic is not eligible: one manager prompt covers every open
+ * position, so it can't be split into concurrent control/candidate arms the
+ * way a screener run (one arm per run, tagged on the deploy) can.
+ */
+export function eligibleSections(cfg = config) {
+  const sections = ["screener_criteria"];
+  if (cfg?.strategy?.activeStrategy !== "evil_panda") sections.push("range_selection");
+  return sections;
+}
 
-  // Need at least 15 closes to analyze, or at minimum minCloses * 2
-  if (perfData.length < Math.max(15, minCloses * 2)) {
-    log("autoresearch", `Not enough data (${perfData.length} closes) — skipping`);
-    return;
-  }
-
-  // 1. Attribute recent losses to prompt sections
-  const recent = perfData.slice(-15);
-  const sectionLosses = {
-    screener_criteria: [],
-    manager_logic: [],
-    range_selection: [],
-  };
-
+/** Map recent losing closes to the prompt section most likely responsible. */
+export function attributeLosses(recent) {
+  const sectionLosses = { screener_criteria: [], manager_logic: [], range_selection: [] };
   for (const p of recent) {
     if ((p.pnl_usd ?? 0) >= 0) continue; // skip winners
+    if (p.pnl_unknown) continue;          // a 0 placeholder, not a measured loss
 
     const reason = (p.close_reason || "").toLowerCase();
 
     if (reason.includes("stop_loss") || reason.includes("trailing_tp") || reason.includes("oor downside")) {
       sectionLosses.manager_logic.push(p);
-    } else if ((p.range_efficiency ?? 100) < 30) {
-      sectionLosses.range_selection.push(p);
     } else if (reason.includes("oor upside")) {
-      // OOR upside on single-sided-below (bid_ask, SOL-only spot) is a
-      // STRATEGY problem, not a range problem — wider range only adds bins
-      // below and literally cannot catch upside moves.  Attribute to screener
-      // so the LLM considers strategy changes, not range widening.
+      // Checked BEFORE range efficiency: a single-sided-below position that went
+      // OOR upside always has low range efficiency, but wider range only adds
+      // bins below and cannot catch an upside move. That is a strategy/screening
+      // problem, so bid_ask and SOL-only spot go to the screener.
       const strat = (p.strategy || "").toLowerCase();
-      if (strat.includes("bid_ask") || strat === "spot") {
+      const twoSided = p.sol_split_pct != null && p.sol_split_pct < 100;
+      if (strat.includes("bid_ask") || (strat === "spot" && !twoSided)) {
         sectionLosses.screener_criteria.push(p);
       } else {
         sectionLosses.range_selection.push(p);
       }
+    } else if ((p.range_efficiency ?? 100) < 30) {
+      sectionLosses.range_selection.push(p);
     } else {
       sectionLosses.screener_criteria.push(p);
     }
   }
+  return sectionLosses;
+}
 
-  // 2. Pick the worst section — with rotation to avoid optimizing the same section repeatedly
-  const sections = Object.entries(sectionLosses).filter(([, losses]) => losses.length > 0);
+// A line is protected when it states a binding rule. Candidates must keep every
+// protected line verbatim and may not add new ones (added HARD rules can never
+// be removed by a later experiment, which is how the 1h-appreciation filter
+// ratcheted from 25% down to 0.5%).
+const PROTECTED_LINE = /HARD RULE|HARD SKIP|\bMUST\b|\bNEVER\b/;
+
+/**
+ * Validate a generated candidate against the section it replaces.
+ * Returns null when acceptable, otherwise the rejection reason.
+ */
+export function validateCandidate(original, modified, cfg = config) {
+  const maxDiffPct = cfg?.autoresearch?.maxDiffPct ?? 30;
+  const origLines = String(original ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const modLines = String(modified ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
+  if (!modLines.length) return "empty candidate";
+  const modSet = new Set(modLines);
+  const origSet = new Set(origLines);
+
+  const dropped = origLines.filter((l) => PROTECTED_LINE.test(l) && !modSet.has(l));
+  if (dropped.length) return `changes or drops a protected line: "${dropped[0].slice(0, 100)}"`;
+  const addedProtected = modLines.filter((l) => PROTECTED_LINE.test(l) && !origSet.has(l));
+  if (addedProtected.length) return `adds a new binding rule: "${addedProtected[0].slice(0, 100)}"`;
+
+  if (/^-{3,}$/m.test(String(modified))) return "contains --- delimiter lines";
+
+  const placeholders = (t) => new Set(String(t).match(/\$\{\w+\}/g) || []);
+  const missing = [...placeholders(original)].filter((ph) => !placeholders(modified).has(ph));
+  if (missing.length) return `drops template placeholder(s): ${missing.join(", ")}`;
+
+  const { removed, added } = lineDiff(original, modified);
+  const changed = Math.max(removed.length, added.length);
+  const pct = (changed / Math.max(origLines.length, 1)) * 100;
+  if (pct > maxDiffPct) return `diff too large: ${changed}/${origLines.length} lines (${pct.toFixed(0)}% > ${maxDiffPct}%)`;
+  return null;
+}
+
+async function analyzeAndGenerate(perfData, lessons, cfg, state) {
+  // Need at least 15 closes to attribute losses from.
+  if (perfData.length < 15) {
+    log("autoresearch", `Not enough data (${perfData.length} closes) — skipping`);
+    return;
+  }
+
+  // 1. Attribute recent losses to prompt sections
+  const sectionLosses = attributeLosses(perfData.slice(-15));
+
+  // 2. Pick the worst section — with rotation to avoid optimizing the same section repeatedly.
+  // Sections whose text the agent never sees under the current strategy are skipped.
+  const allowed = new Set(eligibleSections(cfg));
+  const sections = Object.entries(sectionLosses).filter(([s, losses]) => allowed.has(s) && losses.length > 0);
   if (sections.length === 0) {
-    log("autoresearch", "No losses in recent closes — nothing to optimize");
+    log("autoresearch", `No attributed losses in an eligible section (${[...allowed].join(", ")}) — nothing to optimize`);
     return;
   }
 
@@ -323,7 +780,7 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
   let hypothesis, modifiedText;
 
   try {
-    const result = await callLLM(llmModel, worstSection, worstCount, currentText, failureDesc + kbContext);
+    const result = await _generator(llmModel, worstSection, worstCount, currentText, failureDesc + kbContext);
     hypothesis = result.hypothesis;
     modifiedText = result.modifiedText;
   } catch (e) {
@@ -336,37 +793,34 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
     return;
   }
 
-  // 5. Compute baseline from last N positions
-  const baselinePositions = perfData.slice(-minCloses);
-  const baselineWins = baselinePositions.filter(p => (p.pnl_usd ?? 0) > 0).length;
-  const baselineWR = baselinePositions.length > 0
-    ? (baselineWins / baselinePositions.length) * 100
-    : 0;
-  const baselineAvgPnl = baselinePositions.length > 0
-    ? baselinePositions.reduce((s, p) => s + (p.pnl_pct ?? 0), 0) / baselinePositions.length
-    : 0;
+  // Reject before anything goes live. A cooldown stops the next close from
+  // immediately asking the generator again.
+  const invalid = validateCandidate(currentText, modifiedText, cfg);
+  if (invalid) {
+    log("autoresearch", `Rejected candidate for ${worstSection} (never went live): ${invalid}`);
+    try {
+      const fresh = loadAutoresearch();
+      if (!fresh.active) {
+        fresh.cooldownRemaining = cfg.autoresearch?.cooldownCloses ?? 5;
+        saveAutoresearch(fresh);
+      }
+    } catch { /* degraded file: nothing to record */ }
+    return;
+  }
 
-  // 6. Create experiment
+  // 5. Create the experiment. No baseline window: the control arm runs
+  // concurrently (alternate screener runs get control vs candidate text).
   const experiment = {
     id: `exp_${Date.now()}`,
+    design: "ab",
     section: worstSection,
     hypothesis: hypothesis || "Targeted modification to reduce losses",
-    original_text: currentText,
-    modified_text: modifiedText,
+    original_text: currentText,   // control arm
+    modified_text: modifiedText,  // candidate arm
     started_at: new Date().toISOString(),
-    started_at_position: perfData.length,
-    baseline: {
-      win_rate: Math.round(baselineWR * 10) / 10,
-      avg_pnl_pct: Math.round(baselineAvgPnl * 100) / 100,
-      positions: baselinePositions.length,
-    },
-    trial: {
-      win_rate: null,
-      avg_pnl_pct: null,
-      positions: 0,
-    },
+    trial: { control: 0, candidate: 0, excluded: 0 },
     status: "active",
-    environment_snapshot: getEnvironmentSnapshot(),
+    environment_snapshot: getEnvironmentSnapshot(cfg),
   };
 
   // Snapshot current Darwin signal weights for audit trail.
@@ -379,15 +833,118 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
     experiment.weights_at_start = null;
   }
 
-  state.active = experiment;
-  saveAutoresearch(state);
+  // Re-check the persisted state after the (slow) generator call: another run
+  // or an operator command may have changed it meanwhile. Never start a second
+  // experiment, and never overwrite newer state with the pre-LLM snapshot.
+  const fresh = loadAutoresearch();
+  if (fresh.active || fresh.pending_proposal) {
+    log("autoresearch", `${fresh.active ? `Experiment ${fresh.active.id} became active` : "A proposal became pending"} while generating — discarding this candidate`);
+    return;
+  }
+  fresh.active = experiment;
+  saveAutoresearch(fresh);
 
-  // 7. Activate the override
-  setPromptSectionOverride(worstSection, modifiedText);
+  // 6. Serve the candidate to the candidate arm only.
+  setExperimentCandidate({ id: experiment.id, section: worstSection, text: modifiedText });
 
-  log("autoresearch", `Experiment ${experiment.id} started: ${worstSection}`);
+  log("autoresearch", `Experiment ${experiment.id} started (A/B): ${worstSection}`);
   log("autoresearch", `Hypothesis: ${hypothesis}`);
-  log("autoresearch", `Baseline WR: ${experiment.baseline.win_rate}%, avg PnL: ${experiment.baseline.avg_pnl_pct}%`);
+}
+
+// ─── Verdict: concurrent A/B with a bootstrap CI ─────────────
+
+// Positions smaller than this are dust or a failed deploy, not a trial.
+const DUST_SOL = 0.01;
+const BOOTSTRAP_ITERATIONS = 2000;
+
+/**
+ * Split an experiment's tagged closes into arms of { pnl, w }, where pnl is
+ * the close's PnL % and w its size in SOL. pnl_unknown closes (recorded as a
+ * 0 placeholder) and unsized/dust positions are excluded. Size weighting also
+ * means a dust "win" can't count like a real one.
+ */
+export function splitArms(records, experimentId) {
+  const arms = { control: [], candidate: [], excluded: 0 };
+  for (const p of records || []) {
+    if (p?.experiment_id !== experimentId) continue;
+    const arm = p.experiment_arm;
+    const pnl = Number(p.pnl_pct);
+    const w = Number(p.amount_sol);
+    if ((arm !== "control" && arm !== "candidate") || p.pnl_unknown || !Number.isFinite(pnl) || !Number.isFinite(w) || w < DUST_SOL) {
+      arms.excluded++;
+      continue;
+    }
+    arms[arm].push({ pnl, w });
+  }
+  return arms;
+}
+
+function weightedMean(xs) {
+  let num = 0;
+  let den = 0;
+  for (const { pnl, w } of xs) { num += pnl * w; den += w; }
+  return den > 0 ? num / den : 0;
+}
+
+// mulberry32: small seeded PRNG so a verdict is reproducible from its inputs.
+function seededRandom(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function seedFromId(id) {
+  return parseInt(hashText(id).slice(0, 8), 16);
+}
+
+/**
+ * Verdict for candidate vs control. Each arm is an array of { pnl, w }.
+ * - "insufficient": fewer than minPerArm closes in an arm, still under the cap
+ * - "inconclusive": the time cap passed before both arms reached minPerArm
+ * - "pass": bootstrap 95% CI of (candidate − control) size-weighted mean PnL
+ *   has lower bound > 0 AND the point estimate is >= minEffectPct
+ * - "fail": enough closes, but not a clear, large-enough improvement
+ * Evaluated once, when both arms first reach minPerArm (a fixed-sample test:
+ * re-checking after every close would inflate false positives).
+ */
+export function computeVerdict(control, candidate, {
+  minPerArm = 100,
+  minEffectPct = 1.5,
+  maxDays = 14,
+  ageDays = 0,
+  iterations = BOOTSTRAP_ITERATIONS,
+  seed = 1,
+} = {}) {
+  const base = { n_control: control.length, n_candidate: candidate.length };
+  if (Math.min(control.length, candidate.length) < minPerArm) {
+    return { ...base, verdict: ageDays >= maxDays ? "inconclusive" : "insufficient" };
+  }
+  const delta = weightedMean(candidate) - weightedMean(control);
+  const rand = seededRandom(seed);
+  const resample = (xs) => {
+    const out = new Array(xs.length);
+    for (let i = 0; i < xs.length; i++) out[i] = xs[Math.floor(rand() * xs.length)];
+    return out;
+  };
+  const diffs = new Array(iterations);
+  for (let i = 0; i < iterations; i++) diffs[i] = weightedMean(resample(candidate)) - weightedMean(resample(control));
+  diffs.sort((a, b) => a - b);
+  const q = (p) => diffs[Math.min(iterations - 1, Math.max(0, Math.floor(p * iterations)))];
+  const ci = [q(0.025), q(0.975)];
+  const round = (x) => Math.round(x * 1000) / 1000;
+  return {
+    ...base,
+    verdict: ci[0] > 0 && delta >= minEffectPct ? "pass" : "fail",
+    delta_pct: round(delta),
+    ci95: ci.map(round),
+    control_mean_pct: round(weightedMean(control)),
+    candidate_mean_pct: round(weightedMean(candidate)),
+  };
 }
 
 // ─── Evaluate Active Experiment ──────────────────────────────
@@ -395,120 +952,101 @@ async function analyzeAndGenerate(perfData, lessons, cfg, state) {
 async function evaluateExperiment(perfData, cfg, state) {
   const experiment = state.active;
   if (!experiment) return;
+  const ar = cfg.autoresearch || {};
+  const cooldownCloses = ar.cooldownCloses ?? 5;
 
-  const minCloses = cfg.autoresearch?.minClosesPerTrial ?? 7;
-  const minEvidenceCloses = cfg.autoresearch?.minEvidenceCloses ?? Math.max(10, minCloses + 2);
-  const minAbsoluteWinRateDeltaPct = cfg.autoresearch?.minAbsoluteWinRateDeltaPct ?? 10;
-  const minAbsolutePnlDeltaPct = cfg.autoresearch?.minAbsolutePnlDeltaPct ?? 0.5;
-  const improvementPct = cfg.autoresearch?.improvementPct ?? 15;
-  const declinePct = cfg.autoresearch?.declinePct ?? 15;
-  const cooldownCloses = cfg.autoresearch?.cooldownCloses ?? 5;
+  if (experiment.design !== "ab") {
+    // Started by the pre-A/B loop: it has no arm-tagged closes and never will.
+    log("autoresearch", `Experiment ${experiment.id} predates the A/B design — closing it as abandoned`);
+    finishExperiment(state, "abandoned_legacy_design", 0);
+    return;
+  }
 
-  if (environmentChangedSince(experiment.environment_snapshot)) {
-    log("autoresearch", `Environment changed during ${experiment.id} — invalidating trial to avoid confounded results`);
+  if (environmentChangedSince(experiment.environment_snapshot, cfg)) {
+    log("autoresearch", `Threshold values changed during ${experiment.id} — invalidating trial to avoid confounded results`);
     finishExperiment(state, "invalidated_environment_change", 0);
     return;
   }
 
-  // Screener/range changes should only be judged on positions deployed after the
-  // experiment started. Manager changes should be judged on any positions CLOSED
-  // after the experiment started, including positions that were already open.
-  const trialPositions = getTrialPositionsForExperiment(experiment, perfData);
-  const trialCount = trialPositions.length;
-
-  experiment.trial.positions = trialCount;
-
-  // Circuit breaker: if first 3 trial closes are ALL losses, auto-revert
-  if (trialCount >= 3 && trialCount < minCloses) {
-    const first3 = trialPositions.slice(0, 3);
-    const allLosses = first3.every(p => (p.pnl_usd ?? 0) < 0);
-    if (allLosses) {
-      log("autoresearch", `Circuit breaker: first 3 closes all losses — reverting ${experiment.id}`);
-      finishExperiment(state, "reverted_circuit_breaker", cooldownCloses);
-      return;
-    }
+  const arms = splitArms(perfData, experiment.id);
+  const tagged = arms.control.length + arms.candidate.length + arms.excluded;
+  if (tagged < (experiment.tagged_seen ?? 0)) {
+    // Closes we already counted are gone (clearPerformance or a trim): the
+    // evidence can't be rebuilt, so don't leave the experiment hanging.
+    log("autoresearch", `Performance history for ${experiment.id} was cleared (${experiment.tagged_seen} → ${tagged} tagged closes) — closing it as abandoned`);
+    finishExperiment(state, "abandoned_history_cleared", 0);
+    return;
   }
+  experiment.tagged_seen = tagged;
+  experiment.trial = { control: arms.control.length, candidate: arms.candidate.length, excluded: arms.excluded };
 
-  // Not enough data yet
-  if (trialCount < minCloses) {
-    saveAutoresearch(state);
-    log("autoresearch", `Experiment ${experiment.id}: ${trialCount}/${minCloses} closes`);
+  // Circuit breaker (safety valve, candidate arm only): first 3 candidate closes all losses.
+  if (arms.candidate.length >= 3 && arms.candidate.length < 10 && arms.candidate.slice(0, 3).every((x) => x.pnl < 0)) {
+    log("autoresearch", `Circuit breaker: first 3 candidate closes all losses — discarding ${experiment.id}`);
+    finishExperiment(state, "reverted_circuit_breaker", cooldownCloses);
     return;
   }
 
-  // Require a slightly larger evidence window before making a keep/revert call.
-  // This reduces noisy decisions when the default minCloses is just barely met.
-  if (trialCount < minEvidenceCloses) {
+  const ageDays = (Date.now() - Date.parse(experiment.started_at)) / 86_400_000;
+  const result = computeVerdict(arms.control, arms.candidate, {
+    minPerArm: ar.minClosesPerArm ?? 100,
+    minEffectPct: ar.minEffectPct ?? 1.5,
+    maxDays: ar.maxExperimentDays ?? 14,
+    ageDays,
+    seed: seedFromId(experiment.id),
+  });
+
+  if (result.verdict === "insufficient") {
     saveAutoresearch(state);
-    log("autoresearch", `Experiment ${experiment.id}: ${trialCount}/${minEvidenceCloses} evidence closes (waiting for a less noisy verdict)`);
+    log("autoresearch", `Experiment ${experiment.id}: control ${result.n_control} / candidate ${result.n_candidate} closes (need ${ar.minClosesPerArm ?? 100} per arm, day ${ageDays.toFixed(1)} of ${ar.maxExperimentDays ?? 14})`);
     return;
   }
 
-  // Compute trial metrics
-  const trialWins = trialPositions.filter(p => (p.pnl_usd ?? 0) > 0).length;
-  const trialWR = (trialWins / trialCount) * 100;
-  const trialAvgPnl = trialPositions.reduce((s, p) => s + (p.pnl_pct ?? 0), 0) / trialCount;
-
-  experiment.trial.win_rate = Math.round(trialWR * 10) / 10;
-  experiment.trial.avg_pnl_pct = Math.round(trialAvgPnl * 100) / 100;
-
-  // Compare to baseline using composite score: 60% win rate + 40% avg PnL
-  const baselineWR = experiment.baseline.win_rate;
-  const wrImprovement = ((trialWR - baselineWR) / Math.max(baselineWR, 1)) * 100;
-  const absoluteWinRateDelta = trialWR - baselineWR;
-
-  const baselinePnl = experiment.baseline.avg_pnl_pct;
-  const pnlImprovement = baselinePnl !== 0
-    ? ((trialAvgPnl - baselinePnl) / Math.max(Math.abs(baselinePnl), 0.1)) * 100
-    : (trialAvgPnl > 0 ? 100 : trialAvgPnl < 0 ? -100 : 0);
-  const absolutePnlDelta = trialAvgPnl - baselinePnl;
-
-  const compositeImprovement = (wrImprovement * 0.6) + (pnlImprovement * 0.4);
-
-  const trialLosses = trialCount - trialWins;
-  const isImbalancedTinySample = trialCount < 2 * minEvidenceCloses && (trialWins === 0 || trialLosses === 0);
-  if (isImbalancedTinySample) {
-    log("autoresearch", `Experiment ${experiment.id}: ${trialWins}/${trialCount} wins/losses too one-sided for a confident verdict — waiting for more closes`);
-    saveAutoresearch(state);
+  experiment.result = result;
+  if (result.verdict === "inconclusive") {
+    log("autoresearch", `Experiment ${experiment.id} hit the ${ar.maxExperimentDays ?? 14}-day cap before ${ar.minClosesPerArm ?? 100} closes per arm — inconclusive, candidate discarded`);
+    finishExperiment(state, "inconclusive_time_cap", cooldownCloses);
     return;
   }
 
-  const hasMeaningfulAbsoluteDelta =
-    Math.abs(absoluteWinRateDelta) >= minAbsoluteWinRateDeltaPct ||
-    Math.abs(absolutePnlDelta) >= minAbsolutePnlDeltaPct;
-
-  if (!hasMeaningfulAbsoluteDelta) {
-    log("autoresearch", `Experiment ${experiment.id}: absolute deltas too small for a confident verdict (WR Δ ${absoluteWinRateDelta.toFixed(1)} pts, PnL Δ ${absolutePnlDelta.toFixed(2)} pts)`);
-    finishExperiment(state, "inconclusive", cooldownCloses);
+  const summary = `Δ ${result.delta_pct} pp (95% CI ${result.ci95[0]}..${result.ci95[1]}), n=${result.n_control}/${result.n_candidate}`;
+  if (result.verdict === "fail") {
+    log("autoresearch", `Experiment ${experiment.id}: no clear improvement (${summary}) — candidate discarded, current text stays`);
+    finishExperiment(state, "discarded", cooldownCloses);
     return;
   }
 
-  log("autoresearch", `Experiment ${experiment.id}: trial WR ${trialWR.toFixed(1)}% vs baseline ${baselineWR.toFixed(1)}% (WR improvement: ${wrImprovement.toFixed(1)}%, PnL improvement: ${pnlImprovement.toFixed(1)}%, composite: ${compositeImprovement.toFixed(1)}%)`);
-
-  if (compositeImprovement >= improvementPct) {
-    // KEEP — the modification helped
-    log("autoresearch", `KEEPING experiment ${experiment.id} — composite ${compositeImprovement.toFixed(1)}% improvement (WR: ${wrImprovement.toFixed(1)}%, PnL: ${pnlImprovement.toFixed(1)}%)`);
-    experiment.status = "kept";
-    // Persist the kept override so it survives restarts
-    if (!state.kept_overrides) state.kept_overrides = {};
-    state.kept_overrides[experiment.section] = experiment.modified_text;
-    // Log as lesson
-    logExperimentLesson(experiment, "kept", compositeImprovement);
-    state.experiments.push(experiment);
-    state.active = null;
-    state.cooldownRemaining = cooldownCloses;
-    saveAutoresearch(state);
-  } else if (compositeImprovement <= -declinePct) {
-    // REVERT — the modification hurt
-    log("autoresearch", `REVERTING experiment ${experiment.id} — composite ${compositeImprovement.toFixed(1)}% decline (WR: ${wrImprovement.toFixed(1)}%, PnL: ${pnlImprovement.toFixed(1)}%)`);
-    logExperimentLesson(experiment, "reverted", compositeImprovement);
-    finishExperiment(state, "reverted", cooldownCloses);
-  } else {
-    // INCONCLUSIVE — revert to be safe
-    log("autoresearch", `DISCARDING experiment ${experiment.id} — inconclusive (composite: ${compositeImprovement.toFixed(1)}%, WR: ${wrImprovement.toFixed(1)}%, PnL: ${pnlImprovement.toFixed(1)}%)`);
-    logExperimentLesson(experiment, "inconclusive", compositeImprovement);
-    finishExperiment(state, "inconclusive", cooldownCloses);
+  // PASS. Proposal mode by default: a human approves before anything is kept.
+  if (ar.autoKeep === true) {
+    log("autoresearch", `Experiment ${experiment.id} passed (${summary}) — auto-keeping (autoresearchAutoKeep=true)`);
+    keepOverride(state, experiment.section, experiment.modified_text, experiment.id, cfg);
+    finishExperiment(state, "kept", cooldownCloses);
+    return;
   }
+  state.pending_proposal = {
+    experiment_id: experiment.id,
+    section: experiment.section,
+    hypothesis: experiment.hypothesis,
+    text: experiment.modified_text,
+    result,
+    proposed_at: new Date().toISOString(),
+    strategy: cfg.strategy?.activeStrategy ?? null,
+    default_hash: defaultSectionHash(experiment.section),
+  };
+  log("autoresearch", `Experiment ${experiment.id} passed (${summary}) — proposed for operator review (/autoresearch approve | reject)`);
+  finishExperiment(state, "proposed", cooldownCloses);
+}
+
+/** Record `text` as the kept override for `section` and apply it if enabled. */
+function keepOverride(state, section, text, experimentId, cfg) {
+  state.kept_overrides = { ...(state.kept_overrides || {}), [section]: text };
+  state.kept_meta = { ...(state.kept_meta || {}), [section]: {
+    experiment_id: experimentId,
+    kept_at: new Date().toISOString(),
+    strategy: cfg.strategy?.activeStrategy ?? null,
+    default_hash: defaultSectionHash(section),
+  } };
+  if (cfg?.autoresearch?.enabled === true) setPromptSectionOverride(section, text);
 }
 
 function finishExperiment(state, status, cooldownCloses) {
@@ -516,32 +1054,14 @@ function finishExperiment(state, status, cooldownCloses) {
   if (!experiment) return;
 
   experiment.status = status;
-  // If this section has a kept override, restore it instead of clearing entirely
-  const keptText = state.kept_overrides?.[experiment.section];
-  if (keptText) {
-    setPromptSectionOverride(experiment.section, keptText);
-  } else {
-    clearPromptSectionOverride(experiment.section);
-  }
+  experiment.finished_at = new Date().toISOString();
+  // The candidate was only ever served to its arm; control text (kept override
+  // or default) was never replaced, so there is nothing else to restore.
+  clearExperimentCandidate();
   state.experiments.push(experiment);
   state.active = null;
   state.cooldownRemaining = cooldownCloses;
   saveAutoresearch(state);
-}
-
-function logExperimentLesson(experiment, outcome, improvementPct) {
-  try {
-    // Dynamic import to avoid circular dependency
-    import("./lessons.js").then(({ addLesson }) => {
-      const label = outcome === "kept" ? "KEPT" : outcome === "reverted" ? "REVERTED" : "INCONCLUSIVE";
-      addLesson(
-        `[AUTORESEARCH ${label}] Section "${experiment.section}": ${experiment.hypothesis}. ` +
-        `Trial WR: ${experiment.trial.win_rate}% vs baseline ${experiment.baseline.win_rate}% ` +
-        `(${improvementPct > 0 ? "+" : ""}${improvementPct.toFixed(1)}%).`,
-        ["autoresearch", experiment.section, outcome],
-      );
-    }).catch(() => {});
-  } catch { /* best-effort */ }
 }
 
 // ─── LLM Call ────────────────────────────────────────────────
@@ -554,24 +1074,37 @@ function safeWeightsSummary() {
   }
 }
 
+// Human-written research direction (karpathy/autoresearch's program.md idea).
+const PROGRAM_FILE = path.join(__dirname, "autoresearch-program.md");
+const PROGRAM_FALLBACK = "(autoresearch-program.md is missing.) Make one small, reversible change that reduces losses. Prefer removing or simplifying a rule over adding one.";
+
+export function loadResearchProgram() {
+  try {
+    // Drop the leading editor note (an HTML comment addressed to the human).
+    const text = fs.readFileSync(PROGRAM_FILE, "utf8").replace(/^\s*<!--[\s\S]*?-->\s*/, "").trim();
+    return text || PROGRAM_FALLBACK;
+  } catch {
+    return PROGRAM_FALLBACK;
+  }
+}
+
 async function callLLM(model, sectionName, lossCount, currentText, failureDesc) {
   const provider = getLlmProvider();
 
-  const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your goal is to make small, surgical edits that reduce losses.
+  const systemMsg = `You optimize prompts for an autonomous LP (Liquidity Provider) trading agent on Meteora/Solana DLMM. The agent uses these prompts as behavioral instructions. Your candidate is A/B tested against the current text on live closes, and a human approves any winner before it is kept.
 
-KEY DOMAIN KNOWLEDGE for your modifications:
-- STRATEGIES: The agent can deploy "bid_ask" (single-sided SOL below price — earns fees on sell pressure, safe but goes idle if price pumps UP) or "spot" with sol_split_pct (two-sided, e.g. 80% SOL / 20% token — captures fees in both directions, better for pumping tokens but riskier if token dumps).
-- OOR UPSIDE: Price pumped above the position range. For bid_ask, SOL sits idle earning nothing. Spot two-sided would have captured fees on the way up.
-- OOR DOWNSIDE: Price dropped below the position range. SOL converted to token, real loss. Wider range helps stay in range longer.
-- If failures show repeated "OOR upside" with bid_ask, consider switching to spot with high sol_split_pct (80-90) for those pool types, or improving screener criteria to avoid deploying into tokens that are mid-pump.
-- If failures show "OOR downside", consider widening price_range_pct or tightening screening thresholds.
-- HARD RULE: NEVER propose widening price_range_pct to fix OOR upside on bid_ask or SOL-only spot strategies. These strategies place bins BELOW the active bin only — wider range adds more bins below, which CANNOT reach a price that pumped ABOVE. This is a physical impossibility, not a tuning problem. If OOR upside is the issue, the fix is strategy selection or screener criteria, never range width.
-- Active trading strategy: ${config.strategy.activeStrategy}. Changes must stay compatible with it.
+RESEARCH DIRECTION (human-edited, from autoresearch-program.md):
+${loadResearchProgram()}
+
+MECHANICAL RULES (enforced in code; a candidate that breaks one is rejected before it goes live):
+- Keep every line containing HARD RULE, HARD SKIP, MUST or NEVER exactly as written, and do not add new ones.
+- Change at most ~${config.autoresearch?.maxDiffPct ?? 30}% of the lines.
 - Keep template placeholders such as \${deployAmount} and \${currentBalanceSol} exactly as written; the runner fills them in.
+- Active trading strategy: ${config.strategy.activeStrategy}. Changes must stay compatible with it.
 - Current learned signal weights:
 ${safeWeightsSummary()}`;
 
-  const userMsg = `Section "${sectionName}" has caused ${lossCount} recent losses.
+  const userMsg = `Section "${sectionName}" was attributed ${lossCount} recent losses.
 
 Current text:
 ---
@@ -581,9 +1114,9 @@ ${currentText}
 Recent failures:
 ${failureDesc}
 
-Generate exactly ONE small, targeted modification. Change only one instruction or threshold. Do not rewrite the whole section.
+Propose exactly ONE small change. Removing or simplifying an instruction is as valid as adding or tightening one, and is preferred when a rule is not clearly earning its keep: all else equal, a shorter prompt wins. Do not rewrite the whole section.
 
-Return a JSON object: {"hypothesis": one sentence on what you changed and why, "modified_text": the full section text with your single change applied, without the --- delimiters}.`;
+Return a JSON object: {"hypothesis": one sentence on what you changed (added, removed, loosened or tightened) and why, "modified_text": the full section text with your single change applied, without the --- delimiters}.`;
   const schema = {
     type: "object",
     additionalProperties: false,
@@ -613,6 +1146,7 @@ Return a JSON object: {"hypothesis": one sentence on what you changed and why, "
     const schemaPath = path.join(os.tmpdir(), `meridian-autoresearch-${process.pid}.schema.json`);
     fs.writeFileSync(schemaPath, JSON.stringify(schema));
     const content = await runCodexExec(model, `${systemMsg}\n\n${userMsg}`, {
+      timeoutMs: AUTORESEARCH_LLM_TIMEOUT_MS,
       cwd: process.cwd(),
       sandbox: "read-only",
       skipGitRepoCheck: true,
@@ -631,6 +1165,7 @@ Return a JSON object: {"hypothesis": one sentence on what you changed and why, "
     const { runClaudeCli } = await import("./llm-provider.js");
 
     const content = await runClaudeCli(model, userMsg, {
+      timeoutMs: AUTORESEARCH_LLM_TIMEOUT_MS,
       effort: "high",
       systemPrompt: systemMsg,
       jsonSchema: schema,
@@ -661,26 +1196,46 @@ Return a JSON object: {"hypothesis": one sentence on what you changed and why, "
     body.reasoning_split = true;
   }
 
-  const response = await fetch(baseURL, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AUTORESEARCH_LLM_TIMEOUT_MS);
+  let data;
+  try {
+    const response = await fetch(baseURL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
 
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "unknown");
-    throw new Error(`LLM provider returned ${response.status}: ${errText}`);
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "unknown");
+      throw new Error(`LLM provider returned ${response.status}: ${errText}`);
+    }
+
+    data = await response.json();
+  } catch (e) {
+    if (controller.signal.aborted) throw new Error(`autoresearch LLM call timed out after ${AUTORESEARCH_LLM_TIMEOUT_MS / 1000}s`, { cause: e });
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-
-  const data = await response.json();
   const message = data.choices?.[0]?.message;
   const content = message?.content;
   if (!content) throw new Error("Empty response from LLM");
 
   return toResult(content);
+}
+
+// The generator is swappable so tests can mock it (no LLM or network in tests).
+let _generator = callLLM;
+export function __setAutoresearchGeneratorForTests(fn) {
+  _generator = typeof fn === "function" ? fn : callLLM;
+}
+export function __resetAutoresearchLockForTests() {
+  _running = null;
 }
 
 // ─── Public Accessors ────────────────────────────────────────

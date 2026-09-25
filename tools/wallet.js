@@ -26,7 +26,7 @@ function getWallet() {
 }
 
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
-const JUPITER_ULTRA_API = "https://api.jup.ag/ultra/v1";
+const JUPITER_SWAP_V2_API = "https://api.jup.ag/swap/v2";
 const JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1";
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY || "";
 
@@ -143,7 +143,8 @@ export async function getWalletBalances() {
 }
 
 /**
- * Swap tokens via Jupiter Ultra API (order → sign → execute).
+ * Swap tokens via Jupiter Swap v2 (order → sign → execute), with the swap/v1
+ * quote+swap API as a fallback that is only used before anything is signed.
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -182,6 +183,104 @@ export function uiToRawAmount(amount, decimals) {
   return ((negative && raw !== 0n ? -raw : raw)).toString();
 }
 
+/**
+ * Price impact of a Swap v2 /order response, in percent (0.12 = 0.12%).
+ * Prefers `priceImpact` (number, already percent); falls back to the deprecated
+ * `priceImpactPct` (string decimal fraction, e.g. "-0.0012") × 100. Returns
+ * null when neither is a finite number. Sign is preserved; callers take abs.
+ */
+export function parsePriceImpactPercent(order) {
+  const direct = order?.priceImpact;
+  if (direct != null && direct !== "" && Number.isFinite(Number(direct))) return Number(direct);
+  const frac = order?.priceImpactPct;
+  if (frac != null && frac !== "" && Number.isFinite(Number(frac))) return Number(frac) * 100;
+  return null;
+}
+
+/** Documented Swap v2 /execute `code` values. */
+export const EXECUTE_CODES = {
+  0: "Success",
+  [-1]: "Missing cached order (requestId not found or expired)",
+  [-2]: "Invalid signed transaction",
+  [-3]: "Invalid message bytes",
+  [-1000]: "Aggregator: failed to land",
+  [-1001]: "Aggregator: unknown error",
+  [-1002]: "Aggregator: invalid transaction",
+  [-1003]: "Aggregator: transaction not fully signed",
+  [-1004]: "Aggregator: invalid block height",
+  [-2000]: "RFQ: failed to land",
+  [-2001]: "RFQ: unknown error",
+  [-2002]: "RFQ: invalid payload",
+  [-2003]: "RFQ: quote expired",
+  [-2004]: "RFQ: swap rejected",
+};
+
+// Codes where Jupiter rejected the tx before sending it. Only these (and only
+// with no signature in the response) make the swap/v1 fallback safe.
+const PRE_LANDING_CODES = new Set([-1, -2, -3, -1002, -1003, -1004, -2002, -2003, -2004]);
+
+/**
+ * Classify a Swap v2 /execute result. Pure; no I/O.
+ *  - "success":     status "Success" with a signature on a 2xx.
+ *  - "ambiguous":   transport error, HTTP 5xx, any signature without a 2xx
+ *                   "Success", or a code other than the pre-send rejections
+ *                   (failed to land, unknown, undocumented). The tx may have
+ *                   landed: check on-chain, never fall back.
+ *  - "pre_landing": documented pre-send rejection code and no signature.
+ *                   Safe to fall back.
+ *  - "failed":      non-5xx response with no code and no signature (e.g. a
+ *                   plain 4xx). No fallback.
+ */
+export function classifyExecuteResponse({ httpStatus, body, transportError }) {
+  if (transportError) {
+    return { kind: "ambiguous", reason: `transport error: ${transportError.message}`, signature: null };
+  }
+  const signature = typeof body?.signature === "string" && body.signature ? body.signature : null;
+  const code = body?.code != null && Number.isFinite(Number(body.code)) ? Number(body.code) : null;
+  const meaning = code != null ? (EXECUTE_CODES[code] ?? "undocumented code") : "no code";
+  const desc = `HTTP ${httpStatus ?? "?"}, status=${body?.status ?? "?"}, code=${code ?? "-"} (${meaning})`;
+
+  if (httpStatus >= 500) return { kind: "ambiguous", reason: desc, signature, code };
+  if (body?.status === "Success") {
+    const ok2xx = httpStatus >= 200 && httpStatus < 300;
+    return { kind: ok2xx && signature ? "success" : "ambiguous", reason: desc, signature, code };
+  }
+  if (signature) return { kind: "ambiguous", reason: desc, signature, code };
+  if (code != null && PRE_LANDING_CODES.has(code)) return { kind: "pre_landing", reason: desc, signature: null, code };
+  // Any other code (failed to land, unknown error, undocumented) means Jupiter
+  // may have sent the tx: check the locally known signature on-chain.
+  if (code != null) return { kind: "ambiguous", reason: desc, signature: null, code };
+  return { kind: "failed", reason: desc, signature: null, code };
+}
+
+/** Base58 tx id of a signed VersionedTransaction, or null if unsigned. */
+function firstSignature(tx) {
+  const sig = tx?.signatures?.[0];
+  if (!sig || sig.every((b) => b === 0)) return null;
+  return bs58.encode(sig);
+}
+
+/**
+ * Poll getSignatureStatuses until the tx is confirmed/finalized, has errored,
+ * or attempts run out. RPC errors count as "not found yet".
+ */
+async function checkSignatureOnChain(connection, signature, { attempts = 15, intervalMs = 2000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const { value } = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+      const st = value?.[0];
+      if (st?.err) return { landed: true, ok: false, err: st.err };
+      if (st && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")) {
+        return { landed: true, ok: true };
+      }
+    } catch (e) {
+      log("swap", `Signature status check failed (${e.message})`);
+    }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return { landed: false };
+}
+
 // Normalize any SOL-like address to the correct wrapped SOL mint
 export function normalizeMint(mint) {
   if (!mint) return mint;
@@ -197,11 +296,16 @@ export function normalizeMint(mint) {
   return mint;
 }
 
+/**
+ * @param {object} params
+ * @param {object} [deps] Test seam only: { connection, wallet, statusPollMs,
+ *   statusPollAttempts }. Production callers pass nothing.
+ */
 export async function swapToken({
   input_mint,
   output_mint,
   amount,
-}) {
+}, deps = {}) {
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
 
@@ -214,8 +318,8 @@ export async function swapToken({
   }
 
   try {
-    const wallet = getWallet();
-    const connection = getConnection();
+    const wallet = deps.wallet ?? getWallet();
+    const connection = deps.connection ?? getConnection();
 
     // ─── Gas-buffer safety net (central, can't-bypass) ─────────
     // NEVER let a SOL-out swap drain the wallet below the gas reserve. This is a
@@ -257,9 +361,10 @@ export async function swapToken({
     }
     const toUi = (raw, dec) => (raw != null && !isNaN(Number(raw)) ? Number(raw) / Math.pow(10, dec) : null);
 
-    // ─── Get Ultra order (unsigned tx + requestId) ─────────────
+    // ─── Get Swap v2 order (unsigned tx + requestId) ───────────
+    // No slippageBps on purpose: slippage stays with Jupiter's RTSE, as before.
     const orderUrl =
-      `${JUPITER_ULTRA_API}/order` +
+      `${JUPITER_SWAP_V2_API}/order` +
       `?inputMint=${input_mint}` +
       `&outputMint=${output_mint}` +
       `&amount=${amountStr}` +
@@ -271,17 +376,31 @@ export async function swapToken({
     if (!orderRes.ok) {
       const body = await orderRes.text();
       if (orderRes.status === 500) {
-        log("swap", `Ultra failed for ${input_mint}, falling back to regular swap API`);
+        log("swap", `Swap v2 order failed for ${input_mint}, falling back to swap/v1 quote API`);
         return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
       }
-      throw new Error(`Ultra order failed: ${orderRes.status} ${body}`);
+      throw new Error(`Swap v2 order failed: ${orderRes.status} ${body}`);
     }
 
     const order = await orderRes.json();
-    if (order.errorCode || order.errorMessage) {
-      log("swap", `Ultra error for ${input_mint}, falling back to regular swap API`);
+    // transaction is "" when the router quoted but could not build a tx
+    // (errorCode/errorMessage set), and null when taker is missing.
+    if (!order.transaction || order.errorCode || order.errorMessage) {
+      log(
+        "swap",
+        `Swap v2 order has no transaction for ${input_mint} ` +
+          `(router=${order.router ?? "?"} errorCode=${order.errorCode ?? "-"} ${order.errorMessage ?? ""}), ` +
+          `falling back to swap/v1 quote API`
+      );
       return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
     }
+
+    const impact = parsePriceImpactPercent(order);
+    log(
+      "swap",
+      `Swap v2 order: router=${order.router ?? "?"} mode=${order.mode ?? "?"} ` +
+        `priceImpact=${impact == null ? "n/a" : `${Math.abs(impact).toFixed(4)}%`}`
+    );
 
     const { transaction: unsignedTx, requestId } = order;
 
@@ -289,36 +408,86 @@ export async function swapToken({
     const tx = VersionedTransaction.deserialize(Buffer.from(unsignedTx, "base64"));
     tx.sign([wallet]);
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
+    // The tx id is known before sending, so an ambiguous /execute (no body,
+    // no signature) can still be checked on-chain.
+    const localSig = firstSignature(tx);
 
     // ─── Execute ───────────────────────────────────────────────
-    const execRes = await jupiterFetch(`${JUPITER_ULTRA_API}/execute`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": JUPITER_API_KEY,
-      },
-      body: JSON.stringify({ signedTransaction: signedTx, requestId }),
+    // jupiterFetch may resend on 429/5xx/network errors. That resends the SAME
+    // signed tx (same signature), so it cannot land twice.
+    let execRes = null;
+    let result = null;
+    let transportError = null;
+    try {
+      execRes = await jupiterFetch(`${JUPITER_SWAP_V2_API}/execute`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": JUPITER_API_KEY,
+        },
+        body: JSON.stringify({ signedTransaction: signedTx, requestId }),
+      });
+      const text = await execRes.text();
+      try { result = text ? JSON.parse(text) : null; } catch { result = null; }
+    } catch (e) {
+      transportError = e;
+    }
+
+    const outcome = classifyExecuteResponse({ httpStatus: execRes?.status, body: result, transportError });
+    const amounts = (r) => ({
+      amount_in: r?.inputAmountResult ?? null,
+      amount_out: r?.outputAmountResult ?? null,
+      in_ui: toUi(r?.inputAmountResult, decimals),
+      out_ui: toUi(r?.outputAmountResult, outDecimals),
     });
-    if (!execRes.ok) {
-      throw new Error(`Ultra execute failed: ${execRes.status} ${await execRes.text()}`);
+
+    if (outcome.kind === "success") {
+      log("swap", `SUCCESS tx: ${result.signature}`);
+      return { success: true, tx: result.signature, input_mint, output_mint, ...amounts(result) };
     }
 
-    const result = await execRes.json();
-    if (result.status === "Failed") {
-      throw new Error(`Swap failed on-chain: code=${result.code}`);
+    if (outcome.kind === "pre_landing") {
+      // Jupiter rejected the tx before sending it and returned no signature:
+      // nothing can land, so the swap/v1 route is safe to try.
+      log("swap", `Swap v2 execute rejected before landing (${outcome.reason}), falling back to swap/v1 quote API`);
+      return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
     }
 
-    log("swap", `SUCCESS tx: ${result.signature}`);
+    if (outcome.kind === "failed") {
+      throw new Error(`Swap v2 execute failed: ${outcome.reason}`);
+    }
 
+    // ─── Ambiguous: the tx may have landed. Never fall back. ──
+    const sig = outcome.signature || localSig;
+    log("swap", `Swap v2 execute ambiguous (${outcome.reason}); checking signature ${sig ?? "(none)"} on-chain`);
+    if (!sig) {
+      return {
+        success: false,
+        ambiguous: true,
+        input_mint,
+        output_mint,
+        error: `Swap v2 execute outcome unknown (${outcome.reason}) and no signature to check — verify wallet balances before retrying`,
+      };
+    }
+    const chain = await checkSignatureOnChain(connection, sig, {
+      attempts: deps.statusPollAttempts ?? 15,
+      intervalMs: deps.statusPollMs ?? 2000,
+    });
+    if (chain.landed && chain.ok) {
+      log("swap", `SUCCESS (confirmed on-chain after ambiguous execute) tx: ${sig}`);
+      return { success: true, tx: sig, input_mint, output_mint, confirmed_via: "rpc", ...amounts(result) };
+    }
+    if (chain.landed) {
+      throw new Error(`Swap failed on-chain (${sig}): ${JSON.stringify(chain.err)}`);
+    }
+    log("swap_error", `Swap v2 tx ${sig} unconfirmed after execute (${outcome.reason})`);
     return {
-      success: true,
-      tx: result.signature,
+      success: false,
+      ambiguous: true,
+      tx: sig,
       input_mint,
       output_mint,
-      amount_in: result.inputAmountResult,
-      amount_out: result.outputAmountResult,
-      in_ui: toUi(result.inputAmountResult, decimals),
-      out_ui: toUi(result.outputAmountResult, outDecimals),
+      error: `Swap v2 execute outcome unknown (${outcome.reason}); tx ${sig} not confirmed yet — it may still land, do not retry until it has expired`,
     };
   } catch (error) {
     log("swap_error", error.message);

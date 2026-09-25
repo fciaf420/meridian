@@ -16,7 +16,7 @@ process.env.LPAGENT_RPM = "1000";
   process.env.WALLET_PRIVATE_KEY = bs58.encode(Keypair.generate().secretKey);
 }
 
-const { fetchTopLpersStats, mapTopLpersRows, evaluateTopLpersGate } = await import("../tools/study.js");
+const { fetchTopLpersStats, mapTopLpersRows, evaluateTopLpersGate, fetchStudyWithRetry } = await import("../tools/study.js");
 const { getLpOverview, fetchHistoricalPositionMap } = await import("../tools/lp-overview.js");
 
 const realFetch = globalThis.fetch;
@@ -247,4 +247,41 @@ test("historical positions fetch one page only on the non-blocking path", async 
   const map = await fetchHistoricalPositionMap({ wait: false });
   assert.equal(calls.length, 1);
   assert.equal(map.size, 100);
+});
+
+// ─── study-top-lp proxy retry ────────────────────────────────
+const NO_DELAY = { delaysMs: [0, 0, 0] };
+const circuitOpen = () => jsonResponse({ error: "LPAgent circuit open" }, 500);
+
+test("fetchStudyWithRetry retries 'circuit open' 500s until the proxy recovers", async () => {
+  let n = 0;
+  const calls = mockFetch(() => (++n < 3 ? circuitOpen() : jsonResponse({ ownerCount: 1 })));
+  const res = await fetchStudyWithRetry("https://x/study", {}, NO_DELAY);
+  assert.equal(res.status, 200);
+  assert.equal(calls.length, 3);
+});
+
+test("fetchStudyWithRetry does not retry non-transient errors", async () => {
+  for (const [status, body] of [[401, { error: "unauthorized" }], [404, {}], [500, { error: "boom" }]]) {
+    const calls = mockFetch(() => jsonResponse(body, status));
+    const res = await fetchStudyWithRetry("https://x/study", {}, NO_DELAY);
+    assert.equal(res.status, status);
+    assert.equal(calls.length, 1, `status ${status} should not retry`);
+  }
+});
+
+test("fetchStudyWithRetry gives up after the last delay and returns the failing response", async () => {
+  const calls = mockFetch(() => circuitOpen());
+  const res = await fetchStudyWithRetry("https://x/study", {}, NO_DELAY);
+  assert.equal(res.status, 500);
+  assert.equal(calls.length, 4);
+  assert.match(await res.text(), /circuit open/);
+});
+
+test("fetchStudyWithRetry retries 503 and network errors, rethrows when exhausted", async () => {
+  let n = 0;
+  mockFetch(() => { n++; if (n === 1) throw new TypeError("fetch failed"); return n === 2 ? jsonResponse({}, 503) : jsonResponse({ ok: 1 }); });
+  assert.equal((await fetchStudyWithRetry("https://x/study", {}, NO_DELAY)).status, 200);
+  mockFetch(() => { throw new TypeError("fetch failed"); });
+  await assert.rejects(fetchStudyWithRetry("https://x/study", {}, NO_DELAY), /fetch failed/);
 });

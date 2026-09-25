@@ -23,6 +23,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
+import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
@@ -829,6 +830,7 @@ export async function deployPosition({
         active_bin: activeBin.binId,
         initial_value_usd: 0,
         study_avg_hold_hours,
+        ...getExperimentTag(),
       });
       log("deploy", `Pre-tracked position ${posAddr.slice(0, 8)} (wide-range: liquidity pending)`);
 
@@ -955,6 +957,7 @@ export async function deployPosition({
       initial_value_usd,
       study_avg_hold_hours,
       signal_snapshot,
+      ...getExperimentTag(), // autoresearch A/B arm, when deployed inside one
     });
 
     return {
@@ -1923,13 +1926,8 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         close_reason: closeReason,
         deployed_at: tracked.deployed_at,
         signal_snapshot: tracked.signal_snapshot || null,
+        ...(tracked.experiment_id && { experiment_id: tracked.experiment_id, experiment_arm: tracked.experiment_arm }),
       });
-
-      // Clean up transient nugget entries
-      try {
-        const { forgetPositionSnapshot } = await import("../memory.js");
-        forgetPositionSnapshot(tracked);
-      } catch { /* best-effort */ }
 
       // ─── Hard rule: swap ONLY the withdrawn base token back to SOL ───
       // Sell only the DELTA this close added to the wallet (post - pre), never
