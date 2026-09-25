@@ -6,6 +6,7 @@
   "main": "index.js",
   "scripts": {
     "setup": "node setup.js",
+    "settings": "node settings.js",
     "start": "node index.js",
     "dev": "DRY_RUN=true node index.js",
     "dev:web": "cd web && npm run dev",

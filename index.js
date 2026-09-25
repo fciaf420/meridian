@@ -822,6 +822,7 @@ const TELEGRAM_HELP = [
   "DLMM LP Agent — Telegram control",
   "",
   "/status — wallet + open positions",
+  "/settings — effective config + which file each setting lives in",
   "/usdc [on|off] — show or toggle USDC mode",
   "/candidates — refresh top pools (then reply a number to deploy)",
   "1 / 2 / 3 … — deploy into that pool",
@@ -908,6 +909,12 @@ async function handleTelegramCommand(rawText) {
       }
       await tgSend(lines.join("\n"));
     });
+  }
+
+  // ── Settings (effective config + which file each value lives in) ──
+  if (text === "/settings" || text === "/config") {
+    const { buildSettingsReport } = await import("./settings-report.js");
+    return tgSend(buildSettingsReport({ color: false }));
   }
 
   // ── USDC mode (show/toggle) — terminal-parity with the CLI /usdc command ──

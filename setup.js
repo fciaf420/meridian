@@ -1,6 +1,7 @@
 /**
  * Interactive setup wizard.
- * Runs before the agent starts. Saves settings to user-config.json.
+ * Runs before the agent starts. MERGES settings into user-config.json
+ * (never overwrites the whole file — keys it doesn't ask about are preserved).
  * Run: npm run setup
  */
 
@@ -40,6 +41,11 @@ function askNum(question, defaultVal, { min, max } = {}) {
   });
 }
 
+async function askBool(question, defaultVal) {
+  const raw = await ask(`${question} (true/false)`, String(defaultVal));
+  return raw === true || String(raw).toLowerCase() === "true";
+}
+
 function askChoice(question, choices) {
   return new Promise(async (resolve) => {
     const labels = choices.map((c, i) => `  ${i + 1}. ${c.label}`).join("\n");
@@ -54,13 +60,13 @@ function askChoice(question, choices) {
   });
 }
 
-// ─── Presets ──────────────────────────────────────────────────────────────────
+// ─── Presets (Meteora screening + cadence/exits) ────────────────────────────────
 const PRESETS = {
   degen: {
     label:                 "🔥 Degen",
     timeframe:             "30m",
-    maxVolatility:         12.0,   // pumping meme coins welcome
-    maxPriceChangePct:     1000,   // don't filter pumps — high fee/TVL is the gate
+    maxVolatility:         12.0,
+    maxPriceChangePct:     1000,
     minOrganic:            60,
     minHolders:            200,
     maxMcap:               5_000_000,
@@ -73,8 +79,8 @@ const PRESETS = {
   moderate: {
     label:                 "⚖️  Moderate",
     timeframe:             "4h",
-    maxVolatility:         8.0,    // allow active meme coins
-    maxPriceChangePct:     300,    // allow up to 3x pump if fee/TVL justifies it
+    maxVolatility:         8.0,
+    maxPriceChangePct:     300,
     minOrganic:            65,
     minHolders:            500,
     maxMcap:               10_000_000,
@@ -88,7 +94,7 @@ const PRESETS = {
     label:                 "🛡️  Safe",
     timeframe:             "24h",
     maxVolatility:         2.5,
-    maxPriceChangePct:     80,     // avoid pumped coins
+    maxPriceChangePct:     80,
     minOrganic:            75,
     minHolders:            1000,
     maxMcap:               10_000_000,
@@ -100,7 +106,7 @@ const PRESETS = {
   },
 };
 
-// Load existing config
+// Load existing config — we MERGE onto this, never replace it.
 const existing = fs.existsSync(CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
   : {};
@@ -108,7 +114,7 @@ const existing = fs.existsSync(CONFIG_PATH)
 const DEFAULT_MODELS_BY_PROVIDER = {
   claude: "sonnet",
   codex: "gpt-4o",
-  deepseek: "deepseek-chat",
+  deepseek: "deepseek-v4-pro",
   minimax: "MiniMax-M2.7",
   openrouter: "openai/gpt-5.4-nano",
 };
@@ -119,6 +125,10 @@ console.log(`
 ╔═══════════════════════════════════════════╗
 ║       DLMM LP Agent — Setup Wizard        ║
 ╚═══════════════════════════════════════════╝
+
+  Settings are MERGED into user-config.json — anything not asked here
+  (learning, knowledge base, GMGN filters, etc.) is left untouched.
+  Secrets (keys/wallet/RPC) belong in .env, not here.
 `);
 
 // ─── Preset selection ─────────────────────────────────────────────────────────
@@ -138,7 +148,7 @@ console.log(preset
 
 const p = (key, fallback) => preset?.[key] ?? e(key, fallback);
 
-// ─── Wallet & RPC ─────────────────────────────────────────────────────────────
+// ─── Wallet & RPC (secrets stay in .env) ────────────────────────────────────────
 console.log("── Wallet & RPC ──────────────────────────────");
 
 const rpcUrl = await ask(
@@ -146,25 +156,18 @@ const rpcUrl = await ask(
   e("rpcUrl", process.env.RPC_URL || "https://api.mainnet-beta.solana.com")
 );
 
-// Extract Helius API key from RPC URL if possible
-const heliusMatch = rpcUrl.match(/api-key=([^&]+)/);
-const heliusDefault = heliusMatch?.[1] || process.env.HELIUS_API_KEY || "";
-const heliusApiKey = await ask(
-  "Helius API key (same key as RPC URL, for wallet balance)",
-  e("heliusApiKey", heliusDefault)
-);
-
-const walletKey = await ask(
-  "Wallet private key (base58)",
-  e("walletKey", process.env.WALLET_PRIVATE_KEY ? "*** (already set in .env)" : "")
-);
+if (process.env.WALLET_PRIVATE_KEY) {
+  console.log("  Wallet: *** already set in .env (leaving it there — secrets belong in .env)");
+} else {
+  console.log("  ⚠ WALLET_PRIVATE_KEY is NOT set in .env. Add it to .env before running the bot.");
+}
 
 // ─── Deployment ───────────────────────────────────────────────────────────────
 console.log("\n── Deployment ────────────────────────────────");
 
 const deployAmountSol = await askNum(
   "SOL to deploy per position",
-  e("deployAmountSol", 0.3),
+  e("deployAmountSol", 0.1),
   { min: 0.01, max: 50 }
 );
 
@@ -174,12 +177,15 @@ const maxPositions = await askNum(
   { min: 1, max: 10 }
 );
 
+const gasReserve = await askNum(
+  "SOL gas reserve to always keep (hard floor)",
+  e("gasReserve", 0.2),
+  { min: 0.01 }
+);
+
 const minSolToOpen = await askNum(
   "Min SOL balance to open a new position",
-  e("minSolToOpen", getEffectiveMinSolToOpen({
-    deployAmountSol,
-    gasReserve: e("gasReserve", 0.2),
-  })),
+  e("minSolToOpen", getEffectiveMinSolToOpen({ deployAmountSol, gasReserve })),
   { min: 0.05 }
 );
 
@@ -193,163 +199,128 @@ const maxDeployAmount = await askNum(
 console.log("\n── USDC Mode ─────────────────────────────────");
 console.log("  Hold capital in USDC: auto-swap USDC→SOL on entry, settle back to USDC on exit.");
 
-const usdcModeAns = await ask(
-  "Enable USDC mode? (true/false)",
-  String(e("usdcMode", false))
-);
-const usdcMode = usdcModeAns === "true" || usdcModeAns === true;
+const usdcMode = await askBool("Enable USDC mode?", e("usdcMode", false));
 
 let deployAmountUsd, maxDeployUsd, minUsdcToOpen, gasReserveSol;
 if (usdcMode) {
-  deployAmountUsd = await askNum(
-    "USD to deploy per position",
-    e("deployAmountUsd", 50),
-    { min: 1 }
-  );
-  maxDeployUsd = await askNum(
-    "Max USD per single position (safety cap)",
-    e("maxDeployUsd", Math.max(500, deployAmountUsd)),
-    { min: deployAmountUsd }
-  );
-  minUsdcToOpen = await askNum(
-    "Min USDC balance to open a new position",
-    e("minUsdcToOpen", deployAmountUsd),
-    { min: 0 }
-  );
-  gasReserveSol = await askNum(
-    "Native SOL gas reserve to keep (warn-only, no auto top-up)",
-    e("gasReserveSol", 0.05),
-    { min: 0.01 }
-  );
+  deployAmountUsd = await askNum("USD to deploy per position", e("deployAmountUsd", 50), { min: 1 });
+  maxDeployUsd = await askNum("Max USD per single position (safety cap)", e("maxDeployUsd", Math.max(500, deployAmountUsd)), { min: deployAmountUsd });
+  minUsdcToOpen = await askNum("Min USDC balance to open a new position", e("minUsdcToOpen", deployAmountUsd), { min: 0 });
+  gasReserveSol = await askNum("Native SOL gas reserve to keep", e("gasReserveSol", 0.2), { min: 0.01 });
 }
 
-// ─── Risk ─────────────────────────────────────────────────────────────────────
-console.log("\n── Risk & Filters ────────────────────────────");
+// ─── Screening source ───────────────────────────────────────────────────────────
+console.log("\n── Screening Source ──────────────────────────");
+const sourceChoice = await askChoice("Where do pool candidates come from?", [
+  { label: `GMGN     — advanced token screening (filters live in gmgn-config.json)${e("screeningSource") === "gmgn" ? " (current)" : ""}`, key: "gmgn" },
+  { label: `Meteora  — Meteora pool API + thresholds below${e("screeningSource", "meteora") === "meteora" ? " (current)" : ""}`, key: "meteora" },
+]);
+const screeningSource = sourceChoice.key;
 
-const timeframe = await ask(
-  "Pool discovery timeframe (30m / 1h / 4h / 12h / 24h)",
-  p("timeframe", "4h")
-);
+// Meteora-specific filters only matter when source = meteora.
+let timeframe, maxVolatility, maxPriceChangePct, minOrganic, minHolders, maxMcap;
+if (screeningSource === "meteora") {
+  console.log("\n── Meteora Filters ───────────────────────────");
+  timeframe         = await ask("Pool discovery timeframe (30m / 1h / 4h / 12h / 24h)", p("timeframe", "4h"));
+  maxVolatility     = await askNum("Max pool volatility", p("maxVolatility", 8.0), { min: 0.5, max: 20 });
+  maxPriceChangePct = await askNum("Max price change % allowed (300 = allow 3x pumps)", p("maxPriceChangePct", 300), { min: 10 });
+  minOrganic        = await askNum("Min organic score (0-100)", p("minOrganic", 65), { min: 0, max: 100 });
+  minHolders        = await askNum("Min token holders", p("minHolders", 500), { min: 1 });
+  maxMcap           = await askNum("Max token market cap USD", p("maxMcap", 10_000_000), { min: 100_000 });
+} else {
+  console.log("\n  ✓ GMGN screening — edit token filters (mcap, holders, KOL, snipers, indicators)");
+  console.log("    in gmgn-config.json. Copy gmgn-config.example.json if it doesn't exist yet.");
+}
 
-const maxVolatility = await askNum(
-  "Max pool volatility",
-  p("maxVolatility", 8.0),
-  { min: 0.5, max: 20 }
-);
+// ─── Strategy ─────────────────────────────────────────────────────────────────
+console.log("\n── Strategy ──────────────────────────────────");
+const stratChoice = await askChoice("Active strategy:", [
+  { label: `Evil Panda — single-sided SOL spot, indicator-gated${e("activeStrategy", "evil_panda") === "evil_panda" ? " (current)" : ""}`, key: "evil_panda" },
+  { label: `Classic    — use the configured shape below${e("activeStrategy") && e("activeStrategy") !== "evil_panda" ? " (current)" : ""}`, key: "classic" },
+]);
 
-const maxPriceChangePct = await askNum(
-  "Max price change % allowed (e.g. 300 = allow 3x pumps)",
-  p("maxPriceChangePct", 300),
-  { min: 10 }
-);
+let activeStrategy, strategyShape, evilPandaPriceRangePct, evilPandaMinMcap, evilPandaMinTokenVolume24h;
+if (stratChoice.key === "evil_panda") {
+  activeStrategy = "evil_panda";
+  strategyShape  = "spot"; // Evil Panda is always spot
+  evilPandaPriceRangePct     = await askNum("Evil Panda price range %", e("evilPandaPriceRangePct", 75), { min: 5, max: 100 });
+  evilPandaMinMcap           = await askNum("Evil Panda min market cap USD", e("evilPandaMinMcap", 200_000), { min: 0 });
+  evilPandaMinTokenVolume24h = await askNum("Evil Panda min 24h volume USD", e("evilPandaMinTokenVolume24h", 750_000), { min: 0 });
+} else {
+  activeStrategy = e("activeStrategy", "classic") === "evil_panda" ? "classic" : e("activeStrategy", "classic");
+  const shapeChoice = await askChoice("Position shape:", [
+    { label: "Spot",    key: "spot" },
+    { label: "Bid/Ask", key: "bid_ask" },
+  ]);
+  strategyShape = shapeChoice.key;
+}
 
-const minOrganic = await askNum(
-  "Min organic score (0-100)",
-  p("minOrganic", 65),
-  { min: 0, max: 100 }
-);
-
-const minHolders = await askNum(
-  "Min token holders",
-  p("minHolders", 500),
-  { min: 1 }
-);
-
-const maxMcap = await askNum(
-  "Max token market cap USD",
-  p("maxMcap", 10_000_000),
-  { min: 100_000 }
-);
-
-// ─── Exit ─────────────────────────────────────────────────────────────────────
+// ─── Exit Rules ─────────────────────────────────────────────────────────────────
 console.log("\n── Exit Rules ────────────────────────────────");
 
-const takeProfitFeePct = await askNum(
-  "Take profit when fees earned >= X% of deployed capital",
-  p("takeProfitFeePct", 5),
-  { min: 0.1, max: 100 }
-);
-
-const outOfRangeWaitMinutes = await askNum(
-  "Minutes out-of-range before closing",
-  p("outOfRangeWaitMinutes", 30),
-  { min: 1 }
-);
+const takeProfitFeePct = await askNum("Take profit when fees earned >= X% of deployed capital", p("takeProfitFeePct", 7), { min: 0.1, max: 100 });
+const stopLossPct      = await askNum("Stop loss % (negative, e.g. -5)", e("stopLossPct", -5), { max: 0 });
+const trailingTakeProfit = await askBool("Trailing take profit?", e("trailingTakeProfit", true));
+let trailingTriggerPct, trailingDropPct;
+if (trailingTakeProfit) {
+  trailingTriggerPct = await askNum("  Trailing trigger % (arm trailing once PnL ≥ this)", e("trailingTriggerPct", 5), { min: 0.1 });
+  trailingDropPct    = await askNum("  Trailing drop % (close after this drop from peak)", e("trailingDropPct", 4), { min: 0.1 });
+}
+const outOfRangeWaitMinutes = await askNum("Minutes out-of-range before closing", p("outOfRangeWaitMinutes", 3), { min: 1 });
 
 // ─── Scheduling ───────────────────────────────────────────────────────────────
 console.log("\n── Scheduling ────────────────────────────────");
 
-const managementIntervalMin = await askNum(
-  "Management cycle interval (minutes)",
-  p("managementIntervalMin", 10),
-  { min: 1 }
-);
-
-const screeningIntervalMin = await askNum(
-  "Screening cycle interval (minutes)",
-  p("screeningIntervalMin", 30),
-  { min: 5 }
-);
+const managementIntervalMin = await askNum("Management cycle interval (minutes)", p("managementIntervalMin", 3), { min: 1 });
+const screeningIntervalMin   = await askNum("Screening cycle interval (minutes)", p("screeningIntervalMin", 45), { min: 5 });
 
 // ─── LLM ──────────────────────────────────────────────────────────────────────
 console.log("\n── LLM ───────────────────────────────────────");
 
-const defaultLlmProvider = e("llmProvider", process.env.LLM_PROVIDER || "codex");
+const defaultLlmProvider = e("llmProvider", process.env.LLM_PROVIDER || "deepseek");
 const llmProviderChoice = await askChoice("LLM provider:", [
-  { label: `Claude OAuth${defaultLlmProvider === "claude" ? " (default)" : ""}`, key: "claude" },
-  { label: `Codex OAuth${defaultLlmProvider === "codex" ? " (default)" : ""}`, key: "codex" },
-  { label: `OpenRouter${defaultLlmProvider === "openrouter" ? " (default)" : ""}`, key: "openrouter" },
-  { label: `DeepSeek${defaultLlmProvider === "deepseek" ? " (default)" : ""}`, key: "deepseek" },
-  { label: `MiniMax Token Plan${defaultLlmProvider === "minimax" ? " (default)" : ""}`, key: "minimax" },
+  { label: `DeepSeek${defaultLlmProvider === "deepseek" ? " (current)" : ""}`, key: "deepseek" },
+  { label: `Claude OAuth${defaultLlmProvider === "claude" ? " (current)" : ""}`, key: "claude" },
+  { label: `Codex OAuth${defaultLlmProvider === "codex" ? " (current)" : ""}`, key: "codex" },
+  { label: `OpenRouter${defaultLlmProvider === "openrouter" ? " (current)" : ""}`, key: "openrouter" },
+  { label: `MiniMax Token Plan${defaultLlmProvider === "minimax" ? " (current)" : ""}`, key: "minimax" },
 ]);
 const llmProvider = llmProviderChoice.key || defaultLlmProvider;
 const providerDefaultModel = DEFAULT_MODELS_BY_PROVIDER[llmProvider] || "gpt-4o";
-const globalDefaultLlmModel = e(
-  "llmModel",
-  process.env.LLM_MODEL || providerDefaultModel
-);
-const managementModel = await ask(
-  "Manager model ID",
-  e("managementModel", globalDefaultLlmModel)
-);
-const screeningModel = await ask(
-  "Screener model ID",
-  e("screeningModel", globalDefaultLlmModel)
-);
-const generalModel = await ask(
-  "General/chat model ID",
-  e("generalModel", globalDefaultLlmModel)
-);
-const autoresearchModel = await ask(
-  "Autoresearch model ID",
-  e("autoresearchModel", globalDefaultLlmModel)
-);
+const globalDefaultLlmModel = e("llmModel", process.env.LLM_MODEL || providerDefaultModel);
+const managementModel  = await ask("Manager model ID", e("managementModel", globalDefaultLlmModel));
+const screeningModel   = await ask("Screener model ID", e("screeningModel", globalDefaultLlmModel));
+const generalModel     = await ask("General/chat model ID", e("generalModel", globalDefaultLlmModel));
+const autoresearchModel = await ask("Autoresearch model ID", e("autoresearchModel", globalDefaultLlmModel));
 
-const dryRun = await ask(
-  "Dry run mode? (true = no real transactions)",
-  e("dryRun", "false")
-);
+const dryRun = await askBool("Dry run mode? (true = no real transactions)", e("dryRun", false));
 
 rl.close();
 
-// ─── Save ──────────────────────────────────────────────────────────────────────
-const userConfig = {
+// ─── Save (MERGE onto existing) ─────────────────────────────────────────────────
+const changes = {
   preset: presetChoice.key,
   rpcUrl,
-  ...(walletKey && !walletKey.startsWith("***") ? { walletKey } : {}),
   deployAmountSol,
   maxPositions,
+  gasReserve,
   minSolToOpen,
   maxDeployAmount,
   usdcMode,
   ...(usdcMode ? { deployAmountUsd, maxDeployUsd, minUsdcToOpen, gasReserveSol } : {}),
-  timeframe,
-  maxVolatility,
-  maxPriceChangePct,
-  minOrganic,
-  minHolders,
-  maxMcap,
+  screeningSource,
+  ...(screeningSource === "meteora"
+    ? { timeframe, maxVolatility, maxPriceChangePct, minOrganic, minHolders, maxMcap }
+    : {}),
+  activeStrategy,
+  strategy: strategyShape,
+  ...(activeStrategy === "evil_panda"
+    ? { evilPandaPriceRangePct, evilPandaMinMcap, evilPandaMinTokenVolume24h }
+    : {}),
   takeProfitFeePct,
+  stopLossPct,
+  trailingTakeProfit,
+  ...(trailingTakeProfit ? { trailingTriggerPct, trailingDropPct } : {}),
   outOfRangeWaitMinutes,
   managementIntervalMin,
   screeningIntervalMin,
@@ -359,39 +330,39 @@ const userConfig = {
   screeningModel,
   generalModel,
   autoresearchModel,
-  dryRun: dryRun === "true",
+  dryRun,
 };
 
+// MERGE: preserve every key the wizard didn't touch (learning, knowledgeBase, etc.)
+const userConfig = { ...existing, ...changes };
 fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
 const presetName = preset ? preset.label : "Custom";
+const preserved = Object.keys(existing).filter((k) => !(k in changes));
 
 console.log(`
 ╔═══════════════════════════════════════════╗
 ║           Configuration Saved             ║
 ╚═══════════════════════════════════════════╝
 
-Preset:       ${presetName}
-Timeframe:    ${timeframe}
+Preset:        ${presetName}
+Screening:     ${screeningSource}${screeningSource === "gmgn" ? "  (filters in gmgn-config.json)" : `  (timeframe ${timeframe})`}
+Strategy:      ${activeStrategy} / ${strategyShape}${activeStrategy === "evil_panda" ? `  (range ${evilPandaPriceRangePct}%)` : ""}
 
-  Deploy:     ${deployAmountSol} SOL/position  |  Max: ${maxPositions} positions
-  Min balance: ${minSolToOpen} SOL to open${usdcMode ? `
-  USDC mode:  ON — $${deployAmountUsd}/position  |  max $${maxDeployUsd}  |  gas reserve ${gasReserveSol} SOL` : `
-  USDC mode:  OFF`}
+  Deploy:      ${deployAmountSol} SOL/position  |  Max: ${maxPositions} positions
+  Min balance: ${minSolToOpen} SOL to open  |  gas reserve ${gasReserve} SOL${usdcMode ? `
+  USDC mode:   ON — $${deployAmountUsd}/position  |  max $${maxDeployUsd}  |  gas reserve ${gasReserveSol} SOL` : `
+  USDC mode:   OFF`}
   Take profit: fees >= ${takeProfitFeePct}%
-  Volatility:  max ${maxVolatility}
-  Organic:     min ${minOrganic}
-  Holders:     min ${minHolders}
-  Max mcap:    $${maxMcap.toLocaleString()}
+  Stop loss:   ${stopLossPct}%
+  Trailing TP: ${trailingTakeProfit ? `on (trigger ${trailingTriggerPct}% / drop ${trailingDropPct}%)` : "off"}
   OOR close:   after ${outOfRangeWaitMinutes} min
   Mgmt:        every ${managementIntervalMin} min
   Screening:   every ${screeningIntervalMin} min
-  Provider:    ${llmProvider}
-  Manager:     ${managementModel}
-  Screener:    ${screeningModel}
-  General:     ${generalModel}
-  Research:    ${autoresearchModel}
+  Provider:    ${llmProvider}  (manager ${managementModel} / screener ${screeningModel})
   Dry run:     ${dryRun}
 
-Run "npm start" to launch the agent.
+  Preserved untouched: ${preserved.length ? preserved.join(", ") : "(none)"}
+
+Run "npm run settings" to review, then "npm start" to launch.
 `);
