@@ -1035,3 +1035,16 @@ test("candidates: each row links the token on GMGN when the mint is known", () =
   assert.equal(gmgn(keyboard[1])?.url, `https://gmgn.ai/sol/token/${MINT}`);
   assert.equal(gmgn(keyboard[2]), undefined);
 });
+
+test("positions: each position gets a links row with GMGN for its token mint", () => {
+  const MINT = "Mint111111111111111111111111111111111111111";
+  const { keyboard } = ui.renderPositions({ positions: [
+    { position: "Pos11111111111111111111111111111111111111111", pool: "Pool1111111111111111111111111111111111111111", pair: "AAA-SOL", base_mint: MINT, in_range: true },
+    { position: "Pos22222222222222222222222222222222222222222", pool: "Pool2222222222222222222222222222222222222222", pair: "BBB-SOL", in_range: true },
+  ] }, { refs: ui.createRefMap(), bins: true });
+  const flat = keyboard.flat();
+  const gmgn = flat.filter((b) => b.text === "GMGN ↗");
+  assert.equal(gmgn.length, 1);
+  assert.equal(gmgn[0].url, `https://gmgn.ai/sol/token/${MINT}`);
+  assert.ok(keyboard.every((row) => row.length <= 3), "no row wider than 3 buttons");
+});
