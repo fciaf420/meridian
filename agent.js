@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { buildSystemPrompt } from "./prompt.js";
+import { buildSystemPrompt, runWithExperimentArm } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 import { getWalletBalances } from "./tools/wallet.js";
@@ -95,7 +95,8 @@ export function getScreenerModelLabel() {
 }
 
 export async function screenerLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = []) {
-  return agentLoop(goal, maxSteps, sessionHistory, "SCREENER", config.llm.screeningModel);
+  // Autoresearch A/B: each screener run gets the next experiment arm (no-op without an experiment).
+  return runWithExperimentArm(() => agentLoop(goal, maxSteps, sessionHistory, "SCREENER", config.llm.screeningModel));
 }
 
 function getRolePrimaryModel(agentType) {

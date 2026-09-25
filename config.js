@@ -232,19 +232,20 @@ export const config = {
     meanReversionRate: u.darwinianMeanReversionRate ?? 0.02,
   },
 
-  // ─── Autoresearch (ATLAS-inspired prompt optimization) ─────
+  // ─── Autoresearch (prompt A/B experiments, after karpathy/autoresearch) ─────
   autoresearch: {
     enabled: u.autoresearch ?? false,
-    minClosesPerTrial: u.autoresearchMinCloses ?? 7,
-    minEvidenceCloses: u.autoresearchMinEvidenceCloses ?? Math.max(10, (u.autoresearchMinCloses ?? 7) + 2),
+    // Concurrent A/B verdict: control vs candidate arms, size-weighted mean PnL,
+    // seeded bootstrap 95% CI. Keep only if CI lower bound > 0 AND effect >= minEffectPct.
+    minClosesPerArm: u.autoresearchMinClosesPerArm ?? 100,
+    minEffectPct: u.autoresearchMinEffectPct ?? 1.5,          // percentage points of mean PnL
+    maxExperimentDays: u.autoresearchMaxExperimentDays ?? 14, // cap: inconclusive, candidate discarded
+    autoKeep: u.autoresearchAutoKeep ?? false,                // false = a passing candidate becomes a pending proposal
     minAttributedLosses: u.autoresearchMinAttributedLosses ?? 3,
-    minAbsoluteWinRateDeltaPct: u.autoresearchMinAbsoluteWinRateDeltaPct ?? 10,
-    minAbsolutePnlDeltaPct: u.autoresearchMinAbsolutePnlDeltaPct ?? 0.5,
-    improvementPct: u.autoresearchImprovementPct ?? 15,
-    declinePct: u.autoresearchDeclinePct ?? 15,
     cooldownCloses: u.autoresearchCooldownCloses ?? 5,
     llmModel: u.autoresearchModel ?? DEFAULT_MODEL,
     reasoningEffort: u.autoresearchReasoningEffort ?? "medium",
+    maxDiffPct: u.autoresearchMaxDiffPct ?? 30, // reject candidates that change more than this % of lines
   },
 
   // ─── Knowledge Base ─────────────��──────

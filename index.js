@@ -32,6 +32,7 @@ import {
   isScreeningBusy, setScreeningBusy,
 } from "./session.js";
 import { startServer } from "./server.js";
+import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
 import { getScreeningThresholdSummary, getStartupMode } from "./runtime-helpers.js";
 import { getRangeSelectionText } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
@@ -830,6 +831,7 @@ const TELEGRAM_HELP = [
   "/thresholds — screening thresholds + performance",
   "/learn [pool] — study top LPers (all top pools, or one address)",
   "/evolve — evolve thresholds from performance",
+  "/autoresearch [list|show|revert|restore …] — prompt overrides (operator only)",
   "/stop — shut the agent down",
   "/help — this list",
   "",
@@ -1035,6 +1037,12 @@ async function handleTelegramCommand(rawText) {
     });
   }
 
+  // ── Autoresearch overrides (operator path; logic lives in autoresearch.js) ──
+  if (lower === "/autoresearch" || lower.startsWith("/autoresearch ")) {
+    for (const chunk of autoresearchTelegramChunks(handleAutoresearchCommand(text.slice(13)))) await sendMessage(chunk);
+    return;
+  }
+
   // ── Free-form chat ──
   return runRemote(async () => {
     const { content } = await lightChat(text, sessionHistory, config.llm.generalModel);
@@ -1160,6 +1168,7 @@ Commands:
   /learn <addr>  Study top LPers from a specific pool address
   /thresholds    Show current screening thresholds + performance stats
   /evolve        Manually trigger threshold evolution from performance data
+  /autoresearch  Prompt overrides: list | show | revert | restore <section>
   /stop          Shut down
 `);
 
@@ -1353,6 +1362,12 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
           console.log("\nSaved to user-config.json. Applied immediately.\n");
         }
       });
+      return;
+    }
+
+    if (input === "/autoresearch" || input.toLowerCase().startsWith("/autoresearch ")) {
+      console.log(`\n${handleAutoresearchCommand(input.slice(13))}\n`);
+      rl.prompt();
       return;
     }
 
