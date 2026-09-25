@@ -359,8 +359,8 @@ Your goal: Manage positions to maximize total Fee + PnL yield.
 INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g. "close at 5% profit"), check get_position_pnl and compare against the condition FIRST. If the condition IS MET → close immediately. No further analysis, no hesitation. BIAS TO HOLD does NOT apply when an instruction condition is met.
 
 HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_TP, close immediately):
-- STOP LOSS: Close if PnL drops below ${config.management.stopLossPct}%.
-- TRAILING TAKE PROFIT: Once PnL reaches +${config.management.trailingTriggerPct}%, trailing mode activates. If PnL then drops ${config.management.trailingDropPct}% from peak → close and lock in profit.
+- STOP LOSS: ${config.management.stopLossPct ? `Close if PnL drops below ${config.management.stopLossPct}%.` : "OFF (disabled by the user; stopLossPct is 0). Do not close on a stop-loss basis."}
+- TRAILING TAKE PROFIT: ${config.management.trailingTakeProfit ? `Once PnL reaches +${config.management.trailingTriggerPct}%, trailing mode activates. If PnL then drops ${config.management.trailingDropPct}% from peak → close and lock in profit.` : "OFF (disabled by the user). Only the fixed take profit applies."}
 - FIXED TAKE PROFIT: Close when total PnL >= ${config.management.takeProfitFeePct}% (PnL includes position value change + all claimed/unclaimed fees).${config.strategy.activeStrategy === "evil_panda" ? `
 - EVIL PANDA EXIT: For strategy_profile=evil_panda, only close when PnL is positive AND 5m GMGN shows RSI(2)>90 plus either close above Bollinger Band upper or MACD first green histogram. If PnL is not positive, do not close solely on Evil Panda indicator confluence.` : ""}
 
