@@ -11,13 +11,15 @@ import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidat
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
 import { registerCronRestarter, executeTool } from "./tools/executor.js";
-import { startPolling, stopPolling, sendMessage, isEnabled as telegramEnabled } from "./telegram.js";
+import { startPolling, stopPolling, sendMessage, sendHTML, editHTML, answerCallback, setMyCommands, isEnabled as telegramEnabled } from "./telegram.js";
+import { createTelegramUI, BOT_COMMANDS, readRecentErrors } from "./telegram-ui.js";
+import { isScreeningPaused, setScreeningPaused } from "./state.js";
 import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
-import { emit } from "./notifier.js";
+import { emit, on } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { startPnlWatcher, stopPnlWatcher } from "./pnl-watcher.js";
@@ -32,8 +34,9 @@ import {
   isScreeningBusy, setScreeningBusy,
 } from "./session.js";
 import { startServer } from "./server.js";
+import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
-import { getScreeningThresholdSummary, getStartupMode } from "./runtime-helpers.js";
+import { getScreeningThresholdSummary, getStartupMode, screeningCronGate } from "./runtime-helpers.js";
 import { getRangeSelectionText } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
@@ -185,6 +188,295 @@ async function resetIdleManagementInterval() {
     value: IDLE_MANAGEMENT_INTERVAL_MIN,
     reason: "no open positions",
   });
+}
+
+// Screening cycle, shared by the cron and Telegram's "Run screening now".
+// The gate (runtime-helpers screeningCronGate) is checked synchronously and the
+// screening lock taken BEFORE any await, so a cron tick, Telegram command or web
+// request can't slip in between. The operator pause (state.json) only stops the
+// scheduled cron; management and the PnL watcher never look at it.
+function runScreeningCycle({ manual = false } = {}) {
+  const gate = screeningCronGate({
+    paused: isScreeningPaused(),
+    busy: isBusy(),
+    screeningBusy: isScreeningBusy(),
+    managementBusy: isManagementBusy(),
+    manual,
+  });
+  if (!gate.run) {
+    if (gate.touchTimer) timers.screeningLastRun = Date.now();
+    if (gate.reason !== "a screening cycle is already running") log("cron", `Screening skipped — ${gate.reason}`);
+    return { started: false, reason: gate.reason, done: Promise.resolve(null) };
+  }
+  setScreeningBusy(true);
+  timers.screeningLastRun = Date.now();
+  if (manual) log("cron", "Screening cycle triggered manually (Telegram)");
+  return { started: true, reason: null, done: screeningCycleBody() };
+}
+
+async function screeningCycleBody() {
+  let screenReport = null;
+  try {
+    // Hard guards — don't even run the agent if preconditions aren't met
+    try {
+      const [positions, balance] = await Promise.all([getMyPositions(), getWalletBalances()]);
+      if (positions.total_positions >= config.risk.maxPositions) {
+        log("cron", `Screening skipped — max positions reached (${positions.total_positions}/${config.risk.maxPositions})`);
+        return;
+      }
+      if (usdcModeEnabled()) {
+        // Warn-only gas reserve: don't auto top-up, just pause + alert.
+        if (balance.sol < config.usdc.gasReserveSol) {
+          log("cron", `Screening skipped — SOL ${balance.sol.toFixed(4)} below gas reserve ${config.usdc.gasReserveSol}`);
+          emit("gas_low", { sol: balance.sol, reserve: config.usdc.gasReserveSol });
+          return;
+        }
+        if ((balance.usdc ?? 0) < config.usdc.minUsdcToOpen) {
+          log("cron", `Screening skipped — insufficient USDC ($${(balance.usdc ?? 0).toFixed(2)} < $${config.usdc.minUsdcToOpen})`);
+          return;
+        }
+      } else if (balance.sol < config.management.minSolToOpen) {
+        log("cron", `Screening skipped — insufficient SOL (${balance.sol.toFixed(3)} < ${config.management.minSolToOpen})`);
+        return;
+      }
+    } catch (e) {
+      log("cron_error", `Screening pre-check failed: ${e.message}`);
+      return;
+    }
+
+    const screenModel = getScreenerModelLabel();
+    log("cron", `Starting screening cycle [model: ${screenModel}]`);
+    // Compute dynamic deploy amount based on current wallet (compounding)
+    const currentBalance = await getWalletBalances().catch(() => null);
+    const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
+    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance?.sol ?? "?"} SOL)`);
+
+    // Load saved strategies for reference (LLM picks per token)
+    const activeStrategy = getActiveStrategy();
+    const strategyBlock = activeStrategy
+      ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrategy.name} — ${activeStrategy.lp_strategy}, best for: ${activeStrategy.best_for}`
+      : "";
+
+    // Pre-load top 3 candidates with recon data in parallel
+    let candidateBlocks = "";
+    let loadedCandidates = [];
+    const hardSkipped = [];
+    try {
+      const result = await getTopCandidates({ limit: 5 });
+      const candidates = result?.candidates || [];
+      loadedCandidates = candidates;
+      // Fetch dynamic fees sequentially to avoid RPC rate limit bursts
+      const { fetchDynamicFee } = await import("./tools/screening.js");
+      const dynFeeMap = {};
+      for (const c of candidates) {
+        dynFeeMap[c.pool] = await fetchDynamicFee(c.pool);
+      }
+      const blocks = await Promise.allSettled(candidates.map(async (c) => {
+        const baseMint = c.base_mint || c.base?.mint || null;
+        const [sw, holders, narrative, poolMem, tokenInfo, gmgnData, gmgnSignal] = await Promise.allSettled([
+          checkSmartWalletsOnPool({ pool_address: c.pool }),
+          baseMint ? getTokenHolders({ mint: baseMint }) : null,
+          baseMint ? getTokenNarrative({ mint: baseMint }) : null,
+          recallForPool(c.pool),
+          baseMint ? getTokenInfo({ query: baseMint }) : null,
+          baseMint ? fetchGmgnPriceInfo(baseMint) : null,
+          baseMint ? fetchGmgnSignal(baseMint) : null,
+        ]);
+        const swResult = sw.status === "fulfilled" ? sw.value : null;
+        const holdResult = holders.status === "fulfilled" ? holders.value : null;
+        const narrResult = narrative.status === "fulfilled" ? narrative.value : null;
+        const memResult = poolMem.status === "fulfilled" ? poolMem.value : null;
+        const infoResult = tokenInfo.status === "fulfilled" ? tokenInfo.value : null;
+        const gmgnResult = gmgnData.status === "fulfilled" ? gmgnData.value : null;
+        const gmgnSignalResult = gmgnSignal.status === "fulfilled" ? gmgnSignal.value : null;
+        c._gmgnResult = gmgnResult;  // attach to candidate for signal staging
+        c._gmgnSignal = gmgnSignalResult;
+        const dynFeeResult = dynFeeMap[c.pool] || null;
+        const tokenData = infoResult?.results?.[0];
+        const smartWalletCount = swResult?.in_pool?.length || 0;
+        c._smartWalletCount = smartWalletCount;
+        c._globalFeesSol = holdResult?.global_fees_sol ?? null;
+        c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
+
+        let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
+        const srcTag = formatCandidateSources(c);
+        if (srcTag) block += ` | ${srcTag}`;
+
+        if (Array.isArray(c.darwin_top_signals) && c.darwin_top_signals.length > 0) {
+          const topSignals = c.darwin_top_signals
+            .map((s) => `${s.signal}=${s.value} (${s.direction})`)
+            .join(", ");
+          block += `\n  Darwin context: higher score = better fit to learned winning signals. Top drivers: ${topSignals}`;
+        }
+
+        if (dynFeeResult) block += ` | base_fee: ${c.fee_pct}% | dynamic_fee: ${dynFeeResult.dynamic_fee_pct}%`;
+        if (tokenData) {
+          if (tokenData.mcap) block += ` | mcap: $${(tokenData.mcap / 1000).toFixed(0)}k`;
+          if (tokenData.stats_1h?.price_change) block += ` | 1h: ${tokenData.stats_1h.price_change}%`;
+        }
+        // GMGN token signals (screeningSource gmgn/both): KOL / smart money / indicators.
+        if (c.gmgn) {
+          const kolNames = c.gmgn_kol_names?.length ? ` (${c.gmgn_kol_names.slice(0, 3).join(", ")})` : "";
+          const ind = c.indicators ? ` | supertrend=${c.indicators.supertrendDirection ?? "?"} rsi=${c.indicators.rsi ?? "?"}` : "";
+          block += `\n  GMGN screen: smart=${c.gmgn_smart_wallets ?? "?"} kol=${c.gmgn_kol_wallets ?? "?"}${kolNames}${c.gmgn_dump_kol_significant ? ` dump_kol=${c.gmgn_dump_kol_significant}` : ""}${ind}`;
+        }
+        if (smartWalletCount > 0) block += `\n  Smart wallets: ${smartWalletCount} found`;
+        else block += `\n  Smart wallets: none`;
+        if (holdResult?.global_fees_sol != null) block += ` | global_fees: ${holdResult.global_fees_sol} SOL`;
+        if (holdResult?.top_10_real_holders_pct != null) block += ` | top10: ${holdResult.top_10_real_holders_pct}%`;
+        if (narrResult?.narrative) block += `\n  Narrative: ${narrResult.narrative.slice(0, 500)}`;
+        if (memResult) block += `\n  Memory: ${memResult}`;
+        if (gmgnResult) {
+          block += ` | ath: ${gmgnResult.ath_proximity_pct ?? "?"}%`;
+          block += ` | momentum: 5m=${gmgnResult.change_5m ?? "?"}% 1h=${gmgnResult.change_1h ?? "?"}%`;
+          block += ` | token24hVol: $${Math.round(gmgnResult.volume_24h ?? 0)} | tokenMcap: $${Math.round(gmgnResult.market_cap ?? 0)}`;
+          if (gmgnResult.candles) {
+            const epPass = gmgnResult.volume_24h >= (config.strategy.evilPanda?.minTokenVolume24h ?? 750000)
+              && gmgnResult.market_cap >= (config.strategy.evilPanda?.minMcap ?? 200000)
+              && gmgnResult.candles.evil_panda_entry_ok;
+            c._evilPandaPass = !!epPass;
+            block += `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, mcap>=${config.strategy.evilPanda?.minMcap ?? 200000}, 5m Supertrend green/price above`;
+            block += ` | supertrend=${gmgnResult.candles.supertrend_direction ?? "?"}/${gmgnResult.candles.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${gmgnResult.candles.rsi_2 ?? "?"}`;
+          }
+          if (gmgnResult.ath_proximity_pct != null && gmgnResult.ath_proximity_pct >= config.screening.athTopThresholdPct) {
+            block += `\n  ATH WARNING: ${gmgnResult.ath_proximity_pct}% of ATH (>=${config.screening.athTopThresholdPct}%) — override bid_ask range to 65-80%`;
+          }
+          if (gmgnResult.change_1h > 10 && gmgnResult.change_5m < -2) {
+            block += `\n  MOMENTUM WARNING: pump fading (1h +${gmgnResult.change_1h}%, 5m ${gmgnResult.change_5m}%) — widen range or consider skipping`;
+          }
+        }
+        if (gmgnSignalResult) {
+          block += `\n  GMGN signal: ${gmgnSignalResult.summary}`;
+        }
+        return { pool: c.pool, block };
+      }));
+      const rankedCandidates = rankCandidatesByDarwin(candidates);
+      loadedCandidates = rankedCandidates;
+      const blockMap = new Map(
+        blocks
+          .filter((b) => b.status === "fulfilled")
+          .map((b) => [b.value.pool, b.value.block])
+      );
+      // Hard skips are threshold checks on pre-loaded data: drop failing candidates in
+      // code so the model only judges the survivors (narrative, momentum, pick-or-skip).
+      // Unknown values (null) never cause a skip here; the model still sees them.
+      const hardSkipReason = (c) => {
+        if (c._globalFeesSol != null && c._globalFeesSol < config.screening.minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${config.screening.minTokenFeesSol}`;
+        if (Number.isFinite(c._top10Pct) && c._top10Pct > 60) return `top10 ${c._top10Pct}% > 60%`;
+        if (config.strategy.activeStrategy === "evil_panda" && c._evilPandaPass === false) return "Evil Panda entry FAIL";
+        return null;
+      };
+      const survivors = [];
+      for (const c of rankedCandidates) {
+        const reason = hardSkipReason(c);
+        if (reason) hardSkipped.push(`${c.name}: ${reason}`);
+        else survivors.push(c);
+      }
+      if (hardSkipped.length > 0) log("cron", `Screening hard-skipped in code: ${hardSkipped.join("; ")}`);
+      const validBlocks = survivors
+        .map((c) => blockMap.get(c.pool))
+        .filter(Boolean);
+      if (validBlocks.length > 0) {
+        candidateBlocks = `\n\nPRE-LOADED CANDIDATES (recon already done — evaluate and deploy the best one):\nDarwin score is a learned 0-100 ranking over the current shortlist. Higher = stronger fit to historically winning signal patterns. Use it as a ranking aid, not a hard deploy rule.\n${validBlocks.join("\n\n")}\n`;
+      }
+      // Stage signals for each candidate so deploy can snapshot them
+      for (const c of rankedCandidates) {
+        try {
+          stageSignals(c.pool, {
+            organic_score: c.organic_score ?? null,
+            fee_tvl_ratio: c.fee_active_tvl_ratio ?? null,
+            volume: c.volume ?? null,
+            volatility: c.volatility ?? null,
+            mcap: c.mcap ?? null,
+            holder_count: c.holders ?? null,
+            smart_wallets_present: (c._smartWalletCount || 0) > 0,
+            narrative_quality: null, // filled by tool signal capture in executor
+            study_win_rate: null,    // filled by tool signal capture in executor
+            ath_proximity: c._gmgnResult?.ath_proximity_pct ?? null,
+            // New Darwinian signals
+            volume_trend: c._gmgnResult?.candles?.volume_trend ?? null,
+            gmgn_signal_present: (c._gmgnSignal?.signal_count_30m || 0) > 0,
+            change_1h: c._gmgnResult?.change_1h ?? null,
+            candle_price_range: c._gmgnResult?.candles?.price_range_pct ?? null,
+            token_volume_24h: c._gmgnResult?.volume_24h ?? null,
+            token_market_cap: c._gmgnResult?.market_cap ?? null,
+            supertrend_green: c._gmgnResult?.candles?.supertrend_green ?? null,
+            rsi_2: c._gmgnResult?.candles?.rsi_2 ?? null,
+            // Extra GMGN signal metadata (not weighted but stored for analysis)
+            gmgn_signal_count_30m: c._gmgnSignal?.signal_count_30m ?? null,
+            gmgn_signal_count_2h: c._gmgnSignal?.signal_count_2h ?? null,
+            gmgn_signal_amount_30m: c._gmgnSignal?.signal_amount_usd_30m ?? null,
+            gmgn_signal_amount_2h: c._gmgnSignal?.signal_amount_usd_2h ?? null,
+            gmgn_latest_signal_age_min: c._gmgnSignal?.latest_signal_age_min ?? null,
+            gmgn_latest_sold_ratio: c._gmgnSignal?.latest_sold_ratio_percent ?? null,
+          }, c.base_mint || c.base?.mint || null);
+        } catch { /* staging is best-effort */ }
+      }
+    } catch (e) {
+      log("cron", `Pre-load failed (${e.message}), agent will fetch manually`);
+    }
+
+    // Every pre-loaded candidate failed a hard skip: nothing is left to judge, and the
+    // no-preload fallback would only re-fetch the same shortlist. Skip the LLM call.
+    if (loadedCandidates.length > 0 && hardSkipped.length >= loadedCandidates.length) {
+      screenReport = `Screening: all ${loadedCandidates.length} candidate(s) failed hard-skip rules in code — no deploy.\n${hardSkipped.map((s) => `- ${s}`).join("\n")}`;
+      return screenReport; // finally{} still releases the screening lock and emits the report
+    }
+
+    // Inject Darwinian signal weights if available
+    let signalWeightsBlock = "";
+    try {
+      const weightsSummary = getWeightsSummary();
+      if (weightsSummary) {
+        signalWeightsBlock = `\n\n${weightsSummary}\n`;
+      }
+    } catch { /* best-effort */ }
+
+    // Pre-load KB articles relevant to candidates
+    let kbScreenContext = "";
+    try {
+      const kbHints = kbRecallForScreening(loadedCandidates);
+      if (kbHints) kbScreenContext = `\n\n${kbHints}`;
+    } catch { /* best-effort */ }
+
+    const gmgnSignalGuide = candidateBlocks
+      ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n- Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n`
+      : "";
+
+    const { content } = await screenerLoop(`
+SCREENING CYCLE — DEPLOY ONLY${signalWeightsBlock}${kbScreenContext}${candidateBlocks}${gmgnSignalGuide}
+${strategyBlock}
+${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and GMGN signal data.
+Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
+HARD SKIP rules still apply:
+- global_fees_sol < ${config.screening.minTokenFeesSol} SOL → skip (bundled/scam)
+- top_10_real_holders_pct > 60% OR bundlers > 30% → skip
+- No smart wallets or GMGN confirmation + empty/hype narrative → skip
+
+Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL.
+Size your price_range_pct from the VOLATILITY TABLE in the range selection rules below — NOT from study avg_range_pct.
+study_top_lpers is useful for strategy choice (bid_ask vs spot), hold times, and win rates — but their range data is from a different market regime and should not drive your range.` : `1. get_top_candidates, pick the best one.
+2. check_smart_wallets_on_pool, get_token_holders (check global_fees_sol >= ${config.screening.minTokenFeesSol}), get_token_narrative.
+3. HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL or holders/narrative red flags.
+4. study_top_lpers → use for strategy choice, hold times, win rates. Do NOT use avg_range_pct for your range — size from the VOLATILITY TABLE instead.
+5. deploy_position with ${deployAmount} SOL and price_range_pct from volatility table (adjusted by lessons).`}
+${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
+? `\n\nUSDC MODE IS ON: deploy sizing/funding is automatic — the system swaps USDC→SOL ($${config.usdc.deployAmountUsd}/position) and deploys single-sided. Do NOT pick a SOL amount or call swap_token to prepare funds; just call deploy_position for the chosen pool.`
+: ""}
+    `, config.llm.maxSteps, []);
+    screenReport = content;
+  } catch (error) {
+    log("cron_error", `Screening cycle failed: ${error.message}`);
+    screenReport = `Screening cycle failed: ${error.message}`;
+  } finally {
+    setScreeningBusy(false);
+    if (screenReport) {
+      emit("cycle:screening", { report: screenReport });
+      // File screening deploy to KB (direct write, no LLM)
+      try { fileScreeningResult(screenReport); } catch { /* best-effort */ }
+    }
+  }
+  return screenReport;
 }
 
 function startCronJobs() {
@@ -397,6 +689,7 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
     } catch (error) {
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
+      emit("cycle_error", { cycle: "Management", error: error.message });
     } finally {
       setManagementBusy(false);
       if (mgmtReport) emit("cycle:management", { report: mgmtReport, routine: mgmtRoutine });
@@ -422,284 +715,7 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
   });
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, async () => {
-    if (isBusy()) {
-      timers.screeningLastRun = Date.now();
-      log("cron", "Screening deferred — position action in progress");
-      return;
-    }
-    if (isScreeningBusy()) return;
-    if (isManagementBusy()) {
-      timers.screeningLastRun = Date.now();
-      log("cron", "Screening deferred — management cycle in progress");
-      return;
-    }
-
-    // Acquire the screening lock BEFORE the awaited wallet/position prechecks
-    // so a Telegram command / web request / overlapping cron can't slip in
-    // during the await window. Released in finally on every path below.
-    setScreeningBusy(true);
-    timers.screeningLastRun = Date.now();
-    let screenReport = null;
-    try {
-      // Hard guards — don't even run the agent if preconditions aren't met
-      try {
-        const [positions, balance] = await Promise.all([getMyPositions(), getWalletBalances()]);
-        if (positions.total_positions >= config.risk.maxPositions) {
-          log("cron", `Screening skipped — max positions reached (${positions.total_positions}/${config.risk.maxPositions})`);
-          return;
-        }
-        if (usdcModeEnabled()) {
-          // Warn-only gas reserve: don't auto top-up, just pause + alert.
-          if (balance.sol < config.usdc.gasReserveSol) {
-            log("cron", `Screening skipped — SOL ${balance.sol.toFixed(4)} below gas reserve ${config.usdc.gasReserveSol}`);
-            emit("gas_low", { sol: balance.sol, reserve: config.usdc.gasReserveSol });
-            return;
-          }
-          if ((balance.usdc ?? 0) < config.usdc.minUsdcToOpen) {
-            log("cron", `Screening skipped — insufficient USDC ($${(balance.usdc ?? 0).toFixed(2)} < $${config.usdc.minUsdcToOpen})`);
-            return;
-          }
-        } else if (balance.sol < config.management.minSolToOpen) {
-          log("cron", `Screening skipped — insufficient SOL (${balance.sol.toFixed(3)} < ${config.management.minSolToOpen})`);
-          return;
-        }
-      } catch (e) {
-        log("cron_error", `Screening pre-check failed: ${e.message}`);
-        return;
-      }
-
-      const screenModel = getScreenerModelLabel();
-      log("cron", `Starting screening cycle [model: ${screenModel}]`);
-      // Compute dynamic deploy amount based on current wallet (compounding)
-      const currentBalance = await getWalletBalances().catch(() => null);
-      const deployAmount = currentBalance ? computeDeployAmount(currentBalance.sol) : config.management.deployAmountSol;
-      log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance?.sol ?? "?"} SOL)`);
-
-      // Load saved strategies for reference (LLM picks per token)
-      const activeStrategy = getActiveStrategy();
-      const strategyBlock = activeStrategy
-        ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrategy.name} — ${activeStrategy.lp_strategy}, best for: ${activeStrategy.best_for}`
-        : "";
-
-      // Pre-load top 3 candidates with recon data in parallel
-      let candidateBlocks = "";
-      let loadedCandidates = [];
-      const hardSkipped = [];
-      try {
-        const result = await getTopCandidates({ limit: 5 });
-        const candidates = result?.candidates || [];
-        loadedCandidates = candidates;
-        // Fetch dynamic fees sequentially to avoid RPC rate limit bursts
-        const { fetchDynamicFee } = await import("./tools/screening.js");
-        const dynFeeMap = {};
-        for (const c of candidates) {
-          dynFeeMap[c.pool] = await fetchDynamicFee(c.pool);
-        }
-        const blocks = await Promise.allSettled(candidates.map(async (c) => {
-          const baseMint = c.base_mint || c.base?.mint || null;
-          const [sw, holders, narrative, poolMem, tokenInfo, gmgnData, gmgnSignal] = await Promise.allSettled([
-            checkSmartWalletsOnPool({ pool_address: c.pool }),
-            baseMint ? getTokenHolders({ mint: baseMint }) : null,
-            baseMint ? getTokenNarrative({ mint: baseMint }) : null,
-            recallForPool(c.pool),
-            baseMint ? getTokenInfo({ query: baseMint }) : null,
-            baseMint ? fetchGmgnPriceInfo(baseMint) : null,
-            baseMint ? fetchGmgnSignal(baseMint) : null,
-          ]);
-          const swResult = sw.status === "fulfilled" ? sw.value : null;
-          const holdResult = holders.status === "fulfilled" ? holders.value : null;
-          const narrResult = narrative.status === "fulfilled" ? narrative.value : null;
-          const memResult = poolMem.status === "fulfilled" ? poolMem.value : null;
-          const infoResult = tokenInfo.status === "fulfilled" ? tokenInfo.value : null;
-          const gmgnResult = gmgnData.status === "fulfilled" ? gmgnData.value : null;
-          const gmgnSignalResult = gmgnSignal.status === "fulfilled" ? gmgnSignal.value : null;
-          c._gmgnResult = gmgnResult;  // attach to candidate for signal staging
-          c._gmgnSignal = gmgnSignalResult;
-          const dynFeeResult = dynFeeMap[c.pool] || null;
-          const tokenData = infoResult?.results?.[0];
-          const smartWalletCount = swResult?.in_pool?.length || 0;
-          c._smartWalletCount = smartWalletCount;
-          c._globalFeesSol = holdResult?.global_fees_sol ?? null;
-          c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
-
-          let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
-          const srcTag = formatCandidateSources(c);
-          if (srcTag) block += ` | ${srcTag}`;
-
-          if (Array.isArray(c.darwin_top_signals) && c.darwin_top_signals.length > 0) {
-            const topSignals = c.darwin_top_signals
-              .map((s) => `${s.signal}=${s.value} (${s.direction})`)
-              .join(", ");
-            block += `\n  Darwin context: higher score = better fit to learned winning signals. Top drivers: ${topSignals}`;
-          }
-
-          if (dynFeeResult) block += ` | base_fee: ${c.fee_pct}% | dynamic_fee: ${dynFeeResult.dynamic_fee_pct}%`;
-          if (tokenData) {
-            if (tokenData.mcap) block += ` | mcap: $${(tokenData.mcap / 1000).toFixed(0)}k`;
-            if (tokenData.stats_1h?.price_change) block += ` | 1h: ${tokenData.stats_1h.price_change}%`;
-          }
-          // GMGN token signals (screeningSource gmgn/both): KOL / smart money / indicators.
-          if (c.gmgn) {
-            const kolNames = c.gmgn_kol_names?.length ? ` (${c.gmgn_kol_names.slice(0, 3).join(", ")})` : "";
-            const ind = c.indicators ? ` | supertrend=${c.indicators.supertrendDirection ?? "?"} rsi=${c.indicators.rsi ?? "?"}` : "";
-            block += `\n  GMGN screen: smart=${c.gmgn_smart_wallets ?? "?"} kol=${c.gmgn_kol_wallets ?? "?"}${kolNames}${c.gmgn_dump_kol_significant ? ` dump_kol=${c.gmgn_dump_kol_significant}` : ""}${ind}`;
-          }
-          if (smartWalletCount > 0) block += `\n  Smart wallets: ${smartWalletCount} found`;
-          else block += `\n  Smart wallets: none`;
-          if (holdResult?.global_fees_sol != null) block += ` | global_fees: ${holdResult.global_fees_sol} SOL`;
-          if (holdResult?.top_10_real_holders_pct != null) block += ` | top10: ${holdResult.top_10_real_holders_pct}%`;
-          if (narrResult?.narrative) block += `\n  Narrative: ${narrResult.narrative.slice(0, 500)}`;
-          if (memResult) block += `\n  Memory: ${memResult}`;
-          if (gmgnResult) {
-            block += ` | ath: ${gmgnResult.ath_proximity_pct ?? "?"}%`;
-            block += ` | momentum: 5m=${gmgnResult.change_5m ?? "?"}% 1h=${gmgnResult.change_1h ?? "?"}%`;
-            block += ` | token24hVol: $${Math.round(gmgnResult.volume_24h ?? 0)} | tokenMcap: $${Math.round(gmgnResult.market_cap ?? 0)}`;
-            if (gmgnResult.candles) {
-              const epPass = gmgnResult.volume_24h >= (config.strategy.evilPanda?.minTokenVolume24h ?? 750000)
-                && gmgnResult.market_cap >= (config.strategy.evilPanda?.minMcap ?? 200000)
-                && gmgnResult.candles.evil_panda_entry_ok;
-              c._evilPandaPass = !!epPass;
-              block += `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, mcap>=${config.strategy.evilPanda?.minMcap ?? 200000}, 5m Supertrend green/price above`;
-              block += ` | supertrend=${gmgnResult.candles.supertrend_direction ?? "?"}/${gmgnResult.candles.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${gmgnResult.candles.rsi_2 ?? "?"}`;
-            }
-            if (gmgnResult.ath_proximity_pct != null && gmgnResult.ath_proximity_pct >= config.screening.athTopThresholdPct) {
-              block += `\n  ATH WARNING: ${gmgnResult.ath_proximity_pct}% of ATH (>=${config.screening.athTopThresholdPct}%) — override bid_ask range to 65-80%`;
-            }
-            if (gmgnResult.change_1h > 10 && gmgnResult.change_5m < -2) {
-              block += `\n  MOMENTUM WARNING: pump fading (1h +${gmgnResult.change_1h}%, 5m ${gmgnResult.change_5m}%) — widen range or consider skipping`;
-            }
-          }
-          if (gmgnSignalResult) {
-            block += `\n  GMGN signal: ${gmgnSignalResult.summary}`;
-          }
-          return { pool: c.pool, block };
-        }));
-        const rankedCandidates = rankCandidatesByDarwin(candidates);
-        loadedCandidates = rankedCandidates;
-        const blockMap = new Map(
-          blocks
-            .filter((b) => b.status === "fulfilled")
-            .map((b) => [b.value.pool, b.value.block])
-        );
-        // Hard skips are threshold checks on pre-loaded data: drop failing candidates in
-        // code so the model only judges the survivors (narrative, momentum, pick-or-skip).
-        // Unknown values (null) never cause a skip here; the model still sees them.
-        const hardSkipReason = (c) => {
-          if (c._globalFeesSol != null && c._globalFeesSol < config.screening.minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${config.screening.minTokenFeesSol}`;
-          if (Number.isFinite(c._top10Pct) && c._top10Pct > 60) return `top10 ${c._top10Pct}% > 60%`;
-          if (config.strategy.activeStrategy === "evil_panda" && c._evilPandaPass === false) return "Evil Panda entry FAIL";
-          return null;
-        };
-        const survivors = [];
-        for (const c of rankedCandidates) {
-          const reason = hardSkipReason(c);
-          if (reason) hardSkipped.push(`${c.name}: ${reason}`);
-          else survivors.push(c);
-        }
-        if (hardSkipped.length > 0) log("cron", `Screening hard-skipped in code: ${hardSkipped.join("; ")}`);
-        const validBlocks = survivors
-          .map((c) => blockMap.get(c.pool))
-          .filter(Boolean);
-        if (validBlocks.length > 0) {
-          candidateBlocks = `\n\nPRE-LOADED CANDIDATES (recon already done — evaluate and deploy the best one):\nDarwin score is a learned 0-100 ranking over the current shortlist. Higher = stronger fit to historically winning signal patterns. Use it as a ranking aid, not a hard deploy rule.\n${validBlocks.join("\n\n")}\n`;
-        }
-        // Stage signals for each candidate so deploy can snapshot them
-        for (const c of rankedCandidates) {
-          try {
-            stageSignals(c.pool, {
-              organic_score: c.organic_score ?? null,
-              fee_tvl_ratio: c.fee_active_tvl_ratio ?? null,
-              volume: c.volume ?? null,
-              volatility: c.volatility ?? null,
-              mcap: c.mcap ?? null,
-              holder_count: c.holders ?? null,
-              smart_wallets_present: (c._smartWalletCount || 0) > 0,
-              narrative_quality: null, // filled by tool signal capture in executor
-              study_win_rate: null,    // filled by tool signal capture in executor
-              ath_proximity: c._gmgnResult?.ath_proximity_pct ?? null,
-              // New Darwinian signals
-              volume_trend: c._gmgnResult?.candles?.volume_trend ?? null,
-              gmgn_signal_present: (c._gmgnSignal?.signal_count_30m || 0) > 0,
-              change_1h: c._gmgnResult?.change_1h ?? null,
-              candle_price_range: c._gmgnResult?.candles?.price_range_pct ?? null,
-              token_volume_24h: c._gmgnResult?.volume_24h ?? null,
-              token_market_cap: c._gmgnResult?.market_cap ?? null,
-              supertrend_green: c._gmgnResult?.candles?.supertrend_green ?? null,
-              rsi_2: c._gmgnResult?.candles?.rsi_2 ?? null,
-              // Extra GMGN signal metadata (not weighted but stored for analysis)
-              gmgn_signal_count_30m: c._gmgnSignal?.signal_count_30m ?? null,
-              gmgn_signal_count_2h: c._gmgnSignal?.signal_count_2h ?? null,
-              gmgn_signal_amount_30m: c._gmgnSignal?.signal_amount_usd_30m ?? null,
-              gmgn_signal_amount_2h: c._gmgnSignal?.signal_amount_usd_2h ?? null,
-              gmgn_latest_signal_age_min: c._gmgnSignal?.latest_signal_age_min ?? null,
-              gmgn_latest_sold_ratio: c._gmgnSignal?.latest_sold_ratio_percent ?? null,
-            }, c.base_mint || c.base?.mint || null);
-          } catch { /* staging is best-effort */ }
-        }
-      } catch (e) {
-        log("cron", `Pre-load failed (${e.message}), agent will fetch manually`);
-      }
-
-      // Every pre-loaded candidate failed a hard skip: nothing is left to judge, and the
-      // no-preload fallback would only re-fetch the same shortlist. Skip the LLM call.
-      if (loadedCandidates.length > 0 && hardSkipped.length >= loadedCandidates.length) {
-        screenReport = `Screening: all ${loadedCandidates.length} candidate(s) failed hard-skip rules in code — no deploy.\n${hardSkipped.map((s) => `- ${s}`).join("\n")}`;
-        return; // finally{} still releases the screening lock and emits the report
-      }
-
-      // Inject Darwinian signal weights if available
-      let signalWeightsBlock = "";
-      try {
-        const weightsSummary = getWeightsSummary();
-        if (weightsSummary) {
-          signalWeightsBlock = `\n\n${weightsSummary}\n`;
-        }
-      } catch { /* best-effort */ }
-
-      // Pre-load KB articles relevant to candidates
-      let kbScreenContext = "";
-      try {
-        const kbHints = kbRecallForScreening(loadedCandidates);
-        if (kbHints) kbScreenContext = `\n\n${kbHints}`;
-      } catch { /* best-effort */ }
-
-      const gmgnSignalGuide = candidateBlocks
-        ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n- Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n`
-        : "";
-
-      const { content } = await screenerLoop(`
-SCREENING CYCLE — DEPLOY ONLY${signalWeightsBlock}${kbScreenContext}${candidateBlocks}${gmgnSignalGuide}
-${strategyBlock}
-${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and GMGN signal data.
-Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
-HARD SKIP rules still apply:
-- global_fees_sol < ${config.screening.minTokenFeesSol} SOL → skip (bundled/scam)
-- top_10_real_holders_pct > 60% OR bundlers > 30% → skip
-- No smart wallets or GMGN confirmation + empty/hype narrative → skip
-
-Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL.
-Size your price_range_pct from the VOLATILITY TABLE in the range selection rules below — NOT from study avg_range_pct.
-study_top_lpers is useful for strategy choice (bid_ask vs spot), hold times, and win rates — but their range data is from a different market regime and should not drive your range.` : `1. get_top_candidates, pick the best one.
-2. check_smart_wallets_on_pool, get_token_holders (check global_fees_sol >= ${config.screening.minTokenFeesSol}), get_token_narrative.
-3. HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL or holders/narrative red flags.
-4. study_top_lpers → use for strategy choice, hold times, win rates. Do NOT use avg_range_pct for your range — size from the VOLATILITY TABLE instead.
-5. deploy_position with ${deployAmount} SOL and price_range_pct from volatility table (adjusted by lessons).`}
-${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
-  ? `\n\nUSDC MODE IS ON: deploy sizing/funding is automatic — the system swaps USDC→SOL ($${config.usdc.deployAmountUsd}/position) and deploys single-sided. Do NOT pick a SOL amount or call swap_token to prepare funds; just call deploy_position for the chosen pool.`
-  : ""}
-      `, config.llm.maxSteps, []);
-      screenReport = content;
-    } catch (error) {
-      log("cron_error", `Screening cycle failed: ${error.message}`);
-      screenReport = `Screening cycle failed: ${error.message}`;
-    } finally {
-      setScreeningBusy(false);
-      if (screenReport) {
-        emit("cycle:screening", { report: screenReport });
-        // File screening deploy to KB (direct write, no LLM)
-        try { fileScreeningResult(screenReport); } catch { /* best-effort */ }
-      }
-    }
+    await runScreeningCycle().done;
   });
 
   // Morning Briefing at 8:00 AM UTC+7 (1:00 AM UTC)
@@ -828,25 +844,29 @@ function launchCron(options = {}) {
 // ═══════════════════════════════════════════
 let startupCandidates = [];
 
+const buildSettingsReportSync = () => buildSettingsReport({ color: false });
+
 const TELEGRAM_HELP = [
   "DLMM LP Agent — Telegram control",
   "",
+  "/menu — button menu (status, positions, candidates, wallet, settings, bot controls)",
   "/status — wallet + open positions",
   "/settings — effective config + which file each setting lives in",
   "/usdc [on|off] — show or toggle USDC mode",
   "/candidates — refresh top pools (then reply a number to deploy)",
-  "1 / 2 / 3 … — deploy into that pool",
-  "auto — agent picks the best pool and deploys",
+  "1 / 2 / 3 … — deploy into that pool (asks for confirmation)",
+  "auto — agent picks the best pool and deploys (asks for confirmation)",
   "go — start autonomous cycles",
   "/briefing — last-24h briefing",
   "/thresholds — screening thresholds + performance",
   "/learn [pool] — study top LPers (all top pools, or one address)",
   "/evolve — evolve thresholds from performance",
-  "/autoresearch [list|show|revert|restore …] — prompt overrides (operator only)",
+  "/autoresearch [list|show|revert|restore|approve|reject …] — prompt overrides (operator only)",
   "/stop — shut the agent down",
   "/help — this list",
   "",
   "Anything else is sent to the agent as a chat message.",
+  "Closing or deploying from buttons always asks for a second confirming tap.",
 ].join("\n");
 
 // Telegram caps a single message at 4096 chars — chunk longer replies.
@@ -858,35 +878,108 @@ async function tgSend(text) {
   }
 }
 
-// Remote busy-guard — mirror of the terminal runBusy/runScreeningBusy, but
-// replies over Telegram and never references readline (safe when headless).
-async function runRemote(fn, { screening = false } = {}) {
-  if (isBusy() || isManagementBusy() || isScreeningBusy()) {
-    await tgSend("⏳ Agent is busy right now — try again in a moment.");
-    return;
-  }
+// Busy-guard shared by Telegram text commands and button actions. The check and
+// the lock happen synchronously (no await in between), so two taps can't both
+// get in. Returns { busy: true } without running fn, else { value }.
+async function tryExclusive(fn, { screening = false } = {}) {
+  if (isBusy() || isManagementBusy() || isScreeningBusy()) return { busy: true };
   setBusy(true);
   if (screening) setScreeningBusy(true);
   try {
-    await fn();
-  } catch (e) {
-    await tgSend(`❌ Error: ${e.message}`);
+    return { busy: false, value: await fn() };
   } finally {
     if (screening) setScreeningBusy(false);
     setBusy(false);
   }
 }
 
-async function handleTelegramCommand(rawText) {
+// Remote busy-guard — mirror of the terminal runBusy/runScreeningBusy, but
+// replies over Telegram and never references readline (safe when headless).
+async function runRemote(fn, { screening = false } = {}) {
+  try {
+    const r = await tryExclusive(fn, { screening });
+    if (r.busy) await tgSend("⏳ Agent is busy right now — try again in a moment.");
+  } catch (e) {
+    await tgSend(`❌ Error: ${e.message}`);
+  }
+}
+
+// Legacy "auto": the screener LLM picks a pool and calls deploy_position.
+async function autoDeployViaAgent() {
+  const balance = await getWalletBalances().catch(() => null);
+  const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
+  const { content } = await screenerLoop(
+    `get_top_candidates, pick the best one, deploy_position with ${amt} SOL. Execute now, don't ask.`,
+    config.llm.maxSteps,
+  );
+  return content;
+}
+
+// Menus, views, two-tap confirmations and alerts (telegram-ui.js). Fund-moving
+// buttons execute through executeTool, the same path the agent's tools use.
+const tgUI = createTelegramUI({
+  tg: { sendHTML, editHTML, answerCallback },
+  config,
+  computeDeployAmount,
+  usdcModeEnabled,
+  getMyPositions,
+  getWalletBalances,
+  getTopCandidates,
+  executeTool,
+  runExclusive: tryExclusive,
+  autoDeploy: autoDeployViaAgent,
+  afterDeploy: () => launchCron({ announce: true }),
+  runScreeningNow: () => runScreeningCycle({ manual: true }),
+  isScreeningPaused,
+  setScreeningPaused: (paused) => setScreeningPaused(paused, "telegram"),
+  getStatusInfo: () => ({
+    activeStrategy: config.strategy.activeStrategy,
+    strategy: config.strategy.strategy,
+    managementModel: config.llm.managementModel,
+    screeningModel: getScreenerModelLabel(),
+    screeningSource: config.screening.source,
+    managementIntervalMin: config.schedule.managementIntervalMin,
+    screeningIntervalMin: config.schedule.screeningIntervalMin,
+    pnlWatcherIntervalSec: config.schedule.pnlWatcherIntervalSec,
+    nextManagement: formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin)),
+    nextScreening: formatCountdown(nextRunIn(timers.screeningLastRun, config.schedule.screeningIntervalMin)),
+    busy: isBusy(),
+    managementBusy: isManagementBusy(),
+    screeningBusy: isScreeningBusy(),
+    cronStarted,
+    usdcMode: usdcModeEnabled(),
+  }),
+  buildSettingsReport: () => buildSettingsReportSync(),
+  handleAutoresearchCommand: (args) => handleAutoresearchCommand(args),
+  readRecentErrors: () => readRecentErrors({ n: 15 }),
+  log,
+});
+tgUI.attachAlerts(on);
+
+const telegramHandlers = {
+  onMessage: (text, ctx) => handleTelegramCommand(text, ctx),
+  onCallback: (data, ctx) => tgUI.handleCallback(data, ctx),
+};
+
+function startTelegram() {
+  if (!telegramEnabled()) return;
+  setMyCommands(BOT_COMMANDS).catch(() => {}); // best-effort
+  startPolling(telegramHandlers);
+}
+
+async function handleTelegramCommand(rawText, ctx = {}) {
   const text = String(rawText || "").trim();
   if (!text) return;
-  log("telegram", `Incoming: ${text}`);
+  log("telegram", `Incoming: ${text.slice(0, 200)}`);
   const lower = text.toLowerCase();
 
   // ── Help ──
-  if (text === "/help" || text === "/start" || text === "/commands") {
+  if (text === "/help" || text === "/commands") {
     return tgSend(TELEGRAM_HELP);
   }
+
+  // ── Menu, /candidates, number-reply deploy and "auto" (all confirm first) ──
+  if (await tgUI.handleMessage(text, ctx)) return;
 
   // ── Shutdown ──
   if (text === "/stop") {
@@ -923,8 +1016,7 @@ async function handleTelegramCommand(rawText) {
 
   // ── Settings (effective config + which file each value lives in) ──
   if (text === "/settings" || text === "/config") {
-    const { buildSettingsReport } = await import("./settings-report.js");
-    return tgSend(buildSettingsReport({ color: false }));
+    return tgSend(buildSettingsReportSync());
   }
 
   // ── USDC mode (show/toggle) — terminal-parity with the CLI /usdc command ──
@@ -932,56 +1024,6 @@ async function handleTelegramCommand(rawText) {
     const arg = text.slice(5).trim().toLowerCase();
     if (arg === "on" || arg === "off") await setUsdcMode(arg === "on");
     return tgSend(usdcStatusText());
-  }
-
-  // ── Candidates (refresh + number the list for deploy) ──
-  if (text === "/candidates") {
-    return runRemote(async () => {
-      const result = await getTopCandidates({ limit: 5 });
-      const candidates = result.candidates || [];
-      startupCandidates = candidates;
-      const header = `🔍 Top pools (${result.total_eligible ?? candidates.length} eligible from ${result.total_screened ?? 0} screened):`;
-      const hint = candidates.length
-        ? `\n\nReply with a number (1-${candidates.length}) to deploy ${DEPLOY} SOL.`
-        : "";
-      await tgSend(`${header}\n\n${formatCandidates(candidates)}${hint}`);
-    });
-  }
-
-  // ── Number pick: deploy into pool N ──
-  const pick = parseInt(text, 10);
-  const isBareNumber = !Number.isNaN(pick) && String(pick) === text;
-  if (isBareNumber && pick >= 1 && pick <= startupCandidates.length) {
-    return runRemote(async () => {
-      const pool = startupCandidates[pick - 1];
-      const balance = await getWalletBalances().catch(() => null);
-      const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
-      await tgSend(`🚀 Deploying ${amt} SOL into ${pool.name}…`);
-      const { content } = await screenerLoop(
-        `Deploy ${amt} SOL into pool ${pool.pool} (${pool.name}). Call deploy_position. Report result.`,
-        config.llm.maxSteps,
-      );
-      launchCron({ announce: true });
-      await tgSend(content);
-    }, { screening: true });
-  }
-  if (isBareNumber) {
-    return tgSend(`No pool #${pick} in the current list. Send /candidates first.`);
-  }
-
-  // ── auto: agent picks and deploys ──
-  if (lower === "auto") {
-    return runRemote(async () => {
-      await tgSend("🤖 Agent is picking and deploying…");
-      const balance = await getWalletBalances().catch(() => null);
-      const amt = balance ? computeDeployAmount(balance.sol) : DEPLOY;
-      const { content } = await screenerLoop(
-        `get_top_candidates, pick the best one, deploy_position with ${amt} SOL. Execute now, don't ask.`,
-        config.llm.maxSteps,
-      );
-      launchCron({ announce: true });
-      await tgSend(content);
-    }, { screening: true });
   }
 
   // ── Briefing (uses the same HTML path as notifications) ──
@@ -1056,7 +1098,7 @@ async function handleTelegramCommand(rawText) {
 
   // ── Autoresearch overrides (operator path; logic lives in autoresearch.js) ──
   if (lower === "/autoresearch" || lower.startsWith("/autoresearch ")) {
-    for (const chunk of autoresearchTelegramChunks(handleAutoresearchCommand(text.slice(13)))) await sendMessage(chunk);
+    for (const chunk of autoresearchTelegramChunks(handleAutoresearchCommand(text.slice(13)))) await sendHTML(chunk); // chunks are HTML-escaped
     return;
   }
 
@@ -1171,7 +1213,7 @@ if (runtimeMode.interactive) {
   maybeRunMissedBriefing().catch(() => {});
 
   // Telegram bot — full remote control (shared dispatcher, terminal-parity).
-  startPolling(handleTelegramCommand);
+  startTelegram();
 
   console.log(`
 Commands:
@@ -1409,7 +1451,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   maybeRunMissedBriefing().catch(() => {});
 
   // Telegram bot — full remote control works headless too.
-  startPolling(handleTelegramCommand);
+  startTelegram();
   if (runtimeMode.runStartupCheck) (async () => {
     // Guard the startup screener with the screening busy flag so it can't
     // overlap a cron screening cycle or a remote-deploy command.
