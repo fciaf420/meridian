@@ -249,17 +249,20 @@ async function applyPriorityFee(tx, feePayer, label) {
   // default could run out mid-tx; a blanket 1.4M fixed that but hurt landing
   // (a tx reserving 1.4M CU is hard to pack next to a busy pool's per-account CU
   // budget — live txs used ~29k of 1.4M and add-liquidity chunks kept expiring).
-  // Simulate at the max to measure, then request 1.2× what it used. Skip if the
-  // SDK tx already set its own CU limit.
+  // ALWAYS simulate at the max to measure, then request 1.2× what it used,
+  // clamped to [50k, 1.4M]. When the SDK already set a limit, keep the lower
+  // of the two: createExtendedEmptyPosition reserves 30k × bins (1.4M for a
+  // wide range, ~29k used) and the SDK's own estimator falls back to 1.4M when
+  // its simulation throws, while e.g. removeLiquidity's sim+30% may be lower.
+  setComputeBudgetIx(tx, isCuLimitIx, ComputeBudgetProgram.setComputeUnitLimit({ units: maxCu }));
+  const measured = await simulateComputeUnits(tx, label);
   let cuLimit = sdkLimit ?? maxCu;
-  if (sdkLimit == null) {
-    const measured = await simulateComputeUnits(tx, label);
-    if (measured) {
-      cuLimit = Math.min(maxCu, Math.max(MIN_CU_LIMIT, Math.ceil(measured * 1.2)));
-      log("priority_fee", `${label}: simulated ${measured} CU → limit ${cuLimit}`);
-    }
-    setComputeBudgetIx(tx, isCuLimitIx, ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
+  if (measured) {
+    const sized = Math.min(maxCu, Math.max(MIN_CU_LIMIT, Math.ceil(measured * 1.2)));
+    cuLimit = sdkLimit != null ? Math.min(sdkLimit, sized) : sized;
+    log("priority_fee", `${label}: simulated ${measured} CU → limit ${cuLimit}${sdkLimit != null ? ` (SDK set ${sdkLimit}${cuLimit < sdkLimit ? ", replaced" : ", kept"})` : ""}`);
   }
+  setComputeBudgetIx(tx, isCuLimitIx, ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
 
   // Cap the total priority fee per tx (price × CU limit) so an estimate spike
   // can't make one tx expensive.

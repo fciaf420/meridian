@@ -12,7 +12,6 @@ import {
   ComputeBudgetProgram,
   Keypair,
   PublicKey,
-  SystemProgram,
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
@@ -293,4 +292,56 @@ test("allSettled over concurrent chunks: one expiring chunk does not block the o
   const rec = reconcileChunkResults(results, funded);
   assert.deepEqual(rec.failed, [failedIdx]);
   assert.equal(conn.calls.sendRaw, 3); // one send per chunk, no resend
+});
+
+// ─── 7. CU limit: always simulate, replace a higher SDK limit ──
+
+test("SDK set 1.4M, tx uses ~29k → replaced with max(50k, measured×1.2)", async () => {
+  const conn = mockConnection({ unitsConsumed: 28_843 });
+  setDeps({ connection: conn });
+  const tx = makeTx(40, [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })]);
+  await applyPriorityFee(tx, wallet.publicKey, "create");
+  assert.equal(conn.calls.simulate, 1);
+  assert.equal(count(tx, isLimit), 1);
+  assert.equal(limitOf(tx), 50_000); // 34,612 clamped up to the 50k floor
+});
+
+test("SDK limit replaced by measured×1.2 when that is lower", async () => {
+  setDeps({ connection: mockConnection({ unitsConsumed: 300_000 }) });
+  const tx = makeTx(40, [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })]);
+  await applyPriorityFee(tx, wallet.publicKey, "add");
+  assert.equal(limitOf(tx), 360_000);
+});
+
+test("SDK limit kept when it is already lower than measured×1.2", async () => {
+  setDeps({ connection: mockConnection({ unitsConsumed: 240_000 }) });
+  const tx = makeTx(40, [ComputeBudgetProgram.setComputeUnitLimit({ units: 262_000 })]); // e.g. removeLiquidity sim+30%
+  await applyPriorityFee(tx, wallet.publicKey, "remove");
+  assert.equal(limitOf(tx), 262_000);
+});
+
+test("simulation failure keeps the SDK limit (never raises it)", async () => {
+  const conn = mockConnection();
+  conn.simulateTransaction = async () => { throw new Error("sim down"); };
+  setDeps({ connection: conn });
+  const tx = makeTx(40, [ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 })]);
+  await applyPriorityFee(tx, wallet.publicKey, "x");
+  assert.equal(limitOf(tx), 250_000);
+});
+
+test("measured×1.2 is clamped to 1.4M", async () => {
+  setDeps({ connection: mockConnection({ unitsConsumed: 1_300_000 }) });
+  const tx = makeTx(40);
+  await applyPriorityFee(tx, wallet.publicKey, "x");
+  assert.equal(limitOf(tx), 1_400_000);
+});
+
+test("fee cap uses the final (replaced) limit", async () => {
+  config.management.minPriorityFeeMicroLamports = 5_000_000; // absurd price to force the cap
+  config.management.maxPriorityFeeLamports = 100_000;
+  setDeps({ connection: mockConnection({ unitsConsumed: 100_000 }) });
+  const tx = makeTx(40, [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })]);
+  await applyPriorityFee(tx, wallet.publicKey, "x");
+  assert.equal(limitOf(tx), 120_000);
+  assert.equal(priceOf(tx), Math.floor((100_000 * 1_000_000) / 120_000));
 });
