@@ -11,7 +11,7 @@
 import { CONFIG_KEY_MAP, getRequiredSolBalance } from "./runtime-helpers.js";
 
 export const DEPLOY_SIZE_MIN_SOL = 0.1;
-export const DEPLOY_SIZE_MAX_SOL = 10;
+export const DEPLOY_SIZE_MAX_SOL = Infinity; // no upper limit on owner-entered sizes (the AI stays bounded in executor.js)
 
 /**
  * Preset groups. `code` is the 2-letter id used in callback_data (tv:<code>:<v>).
@@ -133,8 +133,8 @@ export function validateTradingValue(key, value) {
     case "maxDeployAmount":
     case "minSolToOpen": {
       if (!(v > 0)) return { error: `${labelFor(key)} must be a positive SOL amount` };
-      if (key !== "minSolToOpen" && (v < DEPLOY_SIZE_MIN_SOL || v > DEPLOY_SIZE_MAX_SOL)) {
-        return { error: `deploy size must be ${DEPLOY_SIZE_MIN_SOL}–${DEPLOY_SIZE_MAX_SOL} SOL` };
+      if (key !== "minSolToOpen" && v < DEPLOY_SIZE_MIN_SOL) {
+        return { error: `deploy size must be at least ${DEPLOY_SIZE_MIN_SOL} SOL` };
       }
       return { value: v };
     }
@@ -155,8 +155,8 @@ export function parseCustomDeploySize(text) {
   const m = /^\s*(\d+(?:[.,]\d+)?)\s*(?:sol)?\s*$/i.exec(String(text ?? ""));
   if (!m) return { error: "not a number" };
   const v = Math.round(Number(m[1].replace(",", ".")) * 100) / 100;
-  if (!(v >= DEPLOY_SIZE_MIN_SOL && v <= DEPLOY_SIZE_MAX_SOL)) {
-    return { error: `${m[1]} SOL is outside ${DEPLOY_SIZE_MIN_SOL}–${DEPLOY_SIZE_MAX_SOL} SOL` };
+  if (!(v >= DEPLOY_SIZE_MIN_SOL)) {
+    return { error: `${m[1]} SOL is below the ${DEPLOY_SIZE_MIN_SOL} SOL minimum` };
   }
   return { value: v };
 }

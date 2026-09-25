@@ -66,7 +66,7 @@ const BOUNDS = {
   managementIntervalMin: [1, 1440], screeningIntervalMin: [1, 1440], healthCheckIntervalMin: [1, 1440],
   positionSizePct: [0.01, 1], gasReserve: [0, 5], gasReserveSol: [0, 5],
   deployAmountUsd: [1, 100_000], maxDeployUsd: [1, 100_000], minUsdcToOpen: [0, 1_000_000],
-  maxDeployAmount: [0.1, 100], temperature: [0, 2], maxTokens: [256, 200_000], maxSteps: [1, 100],
+  maxDeployAmount: [0.1, Infinity], temperature: [0, 2], maxTokens: [256, 200_000], maxSteps: [1, 100],
   emergencyPriceDropPct: [-100, -1], webPort: [1, 65_535], twapWindowMinutes: [5, 1440],
   ohlcvBufferMult: [1, 1.8], solanaTrackerDailyCap: [0, 2500],
 };
@@ -202,8 +202,8 @@ export function createAllSettings(deps) {
   function tradingRange(key) {
     return {
       takeProfitFeePct: "> 0 … 100", stopLossPct: "−100 … 0 (0 = off)", trailingTriggerPct: "> 0 … 100",
-      trailingDropPct: "> 0 … < 100", outOfRangeWaitMinutes: "1…1440", deployAmountSol: "0.1…10",
-      maxDeployAmount: "0.1…10", minSolToOpen: "> 0", maxPositions: "1…50", pnlWatcherIntervalSec: "5…3600",
+      trailingDropPct: "> 0 … < 100", outOfRangeWaitMinutes: "1…1440", deployAmountSol: "≥ 0.1",
+      maxDeployAmount: "≥ 0.1", minSolToOpen: "> 0", maxPositions: "1…50", pnlWatcherIntervalSec: "5…3600",
     }[key] ?? null;
   }
 
