@@ -477,3 +477,45 @@ test("cards: TWAP line on lookup and confirm cards (known, blocked and unknown)"
   const card = ui.renderDeployConfirm({ pool: "P", name: "X", bin_step: 100 }, { args: { strategy: "bid_ask" }, range: ui.rangeInfo(50, 100), amountLabel: "1 SOL" }, "n", { entryState: st, entryFilters: filters }).text;
   assert.match(card, /TWAP: price \+28\.2%/);
 });
+
+// ─── 5. Re-center shadow log ─────────────────────────────────────
+const shadow = await import("../tools/recenter-shadow.js");
+
+test("re-center shadow: logs the new range, txs, bin arrays and TWAP gate for upside OOR only; no writes", async () => {
+  const logs = [];
+  const pool = mockPool({ oracle: mockOracle({ twapBin: 1040, active: 1050 }) });
+  const deps = {
+    getPool: async () => pool,
+    binArrayWindow: async (_pool, min, max) => ({ missing: max > 1060 ? [15] : [], min, max }),
+    filters: es.ENTRY_FILTER_DEFAULTS,
+    log: (cat, msg) => logs.push([cat, msg]),
+  };
+  const pos = { position: "PosX1111", pair: "X-SOL", pool: "P", in_range: false, oor_direction: "upside", lower_bin: 900, upper_bin: 969, active_bin: 1050, minutes_out_of_range: 12, composition: { token_pct: 0 } };
+  const plan = await shadow.logRecenterShadow(pos, deps);
+  assert.deepEqual(plan.to, [981, 1050]);
+  assert.equal(plan.width, 70);
+  assert.equal(plan.bin_arrays.all_exist, true);
+  assert.equal(plan.twap_gate, "allow"); // +10.5% < 15%
+  assert.equal(plan.would_recenter, true);
+  assert.equal(logs[0][0], "recenter_shadow");
+  assert.match(logs[0][1], /would re-center 900\.\.969 → 981\.\.1050 \(70 bins\); est\. txs: 1 rebalance_liquidity tx vs close \+ redeploy/);
+  assert.match(logs[0][1], /bin arrays: all exist; TWAP gate: allow/);
+  assert.match(logs[0][1], /Shadow only — no action taken/);
+  assert.ok(!pool.calls.includes("tx"));
+
+  // TWAP spike → the gate denies; token-heavy → would not re-center.
+  const spiky = mockPool({ oracle: mockOracle({ twapBin: 1000, active: 1050 }) });
+  const denied = await shadow.buildRecenterShadow(pos, { ...deps, getPool: async () => spiky });
+  assert.equal(denied.twap_gate, "deny");
+  assert.equal(denied.would_recenter, false);
+  const heavy = await shadow.buildRecenterShadow({ ...pos, composition: { token_pct: 40 } }, deps);
+  assert.equal(heavy.would_recenter, false);
+  assert.match(heavy.blockers[0], /average down/);
+
+  // Missing arrays are reported; downside OOR and in-range positions are ignored.
+  const hi = await shadow.buildRecenterShadow({ ...pos, active_bin: 1100 }, { ...deps, getPool: async () => mockPool({ oracle: mockOracle({ twapBin: 1100, active: 1100 }) }) });
+  assert.equal(hi.bin_arrays.missing, 1);
+  assert.match(shadow.formatRecenterShadow(hi), /1 bin-array init \(~0\.0714 SOL non-refundable\)/);
+  assert.equal(await shadow.buildRecenterShadow({ ...pos, oor_direction: "downside", active_bin: 800 }, deps), null);
+  assert.equal(await shadow.buildRecenterShadow({ ...pos, in_range: true }, deps), null);
+});

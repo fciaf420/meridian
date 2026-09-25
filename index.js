@@ -543,6 +543,11 @@ function startCronJobs() {
         for (const p of pos.positions || []) {
           // Store mid-position snapshot in pool-memory (keyed by pool address)
           if (p.pool) recordPoolSnapshot(p.pool, p);
+          // Re-center shadow log (read-only, not awaited): what an in-place
+          // re-center would do for an upside-OOR position. Close rules unchanged.
+          if (!p.in_range && p.oor_direction === "upside") {
+            import("./tools/recenter-shadow.js").then((m) => m.logRecenterShadow(p)).catch(() => {});
+          }
 
           // Trailing TP / stop loss check
           if (p.pnl_pct != null) {

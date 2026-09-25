@@ -2342,6 +2342,9 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 export { applyPriorityFee as _applyPriorityFeeForTest };
 export { sendManagedTransaction as _sendManagedTransactionForTest };
 export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
+// Read-only access for the re-center shadow log (tools/recenter-shadow.js).
+export { getPool as getPoolForRead, initializedBinArrayWindow };
+
 /** Test hook: seed the pool cache with a mock DLMM instance. */
 export function _setPoolForTest(poolAddress, pool) {
   if (pool == null) poolCache.delete(String(poolAddress));
