@@ -29,6 +29,7 @@ import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } f
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw } from "./close-swap.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
+import { getDepthForDeploy } from "./ohlcv.js";
 import {
   heliusSenderEnabled,
   buildSenderTipIx,
@@ -758,6 +759,27 @@ export async function deployPosition({
       if (binsFromPct > bins_below) {
         log("deploy", `bins_below=${bins_below} (${actualRangePct.toFixed(1)}%) doesn't match price_range_pct=${price_range_pct}%. Using ${binsFromPct} bins instead`);
         bins_below = binsFromPct;
+      }
+    }
+
+    // Candle-based depth floor (strategy.rangeDepthMode "ohlcv", tools/ohlcv.js):
+    // widen a range shallower than the pool's recent drawdown-based depth. Never
+    // above maxRangePct (capped below) and never below MIN_RANGE_PCT.
+    if (config.strategy?.rangeDepthMode === "ohlcv") {
+      const currentPct = (1 - Math.pow(1 + stepPct, -bins_below)) * 100;
+      const od = await getDepthForDeploy({ pool: pool_address, mint: base_mint || null }).catch(() => null);
+      if (od?.depthPct > 0) {
+        const maxPctCap = Number(config.strategy?.maxRangePct) || 80;
+        const targetPct = Math.max(MIN_RANGE_PCT, Math.min(od.depthPct, maxPctCap, 99));
+        if (currentPct + 0.5 < targetPct) {
+          const widenedBins = calculateBinsForPriceRange(resolvedBinStep, targetPct);
+          log("deploy", `OHLCV depth: widening ${bins_below} bins (${currentPct.toFixed(1)}%) to ${widenedBins} bins (${targetPct}%) — ${od.reason}`);
+          bins_below = widenedBins;
+        } else {
+          log("deploy", `OHLCV depth ${od.depthPct}% ≤ requested ${currentPct.toFixed(1)}% — keeping it (${od.reason})`);
+        }
+      } else {
+        log("deploy", "OHLCV depth unavailable — keeping the requested range (volatility table)");
       }
     }
 

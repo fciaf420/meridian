@@ -361,3 +361,17 @@ test("owner-only: a stranger's All-settings taps or typed values never reach the
   assert.equal(process.env.DRY_RUN, "true");
   assert.equal(apiCalls.length, 0);
 });
+
+test("candle range-depth keys are listed (ohlcvTiers is structured, so hidden)", () => {
+  const { svc } = makeService();
+  const mode = svc.find("rangeDepthMode");
+  assert.equal(mode.type, "enum");
+  assert.deepEqual(mode.enum, ["ohlcv", "volatility"]);
+  assert.equal(mode.group, "strat");
+  assert.equal(svc.current(mode), "ohlcv");
+  assert.equal(svc.find("ohlcvBufferMult").type, "number");
+  assert.equal(svc.current(svc.find("ohlcvBufferMult")), 1.3);
+  assert.equal(svc.current(svc.find("solanaTrackerDailyCap")), 60);
+  assert.ok(svc.validate(svc.find("ohlcvBufferMult"), "5").error, "above the bound");
+  assert.equal(svc.find("ohlcvTiers"), null);
+});
