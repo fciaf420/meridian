@@ -13,7 +13,7 @@ import { getWalletBalances, swapToken } from "./wallet.js";
 import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { setPositionInstruction, getTrackedPosition } from "../state.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
@@ -362,7 +362,7 @@ export async function executeTool(name, args) {
 
     if (success) {
       if (name === "deploy_position") {
-        emit("deploy", { pair: args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, amountUsd: usdcModeEnabled() ? (args.initial_value_usd ?? null) : null, position: result.position, tx: result.tx });
+        emit("deploy", { pair: args.pool_name || args.pool_address?.slice(0, 8), pool: args.pool_address, amountSol: args.amount_y ?? args.amount_sol ?? 0, amountUsd: usdcModeEnabled() ? (args.initial_value_usd ?? null) : null, position: result.position, tx: result.tx ?? result.txs?.[0], txs: result.txs ?? null });
         // Post-deploy management cadence is a fixed mapping from pool volatility.
         // Falls back to the pool's current volatility when the model did not pass it.
         // Best-effort: a failure here must never turn a landed deploy into an error.
@@ -381,7 +381,8 @@ export async function executeTool(name, args) {
           log("config", `Post-deploy cadence update failed: ${e.message}`);
         }
       } else if (name === "close_position") {
-        emit("close", { pair: args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? null });
+        const closedTracked = getTrackedPosition(args.position_address);
+        emit("close", { pair: closedTracked?.pool_name || args.position_address?.slice(0, 8), position: args.position_address, pool: result.pool ?? closedTracked?.pool ?? null, txs: result.txs ?? null, pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? null });
         // USDC mode: auto-settle recovered base token + surplus SOL back to USDC.
         if (usdcModeEnabled()) {
           try {

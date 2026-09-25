@@ -117,6 +117,9 @@ export async function runPnlWatcher() {
 
         emit("pnl_watcher_close", {
           pair: p.pair,
+          position: p.position,
+          pool: p.pool,
+          txs: closeResult.txs ?? null,
           pnlPct: p.pnl_pct,
           pnlSol: p.pnl_sol,
           pnlUsd: p.pnl_usd,
