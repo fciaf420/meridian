@@ -362,6 +362,30 @@ export function setLastBriefingDate() {
   save(state);
 }
 
+// ─── Screening pause (Telegram bot controls) ───────────────────
+
+/**
+ * Operator pause for the screening cron. Persisted in state.json so a restart
+ * keeps it paused. Management and the PnL watcher ignore it on purpose.
+ */
+export function isScreeningPaused() {
+  const state = load();
+  return state._screeningPaused?.paused === true;
+}
+
+export function getScreeningPause() {
+  const state = load();
+  return state._screeningPaused || { paused: false, at: null, by: null };
+}
+
+export function setScreeningPaused(paused, by = "operator") {
+  const state = load();
+  state._screeningPaused = { paused: !!paused, at: new Date().toISOString(), by };
+  save(state);
+  log("state", `Screening ${paused ? "PAUSED" : "RESUMED"} by ${by}`);
+  return state._screeningPaused;
+}
+
 /**
  * Reconcile local state with actual on-chain positions.
  * Marks any local open positions as closed if they are not in the on-chain list.

@@ -148,3 +148,18 @@ export function normalizeScreeningSource(value, { warn = (msg) => console.warn(m
   warn(`[config] Invalid screeningSource ${JSON.stringify(value)}: expected one of ${SCREENING_SOURCES.join(" | ")}. Falling back to "meteora".`);
   return "meteora";
 }
+
+/**
+ * Gate for the screening cycle (cron tick or a manual "run now").
+ * The operator pause only stops the scheduled cron; a manual run still goes,
+ * but never overlaps a running cycle or a position action.
+ * Returns { run, reason, touchTimer }; touchTimer mirrors the old cron, which
+ * reset the countdown when it deferred.
+ */
+export function screeningCronGate({ paused = false, busy = false, screeningBusy = false, managementBusy = false, manual = false } = {}) {
+  if (paused && !manual) return { run: false, reason: "screening paused by operator", touchTimer: true };
+  if (busy) return { run: false, reason: "a position action is in progress", touchTimer: true };
+  if (screeningBusy) return { run: false, reason: "a screening cycle is already running", touchTimer: false };
+  if (managementBusy) return { run: false, reason: "a management cycle is in progress", touchTimer: true };
+  return { run: true, reason: null, touchTimer: false };
+}
