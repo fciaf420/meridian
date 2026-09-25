@@ -47,6 +47,15 @@ export const CONFIG_KEY_MAP = {
   gasReserveSol: ["usdc", "gasReserveSol"],
 };
 
+/**
+ * Absolute floor for a deploy's price range (%). deploy_position widens any
+ * narrower range to this; the Telegram range picker labels presets below it.
+ */
+export const MIN_RANGE_PCT = 35;
+
+/** deploy_position rejects a position with fewer total bins than this. */
+export const MIN_BINS = 20;
+
 export function calculateBinsForPriceRange(binStep, priceRangePct) {
   if (!(binStep > 0)) throw new Error("binStep must be greater than 0");
   if (!(priceRangePct > 0) || priceRangePct >= 100) {
