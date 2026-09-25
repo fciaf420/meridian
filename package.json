@@ -13,7 +13,7 @@
     "build:web": "cd web && npm run build",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
-    "test:runtime": "node --test test/test-tx-exec.js test/test-runtime-fixes.js test/test-lpagent.js test/test-autoresearch.js test/test-wallet-swap.js test/test-screening-both.js test/test-telegram.js test/test-pnl-warmup.js test/test-entry-filters.js test/test-trading-settings.js test/test-telegram-wallet.js test/test-all-settings.js test/test-bin-visual.js test/test-deploy-sizing.js",
+    "test:runtime": "node --test test/test-tx-exec.js test/test-runtime-fixes.js test/test-lpagent.js test/test-autoresearch.js test/test-wallet-swap.js test/test-screening-both.js test/test-telegram.js test/test-pnl-warmup.js test/test-entry-filters.js test/test-trading-settings.js test/test-telegram-wallet.js test/test-all-settings.js test/test-bin-visual.js test/test-deploy-sizing.js test/test-close-swap.js",
     "lint": "eslint .",
     "postinstall": "node scripts/patch-anchor.js"
   },
