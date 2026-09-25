@@ -349,7 +349,9 @@ export function computeDeploySizing(walletSol, portfolio = null) {
   const fallbackReason = preferredBasis === "total" && !useTotal ? (portfolio?.reason || "portfolio total not provided") : null;
   const baseSol = useTotal ? Number(portfolio.totalSol) : freeSol;
 
-  const raw  = pct * Math.max(0, baseSol - reserve);
+  // pct is a share of the whole capital; the gas reserve and position rent come
+  // out of the remainder (the free-SOL cap below), not out of the base.
+  const raw  = pct * Math.max(0, baseSol);
   const size = Math.min(ceil, raw);
   // Position rent + tx fees also come out of free SOL (worst case: the deepest
   // allowed range at the smallest bin step); deploy_position re-fits exactly.
@@ -358,7 +360,7 @@ export function computeDeploySizing(walletSol, portfolio = null) {
   const capAmt = floor2(cap);
   const amount = Math.min(round2(size), capAmt);
 
-  const of = `${fmtPct(pct)} of (${fmtSol(baseSol)} SOL ${basis === "total" ? "total" : "free wallet"} − ${reserve} reserve)`;
+  const of = `${fmtPct(pct)} of ${fmtSol(baseSol)} SOL ${basis === "total" ? "total" : "free wallet"}`;
   let why;
   if (round2(size) > capAmt) why = `free SOL ${fmtSol(freeSol)} − ${reserve} reserve − ~${fmtSol(overhead)} rent/fees (cap; ${of} = ${fmtSol(size)})`;
   else if (raw > ceil) why = `max ${ceil} (${of} = ${fmtSol(raw)})`;
