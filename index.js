@@ -222,6 +222,7 @@ function startCronJobs() {
 
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
     let mgmtReport = null;
+    let mgmtRoutine = false;
     try {
       // Pool context + trailing TP / stop loss pre-check
       let memoryHints = "";
@@ -346,6 +347,7 @@ function startCronJobs() {
         if (ruleHits.length === 0) {
           log("cron", `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD (LLM skipped)`);
           mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD.`;
+          mgmtRoutine = true; // nothing happened: dashboard still gets it, Telegram stays quiet
           return; // finally{} still releases the lock and emits the report
         }
         log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
@@ -397,7 +399,7 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
       mgmtReport = `Management cycle failed: ${error.message}`;
     } finally {
       setManagementBusy(false);
-      if (mgmtReport) emit("cycle:management", { report: mgmtReport });
+      if (mgmtReport) emit("cycle:management", { report: mgmtReport, routine: mgmtRoutine });
       try {
         const pos = await getMyPositions().catch(() => null);
         for (const p of pos?.positions || []) {
