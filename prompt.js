@@ -291,7 +291,6 @@ BIAS TO HOLD: Unless an exit rule fires, a pool is dying, volume has collapsed, 
 
 ${_sectionOverrides.manager_logic || _defaultManagerLogic()}
 
-IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
 ${config.usdc.enabled
   ? `After ANY close: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
   : `After ANY close: close_position has already swapped the withdrawn base tokens to SOL. Only if its result shows swap.success=false or status "success_with_exposure", swap that position's withdrawn amount with swap_token.`}

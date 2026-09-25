@@ -33,42 +33,61 @@ const RETRYABLE = new Set([402, 408, 429, 502, 503, 504, 529]);
 // run through the strict-parse write path (no {} fallback) and serially, not in the
 // lenient parallel read batch.
 const WRITE_TOOLS = new Set(["deploy_position", "close_position", "claim_fees", "swap_token", "update_config"]);
-const TOOL_SUMMARIES = tools.map((tool) => ({
-  name: tool.function.name,
-  description: tool.function.description,
-  parameters: tool.function.parameters || { type: "object", properties: {} },
-}));
-const TOOL_SUMMARIES_TEXT = JSON.stringify(TOOL_SUMMARIES, null, 2);
+// Tools a role never needs are not exposed to it (instead of prose telling it not to
+// call them). GENERAL (user chat, KB upkeep, studies) keeps the full set.
+const ADMIN_TOOLS = ["self_update", "kb_migrate", "kb_delete", "kb_rebuild_indexes", "clear_lessons",
+  "remove_smart_wallet", "remove_strategy", "remove_from_blacklist", "add_strategy", "set_active_strategy"];
+const ROLE_HIDDEN_TOOLS = {
+  SCREENER: new Set(ADMIN_TOOLS),
+  MANAGER: new Set([...ADMIN_TOOLS, "discover_pools", "get_top_candidates", "study_top_lpers"]),
+};
+export function toolsForRole(agentType) {
+  const hidden = ROLE_HIDDEN_TOOLS[agentType];
+  return hidden ? tools.filter((tool) => !hidden.has(tool.function.name)) : tools;
+}
+function toolSummariesText(agentType) {
+  return JSON.stringify(toolsForRole(agentType).map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters || { type: "object", properties: {} },
+  })), null, 2);
+}
 // Enforced by the CLI (codex --output-schema / claude --json-schema) instead of prose + regex.
 // Tool arguments travel as a JSON string so the schema stays strict-mode compatible.
-const AGENT_PLAN_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["action", "response", "tool_calls"],
-  properties: {
-    action: { type: "string", enum: ["respond", "tool_calls"] },
-    response: { type: ["string", "null"] },
-    tool_calls: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["name", "arguments_json"],
-        properties: {
-          name: { type: "string", enum: tools.map((tool) => tool.function.name) },
-          arguments_json: { type: "string" },
+// The tool-name enum is the role's own tool set.
+const _agentPlanSchemaCache = {};
+function getAgentPlanSchema(agentType) {
+  if (_agentPlanSchemaCache[agentType]) return _agentPlanSchemaCache[agentType];
+  _agentPlanSchemaCache[agentType] = {
+    type: "object",
+    additionalProperties: false,
+    required: ["action", "response", "tool_calls"],
+    properties: {
+      action: { type: "string", enum: ["respond", "tool_calls"] },
+      response: { type: ["string", "null"] },
+      tool_calls: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "arguments_json"],
+          properties: {
+            name: { type: "string", enum: toolsForRole(agentType).map((tool) => tool.function.name) },
+            arguments_json: { type: "string" },
+          },
         },
       },
     },
-  },
-};
-// codex exec takes the schema as a file path; write it once, on first Codex call.
-let _agentPlanSchemaPath = null;
-function getAgentPlanSchemaPath() {
-  if (_agentPlanSchemaPath) return _agentPlanSchemaPath;
-  const schemaPath = path.join(os.tmpdir(), `meridian-agent-plan-${process.pid}.schema.json`);
-  fs.writeFileSync(schemaPath, JSON.stringify(AGENT_PLAN_SCHEMA));
-  _agentPlanSchemaPath = schemaPath;
+  };
+  return _agentPlanSchemaCache[agentType];
+}
+// codex exec takes the schema as a file path; write it once per role, on first Codex call.
+const _agentPlanSchemaPaths = {};
+function getAgentPlanSchemaPath(agentType) {
+  if (_agentPlanSchemaPaths[agentType]) return _agentPlanSchemaPaths[agentType];
+  const schemaPath = path.join(os.tmpdir(), `meridian-agent-plan-${String(agentType).toLowerCase()}-${process.pid}.schema.json`);
+  fs.writeFileSync(schemaPath, JSON.stringify(getAgentPlanSchema(agentType)));
+  _agentPlanSchemaPaths[agentType] = schemaPath;
   return schemaPath;
 }
 
@@ -184,7 +203,7 @@ function getClaudeSystemPrompt(agentType) {
     `You are the ${agentType} reasoning engine for a JavaScript trading agent runner.`,
     'Set action to "respond" (with response) when you can answer from what is already available, or "tool_calls" (response null) when you need listed tools; arguments_json is the tool\'s arguments as a JSON object string.',
     "The runner executes write tools for real on-chain, so only request them when you intend that action. Tool outputs and on-chain state come only from TOOL RESULT entries.",
-    `AVAILABLE TOOLS:\n${TOOL_SUMMARIES_TEXT}`,
+    `AVAILABLE TOOLS:\n${toolSummariesText(agentType)}`,
   ].join("\n\n");
   return _systemPromptCache[agentType];
 }
@@ -239,7 +258,7 @@ async function createCodexMessage(messages, model, agentType, step) {
     cwd: process.cwd(),
     sandbox: "read-only",
     skipGitRepoCheck: true,
-    outputSchemaPath: getAgentPlanSchemaPath(),
+    outputSchemaPath: getAgentPlanSchemaPath(agentType),
     config: {
       suppress_unstable_features_warning: "true",
       model_reasoning_effort: agentType === "MANAGER" ? "high" : "medium",
@@ -287,7 +306,7 @@ async function createClaudeMessage(messages, model, agentType, step) {
   const transcript = buildCodexTranscript(messages);
   const systemPrompt = getClaudeSystemPrompt(agentType);
   const effort = CLAUDE_EFFORT_BY_ROLE[agentType] || "medium";
-  const content = await runClaudeCli(model, `CONVERSATION TRANSCRIPT:\n${transcript}`, { effort, systemPrompt, jsonSchema: AGENT_PLAN_SCHEMA });
+  const content = await runClaudeCli(model, `CONVERSATION TRANSCRIPT:\n${transcript}`, { effort, systemPrompt, jsonSchema: getAgentPlanSchema(agentType) });
 
   if (!content) {
     throw new Error("Empty response from Claude CLI");
@@ -329,7 +348,7 @@ async function createProviderMessage(messages, model, agentType, step) {
   const completionOptions = {
     model,
     messages,
-    tools,
+    tools: toolsForRole(agentType),
     tool_choice: "auto",
     temperature: config.llm.temperature,
     max_tokens: config.llm.maxTokens,
@@ -478,7 +497,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             const dsResponse = await fallbackClient.chat.completions.create({
               model: dsModel,
               messages,
-              tools,
+              tools: toolsForRole(agentType),
               tool_choice: "auto",
               temperature: config.llm.temperature,
               max_tokens: config.llm.maxTokens,
