@@ -176,3 +176,25 @@ test("overview still accepts a one-element array", async () => {
   const o = await getLpOverview({ force: true });
   assert.equal(o.total_pnl_usd, 10);
 });
+
+test("getKey({ wait: false }) returns null once the LPAGENT_RPM budget is spent", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const keysPath = fileURLToPath(new URL("../lpagent-keys.js", import.meta.url));
+  const script = `
+    const { getKey } = await import(${JSON.stringify(keysPath)});
+    const t0 = Date.now();
+    const first = await getKey({ wait: false });
+    const second = await getKey({ wait: false });
+    console.log(JSON.stringify({ first, second, ms: Date.now() - t0 }));
+    process.exit(0);
+  `;
+  const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, LPAGENT_API_KEY: "only-key", LPAGENT_RPM: "1" },
+    encoding: "utf8",
+  });
+  const r = JSON.parse(out.trim().split("\n").pop());
+  assert.equal(r.first, "only-key");
+  assert.equal(r.second, null);
+  assert.ok(r.ms < 5000, `non-blocking path took ${r.ms}ms`);
+});

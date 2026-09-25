@@ -213,7 +213,8 @@ HELIUS_API_KEY=your_helius_key
 OPENROUTER_API_KEY=sk-or-...
 DEEPSEEK_API_KEY=sk-...
 MINIMAX_API_KEY=...
-LPAGENT_API_KEY=key1,key2
+LPAGENT_API_KEY=your_lpagent_key
+LPAGENT_RPM=5
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=
 DRY_RUN=true
@@ -221,6 +222,7 @@ DRY_RUN=true
 
 Notes:
 
+- `LPAGENT_API_KEY` accepts a comma-separated list, but use a single key. LPAgent's [Terms of Service §7](https://docs.lpagent.io/terms-of-service.md) prohibits creating multiple accounts to circumvent restrictions, so rotating keys from several accounts to get around the rate limit risks termination. If you need more throughput, upgrade the plan (Basic 5, Premium 10, Enterprise 20 requests/min) and set `LPAGENT_RPM` to match. The two-sided spot deploy gate needs a Premium or Enterprise key (`/pools/{id}/top-lpers`); without one, two-sided spot stays blocked.
 - `LLM_PROVIDER` can be `claude`, `codex`, `openrouter`, `deepseek`, or `minimax`
 - `OPENROUTER_API_KEY` is only needed when provider is `openrouter`
 - `DEEPSEEK_API_KEY` is only needed when provider is `deepseek`

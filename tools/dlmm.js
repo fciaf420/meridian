@@ -920,7 +920,8 @@ const LPA_CACHE_TTL = 10_000; // 10 seconds
 /**
  * Fetch ALL open positions from LP Agent for the given wallet.
  * Returns a Map keyed by position address → raw LP Agent position object.
- * Returns null on 429, fetch error, or no API keys configured (triggers Meteora fallback).
+ * Returns null on 429, fetch error, no API keys configured, or an exhausted
+ * per-minute key budget (triggers Meteora fallback).
  */
 async function fetchLpAgentOpenPositions(walletAddress) {
   // Return cached result if fresh
@@ -928,7 +929,9 @@ async function fetchLpAgentOpenPositions(walletAddress) {
     return _lpaCache;
   }
 
-  const apiKey = await getLpaKey();
+  // Non-blocking: when the LPAgent per-minute budget is spent, return null so
+  // the caller (PnL watcher, close snapshot) uses Meteora instead of sleeping.
+  const apiKey = await getLpaKey({ wait: false });
   if (!apiKey) return null;
 
   try {
