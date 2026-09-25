@@ -476,7 +476,7 @@ Use when the user says "add smart wallet", "track this wallet", "add to smart wa
     type: "function",
     function: {
       name: "remove_smart_wallet",
-      description: "Remove a wallet from the smart wallet tracker.",
+      description: "Remove a wallet from the smart wallet tracker. It stops counting as a smart-wallet signal in screening immediately. Use only when the user asks to stop tracking that wallet.",
       parameters: {
         type: "object",
         properties: {
@@ -887,7 +887,7 @@ Parse the text and extract structured criteria, then call this tool to store it.
     type: "function",
     function: {
       name: "remove_strategy",
-      description: "Remove a strategy from the library.",
+      description: "Permanently delete a saved strategy from the library. If it was the active reference, the next saved strategy becomes active. Use only when the user asks to delete it.",
       parameters: {
         type: "object",
         properties: { id: { type: "string", description: "Strategy ID to remove" } },
@@ -1017,7 +1017,7 @@ Call this tool before deploying to any pool — you may have been here before an
     type: "function",
     function: {
       name: "remove_from_blacklist",
-      description: "Remove a token mint from the blacklist.",
+      description: "Remove a token mint from the blacklist so screening and deploys can use it again. Use only when the user asks; a mint blacklisted for a scam or rug reason should stay listed.",
       parameters: {
         type: "object",
         properties: { mint: { type: "string", description: "The mint address to remove" } },
@@ -1125,7 +1125,7 @@ Use this to find articles related to a topic before reading them in full.`,
     type: "function",
     function: {
       name: "kb_delete",
-      description: "Delete an article from the knowledge base. Also removes its INDEX.md entry.",
+      description: "Permanently delete an article from the knowledge base and its INDEX.md entry. Use for articles that are wrong or merged into another; prefer kb_write to correct an article.",
       parameters: {
         type: "object",
         properties: {
