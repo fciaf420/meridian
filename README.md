@@ -215,6 +215,7 @@ LPAGENT_API_KEY=your_lpagent_key
 LPAGENT_RPM=5
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=
+TELEGRAM_ALLOWLIST=
 DRY_RUN=true
 ```
 
@@ -226,7 +227,8 @@ Notes:
 - `DEEPSEEK_API_KEY` is only needed when provider is `deepseek`
 - `MINIMAX_API_KEY` is only needed when provider is `minimax`
 - `claude` and `codex` providers use OAuth login, no API key needed
-- `TELEGRAM_CHAT_ID` can be left empty; Meridian can register it automatically
+- `TELEGRAM_CHAT_ID` should be your own chat id. If it (and `telegramChatId` in user-config) is empty, the first private chat to message the bot is registered once, with a loud warning in the log
+- `TELEGRAM_ALLOWLIST` (optional) is a comma-separated list of Telegram user ids allowed to act inside the owner chat; needed when the owner chat is a group
 - `DRY_RUN=true` is the safest default until you validate behavior
 
 ## Runtime Modes
@@ -304,23 +306,17 @@ The web UI exposes the same chat surface and a command palette.
 
 ### Telegram
 
-Telegram supports the same command style once configured.
+Send `/menu` (or `/start`, or tap the persistent 🏠 Menu button) for the button menu: Status · Positions · Candidates · Wallet · Settings · Bot controls. Views edit the same message in place and have Refresh / Back buttons. Every text command from the REPL still works (`/status`, `/candidates`, `/settings`, `/usdc`, `/autoresearch …`, `/help`, …).
 
-Important ownership rule:
+Bot controls: pause/resume scheduled screening (persisted in `state.json`; management and the PnL watcher keep running), run a screening cycle now, autoresearch status/list/approve/reject, and the last ERROR/WARN log lines (redacted).
 
-- the first Telegram chat to message the bot becomes the registered owner
-- that chat ID is persisted into `user-config.json`
-- messages from other chats are ignored
+Access and confirmation rules:
 
-Telegram can receive:
+- only the owner chat (`telegramChatId` in `user-config.json`, else `TELEGRAM_CHAT_ID`) can control the bot; the sender must be that chat or listed in `TELEGRAM_ALLOWLIST`. Other chats are logged and ignored, never answered
+- with no owner configured, the first private chat is registered once (logged loudly) and persisted to `user-config.json`
+- anything that moves funds (close, deploy, number-reply deploy, `auto`, run screening now) shows a confirmation card first. Confirm carries a single-use nonce that expires after 60s; it executes through the same `executeTool` path the agent uses, so DRY_RUN and every safety check still apply
 
-- deploy notifications
-- close notifications
-- out-of-range alerts
-- PnL watcher auto-close alerts
-- management cycle reports
-- screening cycle reports
-- daily briefing messages
+Telegram alerts (rate-limited): deploys, closes, stop-loss / take-profit auto-closes, partial deploys, out-of-range, gas low and cycle errors, with Positions / Close (confirmation) buttons, plus management and screening cycle reports and the daily briefing.
 
 ## Web Dashboard
 
@@ -521,7 +517,8 @@ meridian/
   pool-memory.js
   unified-memory.js
   server.js
-  telegram.js
+  telegram.js        # Bot API transport + owner-only access control
+  telegram-ui.js     # menus, views, confirmations, alerts
   llm-provider.js
   tools/
   web/
@@ -570,7 +567,7 @@ Check for:
 
 ### Telegram bot responds in one chat but not another
 
-Only the first registered chat is accepted. Clear `telegramChatId` in `user-config.json` if you want to rebind ownership.
+Only the owner chat is accepted (`telegramChatId` in `user-config.json`, else `TELEGRAM_CHAT_ID`). Change `telegramChatId` to rebind ownership. In a group owner chat, add the members' user ids to `TELEGRAM_ALLOWLIST`; ignored updates are logged as `TELEGRAM_WARN`.
 
 ## Disclaimer
 

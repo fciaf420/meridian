@@ -27,7 +27,7 @@ Swaps go through Jupiter Swap API v2 (`/swap/v2/order` + `/execute`, auto slippa
 - The app rewrites `user-config.json` at runtime (threshold evolution, lessons, autoresearch, Telegram chat ID), so expect it to change underneath you.
 - Runtime state is JSON in the repo root (state.json, lessons.json, pool-memory.json, and others) and is gitignored. One tracked file is also rewritten at runtime: `autoresearch.json`. Leave its runtime changes out of commits unless asked.
 - Memory layers: `pool-memory.json` (history by pool address), `lessons.json` (plus `add_pool_note`) and the knowledge base in `knowledge/`. The nuggets layer was removed, so don't reintroduce free-form model-written memory into the system prompt.
-- Telegram: the first chat to message the bot becomes its owner (telegram.js:105).
+- Telegram: only the owner chat (`telegramChatId` / `TELEGRAM_CHAT_ID`; sender must be that chat or in `TELEGRAM_ALLOWLIST`) can control the bot; first-sender registration happens only when no owner is configured. Fund-moving Telegram actions need a second tap: a single-use, 60s server-side nonce (telegram-ui.js), executed via `executeTool`.
 - `screeningSource` is `meteora` (default), `gmgn` or `both`. `both` (tools/screening-both.js) runs the two in parallel, dedupes to one pool per token, applies the Meteora bin-step/TVL/volatility filters to GMGN-only pools, and ranks `confirmed_by_both` first.
 
 ## Prompts and autoresearch
