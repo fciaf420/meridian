@@ -1010,7 +1010,10 @@ function normalizeLpAgentPosition(lpa) {
     },
     allTimeDeposits: {
       total: { usd: lpa.inputValue ?? 0 },
-      tokenX: { amount: lpa.current?.amount0 ?? 0 },
+      // current.amount0 is a RAW base-unit string; amount0Adjusted is UI units,
+      // matching the Meteora path. Note it is the current X holding, not the
+      // original deposit (LPAgent only exposes that via /lp-positions/position).
+      tokenX: { amount: lpa.current?.amount0Adjusted ?? 0 },
       tokenY: { amountSol: lpa.inputNative ?? 0 },
     },
     // Extra fields from LP Agent not in Meteora
