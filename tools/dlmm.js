@@ -130,17 +130,30 @@ async function applyPriorityFee(tx, feePayer, label) {
 
   const estimated = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
   // Fall back to a sane default rather than sending with no priority fee.
-  const microLamports = estimated || (config.management.fallbackPriorityFeeMicroLamports || 50_000);
+  let microLamports = estimated || (config.management.fallbackPriorityFeeMicroLamports || 50_000);
+  // Cap the total priority fee per tx (price × CU limit), so a fee-estimate spike
+  // can't make one tx expensive now that the CU limit defaults to 1.4M.
+  const cuLimitForCap = config.management.computeUnitLimit || 1_400_000;
+  const maxFeeLamports = config.management.maxPriorityFeeLamports ?? 1_000_000; // 0.001 SOL
+  const maxMicroLamports = Math.floor((maxFeeLamports * 1_000_000) / cuLimitForCap);
+  if (microLamports > maxMicroLamports) {
+    log("priority_fee", `${label}: estimate ${microLamports} µL/CU capped to ${maxMicroLamports} (max ${maxFeeLamports} lamports/tx)`);
+    microLamports = maxMicroLamports;
+  }
 
   // Raise the compute-unit limit: position/bin-array init and extended
   // add-liquidity are compute-heavy and exceed the 200k default, failing AFTER
-  // fees are paid. Skip if the SDK tx already set its own CU limit (discriminator 2).
+  // fees are paid. Each InitializeBinArray costs ~200k CU, so an add-liquidity tx
+  // that creates two bin arrays exhausted the old 400k default before the ATA and
+  // deposit instructions ran. Default to the 1.4M per-tx maximum; the priority fee
+  // scales with the limit but stays tiny at typical micro-lamport prices.
+  // Skip if the SDK tx already set its own CU limit (discriminator 2).
   const hasCuLimit = tx.instructions.some(
     (ix) => ix.programId?.equals?.(ComputeBudgetProgram.programId) && ix.data?.[0] === 2,
   );
   if (!hasCuLimit) {
     tx.instructions.unshift(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: config.management.computeUnitLimit || 400_000 })
+      ComputeBudgetProgram.setComputeUnitLimit({ units: config.management.computeUnitLimit || 1_400_000 })
     );
   }
   tx.instructions.unshift(
