@@ -17,7 +17,7 @@ process.env.LPAGENT_RPM = "1000";
 }
 
 const { fetchTopLpersStats, mapTopLpersRows, evaluateTopLpersGate } = await import("../tools/study.js");
-const { getLpOverview } = await import("../tools/lp-overview.js");
+const { getLpOverview, fetchHistoricalPositionMap } = await import("../tools/lp-overview.js");
 
 const realFetch = globalThis.fetch;
 function mockFetch(handler) {
@@ -197,4 +197,54 @@ test("getKey({ wait: false }) returns null once the LPAGENT_RPM budget is spent"
   assert.equal(r.first, "only-key");
   assert.equal(r.second, null);
   assert.ok(r.ms < 5000, `non-blocking path took ${r.ms}ms`);
+});
+
+// Shaped like the documented GET /lp-positions/historical 200 response.
+const histRow = (id) => ({
+  status: "Close",
+  strategyType: "SpotImBalanced",
+  tokenId: id,
+  position: id,
+  pairName: "STARTUP",
+  pool: "POOL",
+  inputValue: 100,
+  inputNative: 0.6,
+  outputValue: 110,
+  collectedFee: 5,
+  pnl: { value: 10, percent: 10, valueNative: 0.05, percentNative: 8 },
+  ageHour: "3.5",
+});
+
+test("historical positions use pageSize=100, platform=meteora and paginate", async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => histRow(`P${i}`));
+  const calls = mockFetch((url) => {
+    const page = Number(new URL(url).searchParams.get("page"));
+    const data = page === 1 ? page1 : [histRow("OLD1")];
+    return jsonResponse({
+      status: "success",
+      data: { data, pagination: { currentPage: page, totalPages: 2, totalCount: 101, pageSize: 100 } },
+    });
+  });
+  const map = await fetchHistoricalPositionMap();
+  assert.equal(calls.length, 2);
+  const u = new URL(calls[0].url);
+  assert.equal(u.pathname, "/open-api/v1/lp-positions/historical");
+  assert.equal(u.searchParams.get("pageSize"), "100");
+  assert.equal(u.searchParams.get("platform"), "meteora");
+  assert.equal(u.searchParams.get("limit"), null);
+  assert.equal(map.size, 101);
+  assert.ok(map.has("OLD1"));
+  // impermanentLoss is not returned by the historical endpoint: unknown, not 0.
+  assert.equal(map.get("P0").il_usd, null);
+});
+
+test("historical positions fetch one page only on the non-blocking path", async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => histRow(`Q${i}`));
+  const calls = mockFetch(() => jsonResponse({
+    status: "success",
+    data: { data: page1, pagination: { currentPage: 1, totalPages: 5, totalCount: 500, pageSize: 100 } },
+  }));
+  const map = await fetchHistoricalPositionMap({ wait: false });
+  assert.equal(calls.length, 1);
+  assert.equal(map.size, 100);
 });

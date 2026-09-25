@@ -133,7 +133,9 @@ function formatHistoricalPosition(match, useSol) {
     final_value_usd: round2(match.outputValue ?? 0),
     fees_usd: round2(match.collectedFee ?? 0),
     fees_sol: round4(match.collectedFeeNative ?? 0),
-    il_usd: round2(match.impermanentLoss ?? 0),
+    // The historical endpoint does not return impermanentLoss (only
+    // /lp-positions/position does), so report unknown rather than 0.
+    il_usd: match.impermanentLoss != null ? round2(match.impermanentLoss) : null,
     age_hours: round2(parseFloat(match.ageHour || 0)),
     lower_bin: match.tickLower,
     upper_bin: match.tickUpper,
@@ -144,20 +146,46 @@ function formatHistoricalPosition(match, useSol) {
   };
 }
 
-/** Fetch the raw historical positions list from LP Agent (max 50). Returns [] on failure. */
-async function fetchHistoricalRaw() {
-  const apiKey = await getApiKey();
+const HISTORICAL_PAGE_SIZE = 100; // documented max for `pageSize`
+const HISTORICAL_MAX_PAGES = 3;
+
+/**
+ * Fetch the raw historical (closed) positions list from LP Agent.
+ * Page 1 uses pageSize=100 (documented max). With wait=true (state sync),
+ * further pages up to HISTORICAL_MAX_PAGES are fetched only while the key
+ * budget allows it without waiting, since each page costs a rate-limit slot.
+ * With { wait: false } (the PnL watcher path) only page 1 is fetched, and
+ * only if a key is free right now. Returns [] on failure.
+ */
+async function fetchHistoricalRaw({ wait = true } = {}) {
+  const apiKey = await getApiKey({ wait });
   if (!apiKey) return [];
   try {
     const owner = await getWalletAddress();
     if (!owner) return [];
-    const res = await fetch(
-      `${LPAGENT_API}/lp-positions/historical?owner=${owner}&page=1&limit=50`,
-      { headers: { "x-api-key": apiKey } }
-    );
-    if (!res.ok) return [];
-    const json = await res.json();
-    return json.data?.data || [];
+    const all = [];
+    let key = apiKey;
+    const maxPages = wait ? HISTORICAL_MAX_PAGES : 1;
+    for (let page = 1; page <= maxPages; page++) {
+      if (page > 1) {
+        key = await getApiKey({ wait: false });
+        if (!key) break;
+      }
+      const res = await fetch(
+        `${LPAGENT_API}/lp-positions/historical?owner=${owner}&platform=meteora&page=${page}&pageSize=${HISTORICAL_PAGE_SIZE}`,
+        { headers: { "x-api-key": key } }
+      );
+      if (!res.ok) {
+        if (page === 1) return [];
+        break;
+      }
+      const json = await res.json();
+      const rows = Array.isArray(json.data?.data) ? json.data.data : [];
+      all.push(...rows);
+      const totalPages = Number(json.data?.pagination?.totalPages);
+      if (rows.length < HISTORICAL_PAGE_SIZE || !(totalPages > page)) break;
+    }
+    return all;
   } catch (e) {
     log("lp_overview", `Failed to fetch historical positions: ${e.message}`);
     return [];
@@ -192,11 +220,12 @@ export async function fetchClosedPositionData(positionAddress) {
  * Fetches the list ONCE and indexes by position address.
  * Use this instead of calling fetchClosedPositionData N times in a loop.
  *
+ * @param {{wait?: boolean}} [opts] wait=false never waits for the LPAgent key budget
  * @returns {Map<string, Object>} positionAddress -> formatted position data
  */
-export async function fetchHistoricalPositionMap() {
+export async function fetchHistoricalPositionMap({ wait = true } = {}) {
   try {
-    const rawPositions = await fetchHistoricalRaw();
+    const rawPositions = await fetchHistoricalRaw({ wait });
     if (rawPositions.length === 0) return new Map();
 
     const { config } = await import("../config.js");

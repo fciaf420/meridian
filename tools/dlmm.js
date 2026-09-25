@@ -1174,7 +1174,7 @@ export async function getMyPositions({ force = false } = {}) {
     const [walletBalResult, lpAgentHistMap] = await Promise.all([
       getWalletBalances().catch(() => ({ sol_price: 0 })),
       hasUntracked
-        ? import("./lp-overview.js").then((m) => m.fetchHistoricalPositionMap()).catch(() => new Map())
+        ? import("./lp-overview.js").then((m) => m.fetchHistoricalPositionMap({ wait: false })).catch(() => new Map())
         : Promise.resolve(new Map()),
     ]);
 
