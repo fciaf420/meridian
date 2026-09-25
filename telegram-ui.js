@@ -31,6 +31,8 @@ export const PAGE_CHAR_BUDGET = 3500; // leaves headroom under Telegram's 4096 c
 export const POSITIONS_PER_PAGE = 5;
 export const CANDIDATES_PER_PAGE = 5;
 export const ENTRY_PREVIEW_TIMEOUT_MS = 8_000;
+/** Upper bound on the candle-depth lookup before the range picker opens. */
+export const OHLCV_DEPTH_TIMEOUT_MS = 8_000;
 export const BINS_STRIP_TIMEOUT_MS = 4_000; // Positions list: show it without strips rather than wait
 export const BINS_VIEW_TIMEOUT_MS = 8_000;
 
@@ -343,6 +345,21 @@ export function rangeForVolatility(volatility, strategy) {
   return spot ? 50 : 45;
 }
 
+/**
+ * Auto range for the picker / default plan: the candidate's candle-based depth
+ * (tools/ohlcv.js, attached as `ohlcv_depth` when rangeDepthMode is "ohlcv"),
+ * else the volatility table. `text` is the card line, e.g.
+ * "Auto 62% (1m·full life 5.5h drawdown 48% ×1.3, gmgn)".
+ */
+export function autoRange(c, strategy) {
+  const od = c?.ohlcv_depth;
+  if (od?.depthPct > 0) {
+    return { pct: od.depthPct, source: "ohlcv", text: `Auto ${od.depthPct}% (${od.basis ?? "candles"})` };
+  }
+  const pct = rangeForVolatility(c?.volatility, strategy);
+  return { pct, source: "volatility", text: `Auto ${pct}% (volatility ${c?.volatility ?? "?"})` };
+}
+
 /** Range presets offered by the Telegram picker (besides Auto). */
 export const RANGE_PRESETS = [25, 50, 80];
 
@@ -379,7 +396,7 @@ export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount
     const r = Number(priceRangePct);
     if (!(r > 0 && r < 100)) return { error: `Invalid range ${priceRangePct}%.` };
     price_range_pct = r;
-  } else price_range_pct = rangeForVolatility(candidate.volatility, strategy);
+  } else price_range_pct = autoRange(candidate, strategy).pct;
 
   const args = {
     pool_address: candidate.pool,
@@ -419,22 +436,27 @@ export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount
     }
   }
   const strategyLabel = evil ? `Evil Panda (single-sided SOL spot, ${price_range_pct}% range)` : `${strategy}, single-sided SOL, ${price_range_pct}% range`;
-  return { args, amountLabel, strategyLabel, evil, range: rangeInfo(price_range_pct, candidate.bin_step) };
+  const depth = evil ? null : candidate.ohlcv_depth ?? null;
+  return { args, amountLabel, strategyLabel, evil, range: rangeInfo(price_range_pct, candidate.bin_step, depth?.depthPct), depth };
 }
 
 /**
  * What deploy_position will actually do with a requested range: below
- * MIN_RANGE_PCT it widens to the floor (tools/dlmm.js). `bins` is the approximate
- * bin count at the pool's bin_step (null when the bin_step is unknown).
+ * MIN_RANGE_PCT it widens to the floor, and (rangeDepthMode "ohlcv") below the
+ * pool's candle depth it widens to that depth (tools/dlmm.js). `bins` is the
+ * approximate bin count at the pool's bin_step (null when the bin_step is unknown).
  */
-export function rangeInfo(requestedPct, binStep) {
-  const effectivePct = Math.max(Number(requestedPct), MIN_RANGE_PCT);
+export function rangeInfo(requestedPct, binStep, ohlcvDepthPct = null) {
+  const req = Number(requestedPct);
+  const depth = Number(ohlcvDepthPct) > MIN_RANGE_PCT ? Number(ohlcvDepthPct) : 0;
+  const effectivePct = Math.max(req, MIN_RANGE_PCT, depth);
   const bs = Number(binStep);
   const bins = bs > 0 ? calculateBinsForPriceRange(bs, effectivePct) : null;
   return {
-    requestedPct: Number(requestedPct),
+    requestedPct: req,
     effectivePct,
-    widened: effectivePct > Number(requestedPct),
+    widened: effectivePct > req,
+    widenedBy: effectivePct > req ? (depth > MIN_RANGE_PCT && effectivePct === depth ? "ohlcv" : "min") : null,
     bins,
     tooFewBins: bins != null && bins < MIN_BINS, // deploy_position would reject it
   };
@@ -443,9 +465,10 @@ export function rangeInfo(requestedPct, binStep) {
 /** "35% (~44 bins at bin step 100)" or with the widening note. */
 function fmtRange(r, binStep) {
   const bins = r.bins != null ? ` (~${r.bins} bins at bin step ${binStep})` : " (bins computed at deploy from the pool's bin step)";
-  return r.widened
-    ? `${r.requestedPct}% requested → deploy widens it to the ${MIN_RANGE_PCT}% minimum${bins}`
-    : `${r.effectivePct}%${bins}`;
+  if (!r.widened) return `${r.effectivePct}%${bins}`;
+  return r.widenedBy === "ohlcv"
+    ? `${r.requestedPct}% requested → deploy widens it to the ${r.effectivePct}% candle depth${bins}`
+    : `${r.requestedPct}% requested → deploy widens it to the ${MIN_RANGE_PCT}% minimum${bins}`;
 }
 
 // ─── Views (pure renderers) ──────────────────────────────────────
@@ -1071,6 +1094,7 @@ export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "
     `Pool: <code>${escapeHtml(c.pool)}</code>`,
     `Strategy: ${strategy} · single-sided SOL (no token side)`,
     `Range: ${escapeHtml(fmtRange(plan.range, c.bin_step))}`,
+    ...(plan.depth?.depthPct > 0 ? [`Candle depth: ${escapeHtml(`${plan.depth.depthPct}% (${plan.depth.basis ?? "candles"})`)}`] : []),
     `Amount: <b>${escapeHtml(plan.amountLabel)}</b>`,
     `bin step ${c.bin_step ?? "?"} · volatility ${c.volatility ?? "?"} · fee/aTVL ${c.fee_active_tvl_ratio ?? c.fee_tvl_ratio ?? "?"}%`,
   ];
@@ -1110,12 +1134,17 @@ export function renderStrategyStep(c, stepId, { defaultStrategy } = {}) {
 
 /** Range options for a strategy: Auto + presets, minus any that deploy would reject. */
 export function rangeOptions(c, strategy) {
-  const auto = rangeForVolatility(c.volatility, strategy);
+  const auto = autoRange(c, strategy).pct;
+  const depth = c.ohlcv_depth?.depthPct ?? null;
   const opts = [{ key: "a", pct: auto, label: `Auto (${auto}%)` }, ...RANGE_PRESETS.map((p) => ({ key: String(p), pct: p, label: `${p}%` }))];
   return opts
-    .map((o) => ({ ...o, range: rangeInfo(o.pct, c.bin_step) }))
+    .map((o) => ({ ...o, range: rangeInfo(o.pct, c.bin_step, depth) }))
     .filter((o) => !o.range.tooFewBins)
-    .map((o) => ({ ...o, label: o.range.widened ? `${o.label} → ${MIN_RANGE_PCT}% min` : o.label }));
+    .map((o) => ({
+      ...o,
+      label: !o.range.widened ? o.label
+        : o.range.widenedBy === "ohlcv" ? `${o.label} → ${o.range.effectivePct}% depth` : `${o.label} → ${MIN_RANGE_PCT}% min`,
+    }));
 }
 
 export function renderRangeStep(c, stepId, strategy, { usdcMode = false } = {}) {
@@ -1125,8 +1154,10 @@ export function renderRangeStep(c, stepId, strategy, { usdcMode = false } = {}) 
   lines.push(
     "",
     "<b>Pick a range</b> (how far below the current price the SOL goes):",
-    `Auto is set from volatility ${c.volatility ?? "?"}.`,
-    `deploy_position enforces a ${MIN_RANGE_PCT}% minimum, so narrower presets get widened to it.`,
+    `${escapeHtml(autoRange(c, strategy).text)}.`,
+    c.ohlcv_depth?.depthPct > 0
+      ? `deploy_position widens any range shallower than the ${c.ohlcv_depth.depthPct}% candle depth.`
+      : `deploy_position enforces a ${MIN_RANGE_PCT}% minimum, so narrower presets get widened to it.`,
   );
   if (opts.length < RANGE_PRESETS.length + 1) lines.push(`Ranges under ${MIN_BINS} bins at bin step ${c.bin_step} are hidden (deploy rejects them).`);
   if (!opts.length) lines.push("⚠️ No range reaches the bin minimum for this pool.");
@@ -1180,6 +1211,7 @@ export function renderExecResult(action, label, result) {
  *   applyTradingSettings(changes)         — → { ok, text, changes, rescheduled } | { ok: false, error } (trading-settings.js)
  *   allSettings                           — all-settings.js createAllSettings() service (registry, validate, risk, apply)
  *   entryPreview(candidate, { strategy }) — read-only pool status / fee mode / TWAP for the confirm card
+ *   getOhlcvDepth(candidate)              — candle-based range depth (tools/ohlcv.js) for Auto + the card; optional
  *   log(category, msg), now(), ttlMs
  */
 export function createTelegramUI(deps) {
@@ -1294,6 +1326,19 @@ export function createTelegramUI(deps) {
     return { nonce, view: renderDeployConfirm(candidate, plan, nonce, { dryRun: isDryRun(), source: source(), warnings, ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, entryState, entryFilters: deps.config.entryFilters || null }) };
   }
 
+  /**
+   * Attach the candle-based depth (rangeDepthMode "ohlcv") so Auto and the card
+   * can show it. Best effort, bounded; the candidate is copied, never mutated.
+   */
+  async function withOhlcvDepth(candidate) {
+    if (deps.config.strategy?.rangeDepthMode !== "ohlcv" || !deps.getOhlcvDepth || candidate?.ohlcv_depth !== undefined) return candidate;
+    const od = await Promise.race([
+      Promise.resolve().then(() => deps.getOhlcvDepth(candidate)),
+      new Promise((resolve) => setTimeout(() => resolve(null), OHLCV_DEPTH_TIMEOUT_MS).unref?.()),
+    ]).catch(() => null);
+    return { ...candidate, ohlcv_depth: od?.depthPct > 0 ? { depthPct: od.depthPct, basis: od.short ?? null } : null };
+  }
+
   // ── deploy picker (strategy → range → confirm) ──
   /**
    * Entry point for every manual candidate deploy. Evil Panda keeps its fixed
@@ -1305,6 +1350,7 @@ export function createTelegramUI(deps) {
       return presentConfirm(ctx, await deployRequest(candidate, { warnings }), opts);
     }
     const usdcMode = !!deps.usdcModeEnabled?.();
+    candidate = await withOhlcvDepth(candidate);
     const id = steps.put("pick", { candidate, usdcMode, strategy: usdcMode ? "bid_ask" : null, origin, warnings });
     const view = usdcMode
       ? renderRangeStep(candidate, id, "bid_ask", { usdcMode: true })

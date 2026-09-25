@@ -34,6 +34,7 @@ import { recordPositionSnapshot as recordPoolSnapshot, recallForPool } from "./p
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { fetchGmgnPriceInfo, fetchGmgnSignal } from "./tools/gmgn.js";
+import { getOhlcvDepth } from "./tools/ohlcv.js";
 import {
   sessionHistory, appendHistory, getHistory,
   isBusy, setBusy,
@@ -302,6 +303,7 @@ async function screeningCycleBody() {
       loadedCandidates = candidates;
       // Fetch dynamic fees sequentially to avoid RPC rate limit bursts
       const { fetchDynamicFee } = await import("./tools/screening.js");
+      const ohlcvDepthOn = config.strategy.rangeDepthMode === "ohlcv" && config.strategy.activeStrategy !== "evil_panda";
       const dynFeeMap = {};
       for (const c of candidates) {
         dynFeeMap[c.pool] = await fetchDynamicFee(c.pool);
@@ -326,6 +328,11 @@ async function screeningCycleBody() {
         const gmgnSignalResult = gmgnSignal.status === "fulfilled" ? gmgnSignal.value : null;
         c._gmgnResult = gmgnResult;  // attach to candidate for signal staging
         c._gmgnSignal = gmgnSignalResult;
+        // Candle-based range depth (tools/ohlcv.js). Token age from GMGN picks the timeframe tier.
+        if (ohlcvDepthOn) {
+          const od = await getOhlcvDepth({ pool: c.pool, mint: baseMint, ageHours: gmgnResult?.token_age_hours ?? null }).catch(() => null);
+          c.ohlcv_depth = od ? { depthPct: od.depthPct, basis: od.short } : null;
+        }
         const dynFeeResult = dynFeeMap[c.pool] || null;
         const tokenData = infoResult?.results?.[0];
         const smartWalletCount = swResult?.in_pool?.length || 0;
@@ -334,6 +341,7 @@ async function screeningCycleBody() {
         c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
 
         let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
+        if (ohlcvDepthOn) block += ` | ohlcv_depth: ${c.ohlcv_depth ? `${c.ohlcv_depth.depthPct}% (${c.ohlcv_depth.basis})` : "n/a (use volatility table)"}`;
         const srcTag = formatCandidateSources(c);
         if (srcTag) block += ` | ${srcTag}`;
 
@@ -478,6 +486,9 @@ async function screeningCycleBody() {
       ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n- Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n`
       : "";
 
+    const rangeSourceLine = config.strategy.rangeDepthMode === "ohlcv" && config.strategy.activeStrategy !== "evil_panda"
+      ? "Size your price_range_pct from the candidate's ohlcv_depth (see OHLCV RANGE DEPTH below); use the VOLATILITY TABLE only when ohlcv_depth is n/a. NOT from study avg_range_pct."
+      : "Size your price_range_pct from the VOLATILITY TABLE in the range selection rules below — NOT from study avg_range_pct.";
     const { content } = await screenerLoop(`
 SCREENING CYCLE — DEPLOY ONLY${signalWeightsBlock}${kbScreenContext}${candidateBlocks}${gmgnSignalGuide}
 ${strategyBlock}
@@ -489,12 +500,12 @@ HARD SKIP rules still apply:
 - No smart wallets or GMGN confirmation + empty/hype narrative → skip
 
 Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL${sizingNote}.
-Size your price_range_pct from the VOLATILITY TABLE in the range selection rules below — NOT from study avg_range_pct.
+${rangeSourceLine}
 study_top_lpers is useful for strategy choice (bid_ask vs spot), hold times, and win rates — but their range data is from a different market regime and should not drive your range.` : `1. get_top_candidates, pick the best one.
 2. check_smart_wallets_on_pool, get_token_holders (check global_fees_sol >= ${config.screening.minTokenFeesSol}), get_token_narrative.
 3. HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL or holders/narrative red flags.
 4. study_top_lpers → use for strategy choice, hold times, win rates. Do NOT use avg_range_pct for your range — size from the VOLATILITY TABLE instead.
-5. deploy_position with ${deployAmount} SOL${sizingNote} and price_range_pct from volatility table (adjusted by lessons).`}
+5. deploy_position with ${deployAmount} SOL${sizingNote} and price_range_pct from volatility table (adjusted by lessons)${config.strategy.rangeDepthMode === "ohlcv" ? "; deploy_position widens it to the pool's candle-based depth when that is deeper" : ""}.`}
 ${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
 ? `\n\nUSDC MODE IS ON: deploy sizing/funding is automatic — the system swaps USDC→SOL ($${config.usdc.deployAmountUsd}/position) and deploys single-sided. Do NOT pick a SOL amount or call swap_token to prepare funds; just call deploy_position for the chosen pool.`
 : ""}
@@ -1077,6 +1088,8 @@ const tgUI = createTelegramUI({
     const { readPoolEntryState } = await import("./tools/entry-safety.js");
     return readPoolEntryState(c.pool, { apiBlacklisted: c.is_blacklisted ?? null, ...opts });
   },
+  // Candle-based range depth for the picker's Auto option (rangeDepthMode "ohlcv").
+  getOhlcvDepth: (c) => getOhlcvDepth({ pool: c.pool, mint: c.base_mint || c.base?.mint || null, ageHours: c.token_age_hours ?? null }),
   parseMint,
   executeTool,
   runExclusive: tryExclusive,
