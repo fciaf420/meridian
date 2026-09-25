@@ -207,6 +207,45 @@ async function broadcastSigned(connection, wire, sendOpts, label, { rpc = true }
   if (!s && !r) throw new Error(`${label}: transaction was not accepted by Helius Sender or the RPC`);
 }
 
+/**
+ * Which bin arrays covering [minBinId, maxBinId] are already initialized?
+ * Returns { missing: number[], min, max } where [min, max] is the contiguous
+ * initialized window around the active bin, clipped to the requested range
+ * (min/max are null if the active bin's own array is missing). Read-only.
+ * A bin array past the default bitmap also needs the bitmap extension account
+ * (more rent), so it counts as missing when the pool has no extension yet.
+ */
+async function initializedBinArrayWindow(pool, minBinId, maxBinId, activeBinId) {
+  const m = await import("@meteora-ag/dlmm");
+  const idxOf = (binId) => m.binIdToBinArrayIndex(new BN(binId)).toNumber();
+  const lo = idxOf(minBinId);
+  const hi = idxOf(maxBinId);
+  const indexes = [];
+  for (let i = lo; i <= hi; i++) indexes.push(i);
+  const keys = indexes.map((i) => m.deriveBinArray(pool.pubkey, new BN(i), pool.program.programId)[0]);
+  const infos = await getConnection().getMultipleAccountsInfo(keys);
+  const exists = new Map(indexes.map((i, k) => [
+    i,
+    !!infos[k] && !(m.isOverflowDefaultBinArrayBitmap(new BN(i)) && !pool.binArrayBitmapExtension),
+  ]));
+  const missing = indexes.filter((i) => !exists.get(i));
+  if (missing.length === 0) return { missing, min: minBinId, max: maxBinId };
+
+  const act = Math.min(Math.max(idxOf(activeBinId), lo), hi);
+  if (!exists.get(act)) return { missing, min: null, max: null };
+  let a = act;
+  let b = act;
+  while (a - 1 >= lo && exists.get(a - 1)) a--;
+  while (b + 1 <= hi && exists.get(b + 1)) b++;
+  const [aLow] = m.getBinArrayLowerUpperBinId(new BN(a));
+  const [, bHigh] = m.getBinArrayLowerUpperBinId(new BN(b));
+  return {
+    missing,
+    min: Math.max(minBinId, aLow.toNumber()),
+    max: Math.min(maxBinId, bHigh.toNumber()),
+  };
+}
+
 async function applyPriorityFee(tx, feePayer, label) {
   if (!tx?.instructions?.length) return tx;
   if (heliusSenderEnabled()) addSenderTip(tx, feePayer);
@@ -873,8 +912,40 @@ export async function deployPosition({
   }
 
   // Range calculation
-  const minBinId = activeBin.binId - activeBinsBelow;
-  const maxBinId = activeBin.binId + activeBinsAbove;
+  let minBinId = activeBin.binId - activeBinsBelow;
+  let maxBinId = activeBin.binId + activeBinsAbove;
+
+  // ─── Never pay for new bin arrays ─────────────────────────────
+  // Initializing a bin array costs ~0.0714 SOL of rent that is never refunded
+  // (there is no close path), i.e. ~6.5% of a 1.1 SOL position. Only deploy
+  // into already-initialized bin arrays: trim the range to the contiguous
+  // initialized window around the active bin, or refuse if that window no
+  // longer meets MIN_BINS / MIN_RANGE_PCT. Runs before any deploy tx is built.
+  // (The two-sided auto-swap above only runs for two-sided spot, which is gated.)
+  if (!(config.management.allowBinArrayInit ?? false)) {
+    const w = await initializedBinArrayWindow(pool, minBinId, maxBinId, activeBin.binId);
+    if (w.missing.length > 0) {
+      if (w.min == null) {
+        log("deploy", `Refusing deploy into ${pool_address}: range needs uninitialized bin arrays ${w.missing.join(",")} (rent is non-refundable)`);
+        return { success: false, error: `Range needs new bin arrays (${w.missing.length} × ~0.0714 SOL non-refundable rent) and no initialized window exists around the active bin. Not deployed.` };
+      }
+      const newBelow = Math.max(0, activeBin.binId - w.min);
+      const newAbove = Math.max(0, w.max - activeBin.binId);
+      const newTotal = newBelow + newAbove;
+      const stepPct = (resolvedBinStep || 0) / 10_000;
+      const newRangePct = stepPct > 0 ? (1 - Math.pow(1 + stepPct, -Math.max(newBelow, newAbove))) * 100 : 0;
+      if (newTotal < MIN_BINS || (stepPct > 0 && newRangePct < MIN_RANGE_PCT)) {
+        log("deploy", `Refusing deploy into ${pool_address}: only ${newTotal} bins (${newRangePct.toFixed(1)}%) are in initialized bin arrays; minimum is ${MIN_BINS} bins / ${MIN_RANGE_PCT}%`);
+        return { success: false, error: `Only ${newTotal} bins (${newRangePct.toFixed(1)}% range) fall in already-initialized bin arrays — below the ${MIN_BINS}-bin / ${MIN_RANGE_PCT}% minimum. Not deployed (won't pay non-refundable bin-array rent).` };
+      }
+      log("deploy", `Trimmed range to initialized bin arrays: ${minBinId}..${maxBinId} → ${w.min}..${w.max} (${totalBins} → ${newTotal} bins, ~${newRangePct.toFixed(1)}%); avoided ${w.missing.length} new bin array(s)`);
+      minBinId = w.min;
+      maxBinId = w.max;
+      activeBinsBelow = newBelow;
+      activeBinsAbove = newAbove;
+      totalBins = newTotal;
+    }
+  }
 
   const strategyMap = {
     spot: StrategyType.Spot,
@@ -2257,3 +2328,4 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 // Exposed for read-only verification scripts/tests (never sends anything).
 export { applyPriorityFee as _applyPriorityFeeForTest };
 export { sendManagedTransaction as _sendManagedTransactionForTest };
+export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
