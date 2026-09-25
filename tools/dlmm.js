@@ -139,9 +139,10 @@ async function applyPriorityFee(tx, feePayer, label) {
 
   const estimated = await estimatePriorityFeeMicroLamports(tx, feePayer, label);
   // Fall back to a sane default rather than sending with no priority fee, and
-  // floor at Helius's recommended landing price so a quiet-market "Medium"
-  // reading (~1k µL/CU) doesn't produce a tx that never lands.
-  const floor = config.management.minPriorityFeeMicroLamports ?? 10_000;
+  // floor the price: at the 10k Helius-"recommended" level, live deploy creates
+  // expired 3× in a row, while earlier txs at 50k landed in ~1s. With the CU
+  // limit sized by simulation, 50k µL/CU is still cheap (≈0.00004 SOL at 800k CU).
+  const floor = config.management.minPriorityFeeMicroLamports ?? 50_000;
   let microLamports = Math.max(
     estimated || (config.management.fallbackPriorityFeeMicroLamports || 50_000),
     floor,
@@ -265,16 +266,27 @@ async function sendManagedTransaction(tx, signers, label) {
       const signature = bs58.encode(tx.signature);
       lastSig = signature;
 
-      await connection.sendRawTransaction(tx.serialize(), {
-        skipPreflight: true,
-        preflightCommitment: "confirmed",
-        maxRetries: 3,
-      });
-      const status = (await connection.confirmTransaction({
-        signature,
-        blockhash: tx.recentBlockhash,
-        lastValidBlockHeight: tx.lastValidBlockHeight,
-      }, "confirmed")).value;
+      const wire = tx.serialize();
+      const sendOpts = { skipPreflight: true, preflightCommitment: "confirmed", maxRetries: 0 };
+      await connection.sendRawTransaction(wire, sendOpts);
+      // Rebroadcast the SAME signed bytes every 2s until confirmed or expired.
+      // A single send is often dropped under load and nothing re-sent it before
+      // the blockhash expired ("block height exceeded"). Identical bytes = same
+      // signature, so a rebroadcast can never double-execute.
+      const rebroadcastMs = config.management.txRebroadcastMs ?? 2_000;
+      const rebroadcast = setInterval(() => {
+        connection.sendRawTransaction(wire, sendOpts).catch(() => { /* best-effort; confirm decides */ });
+      }, rebroadcastMs);
+      let status;
+      try {
+        status = (await connection.confirmTransaction({
+          signature,
+          blockhash: tx.recentBlockhash,
+          lastValidBlockHeight: tx.lastValidBlockHeight,
+        }, "confirmed")).value;
+      } finally {
+        clearInterval(rebroadcast);
+      }
       if (status?.err) {
         throw new SendTransactionError({
           action: "send",
