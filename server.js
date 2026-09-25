@@ -550,8 +550,8 @@ export function startServer(timersFn) {
           for (const p of positions.positions || []) {
             const status = p.in_range ? "in-range" : "OUT OF RANGE";
             const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
-            const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd}`;
-            lines.push(`  ${p.pair} — ${status} | fees: ${fees} | pnl: ${pnl} (${p.pnl_pct}%)`);
+            const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
+            lines.push(`  ${p.pair} — ${status} | fees: ${fees} | pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
           }
           wsSend(ws, {
             type: "chat:response",

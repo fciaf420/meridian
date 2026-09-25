@@ -13,8 +13,26 @@ import {
 import { normalizeCandidateForUi } from "../tools/screening.js";
 
 test("calculateBinsForPriceRange uses the actual bin step", () => {
-  assert.equal(calculateBinsForPriceRange(80, 35), 54);
-  assert.equal(calculateBinsForPriceRange(125, 35), 34);
+  assert.equal(calculateBinsForPriceRange(80, 35), 55);
+  assert.equal(calculateBinsForPriceRange(125, 35), 35);
+});
+
+// Coverage of N bins below the active bin: 1 - (1 + binStep/1e4)^-N
+const coveragePct = (binStep, bins) => (1 - Math.pow(1 + binStep / 10000, -bins)) * 100;
+
+test("calculateBinsForPriceRange always covers at least the requested range", () => {
+  // Regression: Math.abs(Math.ceil(x)) floored the magnitude → 43 bins = 34.81% at bs100
+  assert.equal(calculateBinsForPriceRange(100, 35), 44);
+  assert.ok(coveragePct(100, calculateBinsForPriceRange(100, 35)) >= 35);
+  for (const binStep of [1, 5, 10, 20, 25, 50, 80, 100, 125, 200, 250, 400]) {
+    for (const pct of [1, 5, 10, 35, 50, 69, 80, 90, 99]) {
+      const bins = calculateBinsForPriceRange(binStep, pct);
+      assert.ok(Number.isInteger(bins) && bins > 0, `bins must be a positive integer (bs${binStep} ${pct}%)`);
+      assert.ok(coveragePct(binStep, bins) >= pct - 1e-9, `bs${binStep} ${pct}%: ${bins} bins covers only ${coveragePct(binStep, bins)}%`);
+      // ...and is minimal: one bin fewer would under-cover
+      if (bins > 1) assert.ok(coveragePct(binStep, bins - 1) < pct, `bs${binStep} ${pct}%: ${bins} bins is not minimal`);
+    }
+  }
 });
 
 test("splitRangeBins keeps the full range intact", () => {

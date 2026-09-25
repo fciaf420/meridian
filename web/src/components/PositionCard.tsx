@@ -26,7 +26,8 @@ function formatAge(minutes: number): string {
 function PositionCardInner({ position }: { position: PositionInfo }) {
   const { pair, pool, base_mint, in_range, pnl_pct, unclaimed_fees_sol, unclaimed_fees_usd, age_minutes, active_bin, lower_bin, upper_bin } = position;
 
-  const pnlColor = pnl_pct >= 0 ? "text-emerald-400" : "text-red-400";
+  const pnlKnown = pnl_pct != null && Number.isFinite(pnl_pct);
+  const pnlColor = !pnlKnown ? "text-ash" : pnl_pct >= 0 ? "text-emerald-400" : "text-red-400";
   const fees = unclaimed_fees_sol != null ? `${unclaimed_fees_sol.toFixed(4)} SOL` : unclaimed_fees_usd != null ? `$${unclaimed_fees_usd.toFixed(2)}` : "--";
   const canOpenToken = Boolean(base_mint && base_mint !== WRAPPED_SOL_MINT);
 
@@ -66,7 +67,7 @@ function PositionCardInner({ position }: { position: PositionInfo }) {
         <div>
           <span className="block text-[10px] text-ash">PnL</span>
           <span className={`font-mono text-[11px] font-medium ${pnlColor}`}>
-            {pnl_pct >= 0 ? "+" : ""}{pnl_pct.toFixed(2)}%
+            {pnlKnown ? `${pnl_pct >= 0 ? "+" : ""}${pnl_pct.toFixed(2)}%` : "unknown"}
           </span>
         </div>
         <div>

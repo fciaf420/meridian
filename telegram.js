@@ -164,7 +164,7 @@ export async function notifyClose({ pair, pnlUsd, pnlSol, pnlPct }) {
   const label = unit === "sol" && pnlSol != null ? `${sign}${val.toFixed(4)} SOL` : `${sign}$${val.toFixed(2)}`;
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${label} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    (pnlPct == null ? `PnL: unknown (PnL data unavailable at close)` : `PnL: ${label} (${sign}${pnlPct.toFixed(2)}%)`)
   );
 }
 
@@ -193,6 +193,10 @@ on("deploy", (data) => { if (isEnabled()) notifyDeploy(data).catch(() => {}); })
 on("close", (data) => { if (isEnabled()) notifyClose(data).catch(() => {}); });
 on("out_of_range", (data) => { if (isEnabled()) notifyOutOfRange(data).catch(() => {}); });
 on("gas_low", (data) => { if (isEnabled()) notifyGasLow(data).catch(() => {}); });
+on("deploy_partial", (data) => {
+  if (!isEnabled()) return;
+  sendMessage(`⚠️ Partial deploy: ${data.pair}\nPosition ${data.position} is ${data.status} after a liquidity-add failure (${data.error}).\nX=${data.amountX ?? "?"} Y=${data.amountY ?? "?"}\nKept OPEN for management/close — check it.`).catch(() => {});
+});
 on("pnl_watcher_close", (data) => {
   if (!isEnabled()) return;
   const sign = (data.pnlPct || 0) >= 0 ? "+" : "";
