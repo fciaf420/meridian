@@ -7,7 +7,7 @@ import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./age
 import { log } from "./logger.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail } from "./tools/screening.js";
+import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
 import { registerCronRestarter, executeTool } from "./tools/executor.js";
@@ -521,6 +521,8 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
           c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
 
           let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
+          const srcTag = formatCandidateSources(c);
+          if (srcTag) block += ` | ${srcTag}`;
 
           if (Array.isArray(c.darwin_top_signals) && c.darwin_top_signals.length > 0) {
             const topSignals = c.darwin_top_signals
@@ -533,6 +535,12 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
           if (tokenData) {
             if (tokenData.mcap) block += ` | mcap: $${(tokenData.mcap / 1000).toFixed(0)}k`;
             if (tokenData.stats_1h?.price_change) block += ` | 1h: ${tokenData.stats_1h.price_change}%`;
+          }
+          // GMGN token signals (screeningSource gmgn/both): KOL / smart money / indicators.
+          if (c.gmgn) {
+            const kolNames = c.gmgn_kol_names?.length ? ` (${c.gmgn_kol_names.slice(0, 3).join(", ")})` : "";
+            const ind = c.indicators ? ` | supertrend=${c.indicators.supertrendDirection ?? "?"} rsi=${c.indicators.rsi ?? "?"}` : "";
+            block += `\n  GMGN screen: smart=${c.gmgn_smart_wallets ?? "?"} kol=${c.gmgn_kol_wallets ?? "?"}${kolNames}${c.gmgn_dump_kol_significant ? ` dump_kol=${c.gmgn_dump_kol_significant}` : ""}${ind}`;
           }
           if (smartWalletCount > 0) block += `\n  Smart wallets: ${smartWalletCount} found`;
           else block += `\n  Smart wallets: none`;
