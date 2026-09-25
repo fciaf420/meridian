@@ -120,3 +120,13 @@ test("top-lpers gate requires >= 2 credible LPers averaging >= 80%", () => {
   assert.ok(Math.abs(r.avgWR - 0.925) < 1e-9);
   assert.equal(r.passes, true);
 });
+
+const { lpaCurrentValueUsd } = await import("../runtime-helpers.js");
+
+test("current value prefers numeric `value` over string `currentValue`", () => {
+  // Documented opening-positions example: value reconciles with pnl.value, currentValue does not.
+  assert.equal(lpaCurrentValueUsd({ value: 50639.07907119099, currentValue: "53413.446031254" }), 50639.07907119099);
+  assert.equal(lpaCurrentValueUsd({ currentValue: "53413.446031254" }), 53413.446031254);
+  assert.equal(lpaCurrentValueUsd({ value: null, currentValue: "abc" }), 0);
+  assert.equal(lpaCurrentValueUsd({}), 0);
+});

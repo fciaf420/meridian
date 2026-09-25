@@ -22,7 +22,7 @@ import {
 import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
-import { calculateBinsForPriceRange, splitRangeBins } from "../runtime-helpers.js";
+import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
 
@@ -998,7 +998,9 @@ function normalizeLpAgentPosition(lpa) {
       // LP Agent returns token amounts, not USD — convert using prices
       unclaimedFeeTokenX: { usd: parseFloat(lpa.unCollectedFee0 || 0) * (lpa.price0 || 0) },
       unclaimedFeeTokenY: { usd: parseFloat(lpa.unCollectedFee1 || 0) * (lpa.price1 || 0) },
-      balances: lpa.currentValue ?? lpa.value ?? 0,
+      // `value` (number) is the live position value in USD and reconciles with
+      // pnl.value; `currentValue` (string) does not. Fall back to it only.
+      balances: lpaCurrentValueUsd(lpa),
     },
     allTimeFees: {
       total: { usd: lpa.collectedFee ?? 0 },
