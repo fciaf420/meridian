@@ -803,3 +803,202 @@ test("picker: every callback_data across the picker is ≤ 64 bytes", async () =
   for (const prefix of ["ds:", "dr:", "db:", "dx:", "y:", "n:"]) assert.ok(all.some((d) => d.startsWith(prefix)), prefix);
   for (const d of all) assert.ok(Buffer.byteLength(d, "utf8") <= 64, d);
 });
+
+// ─── Token lookup (paste a mint) ─────────────────────────────────
+const lookupMod = await import("../tools/token-lookup.js");
+const MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+const WSOL = "So11111111111111111111111111111111111111112";
+const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SCREENING = {
+  minBinStep: 80, maxBinStep: 125, minTvl: 10_000, maxTvl: 150_000, maxVolatility: 8, minFeeActiveTvlRatio: 0.05,
+  minMcap: 150_000, maxMcap: 10_000_000, minHolders: 500, minOrganic: 60, minTokenAgeHours: 2, maxTokenAgeHours: null,
+};
+const searchRow = (pool, { quote = WSOL, quoteSymbol = "SOL", bs = 100, tvl = 20_000 } = {}) => ({
+  address: pool, name: `TOK-${quoteSymbol}`, token_x: { symbol: "TOK", address: MINT }, token_y: { symbol: quoteSymbol, address: quote }, pool_config: { bin_step: bs }, tvl,
+});
+// Raw pool-discovery rows, run through the real condensePool().
+const detailRow = (pool, { bs = 100, tvl = 20_000, fee = 0.5, vol = 3, organic = 80, holders = 900, mcap = 2_000_000 } = {}) => ({
+  pool_address: pool, name: "TOK-SOL", pool_type: "dlmm",
+  token_x: { symbol: "TOK", address: MINT, organic_score: organic, market_cap: mcap },
+  token_y: { symbol: "SOL", address: WSOL },
+  dlmm_params: { bin_step: bs }, tvl, active_tvl: tvl, volume: 50_000, fee: 100, fee_active_tvl_ratio: fee, volatility: vol, base_token_holders: holders,
+});
+const POOLS = {
+  PoolLowFee111111111111111111111111111111111: detailRow("PoolLowFee111111111111111111111111111111111", { fee: 0.5, tvl: 20_000 }),
+  PoolHiFeeSmall1111111111111111111111111111: detailRow("PoolHiFeeSmall1111111111111111111111111111", { fee: 1.5, tvl: 15_000, bs: 150 }),
+  PoolHiFeeBig11111111111111111111111111111111: detailRow("PoolHiFeeBig11111111111111111111111111111111", { fee: 1.5, tvl: 40_000, vol: 9 }),
+};
+function lookupDeps(over = {}) {
+  return {
+    searchPools: async () => [
+      ...Object.keys(POOLS).map((p) => searchRow(p)),
+      searchRow("PoolUsdc11111111111111111111111111111111111", { quote: USDC, quoteSymbol: "USDC" }),
+      searchRow("PoolFakeSol111111111111111111111111111111111", { quote: "FakeSoLMint1111111111111111111111111111111", quoteSymbol: "SOL" }),
+    ],
+    poolDetail: async (p) => POOLS[p] ?? null,
+    gmgnPriceInfo: async () => ({ token_age_hours: 1.5, change_1h: 4.2, change_24h: -12.5, market_cap: 2_100_000, holders: 950, candles: { supertrend_direction: "green", rsi_2: 44.4 } }),
+    gmgnSignal: async () => ({ smart_money_count_30m: 3, kol_count_30m: 2 }),
+    isBlacklisted: () => false,
+    ...over,
+  };
+}
+const lookupFor = (over = {}, opts = {}) => (mint) => lookupMod.lookupToken(mint, { deps: lookupDeps(over), screening: SCREENING, ...opts });
+const makeLookupUI = (over = {}, uiOver = {}) => makeUI({ config: customCfg(), lookupToken: lookupFor(over), parseMint: lookupMod.parseMint, ...uiOver });
+
+test("token lookup: a pasted mint (or /token) opens the card; garbage text still goes to chat", async () => {
+  const { u, t } = makeLookupUI();
+  for (const text of ["hello there", "gm", "1111111111111111111111111111111111111111111", `${MINT} please`, "0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl"]) {
+    assert.equal(await u.handleMessage(text, { chatId: OWNER }), false, `"${text}" is not a lookup`);
+  }
+  assert.equal(t.calls.length, 0);
+  assert.equal(await lookupMod.parseMint(MINT), MINT);
+
+  assert.equal(await u.handleMessage(MINT, { chatId: OWNER }), true);
+  const loading = t.sends().at(-1);
+  assert.match(loading.text, /Looking up/);
+  const card = t.edits().at(-1);
+  assert.equal(card.messageId, 500 + t.sends().length, "the Looking up… message is edited in place");
+  assert.match(card.text, /TOK<\/b> token lookup/);
+  assert.match(card.text, /smart money 3 · KOL 2 · supertrend green · RSI\(2\) 44\.4/);
+  assert.match(card.text, /1h \+4\.2% · 24h -12\.5%/);
+
+  assert.equal(await u.handleMessage(`/token ${MINT}`, { chatId: OWNER }), true);
+  assert.match(t.edits().at(-1).text, /token lookup/);
+  assert.equal(await u.handleMessage("/lookup nope", { chatId: OWNER }), true);
+  assert.match(t.sends().at(-1).text, /Usage: <code>\/token/);
+  assert.ok(ui.BOT_COMMANDS.some((c) => c.command === "token"), "/token registered in setMyCommands");
+});
+
+test("token lookup: SOL pools only, sorted by fee/aTVL then TVL, with filter ✅/❌ from the config", async () => {
+  const r = await lookupFor()(MINT);
+  assert.deepEqual(r.pools.map((p) => p.pool), [
+    "PoolHiFeeBig11111111111111111111111111111111", "PoolHiFeeSmall1111111111111111111111111111", "PoolLowFee111111111111111111111111111111111",
+  ], "USDC and fake-SOL (symbol only) pools are excluded");
+  assert.ok(r.pools.every((p) => p.quote.mint === WSOL));
+  const byKey = (checks) => Object.fromEntries(checks.map((c) => [c.key, c.pass]));
+  assert.deepEqual(byKey(r.pools[0].checks.pool), { bin_step: true, tvl: true, volatility: false, fee_tvl: true });
+  assert.deepEqual(byKey(r.pools[1].checks.pool), { bin_step: false, tvl: true, volatility: true, fee_tvl: true });
+  assert.deepEqual(byKey(r.checks.token), { mcap: true, holders: true, organic: true, age: false }, "age 1.5h < minTokenAgeHours 2");
+  const loose = lookupMod.screeningFilterChecks(r.pools[0], { ...SCREENING, maxVolatility: 10, minTokenAgeHours: null });
+  assert.ok(!loose.token.some((c) => c.key === "age"), "an unset age filter is not shown");
+  assert.equal(loose.pool.find((c) => c.key === "volatility").pass, true, "thresholds come from the config passed in");
+
+  const { u, t } = makeLookupUI();
+  await u.handleMessage(MINT, { chatId: OWNER });
+  const card = t.edits().at(-1).text;
+  assert.match(card, /❌ age 1\.5h \(≥ 2h\)/);
+  assert.match(card, /✅ holders 900 \(≥ 500\)/);
+  assert.match(card, /❌ volatility 9 \(≤ 8\)/);
+  assert.match(card, /❌ bin step 150 \(80–125\)/);
+  assert.match(card, /1\. TOK-SOL<\/b> \[meteora\]/, "same block as the Candidates view");
+  const kb = lastMarkup(t.edits().at(-1));
+  assert.equal(allCallbackData(kb).filter((d) => d.startsWith("tp:")).length, 3);
+  assert.ok(findData(kb, "tr:"), "Refresh button");
+  const urls = kb.flat().filter((b) => b.url).map((b) => b.url);
+  assert.ok(urls.includes(`https://gmgn.ai/sol/token/${MINT}`));
+  assert.ok(urls.includes(`https://solscan.io/token/${MINT}`));
+  assert.ok(urls.includes("https://app.meteora.ag/dlmm/PoolHiFeeBig11111111111111111111111111111111"));
+});
+
+test("token lookup: no SOL pool, blacklisted token (no Deploy), Meteora failure", async () => {
+  const none = makeLookupUI({ searchPools: async () => [searchRow("PoolUsdc11111111111111111111111111111111111", { quote: USDC, quoteSymbol: "USDC" })] });
+  await none.u.handleMessage(MINT, { chatId: OWNER });
+  const c1 = none.t.edits().at(-1);
+  assert.match(c1.text, /No SOL-quoted Meteora DLMM pool/);
+  assert.ok(!findData(lastMarkup(c1), "tp:"));
+  assert.ok(findData(lastMarkup(c1), "tr:"), "Refresh still offered");
+
+  const bl = makeLookupUI({ isBlacklisted: (m) => m === MINT });
+  await bl.u.handleMessage(MINT, { chatId: OWNER });
+  const c2 = bl.t.edits().at(-1);
+  assert.match(c2.text, /Blacklisted token/);
+  assert.ok(!findData(lastMarkup(c2), "tp:"), "no deploy button for a blacklisted token");
+  assert.match(c2.text, /TOK-SOL/, "pools are still shown");
+
+  const down = makeLookupUI({ searchPools: async () => { throw new Error("Meteora pool search 503"); } });
+  await down.u.handleMessage(MINT, { chatId: OWNER });
+  assert.match(down.t.edits().at(-1).text, /Meteora lookup failed: Meteora pool search 503/);
+});
+
+test("token lookup: GMGN failure or timeout still renders the card with entry", async () => {
+  const failing = makeLookupUI({ gmgnPriceInfo: async () => { throw new Error("429 rate limited"); }, gmgnSignal: async () => null });
+  await failing.u.handleMessage(MINT, { chatId: OWNER });
+  const c1 = failing.t.edits().at(-1);
+  assert.match(c1.text, /GMGN data unavailable \(429 rate limited\)/);
+  assert.equal(allCallbackData(lastMarkup(c1)).filter((d) => d.startsWith("tp:")).length, 3, "entry still offered");
+
+  const started = Date.now();
+  const slow = await lookupMod.lookupToken(MINT, {
+    deps: lookupDeps({ gmgnPriceInfo: () => new Promise(() => {}), gmgnSignal: () => new Promise(() => {}) }),
+    screening: SCREENING, timeoutMs: 80,
+  });
+  assert.ok(Date.now() - started < 2000, "the lookup is capped");
+  assert.equal(slow.gmgn, null);
+  assert.match(slow.gmgn_error, /timed out/);
+  assert.equal(slow.pools.length, 3, "pool data survives a GMGN timeout");
+});
+
+test("token lookup: Deploy → picker → confirm deploys the chosen SOL pool single-sided, with the ❌ warnings", async () => {
+  const { u, t, exec } = makeLookupUI();
+  await u.handleMessage(MINT, { chatId: OWNER });
+  const cardMsgId = 500 + t.sends().length;
+  const tps = allCallbackData(lastMarkup(t.edits().at(-1))).filter((d) => d.startsWith("tp:"));
+  await u.handleCallback(tps[1], ctxFor(cardMsgId)); // 2nd row: PoolHiFeeSmall (bin step 150)
+  const step = t.edits().at(-1);
+  assert.match(step.text, /How do you want to deploy TOK-SOL\?/);
+  assert.equal(step.messageId, cardMsgId);
+  const id = stepIdOf(step);
+  await u.handleCallback(`ds:${id}:s`, ctxFor(cardMsgId));
+  await u.handleCallback(`dr:${id}:50`, ctxFor(cardMsgId));
+  const confirm = t.edits().at(-1);
+  assert.match(confirm.text, /Outside your screening filters/);
+  assert.match(confirm.text, /❌ bin step 150 \(80–125\) \(deploy_position blocks bin steps outside this range\)/);
+  assert.match(confirm.text, /❌ age 1\.5h/);
+  await u.handleCallback(findData(lastMarkup(confirm), "y:"), ctxFor(cardMsgId));
+  const d = exec.filter((e) => e.name === "deploy_position");
+  assert.equal(d.length, 1);
+  assert.equal(d[0].args.pool_address, "PoolHiFeeSmall1111111111111111111111111111");
+  assert.equal(d[0].args.base_mint, MINT);
+  assert.equal(d[0].args.strategy, "spot");
+  assert.equal(d[0].args.price_range_pct, 50);
+  assert.equal(d[0].args.bins_above, 0);
+  assert.equal(d[0].args.bin_step, 150, "the executor's bin-step check sees the real bin step");
+  assert.ok(!("sol_split_pct" in d[0].args) && !("amount_x" in d[0].args));
+
+  // A blocked deploy (e.g. max positions) surfaces the executor's own text.
+  const blocked = makeLookupUI({}, { executeTool: async () => ({ blocked: true, reason: "Max positions (3) reached. Close a position first." }) });
+  await blocked.u.handleMessage(MINT, { chatId: OWNER });
+  const mid = 500 + blocked.t.sends().length;
+  await blocked.u.handleCallback(findData(lastMarkup(blocked.t.edits().at(-1)), "tp:"), ctxFor(mid));
+  const bid = stepIdOf(blocked.t.edits().at(-1));
+  await blocked.u.handleCallback(`ds:${bid}:b`, ctxFor(mid));
+  await blocked.u.handleCallback(`dr:${bid}:a`, ctxFor(mid));
+  await blocked.u.handleCallback(findData(lastMarkup(blocked.t.edits().at(-1)), "y:"), ctxFor(mid));
+  assert.match(blocked.t.edits().at(-1).text, /Deploy blocked.*\n.*Max positions \(3\) reached/);
+});
+
+test("token lookup: Refresh re-runs in place; wrong chat refused; callback_data ≤ 64 bytes", async () => {
+  let calls = 0;
+  const { u, t, exec } = makeLookupUI({ searchPools: async () => { calls++; return Object.keys(POOLS).map((p) => searchRow(p)); } });
+  await u.handleMessage(MINT, { chatId: OWNER });
+  const mid = 500 + t.sends().length;
+  const kb = lastMarkup(t.edits().at(-1));
+  await u.handleCallback(findData(kb, "tr:"), ctxFor(mid));
+  assert.equal(calls, 2);
+  assert.ok(t.edits().slice(-2).every((e) => e.messageId === mid), "Refresh edits the same message");
+
+  // Picker steps opened from the card refuse another chat.
+  await u.handleCallback(findData(lastMarkup(t.edits().at(-1)), "tp:"), ctxFor(mid));
+  const id = stepIdOf(t.edits().at(-1));
+  await u.handleCallback(`ds:${id}:b`, ctxFor(mid, { chatId: "222" }));
+  assert.ok(t.answers().some((a) => /different chat/.test(a.text)));
+  // A stranger pasting a mint never reaches the UI (transport owner check).
+  tg.__setTelegramTestHooks({ token: "TEST", fetch: mockFetch(), owner: OWNER });
+  const res = await tg.processUpdate(msgUpdate("222", "222", MINT), { onMessage: (text, ctx) => u.handleMessage(text, ctx) });
+  assert.equal(res.handled, false);
+  assert.equal(exec.length, 0);
+
+  const all = t.calls.flatMap((c) => allCallbackData(lastMarkup(c)));
+  assert.ok(all.some((d) => d.startsWith("tp:")) && all.some((d) => d.startsWith("tr:")));
+  for (const d of all) assert.ok(Buffer.byteLength(d, "utf8") <= 64, d);
+});

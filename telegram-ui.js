@@ -28,6 +28,7 @@ export const BOT_COMMANDS = [
   { command: "menu", description: "Main menu" },
   { command: "status", description: "Wallet + open positions" },
   { command: "candidates", description: "Top pools (Deploy → strategy + range → confirm)" },
+  { command: "token", description: "Look up a token mint (SOL DLMM pools, filters, deploy)" },
   { command: "settings", description: "Effective config and where it comes from" },
   { command: "usdc", description: "Show or toggle USDC mode (on|off)" },
   { command: "autoresearch", description: "Prompt overrides: status, list, approve, reject" },
@@ -555,6 +556,90 @@ export function renderCandidates(list, { page = 0, refs, source = "meteora", fet
   return { text, keyboard, page: pg, pages: pages.length };
 }
 
+// ─── Token lookup card (paste a mint) ────────────────────────────
+export const WSOL_MINT = "So11111111111111111111111111111111111111112";
+export const gmgnTokenUrl = (mint) => `https://gmgn.ai/sol/token/${mint}`;
+export const solscanTokenUrl = (mint) => `https://solscan.io/token/${mint}`;
+
+const checkMark = (ch) => (ch.pass === true ? "✅" : ch.pass === false ? "❌" : "❔");
+
+/**
+ * ❌ lines for the confirmation card: the token's and the chosen pool's failed
+ * screening filters. A bin step outside the range is also a deploy_position
+ * hard block, so it says so.
+ */
+export function failedFilterLines(c) {
+  return [...(c?.checks?.token || []), ...(c?.checks?.pool || [])]
+    .filter((ch) => ch.pass === false)
+    .map((ch) => `❌ ${ch.text}${ch.key === "bin_step" ? " (deploy_position blocks bin steps outside this range)" : ""}`);
+}
+
+function fmtPct(v) {
+  const n = Number(v);
+  return v == null || !Number.isFinite(n) ? "?" : `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
+}
+
+/** `pools[i].ref` = the Deploy button's ref (absent when deploy is not offered). */
+export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora" } = {}) {
+  const top = r.pools?.[0] || null;
+  const sym = r.symbol || top?.base?.symbol || shortAddr(r.mint);
+  const lines = [`🔎 <b>${escapeHtml(sym)}</b> token lookup`, `<code>${escapeHtml(r.mint)}</code>`];
+  if (r.blacklisted) lines.push("⛔ <b>Blacklisted token</b>: deploy is disabled.");
+
+  const price = r.gmgn?.price || null;
+  const signal = r.gmgn?.signal || null;
+  const tokenFacts = [
+    `mcap ${fmtUsdCompact(top?.mcap ?? price?.market_cap)}`,
+    `holders ${top?.holders ?? price?.holders ?? "?"}`,
+    `age ${price?.token_age_hours != null ? fmtAge(price.token_age_hours * 60) : "?"}`,
+    `1h ${fmtPct(price?.change_1h)}`,
+    `24h ${fmtPct(price?.change_24h)}`,
+  ];
+  lines.push(`Token: ${escapeHtml(tokenFacts.join(" · "))}`);
+  if (r.gmgn) {
+    const g = [];
+    if (signal) g.push(`smart money ${signal.smart_money_count_30m ?? 0}`, `KOL ${signal.kol_count_30m ?? 0}`);
+    if (price?.candles?.supertrend_direction) g.push(`supertrend ${price.candles.supertrend_direction}`);
+    if (price?.candles?.rsi_2 != null) g.push(`RSI(2) ${Math.round(price.candles.rsi_2 * 10) / 10}`);
+    lines.push(`GMGN: ${escapeHtml(g.join(" · ") || "no signals")}`);
+  } else {
+    lines.push(`⚠️ GMGN data unavailable${r.gmgn_error ? ` (${escapeHtml(clipText(String(r.gmgn_error), 80))})` : ""}`);
+  }
+
+  const tokenChecks = r.checks?.token || [];
+  if (tokenChecks.length) {
+    lines.push("", "<b>Your screening filters</b> (token):", ...tokenChecks.map((ch) => `${checkMark(ch)} ${escapeHtml(ch.text)}`));
+  }
+
+  const pools = r.pools || [];
+  lines.push("");
+  if (r.error) lines.push(`⚠️ Meteora lookup failed: ${escapeHtml(clipText(String(r.error), 120))}`);
+  if (!pools.length) {
+    if (!r.error) lines.push("No SOL-quoted Meteora DLMM pool found for this token. (If this is a wallet address, ask in chat instead.)");
+  } else {
+    lines.push(`<b>SOL DLMM pools</b> (${pools.length}${r.total_pools > pools.length ? ` of ${r.total_pools}` : ""}, by fee/aTVL then TVL):`);
+    pools.forEach((c, i) => {
+      lines.push("", candidateBlock(c, i, source));
+      const pc = c.checks?.pool || [];
+      if (pc.length) lines.push(escapeHtml(pc.map((ch) => `${checkMark(ch)} ${ch.text}`).join(" · ")));
+    });
+  }
+
+  const keyboard = [];
+  pools.forEach((c, i) => {
+    const row = [];
+    if (poolRefs[i]) row.push(btn(`🚀 Deploy ${i + 1}`, `tp:${poolRefs[i]}`));
+    row.push(urlBtn(`Meteora ${i + 1} ↗`, meteoraPoolUrl(c.pool)));
+    keyboard.push(row);
+  });
+  keyboard.push([btn("🔄 Refresh", `tr:${tokenRef}`), btn("⬅ Menu", "m")]);
+  const links = [];
+  if (top) links.push(urlBtn("Meteora ↗", meteoraPoolUrl(top.pool)));
+  links.push(urlBtn("GMGN ↗", gmgnTokenUrl(r.mint)), urlBtn("Solscan ↗", solscanTokenUrl(r.mint)));
+  keyboard.push(links);
+  return { text: clipText(lines.join("\n"), PAGE_CHAR_BUDGET), keyboard };
+}
+
 export function renderTextPages(title, body, { page = 0, prefix, extraRows = [] } = {}) {
   // Paginate the ESCAPED text so entity expansion can't push a page past the cap.
   const pages = paginateText(escapeHtml(body), PAGE_CHAR_BUDGET - title.length - 40);
@@ -885,6 +970,36 @@ export function createTelegramUI(deps) {
     await presentConfirm(ctx, await deployRequest(c, { strategy: p.strategy, priceRangePct: opt.pct, warnings: p.warnings }));
   }
 
+  // ── token lookup (paste a mint) ──
+  /** Card for a cached lookup; registers a Deploy ref per deployable pool. */
+  function tokenCardView(tokenRef) {
+    const entry = refs.get(tokenRef);
+    if (!entry?.result) return { text: "⌛ This lookup expired. Paste the mint again.", keyboard: [[btn("⬅ Menu", "m")]] };
+    const r = entry.result;
+    const poolRefs = (r.pools || []).map((c) => {
+      // Never deployable: blacklisted tokens, pools not quoted in SOL.
+      if (r.blacklisted || c.quote?.mint !== WSOL_MINT) return null;
+      return refs.put({ kind: "token_pool", tokenRef, candidate: c, warnings: failedFilterLines(c) }, `tp:${c.pool}`);
+    });
+    return renderTokenCard(r, { tokenRef, poolRefs, source: source() });
+  }
+
+  /** Look a mint up, editing a "Looking up…" message in place with the card. */
+  async function tokenLookup(mint, ctx, opts = {}) {
+    const loading = { text: `🔎 Looking up <code>${escapeHtml(mint)}</code>…`, keyboard: [] };
+    const msg = await show(ctx, loading, opts);
+    const target = { ...ctx, messageId: msg?.message_id ?? ctx?.messageId ?? null };
+    let result;
+    try {
+      result = await deps.lookupToken(mint);
+    } catch (e) {
+      logf("telegram_error", `Token lookup ${mint.slice(0, 8)} failed: ${e.message}`);
+      result = { mint, pools: [], total_pools: 0, gmgn: null, error: e.message, checks: { token: [], pool: [] } };
+    }
+    const tokenRef = refs.put({ kind: "token", mint, result }, `tok:${mint}`);
+    return show(target, tokenCardView(tokenRef));
+  }
+
   /** The view Back returns to when a picker has no strategy step. */
   async function originView(origin) {
     if (typeof origin === "function") return origin();
@@ -992,6 +1107,25 @@ export function createTelegramUI(deps) {
       }
       await startPicker(c, { chatId: ctx.chatId }, { fresh: true });
       return true;
+    }
+
+    // Token lookup: "/token <mint>", "/lookup <mint>", or a bare mint.
+    const tokenCmd = /^\/(?:token|lookup)(?:@\w+)?(?:\s+(.*))?$/i.exec(text);
+    if (tokenCmd && deps.lookupToken) {
+      const mint = tokenCmd[1] ? await deps.parseMint(tokenCmd[1].trim()) : null;
+      if (!mint) {
+        await deps.tg.sendHTML("Usage: <code>/token &lt;mint&gt;</code> (a Solana token address). You can also just paste the mint.");
+        return true;
+      }
+      await tokenLookup(mint, { chatId: ctx.chatId }, { fresh: true });
+      return true;
+    }
+    if (deps.lookupToken && deps.parseMint && !/\s/.test(text)) {
+      const mint = await deps.parseMint(text);
+      if (mint) {
+        await tokenLookup(mint, { chatId: ctx.chatId }, { fresh: true });
+        return true;
+      }
     }
 
     if (lower === "auto") {
@@ -1142,6 +1276,31 @@ export function createTelegramUI(deps) {
           }
           await answer();
           await startPicker(c, ctx, opts);
+          return;
+        }
+        case "tr": {
+          const entry = refs.get(arg);
+          if (entry?.kind !== "token") {
+            await answer("That button is stale — paste the mint again.", true);
+            return;
+          }
+          await answer("Refreshing…");
+          await tokenLookup(entry.mint, ctx, opts);
+          return;
+        }
+        case "tp": {
+          const entry = refs.get(arg);
+          if (entry?.kind !== "token_pool") {
+            await answer("That button is stale — paste the mint again.", true);
+            return;
+          }
+          const token = refs.get(entry.tokenRef);
+          if (token?.result?.blacklisted || entry.candidate.quote?.mint !== WSOL_MINT) {
+            await answer("This pool can't be deployed into (blacklisted or not SOL-quoted).", true);
+            return;
+          }
+          await answer();
+          await startPicker(entry.candidate, ctx, opts, { origin: () => tokenCardView(entry.tokenRef), warnings: entry.warnings });
           return;
         }
         case "ds":
