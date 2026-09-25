@@ -26,7 +26,7 @@ function getWallet() {
 }
 
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
-const JUPITER_ULTRA_API = "https://api.jup.ag/ultra/v1";
+const JUPITER_SWAP_V2_API = "https://api.jup.ag/swap/v2";
 const JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1";
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY || "";
 
@@ -143,7 +143,8 @@ export async function getWalletBalances() {
 }
 
 /**
- * Swap tokens via Jupiter Ultra API (order → sign → execute).
+ * Swap tokens via Jupiter Swap v2 (order → sign → execute), with the swap/v1
+ * quote+swap API as a fallback that is only used before anything is signed.
  */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -180,6 +181,20 @@ export function uiToRawAmount(amount, decimals) {
   // BigInt strips leading zeros and validates the integer string.
   const raw = BigInt(rawStr === "" ? "0" : rawStr);
   return ((negative && raw !== 0n ? -raw : raw)).toString();
+}
+
+/**
+ * Price impact of a Swap v2 /order response, in percent (0.12 = 0.12%).
+ * Prefers `priceImpact` (number, already percent); falls back to the deprecated
+ * `priceImpactPct` (string decimal fraction, e.g. "-0.0012") × 100. Returns
+ * null when neither is a finite number. Sign is preserved; callers take abs.
+ */
+export function parsePriceImpactPercent(order) {
+  const direct = order?.priceImpact;
+  if (direct != null && direct !== "" && Number.isFinite(Number(direct))) return Number(direct);
+  const frac = order?.priceImpactPct;
+  if (frac != null && frac !== "" && Number.isFinite(Number(frac))) return Number(frac) * 100;
+  return null;
 }
 
 // Normalize any SOL-like address to the correct wrapped SOL mint
@@ -257,9 +272,10 @@ export async function swapToken({
     }
     const toUi = (raw, dec) => (raw != null && !isNaN(Number(raw)) ? Number(raw) / Math.pow(10, dec) : null);
 
-    // ─── Get Ultra order (unsigned tx + requestId) ─────────────
+    // ─── Get Swap v2 order (unsigned tx + requestId) ───────────
+    // No slippageBps on purpose: slippage stays with Jupiter's RTSE, as before.
     const orderUrl =
-      `${JUPITER_ULTRA_API}/order` +
+      `${JUPITER_SWAP_V2_API}/order` +
       `?inputMint=${input_mint}` +
       `&outputMint=${output_mint}` +
       `&amount=${amountStr}` +
@@ -271,17 +287,31 @@ export async function swapToken({
     if (!orderRes.ok) {
       const body = await orderRes.text();
       if (orderRes.status === 500) {
-        log("swap", `Ultra failed for ${input_mint}, falling back to regular swap API`);
+        log("swap", `Swap v2 order failed for ${input_mint}, falling back to swap/v1 quote API`);
         return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
       }
-      throw new Error(`Ultra order failed: ${orderRes.status} ${body}`);
+      throw new Error(`Swap v2 order failed: ${orderRes.status} ${body}`);
     }
 
     const order = await orderRes.json();
-    if (order.errorCode || order.errorMessage) {
-      log("swap", `Ultra error for ${input_mint}, falling back to regular swap API`);
+    // transaction is "" when the router quoted but could not build a tx
+    // (errorCode/errorMessage set), and null when taker is missing.
+    if (!order.transaction || order.errorCode || order.errorMessage) {
+      log(
+        "swap",
+        `Swap v2 order has no transaction for ${input_mint} ` +
+          `(router=${order.router ?? "?"} errorCode=${order.errorCode ?? "-"} ${order.errorMessage ?? ""}), ` +
+          `falling back to swap/v1 quote API`
+      );
       return await swapViaQuoteApi({ wallet, connection, input_mint, output_mint, amountStr, decimals, outDecimals });
     }
+
+    const impact = parsePriceImpactPercent(order);
+    log(
+      "swap",
+      `Swap v2 order: router=${order.router ?? "?"} mode=${order.mode ?? "?"} ` +
+        `priceImpact=${impact == null ? "n/a" : `${Math.abs(impact).toFixed(4)}%`}`
+    );
 
     const { transaction: unsignedTx, requestId } = order;
 
@@ -291,7 +321,7 @@ export async function swapToken({
     const signedTx = Buffer.from(tx.serialize()).toString("base64");
 
     // ─── Execute ───────────────────────────────────────────────
-    const execRes = await jupiterFetch(`${JUPITER_ULTRA_API}/execute`, {
+    const execRes = await jupiterFetch(`${JUPITER_SWAP_V2_API}/execute`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -300,7 +330,7 @@ export async function swapToken({
       body: JSON.stringify({ signedTransaction: signedTx, requestId }),
     });
     if (!execRes.ok) {
-      throw new Error(`Ultra execute failed: ${execRes.status} ${await execRes.text()}`);
+      throw new Error(`Swap v2 execute failed: ${execRes.status} ${await execRes.text()}`);
     }
 
     const result = await execRes.json();
