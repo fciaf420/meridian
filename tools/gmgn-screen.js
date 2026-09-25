@@ -1,7 +1,8 @@
 /**
  * Advanced GMGN screening pipeline adapted to the local `gmgn-cli` binary.
  *
- * This is the OPT-IN screening source (screeningSource="gmgn"). It mirrors the
+ * This is the OPT-IN screening source (screeningSource="gmgn", or "both" via
+ * tools/screening-both.js). It mirrors the
  * upstream 4-stage "advanced GMGN screening" but every GMGN call goes through
  * the hardened `spawnGmgn` helper in ./gmgn.js (serialized queue + min-gap +
  * rate-limit cooldown + `--raw` + parsed-JSON-or-null), and the chart indicator
@@ -750,7 +751,11 @@ export function formatGmgnCandidateForPrompt(p) {
     if (parts) indLine = `\n  Indicators ${interval}: ${parts}`;
   }
 
-  const header = [sym, launchpad, age, mcap, binStep].filter(Boolean).join(" | ");
+  const src = Array.isArray(p.sources) && p.sources.length
+    ? `src=${p.sources.join("+")}${p.confirmed_by_both ? " (confirmed by both)" : ""}`
+    : "";
+
+  const header = [sym, launchpad, age, mcap, binStep, src].filter(Boolean).join(" | ");
   const pool = [tvl, feeTvl, vol, ath].filter(Boolean).join(" | ");
   const risk = [top10, dev, bot, fresh, bundler].filter(Boolean).join(" | ");
   const traction = [holders, fees, smart, kol].filter(Boolean).join(" | ");

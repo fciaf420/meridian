@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
+import { getEffectiveMinSolToOpen, normalizeScreeningSource } from "./runtime-helpers.js";
 import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -58,7 +58,7 @@ export const config = {
 
   // ─── Pool Screening Thresholds ───────────
   screening: {
-    source:            u.screeningSource    ?? "meteora", // "meteora" | "gmgn"
+    source:            normalizeScreeningSource(u.screeningSource), // "meteora" | "gmgn" | "both"; invalid → "meteora"
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl            ?? 150_000,
@@ -79,7 +79,7 @@ export const config = {
     maxTokenAgeHours:  u.maxTokenAgeHours  ?? null, // null = no maximum
   },
 
-  // ─── GMGN Screening (opt-in via screening.source = "gmgn") ───────────
+  // ─── GMGN Screening (opt-in via screening.source = "gmgn" or "both") ─
   // Sourced from gmgn-config.json (preferred), then legacy user-config.json
   // keys (gmgn*), then defaults. See gmgn-config.example.json for the schema.
   gmgn: {
@@ -396,7 +396,7 @@ export function reloadScreeningThresholds() {
   try {
     const fresh = readJsonIfExists(USER_CONFIG_PATH);
     const s = config.screening;
-    if (fresh.screeningSource != null) s.source = fresh.screeningSource;
+    if (fresh.screeningSource != null) s.source = normalizeScreeningSource(fresh.screeningSource);
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
     if (fresh.minOrganic     != null) s.minOrganic     = fresh.minOrganic;
     if (fresh.minHolders     != null) s.minHolders     = fresh.minHolders;

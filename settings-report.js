@@ -4,7 +4,7 @@
 // The 3 config files and their ONE job each:
 //   .env              → SECRETS ONLY (keys, wallet, RPC). Never tuning knobs.
 //   user-config.json  → ALL bot behavior (strategy, risk, schedule, models, screening, learning).
-//   gmgn-config.json  → ONLY the GMGN screening filters. Only when screeningSource = "gmgn".
+//   gmgn-config.json  → ONLY the GMGN screening filters. Only when screeningSource = "gmgn" or "both".
 
 import fs from "fs";
 import path from "path";
@@ -54,6 +54,8 @@ export function buildSettingsReport({ color = false } = {}) {
 
   const dryRun = process.env.DRY_RUN === "true" || u.dryRun === true;
   const srcSource = config.screening.source;
+  const gmgnActive = srcSource === "gmgn" || srcSource === "both";
+  const meteoraActive = srcSource !== "gmgn";
   const usdc = config.usdc.enabled;
 
   // ── header ──
@@ -71,7 +73,7 @@ export function buildSettingsReport({ color = false } = {}) {
   row("user-config.json", exists("user-config.json") ? "present" : C.red("MISSING"), "all bot behavior — edit here");
   row("gmgn-config.json",
     exists("gmgn-config.json") ? "present" : C.yellow("missing"),
-    srcSource === "gmgn" ? C.green("ACTIVE — GMGN filters in use") : C.dim("ignored (screeningSource ≠ gmgn)"));
+    gmgnActive ? C.green("ACTIVE — GMGN filters in use") : C.dim("ignored (screeningSource is meteora)"));
 
   // ── conflict detector (raw .env vs user-config) ──
   const envWins = [
@@ -141,8 +143,14 @@ export function buildSettingsReport({ color = false } = {}) {
   row("trailing TP", config.management.trailingTakeProfit ? `on (trig ${config.management.trailingTriggerPct}% / drop ${config.management.trailingDropPct}%)` : "off", "trailing*");
   row("out-of-range wait", `${config.management.outOfRangeWaitMinutes} min`, "outOfRangeWaitMinutes");
 
-  // ── screening (active source only) ──
-  if (srcSource === "gmgn") {
+  // ── screening (active source(s) only) ──
+  if (srcSource === "both") {
+    h("Screening — BOTH  " + C.dim("(Meteora + GMGN in parallel)"));
+    L.push("  " + C.dim("Meteora filters apply to Meteora discovery. GMGN filters apply to the GMGN pipeline."));
+    L.push("  " + C.dim("GMGN-only pools must also pass bin step, TVL range and max volatility below;"));
+    L.push("  " + C.dim("one pool per token; pools found by both sources rank first."));
+  }
+  if (gmgnActive) {
     h("Screening — GMGN  " + C.dim("(gmgn-config.json)"));
     row("min mcap", `$${Number(config.gmgn.minMcap).toLocaleString()}`, "minMcap");
     row("max mcap", `$${Number(config.gmgn.maxMcap).toLocaleString()}`, "maxMcap");
@@ -152,13 +160,18 @@ export function buildSettingsReport({ color = false } = {}) {
     row("require KOL", config.gmgn.requireKol, "requireKol");
     row("max sniper count", config.gmgn.maxSniperCount, "maxSniperCount");
     row("indicator filter", config.gmgn.indicatorFilter ? "on (Evil Panda gates)" : "off", "indicatorFilter");
-  } else {
+  }
+  if (meteoraActive) {
     h("Screening — Meteora  " + C.dim("(user-config.json)"));
     row("fee/active-TVL ratio", `≥ ${config.screening.minFeeActiveTvlRatio}`, "minFeeActiveTvlRatio");
     row("TVL range", `$${config.screening.minTvl.toLocaleString()}–$${config.screening.maxTvl.toLocaleString()}`, "min/maxTvl");
     row("mcap range", `$${config.screening.minMcap.toLocaleString()}–$${config.screening.maxMcap.toLocaleString()}`, "min/maxMcap");
     row("min holders", config.screening.minHolders, "minHolders");
     row("timeframe", config.screening.timeframe, "timeframe");
+    if (srcSource === "both") {
+      row("bin step range", `${config.screening.minBinStep}–${config.screening.maxBinStep}`, "min/maxBinStep — also GMGN picks");
+      row("max volatility", config.screening.maxVolatility, "maxVolatility — also GMGN picks");
+    }
   }
 
   // ── LLM ──
@@ -200,7 +213,7 @@ export function buildSettingsReport({ color = false } = {}) {
   h("Secrets in .env  " + C.dim("(presence only — values never printed)"));
   const need = [
     ["WALLET_PRIVATE_KEY", true], ["RPC_URL", true],
-    ["GMGN_API_KEY", srcSource === "gmgn"], ["DEEPSEEK_API_KEY", u.llmProvider === "deepseek"],
+    ["GMGN_API_KEY", gmgnActive], ["DEEPSEEK_API_KEY", u.llmProvider === "deepseek"],
     ["TELEGRAM_BOT_TOKEN", false], ["JUPITER_API_KEY", false], ["HELIUS_API_KEY", false],
     ["LPAGENT_API_KEY", false], ["DASHBOARD_TOKEN", false],
   ];
@@ -215,7 +228,7 @@ export function buildSettingsReport({ color = false } = {}) {
   L.push(C.dim("  Where to change things:"));
   L.push(C.dim("    secret/key        → .env"));
   L.push(C.dim("    any tuning knob   → user-config.json  (restart, or agent update_config)"));
-  L.push(C.dim(`    GMGN filters      → gmgn-config.json  ${srcSource === "gmgn" ? "(active)" : "(only when screeningSource=gmgn)"}`));
+  L.push(C.dim(`    GMGN filters      → gmgn-config.json  ${gmgnActive ? "(active)" : "(only when screeningSource=gmgn or both)"}`));
 
   return L.join("\n");
 }
