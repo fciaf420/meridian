@@ -2066,7 +2066,14 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address, _pnlOverride = null }) {
+/** True while a close for this position is running (any caller). */
+export function isCloseInflight(position_address) {
+  return closeInflight.has(normalizeMint(position_address));
+}
+
+// _close_reason: internal override for the recorded close reason (code-driven
+// closes such as the OOR fallback); the LLM-facing tool schema does not expose it.
+export async function closePosition({ position_address, _pnlOverride = null, _close_reason = null }) {
   position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
@@ -2298,7 +2305,9 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
     // Record performance for learning
     const tracked = getTrackedPosition(position_address);
     const oorDir = tracked?.oor_direction || null;
-    const closeReason = oorDir ? `agent decision (OOR ${oorDir})` : "agent decision";
+    const closeReason = typeof _close_reason === "string" && _close_reason.trim()
+      ? _close_reason.trim().slice(0, 120)
+      : oorDir ? `agent decision (OOR ${oorDir})` : "agent decision";
     if (claimedAtClose) recordClaim(position_address, unclaimedFeesUsd ?? undefined);
     recordClose(position_address, closeReason);
     if (tracked) {

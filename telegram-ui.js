@@ -2201,6 +2201,7 @@ export function createTelegramUI(deps) {
     },
     close: (d) => alert("close", d.position, 0, [
       `🔒 <b>Closed</b> ${escapeHtml(d.pair)}`,
+      d.reason ? escapeHtml(d.reason) : null,
       fmtAlertPnl(d),
       txLinks(d.txs) || null,
       closeChart(d),
@@ -2224,6 +2225,14 @@ export function createTelegramUI(deps) {
     gas_low: (d) => alert("gas_low", "gas", 2 * 60 * 60_000,
       `⛽ <b>Gas low — deploy paused</b>\n${escapeHtml(d.reason || `Native SOL ${d.sol} is below the gas reserve${d.reserve != null ? ` of ${d.reserve} SOL` : ""}.`)}\nTop up SOL to resume USDC-mode deploys.`,
       [[btn("💰 Wallet", "wa!")]]),
+    // Emitted by llm-health.js, already deduped there (once per distinct error,
+    // repeated at most hourly); the limiter is a second guard.
+    llm_unavailable: (d) => alert("llm_unavailable", String(d.reason ?? "").slice(0, 80), 60 * 60_000, [
+      `🧠 <b>LLM unavailable</b> (${escapeHtml(d.provider ?? "provider")})`,
+      escapeHtml(String(d.reason ?? "").slice(0, 500)),
+      d.resetText ? `Resets ${escapeHtml(d.resetText)}` : null,
+      "Screening and deploys are paused until it answers. Out-of-range positions past the wait are closed in code; stop-loss / take-profit still run in the PnL watcher.",
+    ].filter(Boolean).join("\n"), [[positionsBtn(), btn("🧯 Recent errors", "er!")]]),
     cycle_error: (d) => alert("cycle_error", `${d.cycle}:${String(d.error).slice(0, 60)}`, 15 * 60_000,
       `❌ <b>${escapeHtml(d.cycle)} cycle failed</b>\n${escapeHtml(String(d.error ?? "").slice(0, 500))}`,
       [[btn("🧯 Recent errors", "er!")]]),

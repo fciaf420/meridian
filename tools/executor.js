@@ -404,7 +404,7 @@ export async function executeTool(name, args) {
       } else if (name === "close_position") {
         const closedTracked = getTrackedPosition(args.position_address);
         const bins = await withTimeout(preCloseBins, CLOSE_BINS_WAIT_MS);
-        emit("close", { pair: closedTracked?.pool_name || args.position_address?.slice(0, 8), position: args.position_address, pool: result.pool ?? closedTracked?.pool ?? null, txs: result.txs ?? null, pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? null, bins });
+        emit("close", { pair: closedTracked?.pool_name || args.position_address?.slice(0, 8), position: args.position_address, pool: result.pool ?? closedTracked?.pool ?? null, txs: result.txs ?? null, pnlUsd: result.pnl_usd ?? 0, pnlSol: result.pnl_sol ?? null, pnlPct: result.pnl_pct ?? null, bins, reason: typeof args._close_reason === "string" ? args._close_reason : null });
         // USDC mode: auto-settle recovered base token + surplus SOL back to USDC.
         if (usdcModeEnabled()) {
           try {
