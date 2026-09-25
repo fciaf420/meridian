@@ -104,17 +104,41 @@ export function environmentChangedSince(snapshot = {}, cfg = config) {
 }
 
 // Set when autoresearch.json is present but unparseable. While degraded we
-// refuse to overwrite the (recoverable) bad file with defaults.
+// refuse to overwrite the (recoverable) bad file. The flag clears as soon as
+// the file parses again (an operator fixed or restored it), without a restart.
 let _autoresearchDegraded = false;
+let _corruptBackupPath = null;
+
+function fileParses() {
+  try {
+    JSON.parse(fs.readFileSync(AUTORESEARCH_FILE, "utf8"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearDegraded() {
+  if (!_autoresearchDegraded) return;
+  _autoresearchDegraded = false;
+  _corruptBackupPath = null;
+  log("autoresearch", `${AUTORESEARCH_FILE} parses again — leaving degraded mode, saves re-enabled`);
+}
+
+export function isAutoresearchDegraded() {
+  return _autoresearchDegraded;
+}
 
 export function loadAutoresearch() {
   if (!fs.existsSync(AUTORESEARCH_FILE)) {
     // File absent — safe to create fresh defaults.
+    clearDegraded();
     saveAutoresearch(freshDefaults());
     return freshDefaults();
   }
   try {
     const data = JSON.parse(fs.readFileSync(AUTORESEARCH_FILE, "utf8"));
+    clearDegraded();
     // Merge with (fresh copies of) DEFAULTS so existing files gain new fields
     // without later mutations leaking into the shared DEFAULTS object.
     return { ...freshDefaults(), ...data };
@@ -126,24 +150,37 @@ export function loadAutoresearch() {
       try {
         const backup = `${AUTORESEARCH_FILE}.corrupt-${Date.now()}`;
         fs.copyFileSync(AUTORESEARCH_FILE, backup);
-        log("autoresearch", `autoresearch.json is corrupt (${err.message}); preserved as ${backup}. Refusing to overwrite until recovered.`);
+        _corruptBackupPath = backup;
+        log("autoresearch", `${AUTORESEARCH_FILE} is corrupt (${err.message}); a copy was preserved as ${backup}. Saves are disabled until ${AUTORESEARCH_FILE} itself is fixed or replaced.`);
       } catch (backupErr) {
-        log("autoresearch", `autoresearch.json is corrupt (${err.message}) and backup failed: ${backupErr.message}. Refusing to overwrite until recovered.`);
+        log("autoresearch", `${AUTORESEARCH_FILE} is corrupt (${err.message}) and backup failed: ${backupErr.message}. Saves are disabled until ${AUTORESEARCH_FILE} itself is fixed or replaced.`);
       }
     }
     _autoresearchDegraded = true;
-    throw new Error(`autoresearch.json is corrupt and was preserved for recovery: ${err.message}`);
+    throw new Error(`autoresearch.json is corrupt and was preserved for recovery: ${err.message}`, { cause: err });
   }
 }
 
 export function saveAutoresearch(data) {
   // Never persist over a corrupt-but-present file; that would destroy
-  // recoverable history. Skip saves until the file is restored.
+  // recoverable history. Once the file parses again the save goes through.
   if (_autoresearchDegraded) {
-    log("autoresearch", "Skipping autoresearch.json save: file is in degraded (corrupt) state. Restore or remove the corrupt backup to re-enable saves.");
-    return;
+    if (fs.existsSync(AUTORESEARCH_FILE) && !fileParses()) {
+      log("autoresearch", `Skipping save: ${AUTORESEARCH_FILE} is corrupt. Fix or replace that file (not the backup${_corruptBackupPath ? ` ${_corruptBackupPath}` : ""}); saves resume once it parses.`);
+      return;
+    }
+    clearDegraded();
   }
-  fs.writeFileSync(AUTORESEARCH_FILE, serializeAutoresearch(data));
+  // Atomic: write a temp file in the same directory, then rename over the
+  // original, so a crash mid-write can't leave a truncated autoresearch.json.
+  const tmp = `${AUTORESEARCH_FILE}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, serializeAutoresearch(data));
+    fs.renameSync(tmp, AUTORESEARCH_FILE);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+    throw e;
+  }
 }
 
 /**
@@ -153,7 +190,7 @@ export function saveAutoresearch(data) {
  */
 export function serializeAutoresearch(data) {
   return JSON.stringify(data, null, 2)
-    .replace(/[\u007f-￿]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    .replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 // ─── Override provenance, staleness and migration ────────────
@@ -923,6 +960,15 @@ async function evaluateExperiment(perfData, cfg, state) {
   }
 
   const arms = splitArms(perfData, experiment.id);
+  const tagged = arms.control.length + arms.candidate.length + arms.excluded;
+  if (tagged < (experiment.tagged_seen ?? 0)) {
+    // Closes we already counted are gone (clearPerformance or a trim): the
+    // evidence can't be rebuilt, so don't leave the experiment hanging.
+    log("autoresearch", `Performance history for ${experiment.id} was cleared (${experiment.tagged_seen} → ${tagged} tagged closes) — closing it as abandoned`);
+    finishExperiment(state, "abandoned_history_cleared", 0);
+    return;
+  }
+  experiment.tagged_seen = tagged;
   experiment.trial = { control: arms.control.length, candidate: arms.candidate.length, excluded: arms.excluded };
 
   // Circuit breaker (safety valve, candidate arm only): first 3 candidate closes all losses.

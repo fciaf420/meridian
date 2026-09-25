@@ -482,6 +482,35 @@ test("autoKeep keeps a pass; noise is discarded; the time cap is inconclusive", 
   assert.equal(st.experiments.at(-1).status, "inconclusive_time_cap");
 });
 
+test("M4: atomic save, degraded mode clears once the file is valid again", () => {
+  ar.saveAutoresearch({ experiments: [], active: null, marker: "a" });
+  assert.deepEqual(fs.readdirSync(TMP).filter((f) => f.startsWith("autoresearch.json.tmp")), [], "no temp file left behind");
+
+  fs.writeFileSync(AR_FILE, "{ not json");
+  assert.throws(() => ar.loadAutoresearch(), /corrupt/);
+  assert.equal(ar.isAutoresearchDegraded(), true);
+  ar.saveAutoresearch({ experiments: [], marker: "blocked" });
+  assert.equal(fs.readFileSync(AR_FILE, "utf8"), "{ not json", "a corrupt file is never overwritten");
+
+  // Operator repairs the main file: the next save goes through without a restart.
+  fs.writeFileSync(AR_FILE, JSON.stringify({ experiments: [] }));
+  ar.saveAutoresearch({ experiments: [], marker: "after-repair" });
+  assert.equal(ar.isAutoresearchDegraded(), false);
+  assert.equal(ar.loadAutoresearch().marker, "after-repair");
+  for (const f of fs.readdirSync(TMP)) if (f.includes(".corrupt-")) fs.rmSync(path.join(TMP, f));
+});
+
+test("M4: an experiment whose performance history was cleared is closed as abandoned", async () => {
+  const cfg = { ...config, autoresearch: { ...config.autoresearch, enabled: true, minClosesPerArm: 100 } };
+  fs.writeFileSync(AR_FILE, ar.serializeAutoresearch(activeState("exp_clr")));
+  await ar.maybeRunAutoresearch(taggedCloses("exp_clr", 10, 0, 0), [], cfg);
+  assert.equal(ar.loadAutoresearch().active.tagged_seen, 20);
+  await ar.maybeRunAutoresearch([], [], cfg); // clearPerformance()
+  const st = ar.loadAutoresearch();
+  assert.equal(st.active, null);
+  assert.equal(st.experiments.at(-1).status, "abandoned_history_cleared");
+});
+
 test("research program is read from autoresearch-program.md without the editor note", () => {
   const program = ar.loadResearchProgram();
   assert.match(program, /Evil Panda/);
