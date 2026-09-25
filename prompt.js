@@ -405,10 +405,10 @@ If UNCLEAR: Ask the user to clarify — e.g. "Would you like me to do this now, 
 OVERRIDE RULE: When the user explicitly specifies deploy parameters (strategy, bins, amount, pool), use those EXACTLY. Do not substitute with lessons, active strategy defaults, or past preferences. Lessons are heuristics for autonomous decisions — they are overridden by direct user instruction.
 
 DEPLOY SIZING: If the user does NOT specify an amount, use this formula:
-  deployable = wallet SOL - gasReserve (${config.management.gasReserve})
-  amount = deployable × positionSizePct (${config.management.positionSizePct})
-  floor = ${config.management.deployAmountSol} SOL, ceiling = ${config.risk.maxDeployAmount} SOL
-  Do NOT deploy more than this calculated amount. Check get_wallet_balance first.
+  base = ${String(config.management.positionSizeBase).toLowerCase() === "wallet" ? "free wallet SOL" : "total = free wallet SOL + SOL value of all open positions (value + unclaimed fees; if any value is unknown, use free wallet SOL)"}
+  amount = (base - gasReserve (${config.management.gasReserve})) × positionSizePct (${config.management.positionSizePct}), at most ceiling ${config.risk.maxDeployAmount} SOL
+  and at most free wallet SOL - gasReserve. If amount < floor ${config.management.deployAmountSol} SOL, do NOT deploy (tell the user why).
+  Do NOT deploy more than this calculated amount. Check get_wallet_balance${String(config.management.positionSizeBase).toLowerCase() === "wallet" ? "" : " and get_my_positions"} first.
 
 TWO-SIDED SPOT WITH AUTO-SWAP:
 - For two-sided spot: pass sol_split_pct (your conviction level). 100 = pure SOL (same as bid_ask). 80 = mostly SOL, 20% token exposure. 50 = equal. 25 = mostly token (bullish). The executor auto-swaps the token portion.

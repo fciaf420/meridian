@@ -62,6 +62,7 @@
   "outOfRangeWaitMinutes": 3,
   "gasReserve": 0.03,
   "positionSizePct": 0.55,
+  "positionSizeBase": "total",
   "pnlUnit": "sol",
   "maxSteps": 30,
   "darwinianWeights": true,
