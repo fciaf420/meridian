@@ -16,7 +16,7 @@ import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot, maybePromote, checkCapacity } from "./memory.js";
+import { initMemory, recallForScreening, recallForManagement, rememberPositionSnapshot, checkCapacity } from "./memory.js";
 import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
 import { emit } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
@@ -420,8 +420,6 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
         }
         if (pos && !pos.error && !pos.positions?.length) await resetIdleManagementInterval();
       } catch { /* best-effort */ }
-      // Promote high-hit nugget facts to MEMORY.md
-      maybePromote();
       checkCapacity();
       // Pattern synthesis to knowledge base (throttled, max once/hour, only when recent closes exist)
       try {

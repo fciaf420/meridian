@@ -3,7 +3,7 @@
  * Provides cross-session learning via HRR-based memory.
  */
 
-import { NuggetShelf, promoteFacts } from "nuggets";
+import { NuggetShelf } from "nuggets";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
@@ -380,24 +380,6 @@ export function forgetFact(nuggetName, key) {
   } catch (e) {
     log("memory", `Failed to forget ${nuggetName}/${key}: ${e.message}`);
     return { forgotten: false, error: e.message };
-  }
-}
-
-/**
- * Promote high-hit facts to MEMORY.md for permanent context.
- * Call periodically (e.g. after each management cycle).
- */
-export function maybePromote() {
-  const s = getShelf();
-  try {
-    const promoted = promoteFacts(s);
-    if (promoted > 0) {
-      log("memory", `Promoted ${promoted} facts to MEMORY.md`);
-    }
-    return promoted;
-  } catch (e) {
-    log("memory", `Promotion failed: ${e.message}`);
-    return 0;
   }
 }
 
