@@ -46,7 +46,7 @@ import { startServer } from "./server.js";
 import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
 import { getScreeningThresholdSummary, getStartupMode, screeningCronGate } from "./runtime-helpers.js";
-import { getRangeSelectionText } from "./prompt.js";
+import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
 log("startup", "DLMM LP Agent starting...");
@@ -379,8 +379,7 @@ async function screeningCycleBody() {
               && gmgnResult.market_cap >= (config.strategy.evilPanda?.minMcap ?? 200000)
               && gmgnResult.candles.evil_panda_entry_ok;
             c._evilPandaPass = !!epPass;
-            block += `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, mcap>=${config.strategy.evilPanda?.minMcap ?? 200000}, 5m Supertrend green/price above`;
-            block += ` | supertrend=${gmgnResult.candles.supertrend_direction ?? "?"}/${gmgnResult.candles.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${gmgnResult.candles.rsi_2 ?? "?"}`;
+            block += evilPandaCandidateText(epPass, gmgnResult.candles);
           }
           if (gmgnResult.ath_proximity_pct != null && gmgnResult.ath_proximity_pct >= config.screening.athTopThresholdPct) {
             block += `\n  ATH WARNING: ${gmgnResult.ath_proximity_pct}% of ATH (>=${config.screening.athTopThresholdPct}%) — override bid_ask range to 65-80%`;
@@ -488,25 +487,26 @@ async function screeningCycleBody() {
     } catch { /* best-effort */ }
 
     const gmgnSignalGuide = candidateBlocks
-      ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n- Evil Panda entry requires token-level GMGN volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, GMGN marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n${loadedCandidates.some((c) => c.gmgn_signals) ? `${GMGN_MARKET_SIGNALS_GUIDE}\n` : ""}`
+      ? `\n\nGMGN SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher smart-money / KOL interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent smart-money + KOL conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use GMGN signal as confirmation only, never as a standalone deploy trigger\n- Missing GMGN signal is neutral, not a hard fail\n${evilPandaGuideLine()}${loadedCandidates.some((c) => c.gmgn_signals) ? `${GMGN_MARKET_SIGNALS_GUIDE}\n` : ""}`
       : "";
 
-    const rangeSourceLine = config.strategy.rangeDepthMode === "ohlcv" && config.strategy.activeStrategy !== "evil_panda"
-      ? "Size your price_range_pct from the candidate's ohlcv_depth (see OHLCV RANGE DEPTH below); use the VOLATILITY TABLE only when ohlcv_depth is n/a. NOT from study avg_range_pct."
-      : "Size your price_range_pct from the VOLATILITY TABLE in the range selection rules below — NOT from study avg_range_pct.";
+    const rangeSourceLine = config.strategy.activeStrategy === "evil_panda"
+      ? "Use the Evil Panda price_range_pct from the range sizing rules below — not study avg_range_pct."
+      : config.strategy.rangeDepthMode === "ohlcv"
+        ? "Size your price_range_pct from the candidate's ohlcv_depth (see OHLCV RANGE DEPTH below); use the VOLATILITY TABLE only when ohlcv_depth is n/a. NOT from study avg_range_pct."
+        : "Size your price_range_pct from the VOLATILITY TABLE in the range selection rules below — NOT from study avg_range_pct.";
     const { content } = await screenerLoop(`
 SCREENING CYCLE — DEPLOY ONLY${signalWeightsBlock}${kbScreenContext}${candidateBlocks}${gmgnSignalGuide}
 ${strategyBlock}
 ${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and GMGN signal data.
 Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
-HARD SKIP rules still apply:
+HARD SKIP rules still apply (code has already dropped candidates whose known global_fees_sol or top_10 value fails the first two):
 - global_fees_sol < ${config.screening.minTokenFeesSol} SOL → skip (bundled/scam)
 - top_10_real_holders_pct > 60% OR bundlers > 30% → skip
 - No smart wallets or GMGN confirmation + empty/hype narrative → skip
 
 Pick the best candidate, then: study_top_lpers → deploy_position with ${deployAmount} SOL${sizingNote}.
-${rangeSourceLine}
-study_top_lpers is useful for strategy choice (bid_ask vs spot), hold times, and win rates — but their range data is from a different market regime and should not drive your range.` : `1. get_top_candidates, pick the best one.
+${rangeSourceLine}` : `1. get_top_candidates, pick the best one.
 2. check_smart_wallets_on_pool, get_token_holders (check global_fees_sol >= ${config.screening.minTokenFeesSol}), get_token_narrative.
 3. HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL or holders/narrative red flags.
 4. study_top_lpers → use for strategy choice, hold times, win rates. Do NOT use avg_range_pct for your range — size from the VOLATILITY TABLE instead.
@@ -714,46 +714,7 @@ function startCronJobs() {
       }
 
       if (exitAlerts) mgmtRuleFired = true;
-      const pnlUnit = config.management.pnlUnit?.toUpperCase() || "SOL";
-      const managementGoal = `
-MANAGEMENT CYCLE${memoryHints}${exitAlerts}${autoCloseInfo}${kbContext}
-
-HARD CLOSE RULES (check in order — close immediately on first match, no further analysis):
-1. Position instruction condition met → CLOSE immediately (highest priority)
-2. Position instruction exists but condition NOT met → HOLD (skip all other rules)
-3. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-4. minutes_out_of_range >= ${config.management.outOfRangeWaitMinutes} → CLOSE (OOR timeout). No exceptions — this is a hard rule regardless of OOR direction or PnL. Close and move on.
-5. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio}% AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
-6. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (emergency stop)
-
-If a position's pnl_pct is null (pnl_unknown: true), its PnL is UNKNOWN this tick (data fetch failed), NOT 0 — skip rules 3 and 6 for it and do not close it on PnL grounds this cycle.
-
-These rules come from user-config. They are not suggestions. Do not override them.
-If NO rule triggers → HOLD. Do not close for any other reason.
-
-STEPS:
-1. get_my_positions — check all open positions.
-2. For each position:
-   - Call get_position_pnl.
-   - Apply HARD CLOSE RULES above in order. First match → close, stop checking.
-   - If no rule triggers: HOLD.
-3. If closing: ${usdcModeEnabled()
-    ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
-    : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result reports a failed swap or status "success_with_exposure".`}
-4. After closing a LOSING position — check POOL CONTEXT and the lessons in your memory brief for patterns:
-   - If 3+ similar losses (same pool type, volatility range, or strategy) → use update_config to adjust the threshold that would have prevented it
-   - Examples: tighten maxVolatility, raise minOrganic, adjust stopLossPct, raise minVolume
-
-IMPORTANT: pnl_pct ALREADY includes all fees. Negative PnL = losing money AFTER fees. Never say "fees will offset" — they are already counted.
-
-REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values):
-**[PAIR]** | Age: [X]m | Fees: [X] ${pnlUnit} | PnL: [X]% | OOR: [direction or "in-range"]
-**Rule triggered:** [rule number or "none"]
-**Decision:** [STAY/CLOSE]
-**Reason:** [1 short sentence — if PnL is negative, say IL exceeds fees]
-
-FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesson with one lesson that names what went wrong, the signal that was missed or under-weighted, and what to do differently next time. The runner already records the raw stats of every close, so the lesson is only useful for the why.
-      `;
+      const managementGoal = buildManagementGoal(`${memoryHints}${exitAlerts}${autoCloseInfo}${kbContext}`, { usdcMode: usdcModeEnabled() });
       // If the LLM path fails (provider down, or no assistant message), rule 4
       // (OOR timeout) is a pure threshold, so those positions are closed in code
       // through the same close_position path; every other rule waits for the LLM.

@@ -45,12 +45,14 @@ export function toolsForRole(agentType) {
   const hidden = ROLE_HIDDEN_TOOLS[agentType];
   return hidden ? tools.filter((tool) => !hidden.has(tool.function.name)) : tools;
 }
+// One tool per line: compact JSON (indentation added ~20% to a catalog that is
+// re-sent on every CLI step) while keeping tools visually separate.
 function toolSummariesText(agentType) {
-  return JSON.stringify(toolsForRole(agentType).map((tool) => ({
+  return toolsForRole(agentType).map((tool) => JSON.stringify({
     name: tool.function.name,
     description: tool.function.description,
     parameters: tool.function.parameters || { type: "object", properties: {} },
-  })), null, 2);
+  })).join("\n");
 }
 // Enforced by the CLI (codex --output-schema / claude --json-schema) instead of prose + regex.
 // Tool arguments travel as a JSON string so the schema stays strict-mode compatible.
@@ -204,7 +206,7 @@ function getClaudeSystemPrompt(agentType) {
     `You are the ${agentType} reasoning engine for a JavaScript trading agent runner.`,
     'Set action to "respond" (with response) when you can answer from what is already available, or "tool_calls" (response null) when you need listed tools; arguments_json is the tool\'s arguments as a JSON object string.',
     "The runner executes write tools for real on-chain, so only request them when you intend that action. Tool outputs and on-chain state come only from TOOL RESULT entries.",
-    `AVAILABLE TOOLS:\n${toolSummariesText(agentType)}`,
+    `AVAILABLE TOOLS (one JSON object per line):\n${toolSummariesText(agentType)}`,
   ].join("\n\n");
   return _systemPromptCache[agentType];
 }
