@@ -301,7 +301,14 @@ async function simulateComputeUnits(tx, label) {
   }
 }
 
-async function sendManagedTransaction(tx, signers, label) {
+/**
+ * @param {object} [opts]
+ * @param {() => Promise<boolean>} [opts.beforeResend] Called before any
+ *   re-sign/resend after an expiry, once the prior signature is known not to
+ *   have landed. Return true only when resending is verified safe (e.g. the
+ *   chunk's bins are still empty on-chain); anything else aborts the resend.
+ */
+async function sendManagedTransaction(tx, signers, label, { beforeResend } = {}) {
   const feePayer = signers?.[0]?.publicKey;
   await applyPriorityFee(tx, feePayer, label);
   let lastError = null;
@@ -332,6 +339,18 @@ async function sendManagedTransaction(tx, signers, label) {
           // before resubmit to reduce (not eliminate) the double-submit window.
           // LIMITATION: a silently-landed prior tx could still be resubmitted here.
           await new Promise((r) => setTimeout(r, 1500));
+        }
+
+        if (beforeResend) {
+          let safe = false;
+          try { safe = (await beforeResend()) === true; } catch (checkErr) {
+            log("tx_retry", `${label}: resend check failed (${checkErr?.message || checkErr})`);
+          }
+          if (!safe) {
+            const abort = new Error(`${label}: not resending after expiry — could not verify on-chain that it is safe to resend (prior error: ${lastError?.message || "expired"})`);
+            abort.noRetry = true;
+            throw abort;
+          }
         }
 
         lastSig = null;
@@ -387,7 +406,7 @@ async function sendManagedTransaction(tx, signers, label) {
         /blockhash not found/i.test(message) ||
         /transaction expired/i.test(message);
 
-      if (!retryableExpiry || attempt === 2) {
+      if (error?.noRetry || !retryableExpiry || attempt === 2) {
         throw error;
       }
 
@@ -1054,10 +1073,46 @@ export async function deployPosition({
           slippage: 10, // 10%
         });
         const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
-        for (let i = 0; i < addTxArray.length; i++) {
-          const txHash = await sendManagedTransaction(addTxArray[i], [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`);
-          txHashes.push(txHash);
-          log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+        const { chunkBinRange } = await import("@meteora-ag/dlmm");
+        const chunkRanges = chunkBinRange(minBinId, maxBinId);
+        if (chunkRanges.length !== addTxArray.length) {
+          // Unexpected SDK chunking: can't map txs to bins for reconcile, so
+          // keep the old one-at-a-time behaviour.
+          log("deploy_warn", `SDK returned ${addTxArray.length} add txs for ${chunkRanges.length} bin chunks — sending sequentially`);
+          for (let i = 0; i < addTxArray.length; i++) {
+            const txHash = await sendManagedTransaction(addTxArray[i], [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`);
+            txHashes.push(txHash);
+            log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
+          }
+        } else {
+          // The chunkable builder makes self-contained txs for parallel use
+          // (NoShrink modes, own ATA/wrap, own bin-array inits). Read-only
+          // simulation confirmed they don't conflict: initialize_bin_array and
+          // the bitmap-extension init both succeed on an already-initialized
+          // account, and each chunk is valid in any order. So send them all at
+          // once (each signed once, with its own rebroadcast + confirm): one
+          // confirmation window instead of N, and every chunk is priced off
+          // the same activeId.
+          const readFunded = () => readChunkFunding(pool, newPosition.publicKey, chunkRanges);
+          const results = await Promise.allSettled(addTxArray.map((tx, i) =>
+            sendManagedTransaction(tx, [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`, {
+              // Resend only if this chunk's bins are verified still empty.
+              beforeResend: async () => (await readFunded())?.[i] === false,
+            })));
+          // Reconcile against the position on-chain, never against send
+          // results alone: a "failed" chunk may have landed.
+          const funded = await readFunded();
+          const rec = reconcileChunkResults(results, funded);
+          for (const i of rec.landed) {
+            const r = results[i];
+            if (r.status === "fulfilled") txHashes.push(r.value);
+            log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${r.status === "fulfilled" ? r.value : "confirm failed but its bins are funded on-chain"}`);
+          }
+          if (rec.failed.length || rec.unknown.length) {
+            const why = [...rec.failed, ...rec.unknown].sort((a, b) => a - b)
+              .map((i) => `chunk ${i + 1}/${addTxArray.length} (bins ${chunkRanges[i].lowerBinId}..${chunkRanges[i].upperBinId}) ${rec.failed.includes(i) ? "empty on-chain" : "unverified"}: ${results[i].reason?.message || results[i].reason}`);
+            throw new Error(`${rec.failed.length + rec.unknown.length}/${addTxArray.length} add-liquidity chunk(s) did not land — ${why.join("; ")}`);
+          }
         }
       } catch (liqErr) {
         // Liquidity add failed partway. Earlier chunks may already have landed
@@ -1999,9 +2054,24 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         shouldClaimAndClose: true,
       });
 
-      for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-        const txHash = await sendManagedTransaction(tx, [wallet], "close remove liquidity");
-        txHashes.push(txHash);
+      // Remove chunks cover disjoint bin ranges and each ends with
+      // closePositionIfEmpty (a no-op until the position is empty), so the
+      // last one to land closes the account. Simulation confirmed each is
+      // valid in any order, so send them concurrently. The account-gone check
+      // below still decides success.
+      const removeTxs = Array.isArray(closeTx) ? closeTx : [closeTx];
+      const results = await Promise.allSettled(removeTxs.map((tx, i) =>
+        sendManagedTransaction(tx, [wallet], `close remove liquidity ${i + 1}/${removeTxs.length}`)));
+      for (const r of results) if (r.status === "fulfilled") txHashes.push(r.value);
+      const failed = results.filter((r) => r.status === "rejected");
+      if (failed.length) {
+        const gone = (await getConnection().getAccountInfo(positionPubKey).catch(() => undefined)) === null;
+        if (!gone) {
+          // Not closed: fail this attempt (no blind resend). The next close
+          // rebuilds from on-chain state, so it only removes what is left.
+          throw new Error(`${failed.length}/${removeTxs.length} remove-liquidity tx(s) failed: ${failed.map((r) => r.reason?.message || r.reason).join("; ")}`);
+        }
+        log("close_warn", `${failed.length}/${removeTxs.length} remove tx(s) reported failure but the position account is closed`);
       }
     } catch (removeErr) {
       // Zombie position: liquidity was already removed in a previous attempt
@@ -2287,6 +2357,45 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
 
 // ─── Helpers ──────────────────────────────────────────────────
 /**
+ * Per-chunk funding of a position, read on-chain in one call: for each
+ * { lowerBinId, upperBinId } range, true if any of its bins holds liquidity,
+ * false if all are empty. Returns null when the read fails (unknown).
+ */
+async function readChunkFunding(pool, positionPubKey, ranges) {
+  try {
+    const pd = (await pool.getPosition(positionPubKey))?.positionData;
+    if (!pd) return null;
+    const bins = pd.positionBinData || [];
+    const has = (b) => Number(b.positionXAmount || 0) > 0 || Number(b.positionYAmount || 0) > 0;
+    return ranges.map(({ lowerBinId, upperBinId }) =>
+      bins.some((b) => b.binId >= lowerBinId && b.binId <= upperBinId && has(b)));
+  } catch (e) {
+    log("deploy_warn", `Could not read chunk funding for ${positionPubKey.toString().slice(0, 8)}: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Reconcile concurrently sent chunks with the on-chain read.
+ * @param {PromiseSettledResult[]} results  one per chunk
+ * @param {boolean[]|null} funded  per chunk from readChunkFunding (null = read failed)
+ * @returns {{ landed: number[], failed: number[], unknown: number[] }}
+ *   landed  — confirmed, or rejected but its bins are funded (landed anyway);
+ *   failed  — rejected AND its bins verified empty (safe to report as not deployed);
+ *   unknown — rejected and the read failed (treat as possibly funded).
+ */
+export function reconcileChunkResults(results, funded) {
+  const out = { landed: [], failed: [], unknown: [] };
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") out.landed.push(i);
+    else if (funded?.[i] === true) out.landed.push(i);
+    else if (funded?.[i] === false) out.failed.push(i);
+    else out.unknown.push(i);
+  });
+  return out;
+}
+
+/**
  * Unclaimed fees (UI units) and raw LM rewards held by a position, from the
  * SDK's LbPosition data. Returns null when there is nothing to claim or the
  * amounts can't be read.
@@ -2343,6 +2452,7 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 export { applyPriorityFee as _applyPriorityFeeForTest };
 export { sendManagedTransaction as _sendManagedTransactionForTest };
 export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
+export { readChunkFunding as _readChunkFundingForTest };
 
 /**
  * Test seam only: swap in a mock connection / wallet (pass null to restore the

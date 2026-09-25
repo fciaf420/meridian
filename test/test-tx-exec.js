@@ -24,6 +24,8 @@ const dlmm = await import("../tools/dlmm.js");
 const { config } = await import("../config.js");
 const txSend = await import("../tools/tx-send.js");
 const {
+  reconcileChunkResults,
+  _readChunkFundingForTest: readChunkFunding,
   _applyPriorityFeeForTest: applyPriorityFee,
   _sendManagedTransactionForTest: sendManagedTransaction,
   _setDlmmTestDeps: setDeps,
@@ -182,4 +184,113 @@ test("normal-size tx goes to Sender and the RPC", async () => {
   await sendManagedTransaction(makeTx(50), [wallet], "small");
   assert.equal(conn.calls.sendRaw, 1);
   assert.ok(posts.length >= 1);
+});
+
+// ─── 6. Parallel chunks: reconcile + no blind resend ───────────
+
+const ok = (v) => ({ status: "fulfilled", value: v });
+const bad = (m) => ({ status: "rejected", reason: new Error(m) });
+
+test("reconcile: all chunks confirmed → all landed", () => {
+  const r = reconcileChunkResults([ok("a"), ok("b"), ok("c")], [true, true, true]);
+  assert.deepEqual(r, { landed: [0, 1, 2], failed: [], unknown: [] });
+});
+
+test("reconcile: partial — one chunk rejected and verified empty → failed (partial deploy)", () => {
+  const r = reconcileChunkResults([ok("a"), bad("block height exceeded"), ok("c")], [true, false, true]);
+  assert.deepEqual(r, { landed: [0, 2], failed: [1], unknown: [] });
+});
+
+test("reconcile: rejected but its bins are funded → landed anyway (not a failure, not resent)", () => {
+  const r = reconcileChunkResults([ok("a"), bad("confirm timeout")], [true, true]);
+  assert.deepEqual(r, { landed: [0, 1], failed: [], unknown: [] });
+});
+
+test("reconcile: rejected and on-chain read failed → unknown (kept as possibly funded)", () => {
+  const r = reconcileChunkResults([ok("a"), bad("x")], null);
+  assert.deepEqual(r, { landed: [0], failed: [], unknown: [1] });
+});
+
+test("readChunkFunding maps position bins onto chunk ranges; read error → null", async () => {
+  const bins = [
+    { binId: -100, positionXAmount: "0", positionYAmount: "5" },
+    { binId: -31, positionXAmount: "0", positionYAmount: "0" },
+    { binId: -30, positionXAmount: "0", positionYAmount: "0" },
+    { binId: 45, positionXAmount: "3", positionYAmount: "0" },
+  ];
+  const pool = { getPosition: async () => ({ positionData: { positionBinData: bins } }) };
+  const ranges = [{ lowerBinId: -100, upperBinId: -31 }, { lowerBinId: -30, upperBinId: 39 }, { lowerBinId: 40, upperBinId: 61 }];
+  assert.deepEqual(await readChunkFunding(pool, wallet.publicKey, ranges), [true, false, true]);
+  const broken = { getPosition: async () => { throw new Error("rpc down"); } };
+  assert.equal(await readChunkFunding(broken, wallet.publicKey, ranges), null);
+});
+
+const expireOnce = (n) => { if (n === 1) throw new Error("block height exceeded"); return { err: null }; };
+
+test("no blind resend: expired chunk whose bins can't be verified empty is NOT resent", async () => {
+  const conn = mockConnection({ confirm: expireOnce, statuses: [null] });
+  setDeps({ connection: conn, wallet });
+  mockSender();
+  let checks = 0;
+  await assert.rejects(
+    sendManagedTransaction(makeTx(40), [wallet], "chunk 2/3", { beforeResend: async () => { checks++; return false; } }),
+    /not resending after expiry/,
+  );
+  assert.equal(checks, 1);
+  assert.equal(conn.calls.sendRaw, 1); // only the first send
+  assert.equal(conn.calls.statuses, 1); // prior signature was checked first
+});
+
+test("no blind resend: a throwing resend check also blocks the resend", async () => {
+  const conn = mockConnection({ confirm: expireOnce, statuses: [null] });
+  setDeps({ connection: conn, wallet });
+  mockSender();
+  await assert.rejects(
+    sendManagedTransaction(makeTx(40), [wallet], "chunk", { beforeResend: async () => { throw new Error("read failed"); } }),
+    /not resending/,
+  );
+  assert.equal(conn.calls.sendRaw, 1);
+});
+
+test("resend happens only after the prior sig is not landed AND the bins are verified empty", async () => {
+  const conn = mockConnection({ confirm: expireOnce, statuses: [null] });
+  setDeps({ connection: conn, wallet });
+  mockSender();
+  const sig = await sendManagedTransaction(makeTx(40), [wallet], "chunk", { beforeResend: async () => true });
+  assert.equal(conn.calls.sendRaw, 2);
+  assert.equal(typeof sig, "string");
+});
+
+test("prior signature landed → returns it without calling the resend check or resending", async () => {
+  const conn = mockConnection({ confirm: expireOnce, statuses: [{ err: null, confirmationStatus: "confirmed" }] });
+  setDeps({ connection: conn, wallet });
+  mockSender();
+  let checks = 0;
+  await sendManagedTransaction(makeTx(40), [wallet], "chunk", { beforeResend: async () => { checks++; return true; } });
+  assert.equal(checks, 0);
+  assert.equal(conn.calls.sendRaw, 1);
+});
+
+test("allSettled over concurrent chunks: one expiring chunk does not block the others", async () => {
+  // Chunk B's first confirm expires and its bins can't be verified → rejected;
+  // A and C land. Mirrors the deploy flow: Promise.allSettled + reconcile.
+  const conn = mockConnection();
+  let n = 0;
+  const failSig = new Set();
+  conn.confirmTransaction = async ({ signature }) => {
+    n++;
+    if (n === 2) { failSig.add(signature); throw new Error("block height exceeded"); }
+    return { value: { err: null } };
+  };
+  setDeps({ connection: conn, wallet });
+  mockSender();
+  const txs = [makeTx(30), makeTx(31), makeTx(32)];
+  const results = await Promise.allSettled(txs.map((tx, i) =>
+    sendManagedTransaction(tx, [wallet], `add ${i + 1}/3`, { beforeResend: async () => false })));
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 2);
+  const failedIdx = results.findIndex((r) => r.status === "rejected");
+  const funded = results.map((r) => r.status === "fulfilled");
+  const rec = reconcileChunkResults(results, funded);
+  assert.deepEqual(rec.failed, [failedIdx]);
+  assert.equal(conn.calls.sendRaw, 3); // one send per chunk, no resend
 });
