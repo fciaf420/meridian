@@ -741,7 +741,21 @@ FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesso
   });
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, async () => {
-    await runScreeningCycle().done;
+    let run = runScreeningCycle();
+    // Management and screening fire on shared clock boundaries (e.g. every 10
+    // and every 20 min both hit :00/:20/:40), so the screening tick landed while
+    // management was running and was skipped every single time. Instead of
+    // dropping the slot, wait for that management cycle to finish (max 5 min)
+    // and try once more; every other gate (pause, a position action) is unchanged.
+    if (!run.started && run.reason === "a management cycle is in progress") {
+      const deadline = Date.now() + 5 * 60_000;
+      while (Date.now() < deadline && isManagementBusy()) {
+        await new Promise((r) => setTimeout(r, 5_000));
+      }
+      run = runScreeningCycle();
+      if (run.started) log("cron", "Screening started after the management cycle finished");
+    }
+    await run.done;
   });
 
   // Morning Briefing at 8:00 AM UTC+7 (1:00 AM UTC)
