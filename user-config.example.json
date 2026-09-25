@@ -20,7 +20,6 @@
   "managementFallbackModel": null,
   "screeningFallbackModel": null,
   "generalFallbackModel": null,
-  "memoryNuggetsFirst": true,
   "autoresearch": true,
   "autoresearchModel": "MiniMax-M2.7",
   "autoresearchReasoningEffort": "high",

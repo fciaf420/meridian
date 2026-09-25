@@ -16,6 +16,8 @@ smart-wallets.json
 pool-memory.json
 token-blacklist.json
 strategy-library.json
+# Legacy nuggets memory store (no longer used; kept on disk, safe to delete)
+data/nuggets/
 
 # Knowledge base (LLM-maintained, user-specific)
 knowledge/

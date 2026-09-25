@@ -206,10 +206,9 @@ export const config = {
     managementFallbackModel: u.managementFallbackModel ?? null,
     screeningFallbackModel:  u.screeningFallbackModel  ?? null,
     generalFallbackModel:    u.generalFallbackModel    ?? null,
-  },
-
-  memory: {
-    nuggetsFirst: u.memoryNuggetsFirst ?? true,
+    // Codex agent-loop reasoning effort for every role (low|medium|high|xhigh).
+    // null keeps the per-role default: MANAGER high, others medium.
+    reasoningEffort: u.llmReasoningEffort ?? null,
   },
 
   // ─── Web UI ───────────────────────────
@@ -290,7 +289,6 @@ const SECTION_MAP = {
   schedule: new Set(Object.keys(config.schedule)),
   strategy: new Set(Object.keys(config.strategy)),
   llm: new Set(Object.keys(config.llm)),
-  memory: new Set(Object.keys(config.memory)),
   knowledgeBase: new Set(Object.keys(config.knowledgeBase)),
   research: config.research ? new Set(Object.keys(config.research)) : new Set(),
 };

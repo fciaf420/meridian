@@ -1929,12 +1929,6 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
         ...(tracked.experiment_id && { experiment_id: tracked.experiment_id, experiment_arm: tracked.experiment_arm }),
       });
 
-      // Clean up transient nugget entries
-      try {
-        const { forgetPositionSnapshot } = await import("../memory.js");
-        forgetPositionSnapshot(tracked);
-      } catch { /* best-effort */ }
-
       // ─── Hard rule: swap ONLY the withdrawn base token back to SOL ───
       // Sell only the DELTA this close added to the wallet (post - pre), never
       // the entire base-token balance. Retries up to MAX_ATTEMPTS with backoff;

@@ -33,7 +33,7 @@ export function setStartupCache({ wallet, positions, candidates, lpOverview }) {
   _startupCache = { wallet, positions, candidates, lpOverview, ts: Date.now() };
 }
 import { getPerformanceSummary, getPerformanceHistory, listLessons, evolveThresholds } from "./lessons.js";
-import { getMemoryDashboardData } from "./memory.js";
+import { buildUnifiedMemoryBrief } from "./unified-memory.js";
 import { loadWeights } from "./signal-weights.js";
 import { getActiveExperiment, loadAutoresearch, describeOverrides } from "./autoresearch.js";
 import { buildKnowledgeGraph } from "./tools/knowledge-graph.js";
@@ -142,7 +142,6 @@ function buildAutoresearchPayload() {
 function buildInsightsPayload() {
   return {
     lessons: listLessons({ limit: 30 }),
-    memory: getMemoryDashboardData(),
     darwin: buildDarwinPayload(),
     autoresearch: buildAutoresearchPayload(),
   };
@@ -763,7 +762,7 @@ export function startServer(timersFn) {
           break;
         }
         case "memory": {
-          data = getMemoryDashboardData();
+          data = buildUnifiedMemoryBrief("GENERAL");
           break;
         }
         case "darwin-weights": {

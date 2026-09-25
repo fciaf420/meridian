@@ -234,7 +234,6 @@ export async function fetchTopLpersStats({ pool_address, limit = 20 }) {
 
 /**
  * Get detailed pool info from LP Agent API.
- * Auto-stores key facts in nuggets memory.
  */
 export async function getPoolInfo({ pool_address }) {
   const apiKey = await getKey();
@@ -312,22 +311,6 @@ export async function getPoolInfo({ pool_address }) {
       fee_usd: h.feeUsd,
     })),
   };
-
-  try {
-    const { rememberFact } = await import("../memory.js");
-    const pair = `${tokenX.symbol || "?"}-${tokenY.symbol || "SOL"}`;
-    const key = pair.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
-    const audit = tokenX.audit || {};
-    const safety = [
-      audit.mintAuthorityDisabled ? "mint-off" : "MINT-ON",
-      audit.freezeAuthorityDisabled ? "freeze-off" : "FREEZE-ON",
-      `${(audit.botHoldersPercentage || 0).toFixed(0)}% bots`,
-      `${(audit.topHoldersPercentage || 0).toFixed(0)}% top holders`,
-      `organic ${(tokenX.organicScore || 0).toFixed(0)}`,
-      `${tokenX.holderCount || 0} holders`,
-    ].join(", ");
-    rememberFact("pools", `${key}_audit`, safety);
-  } catch { /* best-effort */ }
 
   return result;
 }

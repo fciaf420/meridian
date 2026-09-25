@@ -12,7 +12,6 @@ import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { config, reloadScreeningThresholds } from "./config.js";
 import { recordPoolDeploy } from "./pool-memory.js";
-import { rememberPoolOutcome, rememberStrategy } from "./memory.js";
 import { recalculateWeights } from "./signal-weights.js";
 import { filePositionClose } from "./knowledge-base.js";
 
@@ -111,12 +110,18 @@ export async function recordPerformance(perf) {
   const range_efficiency = perf.minutes_held > 0
     ? (perf.minutes_in_range / perf.minutes_held) * 100
     : 0;
+  // PnL unknown at close (PR #9 flag): the close path records a placeholder 0
+  // when it could not derive PnL. When it left actual_pnl_pct null, the value
+  // above was derived from final vs initial value and is a real measurement.
+  const pnlUnknown = perf.pnl_unknown === true && perf.actual_pnl_pct != null;
 
   const entry = {
     ...perf,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
+    pnl_unknown: pnlUnknown || undefined,
+    ...(perf.pnl_unknown === true && !pnlUnknown && { pnl_derived: true }),
     recorded_at: new Date().toISOString(),
   };
 
@@ -164,8 +169,8 @@ export async function recordPerformance(perf) {
         base_mint: perf.base_mint,
         deployed_at: perf.deployed_at,
         closed_at: entry.recorded_at,
-        pnl_pct: entry.pnl_pct,
-        pnl_usd: entry.pnl_usd,
+        pnl_pct: pnlUnknown ? null : entry.pnl_pct,
+        pnl_usd: pnlUnknown ? null : entry.pnl_usd,
         range_efficiency: entry.range_efficiency,
         minutes_held: perf.minutes_held,
         close_reason: perf.close_reason,
@@ -179,35 +184,9 @@ export async function recordPerformance(perf) {
     }
   }
 
-  // Store in holographic memory (nuggets)
-  try {
-    const outcome = pnl_pct >= 0 ? "profitable" : "unprofitable";
-    const oorInfo = perf.close_reason?.match(/OOR (upside|downside)/)?.[1];
-    const oorTag = oorInfo ? `, OOR_direction=${oorInfo}` : "";
-    const splitTag = (perf.sol_split_pct != null && perf.sol_split_pct < 100)
-      ? `, sol_split=${perf.sol_split_pct}%, two-sided` : "";
-    rememberPoolOutcome(
-      perf.pool_name || perf.pool,
-      `${outcome}, PnL ${pnl_pct.toFixed(1)}%, range_eff ${range_efficiency.toFixed(0)}%, strategy=${perf.strategy}, bin_step=${perf.bin_step}${oorTag}${splitTag}, vol=${perf.volatility}`
-    );
-    if (perf.strategy && perf.bin_step) {
-      const isTwoSided = perf.sol_split_pct != null && perf.sol_split_pct < 100;
-      const strategyLabel = isTwoSided
-        ? `${perf.strategy}_2sided_bs${perf.bin_step}`
-        : `${perf.strategy}_bs${perf.bin_step}`;
-      const splitInfo = isTwoSided ? `, sol_split=${perf.sol_split_pct}%` : "";
-      rememberStrategy(
-        strategyLabel,
-        `${outcome}, PnL ${pnl_pct.toFixed(1)}%, vol=${perf.volatility}, fee_tvl=${perf.fee_tvl_ratio}${splitInfo}`
-      );
-    }
-  } catch (e) {
-    log("memory", `Failed to store in nuggets: ${e.message}`);
-  }
-
   // File position close to knowledge base (direct write, no LLM)
   try {
-    filePositionClose({ ...perf, pnl_pct, minutes_in_range: perf.minutes_in_range });
+    filePositionClose({ ...perf, pnl_pct: pnlUnknown ? null : pnl_pct, pnl_unknown: pnlUnknown, minutes_in_range: perf.minutes_in_range });
   } catch (e) {
     log("kb", `Failed to file position close to KB: ${e.message}`);
   }
@@ -224,7 +203,7 @@ export async function recordPerformance(perf) {
         userConfig = result.userConfig; // carry forward mutations
         log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
       }
-      // Also evolve from lessons/nuggets (reuses same userConfig + data)
+      // Also evolve from lessons (reuses same userConfig + data)
       const lessonResult = evolveFromLessons(data.lessons || [], config, { userConfig, lessonsData: data });
       if (lessonResult?.changes && Object.keys(lessonResult.changes).length > 0) {
         userConfig = lessonResult.userConfig;
@@ -265,6 +244,7 @@ export async function recordPerformance(perf) {
  * Only generates a lesson if the outcome was clearly good or bad.
  */
 function derivLesson(perf) {
+  if (perf.pnl_unknown) return null; // placeholder 0% PnL: not an outcome to learn from
   const tags = [];
 
   // Categorize outcome
@@ -1126,17 +1106,20 @@ export function getPerformanceSummary() {
 
   if (p.length === 0) return null;
 
-  const totalPnl = p.reduce((s, x) => s + x.pnl_usd, 0);
-  const avgPnlPct = p.reduce((s, x) => s + x.pnl_pct, 0) / p.length;
+  // Closes with unknown PnL carry a placeholder 0; keep them out of PnL/win-rate stats.
+  const known = p.filter((x) => !x.pnl_unknown);
+  const totalPnl = known.reduce((s, x) => s + x.pnl_usd, 0);
+  const avgPnlPct = known.length ? known.reduce((s, x) => s + x.pnl_pct, 0) / known.length : 0;
   const avgRangeEfficiency = p.reduce((s, x) => s + x.range_efficiency, 0) / p.length;
-  const wins = p.filter((x) => x.pnl_usd > 0).length;
+  const wins = known.filter((x) => x.pnl_usd > 0).length;
 
   return {
     total_positions_closed: p.length,
+    ...(p.length !== known.length && { pnl_unknown_closes: p.length - known.length }),
     total_pnl_usd: Math.round(totalPnl * 100) / 100,
     avg_pnl_pct: Math.round(avgPnlPct * 100) / 100,
     avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
-    win_rate_pct: Math.round((wins / p.length) * 100),
+    win_rate_pct: known.length ? Math.round((wins / known.length) * 100) : 0,
     total_lessons: data.lessons.length,
   };
 }

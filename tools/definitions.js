@@ -749,7 +749,7 @@ Examples:
       description: `Get deep pool intelligence from LP Agent API — token audit, fee trends, bot holders, buy/sell ratio.
 Use this for extra due diligence before deploying or to check if a pool is dying during management.
 Rate limited to 5 calls per minute — use sparingly, only when you need deeper intel than get_pool_detail provides.
-Results are auto-saved to memory so you won't need to call it again for the same pool.
+Results are point-in-time and not cached; record anything worth keeping about a pool with add_pool_note.
 
 Returns: token audit (mint/freeze authority, bot %, dev balance, top holder concentration),
 5m and 1h trading stats (buy/sell volume, organic ratio, trader count),
@@ -763,61 +763,6 @@ fee trend over last 24 hours, liquidity amounts.`,
           }
         },
         required: ["pool_address"]
-      }
-    }
-  },
-
-  {
-    type: "function",
-    function: {
-      name: "remember_fact",
-      description: `Store a fact in holographic memory for cross-session learning.
-Use this to remember patterns, outcomes, or strategies that should persist across restarts.
-Nuggets: "pools" (pool outcomes), "strategies" (what strategies work), "lessons" (general rules), "patterns" (market patterns).
-Or create a new nugget name for a new category. Writing an existing nugget+key replaces its value.`,
-      parameters: {
-        type: "object",
-        properties: {
-          nugget: { type: "string", description: "Memory category (pools, strategies, lessons, patterns, or custom)" },
-          key: { type: "string", description: "Short descriptive key for the fact" },
-          value: { type: "string", description: "The fact content to remember" }
-        },
-        required: ["nugget", "key", "value"]
-      }
-    }
-  },
-
-  {
-    type: "function",
-    function: {
-      name: "recall_memory",
-      description: `Query holographic memory for relevant facts from past sessions.
-Use this before making decisions to check if you've learned something relevant.
-Supports fuzzy matching — you don't need an exact key, just a related query (a token symbol, strategy name, or topic).`,
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "What to search for in memory (fuzzy matched)" },
-          nugget: { type: "string", description: "Optional: search only in this nugget (pools, strategies, lessons, patterns)" }
-        },
-        required: ["query"]
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "forget_fact",
-      description: `Remove a fact from holographic memory.
-Use this to clean up stale, incorrect, or outdated facts.
-Specify the nugget name and the exact key of the fact to forget (recall_memory shows keys).`,
-      parameters: {
-        type: "object",
-        properties: {
-          nugget: { type: "string", description: "Memory category the fact belongs to (pools, strategies, lessons, patterns, or custom)" },
-          key: { type: "string", description: "The exact key of the fact to remove" }
-        },
-        required: ["nugget", "key"]
       }
     }
   },
@@ -1142,7 +1087,7 @@ Use this to find articles related to a topic before reading them in full.`,
     type: "function",
     function: {
       name: "kb_migrate",
-      description: `One-time migration: converts existing lessons.json, pool-memory.json, and nuggets data into initial knowledge base articles. Safe to re-run — skips articles that already exist. Also rebuilds INDEX.md and CONCEPTS.md.`,
+      description: `One-time migration: converts existing lessons.json and pool-memory.json data into initial knowledge base articles. Safe to re-run — skips articles that already exist. Also rebuilds INDEX.md and CONCEPTS.md.`,
       parameters: { type: "object", properties: {} }
     }
   },

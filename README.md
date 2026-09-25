@@ -97,8 +97,6 @@ npm install
 cd web && npm install && npm run build && cd ..
 ```
 
-Nuggets (holographic memory) is bundled in `packages/nuggets/` — no separate repo needed.
-
 ### Provider Setup
 
 Choose your provider:
@@ -262,13 +260,12 @@ It simply skips the REPL prompt.
 On launch Meridian typically:
 
 1. loads env and config
-2. initializes Nuggets memory
-3. deduplicates lessons
-4. restores any active autoresearch experiment
-5. starts the web server
-6. starts Telegram polling if configured
-7. starts the PnL watcher
-8. starts management and screening cron cycles
+2. deduplicates lessons
+3. restores any active autoresearch experiment
+4. starts the web server
+5. starts Telegram polling if configured
+6. starts the PnL watcher
+7. starts management and screening cron cycles
 
 ## Scheduler and Concurrency Rules
 
@@ -469,11 +466,11 @@ Prompt budget shape:
 - role-matched lessons up to 15
 - recent lessons fill the remaining budget up to 35 total
 
-### Nuggets Memory
+### Pool Memory
 
-Nuggets provides persistent cross-session memory in `data/nuggets/`. Meridian uses multiple recall channels during management context building, including pool name, strategy plus bin step, strategy only, volatility bucket, and general lesson recall.
+`pool-memory.json` records every deploy and close per pool **address** (PnL, range efficiency, strategy, close reason, win rate) plus mid-position snapshots. Management and screening prompts get it as `POOL CONTEXT`; the agent can read it with `get_pool_memory` and annotate a pool with `add_pool_note`.
 
-High-hit facts can be promoted into longer-lived memory context. The dashboard also exposes structured nugget stats so the memory system is inspectable, not opaque.
+The earlier Nuggets memory layer was removed. If an older install still has `data/nuggets/`, it is ignored and can be deleted.
 
 ### Threshold Evolution
 
@@ -518,7 +515,8 @@ meridian/
   state.js
   lessons.js
   autoresearch.js
-  memory.js
+  pool-memory.js
+  unified-memory.js
   server.js
   telegram.js
   llm-provider.js
