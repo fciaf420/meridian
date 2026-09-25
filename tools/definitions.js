@@ -292,11 +292,8 @@ WARNING: This executes a real on-chain transaction.`,
       name: "close_position",
       description: `Remove all liquidity and close a position.
 This withdraws all tokens back to the wallet and closes the position account.
-Use when:
-- Position has been out of range for > 30 minutes
-- IL exceeds accumulated fees
-- Token shows danger signals (organic score drop, volume crash)
-- Rebalancing (close old + open new)
+When to close is decided by the management rules in your instructions, not by this tool.
+After withdrawing, it swaps the base tokens this close withdrew back to SOL (skipping dust under $0.10; in USDC mode the runner then settles the proceeds to USDC). The result includes pnl_usd, pnl_pct, txs, and a swap object; status "success_with_exposure" means the withdrawn tokens could not be swapped safely and remain in the wallet.
 
 WARNING: This executes a real on-chain transaction. Cannot be undone.`,
       parameters: {
