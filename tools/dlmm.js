@@ -768,6 +768,15 @@ export async function deployPosition({
       log("deploy", `Range too narrow: ${bins_below} bins at bs${resolvedBinStep} = ${finalRangePct.toFixed(1)}% (min ${MIN_RANGE_PCT}%). Correcting to ${correctedBins} bins`);
       bins_below = correctedBins;
     }
+
+    // Enforce the configured maximum depth (strategy.maxRangePct, default 80%).
+    const maxPct = Number(config.strategy?.maxRangePct) || 80;
+    const deepRangePct = (1 - Math.pow(1 + stepPct, -bins_below)) * 100;
+    if (maxPct > MIN_RANGE_PCT && maxPct < 100 && deepRangePct > maxPct + 0.5) {
+      const cappedBins = calculateBinsForPriceRange(resolvedBinStep, maxPct);
+      log("deploy", `Range too deep: ${bins_below} bins at bs${resolvedBinStep} = ${deepRangePct.toFixed(1)}% (max ${maxPct}%). Capping to ${cappedBins} bins`);
+      bins_below = cappedBins;
+    }
   }
 
   // ─── Detect auto-swap need ────────────────────────────────────

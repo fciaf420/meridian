@@ -192,6 +192,7 @@ export const config = {
   // ─── Strategy Mapping ───────────────────
   strategy: {
     activeStrategy: u.activeStrategy ?? "evil_panda",
+    maxRangePct: u.maxRangePct ?? 80, // deepest downside range any deploy may use (%), enforced in deploy_position
     strategy:   u.strategy   ?? "spot",
     binsBelow:  u.binsBelow  ?? 69,  // activeBin - 69 to activeBin = 70 bins total (program max)
     evilPanda: {
