@@ -32,7 +32,7 @@ export const GROUPS = [
   ["other", "Other"],
 ];
 
-const SIZING_FIELDS = new Set(["deployAmountSol", "minSolToOpen", "gasReserve", "positionSizePct"]);
+const SIZING_FIELDS = new Set(["deployAmountSol", "minSolToOpen", "gasReserve", "positionSizePct", "positionSizeBase"]);
 const OTHER_FIELDS = new Set(["pnlUnit", "priorityFeeLevel"]);
 const SECTION_GROUP = {
   risk: "cap", strategy: "strat", screening: "scrm", gmgn: "scrg", entryFilters: "entry",
@@ -50,6 +50,7 @@ export const ENUMS = {
   autoresearchReasoningEffort: ["low", "medium", "high", "xhigh"],
   timeframe: ["5m", "30m", "1h", "2h", "4h", "12h", "24h"],
   pnlUnit: ["sol", "usd"],
+  positionSizeBase: ["total", "wallet"],
   direction: ["asc", "desc"],
 };
 
@@ -263,6 +264,7 @@ export function createAllSettings(deps) {
     const up = (label) => (Number(value) > Number(before) ? [`raises ${label} (${fmtValue(before)} → ${fmtValue(value)})`] : []);
     if (k === "maxDeployAmount") return up("the deploy ceiling");
     if (k === "positionSizePct") return up("the position size");
+    if (k === "positionSizeBase") return value === "total" && before !== "total" ? ["sizes deploys from the whole portfolio (wallet + open positions), so deploys get larger"] : [];
     if (k === "deployAmountUsd" || k === "maxDeployUsd") return up("the USDC deploy size");
     if (k === "gasReserve" || k === "gasReserveSol") return Number(value) < Number(before) ? ["lowers the gas reserve"] : [];
     if (k === "emergencyPriceDropPct") return Number(value) < Number(before) ? [`widens the emergency stop (${before}% → ${value}%)`] : [];

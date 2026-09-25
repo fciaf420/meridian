@@ -399,11 +399,12 @@ Everything in `user-config.json` is optional, but these are the main knobs.
 
 | Field | Meaning |
 | --- | --- |
-| `deployAmountSol` | baseline SOL per deploy |
+| `deployAmountSol` | minimum SOL per deploy (floor; a smaller computed size skips the deploy) |
 | `maxPositions` | maximum concurrent positions |
 | `minSolToOpen` | minimum wallet balance to allow new deploy |
 | `gasReserve` | reserve left for gas |
 | `positionSizePct` | dynamic sizing fraction |
+| `positionSizeBase` | `total` (default) or `wallet`: what `positionSizePct` is a fraction of (see Deploy sizing below) |
 | `minClaimAmount` | minimum amount worth claiming |
 | `outOfRangeBinsToClose` | OOR threshold in bins |
 | `outOfRangeWaitMinutes` | OOR hold time before action |
@@ -416,6 +417,20 @@ Everything in `user-config.json` is optional, but these are the main knobs.
 | `trailingDropPct` | trailing giveback threshold |
 | `priorityFeeLevel` | transaction fee preset |
 | `pnlUnit` | `sol` or `usd` display |
+
+#### Deploy sizing
+
+With no explicit amount, each SOL deploy is sized as:
+
+```
+base   = total SOL           (positionSizeBase "total": free wallet SOL + SOL value of every open DLMM position, unclaimed fees included once)
+       | free wallet SOL     (positionSizeBase "wallet")
+size   = min(maxDeployAmount, positionSizePct × (base − gasReserve))
+amount = min(size, free wallet SOL − gasReserve)      # never more than the SOL actually free to deploy
+amount < deployAmountSol  →  skip, e.g. "size 0.62 below floor 1.1"   # the floor is never forced
+```
+
+On the `total` basis, if any open position's value is unknown or the positions/price lookup fails, the size falls back to the free-wallet basis (smaller, never inflated) and the fallback is logged. `minSolToOpen` still gates screening on free SOL as before. The Telegram deploy card and the agent's deploy instruction show the basis, e.g. `1.13 SOL = 45% of (2.61 SOL total − 0.1 reserve)`. USDC mode sizes in USD (`deployAmountUsd`) and is unaffected.
 
 ### Scheduling
 
