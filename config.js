@@ -62,6 +62,8 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // Refuse any swap whose quoted price impact is above this (%), every caller (wallet.js swapToken).
+    maxSwapPriceImpactPct: u.maxSwapPriceImpactPct ?? 5,
   },
 
   // ─── Pool Screening Thresholds ───────────

@@ -66,7 +66,7 @@ const BOUNDS = {
   managementIntervalMin: [1, 1440], screeningIntervalMin: [1, 1440], healthCheckIntervalMin: [1, 1440],
   positionSizePct: [0.01, 1], gasReserve: [0, 5], gasReserveSol: [0, 5],
   deployAmountUsd: [1, 100_000], maxDeployUsd: [1, 100_000], minUsdcToOpen: [0, 1_000_000],
-  maxDeployAmount: [0.1, Infinity], temperature: [0, 2], maxTokens: [256, 200_000], maxSteps: [1, 100],
+  maxDeployAmount: [0.1, Infinity], maxSwapPriceImpactPct: [0.1, 50], temperature: [0, 2], maxTokens: [256, 200_000], maxSteps: [1, 100],
   emergencyPriceDropPct: [-100, -1], webPort: [1, 65_535], twapWindowMinutes: [5, 1440],
   ohlcvBufferMult: [1, 1.8], solanaTrackerDailyCap: [0, 2500],
 };
@@ -268,6 +268,7 @@ export function createAllSettings(deps) {
     }
     const up = (label) => (Number(value) > Number(before) ? [`raises ${label} (${fmtValue(before)} → ${fmtValue(value)})`] : []);
     if (k === "maxDeployAmount") return up("the deploy ceiling");
+    if (k === "maxSwapPriceImpactPct") return up("the swap price-impact cap");
     if (k === "positionSizePct") return up("the position size");
     if (k === "positionSizeBase") return value === "total" && before !== "total" ? ["sizes deploys from the whole portfolio (wallet + open positions), so deploys get larger"] : [];
     if (k === "deployAmountUsd" || k === "maxDeployUsd") return up("the USDC deploy size");

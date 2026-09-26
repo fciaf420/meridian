@@ -253,6 +253,32 @@ export function parsePriceImpactPercent(order) {
   return null;
 }
 
+export const DEFAULT_MAX_SWAP_PRICE_IMPACT_PCT = 5;
+
+/** Effective price-impact cap in percent (config.risk.maxSwapPriceImpactPct, default 5). */
+export function maxSwapPriceImpactPct() {
+  const v = Number(config.risk?.maxSwapPriceImpactPct);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_SWAP_PRICE_IMPACT_PCT;
+}
+
+/**
+ * Refusal result when |impactPct| exceeds the cap, else null. An unknown
+ * impact (null) is allowed and logged: the field is undocumented on Swap v2,
+ * and blocking every swap if Jupiter dropped it would strand close exits.
+ */
+export function checkPriceImpact(impactPct, { input_mint, output_mint } = {}) {
+  const cap = maxSwapPriceImpactPct();
+  if (impactPct == null) {
+    log("swap", `Price impact unknown for ${input_mint} → ${output_mint}; the ${cap}% cap could not be checked`);
+    return null;
+  }
+  const abs = Math.abs(impactPct);
+  if (abs <= cap) return null;
+  const error = `Swap refused: price impact ${abs.toFixed(2)}% exceeds maxSwapPriceImpactPct ${cap}%`;
+  log("swap", `${error} (${input_mint} → ${output_mint})`);
+  return { success: false, price_impact_refused: true, price_impact_pct: Math.round(abs * 100) / 100, max_price_impact_pct: cap, input_mint, output_mint, error };
+}
+
 /** Documented Swap v2 /execute `code` values. */
 export const EXECUTE_CODES = {
   0: "Success",
@@ -457,6 +483,10 @@ export async function swapToken({
       `Swap v2 order: router=${order.router ?? "?"} mode=${order.mode ?? "?"} ` +
         `priceImpact=${impact == null ? "n/a" : `${Math.abs(impact).toFixed(4)}%`}`
     );
+    // Nothing is signed yet, so a refusal here can't leave anything in flight.
+    // No fallback to swap/v1 either: that would quote the same thin route.
+    const impactRefusal = checkPriceImpact(impact, { input_mint, output_mint });
+    if (impactRefusal) return impactRefusal;
 
     const { transaction: unsignedTx, requestId } = order;
 
@@ -560,6 +590,12 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   if (!quoteRes.ok) throw new Error(`Quote failed: ${quoteRes.status} ${await quoteRes.text()}`);
   const quote = await quoteRes.json();
   if (quote.error) throw new Error(`Quote error: ${quote.error}`);
+  // swap/v1 priceImpactPct is a decimal fraction string ("0.0123" = 1.23%).
+  const v1Impact = quote.priceImpactPct != null && quote.priceImpactPct !== "" && Number.isFinite(Number(quote.priceImpactPct))
+    ? Number(quote.priceImpactPct) * 100
+    : null;
+  const impactRefusal = checkPriceImpact(v1Impact, { input_mint, output_mint });
+  if (impactRefusal) return impactRefusal;
 
   // ─── Get swap tx ───────────────────────────────────────────
   // Same CU price policy as the DLMM send path: the configured floor/fallback
