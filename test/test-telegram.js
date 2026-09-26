@@ -266,7 +266,7 @@ test("close: card shows the exact position; confirm executes exactly once with t
   await u.handleCallback(yes, ctxFor(42)); // replay
   const closes = exec.filter((e) => e.name === "close_position");
   assert.equal(closes.length, 1, "double tap + replay execute once");
-  assert.deepEqual(closes[0].args, { position_address: POS_A });
+  assert.deepEqual(closes[0].args, { position_address: POS_A, _close_reason: "manual (owner, Telegram)" });
   assert.ok(t.edits().some((e) => /Closed<\/b> BONK-SOL/.test(e.text) && /solscan\.io\/tx\//.test(e.text)), "result with tx link edited into the card");
   assert.ok(t.answers().some((a) => a.alert && /already used/i.test(a.text)));
 });
