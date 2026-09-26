@@ -51,3 +51,7 @@ signal-weights.json
 # Claude Code per-user state
 .claude/worktrees/
 .claude/settings.local.json
+
+# Crash-safety artifacts: corrupt-file backups and atomic-write temp files
+*.corrupt-*
+.*.tmp
