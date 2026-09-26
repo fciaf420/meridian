@@ -378,6 +378,128 @@ export function evolveOhlcvBuffer(perfData, config) {
   return { value: next, rationale: `${why}: ohlcvBufferMult ${current} → ${next}` };
 }
 
+// ─── Trailing take-profit evolution ─────────────────────────────
+
+export const TRAILING_TRIGGER_BOUNDS = { min: 1.5, max: 15, step: 0.5 };
+export const TRAILING_DROP_BOUNDS    = { min: 1.0, max: 8,  step: 0.5 };
+const TRAILING_MIN_CLOSES = 5;   // relevant closes since the parameter last changed
+const TRAILING_MIN_EXITS  = 3;   // trailing exits needed by the raise-trigger / widen-drop rules
+const TRAILING_MIN_GAP    = 0.5; // keep trigger − drop ≥ 0.5 so the trail level stays above break-even
+
+const isTrailingExit = (p) => p.trailing_exit === true || /TRAILING_TP/i.test(String(p.close_reason || ""));
+const median = (arr) => percentile(arr, 50);
+const step1 = (n) => Number(n.toFixed(1));
+
+/**
+ * Evolve management.trailingTriggerPct / trailingDropPct — the only exit
+ * settings evolution touches — from closes whose peak PnL is known
+ * (peak_pnl_pct, persisted at close by state.js trailingAtClose).
+ *
+ * A close is evidence for a parameter only if it ran under the current value
+ * of that parameter (trailing_trigger_pct / trailing_drop_pct on the record),
+ * so "≥ 5 relevant closes" counts closes since the parameter last changed.
+ * One 0.5 step per parameter per run. Wins/non-wins use the shared classifier.
+ *
+ * Trigger (1.5–15):
+ *   lower  when ≥ 40% of non-winning closes (PnL ≤ +1%) peaked at
+ *          ≥ 0.5 × trigger but < trigger: profits that were never protected.
+ *   raise  when most (> 50%, ≥ 3) trailing exits closed within 1pt of the
+ *          PnL where trailing armed: the trail is too twitchy.
+ * Drop (1–8):
+ *   tighten when trailing exits give back more than the peak: median exit
+ *           PnL < 0, or median give-back (peak − exit) ≥ drop + 2.
+ *   widen   when ≥ 60% (≥ 3) of trailing exits still closed above +2% while
+ *           in range and earning fees: they were cut early.
+ * Conflicting rules for one parameter cancel out. trigger − drop ≥ 0.5 is
+ * kept where the current values allow it, and the trigger is not raised to
+ * the fixed take profit or above.
+ *
+ * Returns { changes, rationale } or null.
+ */
+export function evolveTrailing(perfData, config) {
+  const m = config?.management || {};
+  if (!m.trailingTakeProfit) return null;
+  const trigger = Number(m.trailingTriggerPct);
+  const drop = Number(m.trailingDropPct);
+  if (!Number.isFinite(trigger) || !Number.isFinite(drop)) return null;
+
+  const known = learnableRecords(perfData).filter((p) =>
+    isFiniteNum(p.peak_pnl_pct) && classifyRecord(p) != null);
+  const changes = {};
+  const rationale = {};
+  let newTrigger = trigger;
+  let newDrop = drop;
+
+  // ── trailingTriggerPct ──
+  const relT = known.filter((p) => Number(p.trailing_trigger_pct) === trigger);
+  if (relT.length >= TRAILING_MIN_CLOSES) {
+    const nonWinners = relT.filter((p) => classifyRecord(p) !== "win");
+    const unprotected = nonWinners.filter((p) => p.peak_pnl_pct >= 0.5 * trigger && p.peak_pnl_pct < trigger);
+    const lower = nonWinners.length > 0 && unprotected.length / nonWinners.length >= 0.4;
+
+    const exits = relT.filter(isTrailingExit);
+    const armLevel = (p) => (isFiniteNum(p.trailing_armed_pct) ? p.trailing_armed_pct : trigger);
+    const twitchy = exits.filter((p) => Math.abs(recordPnlPct(p) - armLevel(p)) <= 1);
+    const raise = exits.length >= TRAILING_MIN_EXITS && twitchy.length / exits.length > 0.5;
+
+    if (lower && !raise) {
+      newTrigger = step1(clamp(trigger - TRAILING_TRIGGER_BOUNDS.step, TRAILING_TRIGGER_BOUNDS.min, TRAILING_TRIGGER_BOUNDS.max));
+      if (newTrigger < trigger) {
+        const peaks = unprotected.map((p) => p.peak_pnl_pct.toFixed(2)).join(", ");
+        rationale.trailingTriggerPct = `${unprotected.length}/${nonWinners.length} non-winning closes peaked between ${step1(0.5 * trigger)}% and the ${trigger}% trigger (peaks ${peaks}%) — profits never protected: lowered trigger ${trigger}% → ${newTrigger}%`;
+      }
+    } else if (raise && !lower) {
+      newTrigger = step1(clamp(trigger + TRAILING_TRIGGER_BOUNDS.step, TRAILING_TRIGGER_BOUNDS.min, TRAILING_TRIGGER_BOUNDS.max));
+      const tp = Number(m.takeProfitFeePct);
+      if (Number.isFinite(tp) && tp > 0 && newTrigger >= tp) newTrigger = trigger; // fixed TP would fire first
+      if (newTrigger > trigger) {
+        rationale.trailingTriggerPct = `${twitchy.length}/${exits.length} trailing exits closed within 1pt of where trailing armed — too twitchy: raised trigger ${trigger}% → ${newTrigger}%`;
+      }
+    }
+  }
+
+  // ── trailingDropPct ──
+  const relD = known.filter((p) => Number(p.trailing_drop_pct) === drop);
+  if (relD.length >= TRAILING_MIN_CLOSES) {
+    const exits = relD.filter(isTrailingExit);
+    const exitPnls = exits.map(recordPnlPct);
+    const giveBacks = exits.map((p) => p.peak_pnl_pct - recordPnlPct(p));
+    const medExit = exits.length ? median(exitPnls) : null;
+    const medGive = exits.length ? median(giveBacks) : null;
+    const tighten = exits.length > 0 && (medExit < 0 || medGive >= drop + 2);
+
+    const cutEarly = exits.filter((p) => recordPnlPct(p) > 2 && p.in_range_at_close === true && Number(p.fees_earned_usd) > 0);
+    const widen = exits.length >= TRAILING_MIN_EXITS && cutEarly.length / exits.length >= 0.6;
+
+    if (tighten) {
+      newDrop = step1(clamp(drop - TRAILING_DROP_BOUNDS.step, TRAILING_DROP_BOUNDS.min, TRAILING_DROP_BOUNDS.max));
+      if (newDrop < drop) {
+        rationale.trailingDropPct = `${exits.length} trailing exit(s): median exit ${medExit.toFixed(2)}%, median give-back ${medGive.toFixed(2)}pt from peak (drop ${drop}) — gave back too much: tightened drop ${drop}% → ${newDrop}%`;
+      }
+    } else if (widen) {
+      newDrop = step1(clamp(drop + TRAILING_DROP_BOUNDS.step, TRAILING_DROP_BOUNDS.min, TRAILING_DROP_BOUNDS.max));
+      if (newDrop > drop) {
+        rationale.trailingDropPct = `${cutEarly.length}/${exits.length} trailing exits closed above +2% while in range and earning fees — cut early: widened drop ${drop}% → ${newDrop}%`;
+      }
+    }
+  }
+
+  // ── Keep trigger − drop ≥ 0.5 where possible ──
+  if (newDrop > drop && newTrigger - newDrop < TRAILING_MIN_GAP) {
+    newDrop = step1(Math.max(drop, newTrigger - TRAILING_MIN_GAP));
+    if (newDrop <= drop) { newDrop = drop; delete rationale.trailingDropPct; }
+  }
+  if (newTrigger < trigger && newTrigger - newDrop < TRAILING_MIN_GAP) {
+    newTrigger = step1(Math.min(trigger, newDrop + TRAILING_MIN_GAP));
+    if (newTrigger >= trigger) { newTrigger = trigger; delete rationale.trailingTriggerPct; }
+  }
+
+  if (newTrigger !== trigger && rationale.trailingTriggerPct) changes.trailingTriggerPct = newTrigger;
+  if (newDrop !== drop && rationale.trailingDropPct) changes.trailingDropPct = newDrop;
+  if (!Object.keys(changes).length) return null;
+  return { changes, rationale };
+}
+
 export function evolveThresholds(perfData, config, { userConfig, lessonsData } = {}) {
   const computed = computeThresholdChanges(perfData, config);
   if (!computed) return null;
@@ -392,6 +514,8 @@ export function evolveThresholds(perfData, config, { userConfig, lessonsData } =
  * Wins and losses come from the shared classifier (learning-data.js): > +1% is
  * a winner, < −1% a loser, and break-even closes are neither. Records excluded
  * from learning (known-bad, corrupt, corrected) are dropped first.
+ *
+ * takeProfitFeePct and stopLossPct are the operator's and are never evolved.
  */
 export function computeThresholdChanges(perfData, config) {
   const learnable = learnableRecords(perfData);
@@ -400,13 +524,14 @@ export function computeThresholdChanges(perfData, config) {
   const winners = learnable.filter((p) => classifyRecord(p) === "win");
   const losers  = learnable.filter((p) => classifyRecord(p) === "loss");
 
-  // The depth buffer learns from how positions ended, not from win/loss PnL,
-  // so it is evaluated even when the PnL signal below is too thin.
+  // The depth buffer and the trailing TP learn from how positions ended, not
+  // from the win/loss split below, so they are evaluated even when it is thin.
   const bufferEvo = evolveOhlcvBuffer(learnable, config);
+  const trailingEvo = evolveTrailing(learnable, config);
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
-  if (!hasSignal && !bufferEvo) return null;
+  if (!hasSignal && !bufferEvo && !trailingEvo) return null;
 
   const changes   = {};
   const rationale = {};
@@ -414,6 +539,11 @@ export function computeThresholdChanges(perfData, config) {
     changes.ohlcvBufferMult = bufferEvo.value;
     rationale.ohlcvBufferMult = bufferEvo.rationale;
   }
+  if (trailingEvo) {
+    Object.assign(changes, trailingEvo.changes);
+    Object.assign(rationale, trailingEvo.rationale);
+  }
+  if (!hasSignal) return { changes, rationale };
 
   // ── 1. maxVolatility ─────────────────────────────────────────
   // If losers tend to cluster at higher volatility → tighten the ceiling.
@@ -515,45 +645,7 @@ export function computeThresholdChanges(perfData, config) {
     }
   }
 
-  // ── 4. stopLossPct ──────────────────────────────────────────────
-  // If losers consistently close well above the stop loss, tighten it.
-  {
-    const current = config.management.stopLossPct ?? -40;
-    const loserPnls = losers.map(p => p.pnl_pct).filter(isFiniteNum);
-    if (loserPnls.length >= 3) {
-      const medianLoserPnl = percentile(loserPnls, 50);
-      // If median loser is much above stop loss (e.g. -12% vs -40%), tighten
-      if (medianLoserPnl > current * 0.5) { // losers are not even close to stop loss
-        const target = medianLoserPnl * 1.3; // set stop a bit below typical loss
-        const newVal = clamp(Number(nudge(current, target, MAX_CHANGE_PER_STEP).toFixed(0)), -50, -5);
-        if (newVal > current) { // tighter = less negative = higher number
-          changes.stopLossPct = newVal;
-          rationale.stopLossPct = `Median loser PnL ${medianLoserPnl.toFixed(1)}% — tightened stop from ${current}% → ${newVal}%`;
-        }
-      }
-    }
-  }
-
-  // ── 5. takeProfitFeePct ────────────────────────────────────────
-  // If winners consistently peak well below take profit, lower TP so we capture gains.
-  {
-    const current = config.management.takeProfitFeePct ?? 15;
-    const winnerPnls = winners.map(p => p.pnl_pct).filter(isFiniteNum);
-    if (winnerPnls.length >= 3) {
-      const p75 = percentile(winnerPnls, 75);
-      // If 75th percentile winner is below TP → most winners never hit TP
-      if (p75 < current * 0.7) {
-        const target = p75 * 1.1;
-        // Floor: never drop below trailingTriggerPct + 2, otherwise fixed TP undercuts trailing
-        const tpFloor = (config.management.trailingTriggerPct ?? 4) + 2;
-        const newVal = clamp(Number(nudge(current, target, MAX_CHANGE_PER_STEP).toFixed(0)), tpFloor, 50);
-        if (newVal < current) {
-          changes.takeProfitFeePct = newVal;
-          rationale.takeProfitFeePct = `75th percentile winner at ${p75.toFixed(1)}% vs TP ${current}% — lowered to ${newVal}% (floor: trailing trigger + 2 = ${tpFloor}%)`;
-        }
-      }
-    }
-  }
+  // (stopLossPct and takeProfitFeePct are not evolved: they are the operator's.)
 
   // ── 6. minBinStep / maxBinStep ─────────────────────────────────
   {
@@ -673,13 +765,14 @@ function persistThresholdChanges(perfData, config, changes, rationale, { userCon
   if (changes.minOrganic           != null) s.minOrganic           = changes.minOrganic;
   if (changes.minBinStep           != null) s.minBinStep           = changes.minBinStep;
   if (changes.maxBinStep           != null) s.maxBinStep           = changes.maxBinStep;
-  if (changes.stopLossPct          != null) m.stopLossPct          = changes.stopLossPct;
-  if (changes.takeProfitFeePct     != null) m.takeProfitFeePct     = changes.takeProfitFeePct;
   if (changes.outOfRangeWaitMinutes != null) m.outOfRangeWaitMinutes = changes.outOfRangeWaitMinutes;
+  if (changes.trailingTriggerPct   != null) m.trailingTriggerPct   = changes.trailingTriggerPct;
+  if (changes.trailingDropPct      != null) m.trailingDropPct      = changes.trailingDropPct;
   if (changes.athTopThresholdPct != null) s.athTopThresholdPct = changes.athTopThresholdPct;
   if (changes.ohlcvBufferMult != null && config.strategy) config.strategy.ohlcvBufferMult = changes.ohlcvBufferMult;
 
   // Log a lesson summarizing the evolution
+  for (const [k, v] of Object.entries(changes)) log("evolve", `${k} → ${v}: ${rationale[k] ?? ""}`);
   const ld = lessonsData || load();
   ld.lessons.push({
     id: Date.now(),
@@ -778,16 +871,8 @@ export function evolveFromLessons(lessons, config, { userConfig, lessonsData } =
     }
   }
 
-  // 1. Downside OOR pattern → tighten stop loss
-  const oorDownCount = tagCounts["downside"] || 0;
-  if (oorDownCount >= 3) {
-    const current = config.management.stopLossPct ?? -40;
-    const newVal = clamp(Math.round(current * 0.85), -50, -5); // tighten by 15%
-    if (newVal > current) {
-      changes.stopLossPct = newVal;
-      rationale.stopLossPct = `${oorDownCount} downside OOR lessons in recent history — tightened stop from ${current}% → ${newVal}%`;
-    }
-  }
+  // (Downside-OOR lessons used to tighten stopLossPct here. The stop loss is
+  // the operator's and is not evolved.)
 
   // 2. Volume collapse pattern → raise minVolume
   const volCollapseCount = tagCounts["volume_collapse"] || 0;
@@ -826,8 +911,6 @@ export function evolveFromLessons(lessons, config, { userConfig, lessonsData } =
 
   // Apply to live config
   const s = config.screening;
-  const m = config.management;
-  if (changes.stopLossPct    != null) m.stopLossPct    = changes.stopLossPct;
   if (changes.minVolume      != null) s.minVolume      = changes.minVolume;
   if (changes.maxVolatility  != null) s.maxVolatility  = changes.maxVolatility;
 

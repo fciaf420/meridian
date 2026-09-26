@@ -245,14 +245,15 @@ const WRITE_TOOLS = new Set([
 // Sane bounded ranges for risk-relevant config keys. Any update_config change that
 // targets one of these keys with an out-of-range (or non-numeric) value is rejected
 // before it can touch live config. Keys not listed here keep their existing behavior.
-const RISK_CONFIG_BOUNDS = {
+export const RISK_CONFIG_BOUNDS = {
   maxDeployAmount: { min: 0, max: 100 },        // SOL per position
   maxPositions: { min: 1, max: 50, integer: true },
   // Stop loss is a PnL threshold, so it is negative (state.js closes when pnl <= stopLossPct;
   // 0 disables it). A positive value would close every position below that profit.
   stopLossPct: { min: -100, max: 0, hint: "use a negative PnL percent, e.g. -20" },
-  trailingTriggerPct: { min: 0, max: 1000 },    // percent gain to arm trailing
-  trailingDropPct: { min: 0, max: 100 },        // percent drop from peak to exit
+  // Same ranges as the trailing evolution (lessons.js TRAILING_*_BOUNDS).
+  trailingTriggerPct: { min: 1.5, max: 15, hint: "percent gain that arms trailing, 1.5–15" },
+  trailingDropPct: { min: 1, max: 8, hint: "percent drop from peak that exits, 1–8" },
   managementIntervalMin: { min: 1, max: 1440, integer: true },
   screeningIntervalMin: { min: 1, max: 1440, integer: true },
   pnlWatcherIntervalSec: { min: 5, max: 86400, integer: true },
@@ -265,7 +266,7 @@ const RISK_CONFIG_BOUNDS = {
  * trailingTakeProfit) are left to update_config's own handling; only numeric
  * risk levers are range-checked here.
  */
-function validateConfigUpdate(args) {
+export function validateConfigUpdate(args) {
   // Normalize into a flat { key: value } map matching update_config's own parsing.
   let changes;
   if (args.setting && args.value !== undefined) {

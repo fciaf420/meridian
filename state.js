@@ -190,6 +190,29 @@ export function depthUseAtClose(pos, closeReason = "") {
 }
 
 /**
+ * Trailing-TP fields for a close record: the peak PnL the position reached,
+ * where trailing armed (null = never), whether the close was the trailing exit,
+ * the trigger/drop in effect, and whether it was in range. Fed to the trailing
+ * evolution (lessons.js evolveTrailing). peak_pnl_pct is omitted when the
+ * position never tracked one, so the evolution can tell "unknown" from 0.
+ * `mgmt` (config.management) fills trigger/drop for positions that closed
+ * before any PnL tick recorded them.
+ */
+export function trailingAtClose(pos, closeReason = "", mgmt = null) {
+  if (!pos) return {};
+  const num = (v) => (v != null && Number.isFinite(Number(v)) ? Number(v) : null);
+  const peak = num(pos.peak_pnl_pct);
+  return {
+    ...(peak != null && { peak_pnl_pct: Math.round(peak * 100) / 100 }),
+    trailing_armed_pct: pos.trailing_active ? num(pos.trailing_armed_pct) ?? num(pos.trailing_trigger_pct) ?? num(mgmt?.trailingTriggerPct) : null,
+    trailing_exit: /TRAILING_TP/i.test(String(closeReason || "")),
+    trailing_trigger_pct: num(pos.trailing_trigger_pct) ?? num(mgmt?.trailingTriggerPct),
+    trailing_drop_pct: num(pos.trailing_drop_pct) ?? num(mgmt?.trailingDropPct),
+    in_range_at_close: !pos.out_of_range_since,
+  };
+}
+
+/**
  * Mark a position as back in range (clears OOR timestamp).
  */
 export function markInRange(position_address) {
@@ -339,6 +362,14 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config, 
   const mgmt = config.management;
   let action = null;
 
+  // The trailing settings this position runs under, for its close record
+  // (trailingAtClose → evolveTrailing only learns from closes under the
+  // current values).
+  for (const [key, field] of [["trailingTriggerPct", "trailing_trigger_pct"], ["trailingDropPct", "trailing_drop_pct"]]) {
+    const v = Number(mgmt?.[key]);
+    if (Number.isFinite(v)) pos[field] = v;
+  }
+
   // Warm-up spike guard. For the first minutes after a (chunked) deploy the PnL
   // sources can report nonsense before every deposit is indexed — seen live: +48.6%
   // 20s after deploy armed trailing TP and the next normal reading closed the position.
@@ -390,6 +421,7 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config, 
     // Activate trailing once profit exceeds trigger
     if (!pos.trailing_active && peakCandidate >= mgmt.trailingTriggerPct) {
       pos.trailing_active = true;
+      pos.trailing_armed_pct = Math.round(peakCandidate * 100) / 100;
       pos.notes.push(`Trailing TP activated at ${peakCandidate.toFixed(1)}%`);
       log("state", `Position ${position_address} trailing TP activated (peak: ${peakCandidate.toFixed(1)}%)`);
     }
@@ -437,7 +469,10 @@ export function recordPnlHold(position_address, action, detail, { onchainPct = n
     const before = Number(pos.peak_pnl_pct);
     pos.peak_pnl_pct = Math.max(0, oc, pos.peak_onchain_pnl_pct ?? -Infinity);
     const trigger = Number(config?.management?.trailingTriggerPct);
-    if (pos.trailing_active && Number.isFinite(trigger) && pos.peak_pnl_pct < trigger) pos.trailing_active = false;
+    if (pos.trailing_active && Number.isFinite(trigger) && pos.peak_pnl_pct < trigger) {
+      pos.trailing_active = false;
+      pos.trailing_armed_pct = null;
+    }
     log("state", `Position ${position_address} peak PnL ${before.toFixed(1)}% not backed on-chain — reset to ${pos.peak_pnl_pct.toFixed(1)}%${pos.trailing_active ? "" : " (trailing off)"}`);
   }
   save(state);
@@ -622,6 +657,7 @@ export async function syncOpenPositions(active_addresses) {
             ? `external close (detected during sync, OOR ${pos.oor_direction})`
             : "external close (detected during sync)",
           ...depthUseAtClose(pos),
+          ...trailingAtClose(pos),
           signal_snapshot: pos.signal_snapshot || null,
           ...(pos.experiment_id && { experiment_id: pos.experiment_id, experiment_arm: pos.experiment_arm }),
         });

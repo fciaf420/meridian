@@ -132,6 +132,20 @@ test("evolution: the known-bad COLLECT record is not a loser, and losers are < �
   assert.ok(lessons.computeThresholdChanges(real, mgmtCfg()).changes.maxVolatility < 10);
 });
 
+test("evolution never touches takeProfitFeePct or stopLossPct (the operator's), even on data that used to move them", () => {
+  // Old section 4: ≥3 losers well above the −40% stop → tighten. Old section 5: winners' p75 ≪ TP → lower TP.
+  const perf = [close(-3), close(-4), close(-5), close(2), close(2.5), close(3), close(2.2)];
+  const res = lessons.computeThresholdChanges(perf, mgmtCfg());
+  assert.ok(res, "there is signal");
+  assert.equal("stopLossPct" in res.changes, false);
+  assert.equal("takeProfitFeePct" in res.changes, false);
+
+  // evolveFromLessons: downside-OOR lessons used to tighten the stop loss.
+  const oorLessons = Array.from({ length: 6 }, (_, i) => ({ id: i, rule: `AVOID ${i}`, tags: ["oor", "downside", "bid_ask"], outcome: "bad" }));
+  const lr = lessons.evolveFromLessons(oorLessons, mgmtCfg());
+  assert.deepEqual(lr.changes, {});
+});
+
 // ─── Lesson derivation + pool memory (recordPerformance) ───
 test("recordPerformance: break-even never becomes WORKED/PREFER; a clear win does; COLLECT teaches nothing", async () => {
   const prevKb = config.knowledgeBase;
