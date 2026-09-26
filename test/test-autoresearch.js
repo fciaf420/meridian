@@ -15,6 +15,7 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-autoresearch-test-")
 const AR_FILE = path.join(TMP, "autoresearch.json");
 process.env.MERIDIAN_AUTORESEARCH_FILE = AR_FILE;
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 
 // recordPerformance also writes the tracked nuggets files and could create the
 // repo's user-config.json; snapshot and restore both so the tree stays clean.

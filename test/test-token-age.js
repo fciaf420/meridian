@@ -20,6 +20,7 @@ process.env.DRY_RUN = "true";
 delete process.env.HELIUS_API_KEY;
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 const age = await import("../tools/token-age.js");

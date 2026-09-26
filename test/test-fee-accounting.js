@@ -19,6 +19,7 @@ import path from "path";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-fee-accounting-"));
 process.chdir(tmp);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 const { trackPosition, getTrackedPosition, recordClaim } = await import("../state.js");

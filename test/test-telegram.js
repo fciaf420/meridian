@@ -15,6 +15,7 @@ delete process.env.TELEGRAM_ALLOWLIST;
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-tg-"));
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 const tg = await import("../telegram.js");

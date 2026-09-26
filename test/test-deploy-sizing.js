@@ -14,6 +14,7 @@ process.env.MERIDIAN_USER_CONFIG_PATH = USER_CFG;
 process.env.MERIDIAN_GMGN_CONFIG_PATH = path.join(TMP, "gmgn-config.json");
 process.env.DRY_RUN = "true";
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 const cfgMod = await import("../config.js");

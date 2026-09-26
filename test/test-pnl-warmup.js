@@ -12,6 +12,7 @@ import path from "path";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-pnl-warmup-"));
 process.chdir(tmp);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 process.env.DRY_RUN = "true";
 
 const { trackPosition, updatePnlAndCheckExits, getTrackedPosition } = await import(
