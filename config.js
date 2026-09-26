@@ -196,7 +196,7 @@ export const config = {
     twapSpikeMaxPct:          nullable("twapSpikeMaxPct", 15),
     twapWindowMinutes:        u.twapWindowMinutes        ?? 60,
     // Jupiter Tokens API scam flag (audit.isSus present, or banned); lookup failure = allow.
-    blockJupiterSuspicious:   u.blockJupiterSuspicious   ?? true,
+    blockJupiterSuspicious:   u.blockJupiterSuspicious   ?? false, // off by default; the owner turns it on in Telegram
   },
 
   // ─── Strategy Mapping ───────────────────

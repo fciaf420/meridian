@@ -141,7 +141,7 @@ test("getTokensInfo: one comma-joined query; unknown mints absent; flags", async
 });
 
 test("evaluateJupiterGuard: isSus present blocks, absent passes, unknown allows, guard off allows", () => {
-  const on = es.ENTRY_FILTER_DEFAULTS;
+  const on = { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true };
   assert.equal(es.evaluateJupiterGuard(jt.normalizeJupToken(SUS), on).pass, false);
   assert.equal(es.evaluateJupiterGuard(jt.normalizeJupToken(OFFICIAL), on).pass, true);
   const unk = es.evaluateJupiterGuard(null, on);
@@ -188,7 +188,7 @@ test("token.js getTokenNarrative: tolerant of a removed/404 endpoint", async () 
 test("Telegram: Entry filters screen has the Jupiter scam-flag toggle", () => {
   const t = ui.ENTRY_TOGGLES.find(([, key]) => key === "blockJupiterSuspicious");
   assert.ok(t);
-  const on = ui.renderEntryFilters({ ...es.ENTRY_FILTER_DEFAULTS });
+  const on = ui.renderEntryFilters({ ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true });
   const btns = on.keyboard.flat();
   const b = btns.find((x) => /Jupiter scam flag/.test(x.text));
   assert.equal(b.text, "✅ Jupiter scam flag");
@@ -219,7 +219,7 @@ test("Telegram: candidate card and token lookup card show Jupiter organic score 
   jt._resetJupTokensCacheForTest();
   const sus = await lookupMod.lookupToken(SUS_MINT, {
     deps: { ...deps, jupiterInfo: async (m) => new Map([[m, jt.normalizeJupToken(SUS)]]) },
-    entryFilters: es.ENTRY_FILTER_DEFAULTS,
+    entryFilters: { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true },
   });
   assert.equal(sus.token_safety.pass, false);
   assert.deepEqual(sus.jupiter, { organic_score: 0, verified: null, sus: true, banned: false });
@@ -230,7 +230,7 @@ test("Telegram: candidate card and token lookup card show Jupiter organic score 
 
   const good = await lookupMod.lookupToken(MINT, {
     deps: { ...deps, jupiterInfo: async (m) => new Map([[m, jt.normalizeJupToken(OFFICIAL)]]) },
-    entryFilters: es.ENTRY_FILTER_DEFAULTS,
+    entryFilters: { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true },
   });
   const gcard = ui.renderTokenCard(good, { tokenRef: "t2" });
   assert.match(gcard.text, /Jupiter: organic 99 · verified/);

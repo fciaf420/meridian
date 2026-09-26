@@ -658,7 +658,7 @@ test("LLM update_config: tightening is applied; disabling a guard or raising a l
   // Turning an off limit back on is tightening.
   config.entryFilters.twapSpikeMaxPct = null;
   assert.equal(checkAgentEntryFilterChange("twapSpikeMaxPct", 20).ok, true);
-  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true };
 });
 
 // ─── Jupiter scam flag (blockJupiterSuspicious) ──────────────────
@@ -666,8 +666,8 @@ const jupMap = (info) => async (mints) => new Map(mints.map((m) => [m, { mint: m
 const splPool = () => mockPool({ tokenX: reserve({ program: es.TOKEN_PROGRAM_ID }) });
 
 test("deploy: Jupiter audit.isSus / banned blocks before any tx; absent passes", async () => {
-  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
-  assert.equal(es.ENTRY_FILTER_DEFAULTS.blockJupiterSuspicious, true);
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true };
+  assert.equal(es.ENTRY_FILTER_DEFAULTS.blockJupiterSuspicious, false, "off by default");
   try {
     es._setJupiterLookupForTest(jupMap({ is_sus: true, banned: false, organic_score: 12, is_verified: false }));
     const pool = splPool();
@@ -688,7 +688,7 @@ test("deploy: Jupiter audit.isSus / banned blocks before any tx; absent passes",
 });
 
 test("deploy: a Jupiter lookup failure or unknown token allows the deploy (never block on an outage)", async () => {
-  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true };
   try {
     es._setJupiterLookupForTest(async () => null); // API down
     await assert.rejects(deployInto(splPool()), /PAST_ENTRY_CHECKS/);
@@ -708,7 +708,7 @@ test("deploy: a Jupiter lookup failure or unknown token allows the deploy (never
     assert.equal(off.pass, true);
     assert.equal(called, false);
   } finally {
-    config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+    config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true };
     es._setJupiterLookupForTest(async () => new Map());
   }
 });
@@ -723,7 +723,7 @@ test("screening: Jupiter-flagged tokens are dropped; others carry organic/verifi
     ["MS", { mint: "MS", is_sus: true, banned: false, organic_score: 3, is_verified: null }],
     ["MG", { mint: "MG", is_sus: false, banned: false, organic_score: 87.345, is_verified: true }],
   ]);
-  const base = { filters: es.ENTRY_FILTER_DEFAULTS, readMints: async () => new Map(), jupiterLookup: lookup };
+  const base = { filters: { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true }, readMints: async () => new Map(), jupiterLookup: lookup };
   const r = await es.screenEntryCandidates(pools, base);
   assert.deepEqual(r.kept.map((p) => p.pool), ["G", "U"]);
   assert.match(r.dropped.find((d) => d.pool === "S").reasons[0], /suspicious \(audit\.isSus\)/);
@@ -741,7 +741,7 @@ test("screening: Jupiter-flagged tokens are dropped; others carry organic/verifi
 test("blockJupiterSuspicious: user toggle normalizes; turning it off is a loosening the agent can't make", () => {
   assert.deepEqual(es.normalizeEntryFilterValue("blockJupiterSuspicious", "false"), { value: false });
   assert.equal(es.isLooseningChange("blockJupiterSuspicious", true, false), true);
-  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: true };
   assert.equal(es.checkAgentEntryFilterChange("blockJupiterSuspicious", false).ok, false);
   assert.equal(es.fmtFilterValue("blockJupiterSuspicious", true), "block");
 });
