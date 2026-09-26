@@ -14,6 +14,7 @@
 
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { instrumentConnection } from "./rpc-stats.js";
 import { candidateTokenAge } from "./token-age.js";
 
 export const WSOL_MINT = "So11111111111111111111111111111111111111112";
@@ -122,7 +123,7 @@ let _lookupConn = null;
 async function defaultReadMint(mint) {
   const { Connection, PublicKey } = await import("@solana/web3.js");
   const { mintFactsFromParsed } = await import("./entry-safety.js");
-  if (!_lookupConn) _lookupConn = new Connection(process.env.RPC_URL, "confirmed");
+  if (!_lookupConn) _lookupConn = instrumentConnection(new Connection(process.env.RPC_URL, "confirmed"));
   const info = await _lookupConn.getParsedAccountInfo(new PublicKey(mint));
   return info?.value ? mintFactsFromParsed(info.value, mint) : null;
 }

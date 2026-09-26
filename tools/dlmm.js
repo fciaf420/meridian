@@ -29,7 +29,8 @@ import {
 import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
-import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
+import { normalizeMint, getWalletBalances, getSolPrice, swapToken, getOnchainTokenBalance } from "./wallet.js";
+import { countRpc, instrumentConnection } from "./rpc-stats.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw, rawToUiString } from "./close-swap.js";
 import { computeOnchainPnl, binPrice, onchainPctForUnit, feesValue, claimedFeesSol } from "./onchain-pnl.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS, fitDeployAmount } from "../runtime-helpers.js";
@@ -75,7 +76,7 @@ let _wallet = null;
 
 function getConnection() {
   if (!_connection) {
-    _connection = new Connection(process.env.RPC_URL, "confirmed");
+    _connection = instrumentConnection(new Connection(process.env.RPC_URL, "confirmed"));
   }
   return _connection;
 }
@@ -113,6 +114,7 @@ async function estimatePriorityFeeMicroLamports(tx, feePayer, label = "tx") {
       verifySignatures: false,
     }));
 
+    countRpc("getPriorityFeeEstimate");
     const res = await fetch(heliusUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -985,7 +987,7 @@ export async function deployPosition({
         // Query actual on-chain balance to use for deploy
         let actualBalance = swapReceived;
         try {
-          const walletBals = await getWalletBalances();
+          const walletBals = await getWalletBalances({ fresh: true });
           const tokenBal = walletBals.tokens?.find(t => t.mint === baseMint);
           if (tokenBal && tokenBal.balance > 0) {
             actualBalance = tokenBal.balance;
@@ -1097,7 +1099,7 @@ export async function deployPosition({
   if (!(Number(initial_value_usd) > 0)) {
     const solCommitted = totalSolAmount > 0 ? totalSolAmount : finalAmountY;
     try {
-      const solPrice = (await getWalletBalances()).sol_price || 0;
+      const solPrice = await getSolPrice();
       if (solPrice > 0 && solCommitted > 0) {
         initial_value_usd = Math.round(solCommitted * solPrice * 100) / 100;
         log("deploy", `initial_value_usd not provided — estimated $${initial_value_usd} (${solCommitted} SOL × $${solPrice})`);
@@ -1622,7 +1624,7 @@ export async function getPositionPnl({ pool_address, position_address }) {
 
     // SOL conversion
     let solPrice = 0;
-    try { solPrice = (await getWalletBalances()).sol_price || 0; } catch { /* best-effort */ }
+    try { solPrice = await getSolPrice(); } catch { /* best-effort */ }
     const toSol = (usd) => solPrice > 0 ? Math.round((usd / solPrice) * 10000) / 10000 : null;
 
     return {
@@ -1794,8 +1796,8 @@ export async function getMyPositions({ force = false } = {}) {
     // Fire remaining independent network calls in parallel:
     // - SOL price
     // - LP Agent historical (only if untracked positions exist)
-    const [walletBalResult, lpAgentHistMap] = await Promise.all([
-      getWalletBalances().catch(() => ({ sol_price: 0 })),
+    const [solPriceResult, lpAgentHistMap] = await Promise.all([
+      getSolPrice().catch(() => 0),
       hasUntracked
         ? import("./lp-overview.js").then((m) => m.fetchHistoricalPositionMap({ wait: false })).catch(() => new Map())
         : Promise.resolve(new Map()),
@@ -1821,7 +1823,7 @@ export async function getMyPositions({ force = false } = {}) {
     }
 
     // SOL price for conversion (one fetch, shared across all positions)
-    const solPrice = walletBalResult.sol_price || 0;
+    const solPrice = solPriceResult || 0;
     const toSol = (usd) => solPrice > 0 ? Math.round((usd / solPrice) * 10000) / 10000 : null;
 
     const positions = await Promise.all(raw.map(async (r) => {

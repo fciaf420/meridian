@@ -10,6 +10,7 @@ import { PublicKey, SystemProgram } from "@solana/web3.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { invalidateWalletBalances } from "./wallet-cache.js";
 
 // ─── Helius Sender ──────────────────────────────────────────────
 // Plain RPC sendTransaction is 1 tx/s on the Free plan, so sends and
@@ -152,6 +153,9 @@ export async function sendAndConfirmSigned(connection, {
     return (await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed")).value;
   } finally {
     clearInterval(rebroadcast);
+    // Deploy, close, claim and the swap/v1 fallback all send here: drop the
+    // 20s wallet-balance cache so post-action reads come from chain.
+    invalidateWalletBalances();
   }
 }
 

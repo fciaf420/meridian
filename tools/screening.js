@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
+import { instrumentConnection } from "./rpc-stats.js";
 import { scoreSignalSnapshot } from "../signal-weights.js";
 import { fetchGmgnSignalMap, attachGmgnSignals, gmgnSignalBooleans } from "./gmgn-signals.js";
 
@@ -412,7 +413,7 @@ export async function fetchDynamicFee(poolAddress) {
   try {
     const { default: DLMM } = await import("@meteora-ag/dlmm");
     const { Connection, PublicKey } = await import("@solana/web3.js");
-    if (!_feeConn) _feeConn = new Connection(process.env.RPC_URL, "confirmed");
+    if (!_feeConn) _feeConn = instrumentConnection(new Connection(process.env.RPC_URL, "confirmed"));
     const pool = await DLMM.create(_feeConn, new PublicKey(poolAddress));
     // getDynamicFee() returns the TOTAL current fee % (base + variable), not the
     // variable component alone. Take base from getFeeInfo() (which correctly
