@@ -177,7 +177,14 @@ export function startServer(timersFn) {
   app.use(express.json());
 
   const server = createServer(app);
-  const wss = new WebSocketServer({ server, path: "/ws" });
+  // Browsers send Origin on WebSocket upgrades; only accept this dashboard's own
+  // origin (or a non-browser client with no Origin), so a random web page open in
+  // the operator's browser can't drive the bot over ws://localhost.
+  const wss = new WebSocketServer({
+    server,
+    path: "/ws",
+    verifyClient: ({ origin, req }) => !origin || isAllowedOrigin(origin, req.headers.host),
+  });
 
   // ═══════════════════════════════════════════
   //  DASHBOARD AUTH (fund-moving surfaces)
@@ -454,7 +461,12 @@ export function startServer(timersFn) {
       } else if (msg.type === "quick-action") {
         await handleQuickAction(ws, msg.action);
       } else if (msg.type === "chat") {
-        await handleChat(ws, wss, msg.text);
+        // Chat runs the full agent (deploy / close / swap tools): token-gated like commands.
+        if (!isAuthorized(ws)) {
+          wsSend(ws, { type: "error", text: DASHBOARD_TOKEN ? "Authenticate first: chat can move funds." : "Chat is disabled: set DASHBOARD_TOKEN to enable it (it can move funds)." });
+        } else {
+          await handleChat(ws, wss, msg.text);
+        }
       } else if (msg.type === "command") {
         await handleCommand(ws, msg.command);
       } else {
@@ -838,9 +850,24 @@ export function startServer(timersFn) {
   // ═══════════════════════════════════════════
 
   return new Promise((resolve) => {
-    server.listen(port, () => {
-      log("server", `Web server listening on http://localhost:${port}`);
+    // Loopback only by default: the dashboard can move funds. DASHBOARD_HOST=0.0.0.0
+    // opts in to LAN access (use with DASHBOARD_TOKEN).
+    const host = process.env.DASHBOARD_HOST || "127.0.0.1";
+    server.listen(port, host, () => {
+      log("server", `Web server listening on http://${host}:${port}`);
       resolve({ app, server, wss });
     });
   });
+}
+
+/** Same-host origin check for WebSocket upgrades (exported for tests). */
+export function isAllowedOrigin(origin, host) {
+  try {
+    const o = new URL(origin);
+    const h = String(host || "").toLowerCase();
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(o.hostname);
+    return o.host.toLowerCase() === h || (loopback && /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(h));
+  } catch {
+    return false;
+  }
 }
