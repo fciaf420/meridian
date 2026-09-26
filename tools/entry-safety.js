@@ -13,6 +13,7 @@
 
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { instrumentConnection } from "./rpc-stats.js";
 
 export const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 export const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -532,7 +533,7 @@ let _stateConn = null;
 export async function readPoolEntryState(poolAddress, opts = {}) {
   const { Connection, PublicKey } = await import("@solana/web3.js");
   const { default: DLMM } = await import("@meteora-ag/dlmm");
-  if (!_stateConn) _stateConn = new Connection(process.env.RPC_URL, "confirmed");
+  if (!_stateConn) _stateConn = instrumentConnection(new Connection(process.env.RPC_URL, "confirmed"));
   const pool = await DLMM.create(_stateConn, new PublicKey(poolAddress));
   return describePoolEntryState(pool, opts);
 }
@@ -633,7 +634,7 @@ export async function screenJupiterFlags(pools, { filters = currentEntryFilters(
 let _screenConn = null;
 async function defaultReadMints(mints) {
   const { Connection } = await import("@solana/web3.js");
-  if (!_screenConn) _screenConn = new Connection(process.env.RPC_URL, "confirmed");
+  if (!_screenConn) _screenConn = instrumentConnection(new Connection(process.env.RPC_URL, "confirmed"));
   return fetchMintFacts(_screenConn, mints);
 }
 
