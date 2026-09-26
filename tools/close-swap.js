@@ -65,6 +65,23 @@ export function rawToUiString(raw, decimals) {
  * where the SDK reports them. Returns null when it can't be determined (base
  * token isn't pool token X, or the position data is missing).
  */
+/**
+ * Base-token amount (raw) a fee claim is expected to add to the wallet: the
+ * position's claimable token-X fees (net of Token-2022 transfer fees when the
+ * SDK reports them). null when it can't be determined.
+ */
+export function expectedClaimFeeRaw(pool, positionData, baseMint) {
+  try {
+    const xMint = pool?.lbPair?.tokenXMint?.toBase58?.() ?? pool?.lbPair?.tokenXMint?.toString?.();
+    if (!baseMint || xMint !== baseMint) return null;
+    const pd = positionData?.positionData;
+    if (!pd) return null;
+    return toRawBigInt(pd.feeXExcludeTransferFee) ?? toRawBigInt(pd.feeX);
+  } catch {
+    return null;
+  }
+}
+
 export function expectedBaseWithdrawRaw(pool, positionData, baseMint) {
   try {
     const xMint = pool?.lbPair?.tokenXMint?.toBase58?.() ?? pool?.lbPair?.tokenXMint?.toString?.();
