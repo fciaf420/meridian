@@ -31,7 +31,7 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw, rawToUiString } from "./close-swap.js";
-import { computeOnchainPnl, binPrice, onchainPctForUnit, feesValue } from "./onchain-pnl.js";
+import { computeOnchainPnl, binPrice, onchainPctForUnit, feesValue, claimedFeesSol } from "./onchain-pnl.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS, fitDeployAmount } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
 import { getDepthForDeploy } from "./ohlcv.js";
@@ -2283,6 +2283,11 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
     let pnlUsd = _pnlOverride?.pnl_usd ?? null;
     let pnlPct = _pnlOverride?.pnl_pct ?? null;
     let finalValueUsd = _pnlOverride?.total_value_usd ?? 0;
+    // Where the recorded PnL came from ("onchain" | "api") and, when on-chain,
+    // its exact SOL amount. Kept on the performance record (briefing.js).
+    let pnlSource = _pnlOverride?.pnl_source ?? null;
+    const overrideSol = _pnlOverride?.pnl_sol;
+    let pnlSol = pnlSource === "onchain" && overrideSol != null && Number.isFinite(Number(overrideSol)) ? Number(overrideSol) : null;
     let feesUsd = 0;
     let unclaimedFeesUsd = null; // USD value of the fees the remove txs will claim (null = unknown)
     const trackedPre = getTrackedPosition(position_address);
@@ -2343,6 +2348,8 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
           const initialUsd = Number(trackedPre.initial_value_usd) || 0;
           log("close", `On-chain PnL ${ocPct}% (value ${oc.valueSol} + fees ${oc.feesSol} SOL vs deposit ${oc.depositSol} SOL) replaces API ${pnlPct ?? "unknown"}%`);
           pnlPct = ocPct;
+          pnlSource = "onchain";
+          pnlSol = Number.isFinite(Number(oc.pnlSol)) ? Number(oc.pnlSol) : null;
           if (initialUsd > 0) {
             pnlUsd = Math.round(initialUsd * ocPct) / 100;
             finalValueUsd = Math.round((initialUsd + pnlUsd) * 100) / 100;
@@ -2505,6 +2512,10 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
       recordClaim(position_address, unclaimedFeesUsd ?? v?.usd ?? undefined, v?.sol ?? undefined);
     }
     recordClose(position_address, closeReason);
+    // All fees this position paid out in SOL (mid-position claims + the claim
+    // at close just recorded), for the performance record.
+    const trackedAfterClaim = getTrackedPosition(position_address) || tracked;
+    const feesSolTotal = trackedAfterClaim ? claimedFeesSol(trackedAfterClaim) : null;
     if (tracked) {
       const deployedAt = new Date(tracked.deployed_at).getTime();
       const minutesHeld = Math.floor((Date.now() - deployedAt) / 60000);
@@ -2551,6 +2562,9 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         actual_pnl_usd: pnlUnknownAtClose ? (canDerivePnl ? null : 0) : (pnlUsd ?? 0),
         actual_pnl_pct: pnlUnknownAtClose ? (canDerivePnl ? null : 0) : pnlPct,
         ...(pnlUnknownAtClose && { pnl_unknown: true }),
+        ...(!pnlUnknownAtClose && { pnl_source: pnlSource || "api" }),
+        ...(!pnlUnknownAtClose && pnlSource === "onchain" && pnlSol != null && { pnl_sol: Math.round(pnlSol * 1e6) / 1e6 }),
+        ...(feesSolTotal != null && Number.isFinite(feesSolTotal) && { fees_sol: Math.round(feesSolTotal * 1e6) / 1e6 }),
         minutes_in_range: minutesHeld - minutesOOR,
         minutes_held: minutesHeld,
         close_reason: closeReason,
