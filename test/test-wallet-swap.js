@@ -325,3 +325,131 @@ test("swap/v1 fallback: expiry with no landing → failure; expiry but landed OK
   assert.equal(r3.success, false);
   assert.match(r3.error, /failed on-chain/);
 });
+
+// ─── Price-impact cap (config.risk.maxSwapPriceImpactPct) ─────
+
+const { config: walletConfig } = await import("../config.js");
+
+test("price impact above maxSwapPriceImpactPct is refused before signing; no execute, no v1 fallback", async () => {
+  const before = walletConfig.risk.maxSwapPriceImpactPct;
+  try {
+    walletConfig.risk.maxSwapPriceImpactPct = 5;
+    // Negative on a healthy quote: the cap must compare the absolute value.
+    const calls = routes({
+      order: () => jsonResponse({ ...orderOk(), priceImpact: -7.5, priceImpactPct: "-0.075" }),
+      execute: () => { throw new Error("execute must not be called"); },
+    });
+    const r = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(stubConnection()));
+    assert.equal(r.success, false);
+    assert.equal(r.price_impact_refused, true);
+    assert.equal(r.price_impact_pct, 7.5);
+    assert.equal(r.max_price_impact_pct, 5);
+    assert.match(r.error, /price impact 7\.50% exceeds maxSwapPriceImpactPct 5%/);
+    assert.equal(execCalls(calls).length, 0);
+    assert.equal(v1Calls(calls).length, 0);
+  } finally {
+    walletConfig.risk.maxSwapPriceImpactPct = before;
+  }
+});
+
+test("price impact at or under the cap executes; the cap follows config", async () => {
+  const before = walletConfig.risk.maxSwapPriceImpactPct;
+  try {
+    walletConfig.risk.maxSwapPriceImpactPct = 5;
+    routes({
+      order: () => jsonResponse({ ...orderOk(), priceImpact: -4.99 }),
+      execute: () => jsonResponse({ status: "Success", signature: "SIG_UNDER", code: 0 }),
+    });
+    const ok = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(stubConnection()));
+    assert.equal(ok.success, true);
+    assert.equal(ok.tx, "SIG_UNDER");
+
+    // Tighter cap: the same 4.99% quote is now refused.
+    walletConfig.risk.maxSwapPriceImpactPct = 2;
+    routes({
+      order: () => jsonResponse({ ...orderOk(), priceImpact: -4.99 }),
+      execute: () => { throw new Error("execute must not be called"); },
+    });
+    const refused = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(stubConnection()));
+    assert.equal(refused.price_impact_refused, true);
+
+    // Invalid config falls back to the 5% default.
+    walletConfig.risk.maxSwapPriceImpactPct = "junk";
+    routes({
+      order: () => jsonResponse({ ...orderOk(), priceImpact: 6 }),
+      execute: () => { throw new Error("execute must not be called"); },
+    });
+    const dflt = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(stubConnection()));
+    assert.equal(dflt.max_price_impact_pct, 5);
+  } finally {
+    walletConfig.risk.maxSwapPriceImpactPct = before;
+  }
+});
+
+test("close swap-backs use maxCloseSwapPriceImpactPct (default 25), not the 5% cap", async () => {
+  const before = { ...walletConfig.risk };
+  try {
+    walletConfig.risk.maxSwapPriceImpactPct = 5;
+    walletConfig.risk.maxCloseSwapPriceImpactPct = 25;
+    // A live-seen 5.307% exit impact: refused under the default cap...
+    routes({
+      order: () => jsonResponse({ ...orderOk(), priceImpact: -5.307 }),
+      execute: () => { throw new Error("execute must not be called"); },
+    });
+    const agent = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(stubConnection()));
+    assert.equal(agent.price_impact_refused, true);
+    assert.equal(agent.price_impact_cap_key, "maxSwapPriceImpactPct");
+
+    // ...but a close swap-back goes through.
+    routes({
+      order: () => jsonResponse({ ...orderOk(), priceImpact: -5.307 }),
+      execute: () => jsonResponse({ status: "Success", signature: "SIG_CLOSE", code: 0 }),
+    });
+    const close = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, { ...deps(stubConnection()), impactCap: "close" });
+    assert.equal(close.success, true);
+    assert.equal(close.tx, "SIG_CLOSE");
+
+    // Above the close cap it is refused too, naming that cap.
+    routes({
+      order: () => jsonResponse({ ...orderOk(), priceImpact: -31.2 }),
+      execute: () => { throw new Error("execute must not be called"); },
+    });
+    const over = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, { ...deps(stubConnection()), impactCap: "close" });
+    assert.equal(over.price_impact_refused, true);
+    assert.equal(over.max_price_impact_pct, 25);
+    assert.equal(over.price_impact_cap_key, "maxCloseSwapPriceImpactPct");
+    assert.match(over.error, /31\.20% exceeds maxCloseSwapPriceImpactPct 25%/);
+
+    // The close cap follows config; an invalid value falls back to 25.
+    walletConfig.risk.maxCloseSwapPriceImpactPct = "junk";
+    routes({
+      order: () => jsonResponse({ ...orderOk(), priceImpact: 26 }),
+      execute: () => { throw new Error("execute must not be called"); },
+    });
+    const dflt = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, { ...deps(stubConnection()), impactCap: "close" });
+    assert.equal(dflt.max_price_impact_pct, 25);
+  } finally {
+    Object.assign(walletConfig.risk, before);
+  }
+});
+
+test("price-impact cap also applies to the swap/v1 fallback quote (fraction units)", async () => {
+  const before = walletConfig.risk.maxSwapPriceImpactPct;
+  try {
+    walletConfig.risk.maxSwapPriceImpactPct = 5;
+    const connection = stubConnection();
+    const calls = routes({
+      order: () => jsonResponse({ transaction: "", errorCode: 1, errorMessage: "no tx" }),
+      quote: () => jsonResponse({ inAmount: "1000000", outAmount: "5000000", priceImpactPct: "0.12" }),
+      swap: () => { throw new Error("v1 swap must not be requested"); },
+    });
+    const r = await swapToken({ input_mint: USDC, output_mint: SOL, amount: 1 }, deps(connection));
+    assert.equal(r.success, false);
+    assert.equal(r.price_impact_refused, true);
+    assert.equal(r.price_impact_pct, 12);
+    assert.equal(calls.filter((c) => c.url.includes("/swap/v1/swap")).length, 0);
+    assert.equal(connection.calls.sendRawTransaction, 0);
+  } finally {
+    walletConfig.risk.maxSwapPriceImpactPct = before;
+  }
+});

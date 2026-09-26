@@ -364,20 +364,26 @@ Use to check available capital before deploying positions.`,
     type: "function",
     function: {
       name: "swap_token",
-      description: `Swap tokens via the Jupiter aggregator (real on-chain transaction).
-Use it when the user asks for a swap, or after close_position when that close's result shows swap.success=false or status "success_with_exposure": then swap only the amount that close withdrew. Other wallet balances are not the agent's to sell.
-Not needed around deploys or normal closes: deploy_position swaps the token side of two-sided spot itself, close_position already swaps its withdrawn base tokens back to SOL, and in USDC mode the runner settles to USDC automatically.
-Returns success, the tx signature and the amounts in and out. A SOL swap that would leave less than the gas reserve is refused.`,
+      description: `Sell a closed position's leftover base token back to SOL via Jupiter (real on-chain transaction).
+Use it only after close_position returned status "success_with_exposure" with swap.exposure_ui > 0: sell at most swap.exposure_ui of that close's base token, to SOL.
+Limits enforced in code (a refused call returns blocked: true with the reason; report it to the owner instead of retrying):
+- input_mint must be a token a close in the last 2h left unsold. Other wallet balances are not the agent's to sell.
+- output_mint must be SOL. SOL→token buys are refused: deploy_position buys the token side of two-sided spot itself.
+- The amount is clamped to what that close left unsold and is still in the wallet.
+- Refused while that close's own swap has an unknown outcome and may still land (until swap.retry_not_before).
+- Any swap whose price impact is above maxSwapPriceImpactPct (default 5%) is refused.
+Not needed around deploys or normal closes: close_position already swaps its withdrawn base tokens back to SOL, and in USDC mode the runner settles to USDC automatically.
+Returns success, the tx signature and the amounts in and out.`,
       parameters: {
         type: "object",
         properties: {
           input_mint: {
             type: "string",
-            description: "Mint address of the token to sell"
+            description: "Mint address of the closed position's base token to sell"
           },
           output_mint: {
             type: "string",
-            description: "Mint address of the token to buy"
+            description: "Must be SOL (So11111111111111111111111111111111111111112)"
           },
           amount: {
             type: "number",
