@@ -2,7 +2,8 @@
  * Evolution tunes the trailing take profit — trailingTriggerPct and
  * trailingDropPct — and nothing else on the exit side (takeProfitFeePct and
  * stopLossPct are the operator's). Also: the close record carries the peak,
- * and the update_config bounds match the evolution ranges.
+ * the update_config bounds match the evolution ranges, and the Telegram alert
+ * calls a trailing exit a trailing stop.
  *
  * Evidence behind the rules (2026-09-26):
  *   P(DOOM)-SOL peaked +5.11% (trigger 5 armed), trail level 1.11% with drop 4,
@@ -30,6 +31,7 @@ const lessons = await import("../lessons.js");
 const { config, reloadScreeningThresholds } = await import("../config.js");
 const state = await import("../state.js");
 const { RISK_CONFIG_BOUNDS, validateConfigUpdate } = await import("../tools/executor.js");
+const { pnlExitTitle } = await import("../telegram-ui.js");
 
 const cfg = (over = {}) => ({
   screening: {},
@@ -230,4 +232,16 @@ test("update_config bounds for the trailing settings match evolution: trigger 1.
   // The AI's own TP / SL levers are unchanged.
   assert.equal(ok({ takeProfitFeePct: 30 }), true);
   assert.equal(ok({ stopLossPct: -25 }), true);
+});
+
+// ─── Alert title ───
+test("alert: a TRAILING_TP exit is a 'Trailing stop' with ✅ / 🔻 by the PnL sign; other exits unchanged", () => {
+  const reason = "TRAILING_TP: PnL dropped 6.3% from peak 5.1% (trail: 4%)";
+  assert.equal(pnlExitTitle({ reason, pnlPct: -1.23 }), "🔻 <b>Trailing stop — auto-closed</b>");
+  assert.equal(pnlExitTitle({ reason, pnlPct: 3.2 }), "✅ <b>Trailing stop — auto-closed</b>");
+  assert.equal(pnlExitTitle({ reason, pnlPct: null }), "⚡ <b>Trailing stop — auto-closed</b>");
+  assert.doesNotMatch(pnlExitTitle({ reason, pnlPct: -1.23 }), /Take-profit/);
+  assert.equal(pnlExitTitle({ reason: "STOP_LOSS: PnL -15%", pnlPct: -15 }), "⚡ <b>Stop-loss hit — auto-closed</b>");
+  assert.equal(pnlExitTitle({ reason: "FIXED_TP: PnL 7.4% >= take profit (7%)", pnlPct: 7.4 }), "⚡ <b>Take-profit hit — auto-closed</b>");
+  assert.equal(pnlExitTitle({ reason: "something else" }), "⚡ <b>Exit hit — auto-closed</b>");
 });
