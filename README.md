@@ -500,6 +500,11 @@ The earlier Nuggets memory layer was removed. If an older install still has `dat
 
 Meridian can evolve screening thresholds from real performance and lesson history. These changes persist back into `user-config.json`.
 
+- A close is a win above +1% PnL and a loss below −1%. Anything in between is break-even and doesn't count toward wins or losses. The same classifier (`learning-data.js`) drives lessons, pool-memory win rates and signal weights.
+- Every evolution rule needs at least `MIN_RULE_SAMPLES` (5) of the closes (or, for lesson-based rules, lessons) it relies on before it moves a setting. A rule that compares winners with losers needs 5 on each side it uses.
+- Records flagged `exclude_from_learning` or `corrupt`, records marked `corrected`, and the known-bad list in `learning-data.js` are never learned from.
+- On the exit side, evolution tunes only the trailing take profit, one 0.5 step per run: `trailingTriggerPct` (1.5–15) and `trailingDropPct` (1–8). It learns only from closes with a known peak that ran under the current value. `takeProfitFeePct` and `stopLossPct` are left to you.
+
 ### Autoresearch
 
 Autoresearch is prompt optimization driven by real closes, inspired by karpathy/autoresearch. Live PnL is a noisy, non-stationary metric, so it runs as a concurrent A/B test and a human approves any change.

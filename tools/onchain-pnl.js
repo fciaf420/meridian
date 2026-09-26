@@ -7,6 +7,8 @@
 // value  = Σ bins (X at the active price + Y) + unclaimed fees X/Y
 // deposit = tracked amount_sol + tracked amount_x at the deploy-bin price
 // pnlPct = (value + fees claimed earlier − deposit) / deposit
+//   fees claimed earlier = total_fees_claimed_sol (recordClaim), plus any
+//   USD-only claims converted at the SOL price
 //
 // Read-only (getPosition + getActiveBin through the shared pool cache), cached
 // ~20s per position. Never throws: returns null when the read or the inputs
@@ -65,7 +67,7 @@ export function binPrice(binId, binStep, decX, decY) {
  * positionData: SDK `position.positionData` (positionBinData[], feeX, feeY)
  * activePrice:  price of X in Y (UI units) at the active bin
  * tracked:      state.json record (amount_sol, amount_x, active_bin_at_deploy, …)
- * solPriceUsd:  optional, only used to convert fees claimed earlier (USD) to SOL
+ * solPriceUsd:  optional; converts claims recorded only in USD to SOL, and gives pnlPctUsd
  */
 export function computeOnchainPnl({ pool, positionData, activePrice, tracked, solPriceUsd = null }) {
   if (!pool || !positionData || !tracked) return null;
@@ -123,16 +125,8 @@ export function computeOnchainPnl({ pool, positionData, activePrice, tracked, so
   }
   if (!(depositSol > 0)) return null;
 
-  // Fees claimed earlier left the position; add them back (USD → SOL).
-  let claimedSol = 0;
-  const claimedUsd = Number(tracked.total_fees_claimed_usd) || 0;
-  if (claimedUsd > 0) {
-    const entrySolUsd = amountX === 0 && amountSol > 0 && Number(tracked.initial_value_usd) > 0
-      ? Number(tracked.initial_value_usd) / amountSol
-      : null;
-    const solUsd = Number(solPriceUsd) > 0 ? Number(solPriceUsd) : entrySolUsd;
-    if (solUsd > 0) claimedSol = claimedUsd / solUsd;
-  }
+  // Fees claimed earlier left the position; add them back in SOL.
+  const claimedSol = claimedFeesSol(tracked, { solPriceUsd, amountSol, amountX });
 
   const pnlSol = valueSol + feesSol + claimedSol - depositSol;
   const round = (n, d) => Math.round(n * 10 ** d) / 10 ** d;
@@ -152,6 +146,57 @@ export function computeOnchainPnl({ pool, positionData, activePrice, tracked, so
     tokenAmount: x,
     solAmount: y,
   };
+}
+
+/**
+ * Fees claimed earlier from a tracked position, in SOL. recordClaim (state.js)
+ * keeps the SOL amount of each claim in total_fees_claimed_sol; a claim that
+ * only had a USD figure (fees_claimed_usd_unpriced, or every claim of a
+ * record from before the SOL figure existed) is converted with the SOL price,
+ * falling back to the entry SOL price of a single-sided SOL deposit.
+ */
+export function claimedFeesSol(tracked, { solPriceUsd = null, amountSol = Number(tracked?.amount_sol), amountX = Number(tracked?.amount_x) || 0 } = {}) {
+  if (!tracked) return 0;
+  const solField = tracked.total_fees_claimed_sol;
+  const hasSolField = solField != null && Number.isFinite(Number(solField));
+  const claimedSolRecorded = hasSolField ? Math.max(0, Number(solField)) : 0;
+  const unpricedUsd = hasSolField
+    ? Number(tracked.fees_claimed_usd_unpriced) || 0
+    : Number(tracked.total_fees_claimed_usd) || 0; // legacy record: USD only
+  let fromUsd = 0;
+  if (unpricedUsd > 0) {
+    const entrySolUsd = amountX === 0 && amountSol > 0 && Number(tracked.initial_value_usd) > 0
+      ? Number(tracked.initial_value_usd) / amountSol
+      : null;
+    const solUsd = Number(solPriceUsd) > 0 ? Number(solPriceUsd) : entrySolUsd;
+    if (solUsd > 0) fromUsd = unpricedUsd / solUsd;
+  }
+  return claimedSolRecorded + fromUsd;
+}
+
+/**
+ * SOL and USD value of a position's unclaimed fees (UI amounts from the SDK
+ * positionData feeX/feeY), for recording a claim. Null when the pool has no
+ * SOL side or the inputs are unusable. usd is null without a SOL price.
+ */
+export function feesValue({ pool, positionData, activePrice, solPriceUsd = null }) {
+  if (!pool || !positionData) return null;
+  const decX = Number(pool.tokenX?.mint?.decimals ?? pool.tokenX?.decimal);
+  const decY = Number(pool.tokenY?.mint?.decimals ?? pool.tokenY?.decimal);
+  if (!Number.isInteger(decX) || !Number.isInteger(decY)) return null;
+  const mintX = pool.tokenX?.publicKey?.toString?.() ?? null;
+  const mintY = pool.tokenY?.publicKey?.toString?.() ?? null;
+  const solIsX = mintX === SOL_MINT && mintY !== SOL_MINT;
+  if (!solIsX && mintY !== SOL_MINT) return null;
+  const px = Number(activePrice);
+  if (!Number.isFinite(px) || px <= 0) return null;
+  const fx = num(positionData.feeX) / 10 ** decX;
+  const fy = num(positionData.feeY) / 10 ** decY;
+  if (!Number.isFinite(fx) || !Number.isFinite(fy)) return null;
+  const sol = solIsX ? fx + fy / px : fy + fx * px;
+  const round = (n, d) => Math.round(n * 10 ** d) / 10 ** d;
+  const solUsd = Number(solPriceUsd);
+  return { sol: round(sol, 9), usd: solUsd > 0 ? round(sol * solUsd, 2) : null, x: fx, y: fy };
 }
 
 /**

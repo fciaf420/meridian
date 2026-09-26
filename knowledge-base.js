@@ -14,6 +14,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { config } from "./config.js";
+import { classifyOutcome, classifyRecord } from "./learning-data.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -480,16 +481,18 @@ export async function migrateFromJson() {
         if (!fs.existsSync(fullPerfPath)) {
           // Unknown-PnL closes carry a placeholder 0; keep them out of win/loss stats.
           const known = perf.filter(p => !p.pnl_unknown);
-          const wins = known.filter(p => (p.pnl_pct ?? 0) >= 0);
-          const losses = known.filter(p => (p.pnl_pct ?? 0) < 0);
+          const wins = known.filter(p => classifyRecord(p) === "win");
+          const losses = known.filter(p => classifyRecord(p) === "loss");
           const avgPnl = known.length ? known.reduce((s, p) => s + (p.pnl_pct ?? 0), 0) / known.length : 0;
 
           let content = `# Historical Performance Summary\n\n`;
           content += `*Migrated from lessons.json — ${perf.length} closed positions*\n\n`;
           content += `## Overview\n\n`;
           content += `- Total positions: ${perf.length}\n`;
-          content += `- Wins: ${wins.length} (${known.length ? ((wins.length / known.length) * 100).toFixed(0) : 0}% of ${known.length} with known PnL)\n`;
-          content += `- Losses: ${losses.length}\n`;
+          const decisive = wins.length + losses.length;
+          content += `- Wins (> +1%): ${wins.length} (${decisive ? ((wins.length / decisive) * 100).toFixed(0) : 0}% of ${decisive} wins + losses)\n`;
+          content += `- Losses (< −1%): ${losses.length}\n`;
+          content += `- Break-even (±1%): ${known.length - decisive}\n`;
           content += `- Average PnL: ${avgPnl.toFixed(2)}%\n\n`;
 
           content += `## Recent Closes\n\n`;
@@ -836,7 +839,9 @@ export function filePositionClose(perf) {
     // Unknown PnL (PR #9 flag) is a placeholder 0, not a break-even: label it.
     const pnlUnknown = perf.pnl_unknown === true;
     const pnl = pnlUnknown ? null : (perf.pnl_pct ?? perf.actual_pnl_pct ?? 0);
-    const outcome = pnlUnknown ? "UNKNOWN" : pnl >= 0 ? "WIN" : "LOSS";
+    // Shared classifier (learning-data.js): within ±1% is BREAKEVEN, not a win.
+    const cls = pnlUnknown ? null : classifyOutcome(pnl);
+    const outcome = cls === "win" ? "WIN" : cls === "loss" ? "LOSS" : cls === "breakeven" ? "BREAKEVEN" : "UNKNOWN";
     const pnlText = pnlUnknown ? "PnL unknown" : `PnL ${pnl.toFixed(1)}%`;
     const now = new Date().toISOString().slice(0, 16);
     const strategy = perf.strategy || "unknown";

@@ -112,6 +112,22 @@ function fmtAgo(ts, now) {
 }
 
 /** PnL line honoring pnlUnit. A null PnL is "unknown", never 0. */
+/**
+ * Title of a PnL-watcher auto-close alert. A TRAILING_TP exit is a trailing
+ * stop, not a take profit: it can close at a loss (P(DOOM)-SOL armed at +5.1%
+ * and exited at −1.23%), so it carries ✅ / 🔻 by the sign of the PnL.
+ */
+export function pnlExitTitle(d = {}) {
+  const reason = String(d.reason || "");
+  if (/TRAILING_TP|trailing/i.test(reason)) {
+    const pnl = d.pnlPct == null ? NaN : Number(d.pnlPct);
+    const icon = Number.isFinite(pnl) ? (pnl >= 0 ? "✅" : "🔻") : "⚡";
+    return `${icon} <b>Trailing stop — auto-closed</b>`;
+  }
+  const kind = /stop|loss/i.test(reason) ? "Stop-loss" : /tp|profit/i.test(reason) ? "Take-profit" : "Exit";
+  return `⚡ <b>${kind} hit — auto-closed</b>`;
+}
+
 export function fmtPnl(p, unit = "sol") {
   if (p?.pnl_pct == null || p?.pnl_unknown) return "unknown";
   const abs = unit === "sol" && p.pnl_sol != null
@@ -2325,7 +2341,7 @@ export function createTelegramUI(deps) {
       closeChart(d),
     ].filter(Boolean).join("\n"), [[positionsBtn()]]),
     pnl_watcher_close: (d) => alert("pnl_watcher_close", d.position, 0, [
-      `⚡ <b>${/stop|loss/i.test(d.reason || "") ? "Stop-loss" : /tp|profit|trail/i.test(d.reason || "") ? "Take-profit" : "Exit"} hit — auto-closed</b> ${escapeHtml(d.pair)}`,
+      `${pnlExitTitle(d)} ${escapeHtml(d.pair)}`,
       escapeHtml(d.reason ?? ""),
       fmtAlertPnl(d),
       txLinks(d.txs) || null,

@@ -316,8 +316,8 @@ test("recalculateWeights learns gmgn_buy_pressure / gmgn_spike from closed posit
   const recorded_at = new Date().toISOString();
   const perf = [];
   // Buy pressure present → wins; spike present → losses (and vice versa).
-  for (let i = 0; i < 12; i++) perf.push({ recorded_at, pnl_usd: 5, signal_snapshot: { gmgn_buy_pressure: true, gmgn_spike: false } });
-  for (let i = 0; i < 12; i++) perf.push({ recorded_at, pnl_usd: -5, signal_snapshot: { gmgn_buy_pressure: false, gmgn_spike: true } });
+  for (let i = 0; i < 12; i++) perf.push({ recorded_at, pnl_usd: 5, pnl_pct: 5, signal_snapshot: { gmgn_buy_pressure: true, gmgn_spike: false } });
+  for (let i = 0; i < 12; i++) perf.push({ recorded_at, pnl_usd: -5, pnl_pct: -5, signal_snapshot: { gmgn_buy_pressure: false, gmgn_spike: true } });
   const { weights: w } = weights.recalculateWeights(perf, { darwin: { minSamples: 10, perSignalMinSamples: 12 } });
   const data = weights.loadWeights();
   assert.equal(data.directions.gmgn_buy_pressure, "present=better");
