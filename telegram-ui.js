@@ -46,7 +46,7 @@ export const BOT_COMMANDS = [
   { command: "usdc", description: "Show or toggle USDC mode (on|off)" },
   { command: "autoresearch", description: "Prompt overrides: status, list, approve, reject" },
   { command: "thresholds", description: "Screening thresholds + performance" },
-  { command: "briefing", description: "Last-24h briefing" },
+  { command: "briefing", description: "Latest daily briefing (/briefing now = fresh)" },
   { command: "help", description: "All commands" },
 ];
 
@@ -1829,6 +1829,14 @@ export function createTelegramUI(deps) {
       return true;
     }
 
+    // /briefing: the latest stored briefing; /briefing now: a fresh one
+    // (logged like the daily one, but the daily schedule is left alone).
+    const briefingCmd = /^\/briefing(?:@\w+)?(?:\s+(\S+))?\s*$/i.exec(text);
+    if (briefingCmd && deps.latestBriefing && deps.generateBriefing) {
+      await briefingCommand(String(briefingCmd[1] || "").toLowerCase());
+      return true;
+    }
+
     // All settings: the owner's next message is the value (commands pass through).
     const pendingCfg = svc() ? cfgPending(ctx.chatId) : null;
     if (/^\/cancel(@\w+)?$/i.test(text) && (pendingCfg || customPending(ctx.chatId))) {
@@ -1905,6 +1913,37 @@ export function createTelegramUI(deps) {
     }
 
     return false;
+  }
+
+  async function briefingCommand(arg) {
+    if (arg === "now") {
+      await deps.tg.sendHTML("📰 Building a fresh briefing…");
+      let html;
+      try {
+        html = await deps.generateBriefing();
+      } catch (e) {
+        logf("telegram_error", `/briefing now failed: ${e.message}`);
+        await deps.tg.sendHTML(`❌ Briefing failed: ${escapeHtml(e.message)}`);
+        return;
+      }
+      try { deps.recordBriefing?.(html); } catch (e) { logf("telegram_warn", `Briefing not logged: ${e.message}`); }
+      for (const page of paginateText(String(html ?? ""), PAGE_CHAR_BUDGET)) await deps.tg.sendHTML(page);
+      return;
+    }
+    if (arg) {
+      await deps.tg.sendHTML("Usage: /briefing (latest sent) or /briefing now (build a fresh one).");
+      return;
+    }
+    const last = deps.latestBriefing();
+    if (!last) {
+      await deps.tg.sendHTML("No briefing stored yet. Send /briefing now for a fresh one.");
+      return;
+    }
+    const when = String(last.ts || "").slice(0, 16).replace("T", " ");
+    const pages = paginateText(escapeHtml(String(last.text ?? "")), PAGE_CHAR_BUDGET - 100);
+    for (let i = 0; i < pages.length; i++) {
+      await deps.tg.sendHTML(`${i === 0 ? `📰 <b>Latest briefing</b> (sent ${escapeHtml(when)} UTC) · /briefing now for a fresh one\n\n` : ""}${pages[i]}`);
+    }
   }
 
   async function menuHeader() {
@@ -2384,7 +2423,9 @@ export function createTelegramUI(deps) {
       if (routine || /^Screening cycle failed:/.test(report ?? "")) return null;
       return sendReport("🔍 <b>Screening cycle</b>", report);
     },
-    briefing: ({ html }) => deps.tg.sendHTML(String(html ?? "")),
+    briefing: async ({ html }) => {
+      for (const page of paginateText(String(html ?? ""), PAGE_CHAR_BUDGET)) await deps.tg.sendHTML(page);
+    },
   };
 
   async function sendReport(title, report) {
