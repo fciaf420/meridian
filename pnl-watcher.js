@@ -13,16 +13,13 @@
 
 import { log } from "./logger.js";
 import { config } from "./config.js";
-import { updatePnlAndCheckExits, getTrackedPosition, recordPnlHold } from "./state.js";
+import { updatePnlAndCheckExits, getTrackedPosition, recordPnlHold, recordAutoClose } from "./state.js";
 import { getMyPositions, closePosition } from "./tools/dlmm.js";
 import { getOnchainPnl, onchainPctForUnit } from "./tools/onchain-pnl.js";
 import { confirmPnlExit, exitKindFromReason } from "./pnl-confirm.js";
 import { emit } from "./notifier.js";
 import { getPositionBins, withTimeout } from "./tools/bin-visual.js";
-import { isBusy, isManagementBusy, isScreeningBusy } from "./session.js";
-import fs from "fs";
-
-const STATE_FILE = "./state.json";
+import { isBusy, isManagementBusy, isScreeningBusy, isDraining } from "./session.js";
 
 let _intervalHandle = null;
 // Per-tick inflight guard: prevents overlapping setInterval ticks from
@@ -34,25 +31,34 @@ let _deps = null;
 export function _setPnlWatcherDepsForTest(d) { _deps = d; }
 const dep = (name, real) => _deps?.[name] ?? real;
 
-function loadState() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  } catch {
-    return { positions: {}, lastUpdated: null };
-  }
+/** True while a watcher tick is running (the shutdown drain waits for it). */
+export function isPnlTickRunning() {
+  return _tickRunning;
 }
 
-function saveState(state) {
+// ─── Dead-man switch ───────────────────────────────────────────
+// HEALTHCHECK_URL (e.g. https://hc-ping.com/<uuid>) is GET-pinged every
+// HEALTHCHECK_EVERY_TICKS watcher ticks (default 10, i.e. every 5 min at 30s).
+// If the process dies or the event loop wedges, the pings stop and the
+// external service alerts, which in-process Telegram alerts can't do.
+// Fire-and-forget with a 5s timeout: it can never slow down or fail a tick.
+let _ticksSincePing = 0;
+export function maybePingHealthcheck() {
+  const url = process.env.HEALTHCHECK_URL;
+  if (!url) return false;
+  const every = Math.max(1, Math.floor(Number(process.env.HEALTHCHECK_EVERY_TICKS) || 10));
+  // Ping on the first tick after start, then every `every` ticks.
+  if (_ticksSincePing++ % every !== 0) return false;
+  const f = dep("fetch", globalThis.fetch);
   try {
-    state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (err) {
-    log("pnl_watcher_error", `Failed to write state.json: ${err.message}`);
+    Promise.resolve(f(url, { method: "GET", signal: AbortSignal.timeout(5_000) }))
+      .catch((e) => log("pnl_watcher_warn", `Healthcheck ping failed: ${e.message}`));
+  } catch (e) {
+    log("pnl_watcher_warn", `Healthcheck ping failed: ${e.message}`);
   }
+  return true;
 }
+export function _resetHealthcheckForTest() { _ticksSincePing = 0; }
 
 /**
  * Would this API reading move the trailing peak or trip an exit? Only then is
@@ -88,7 +94,10 @@ export async function runPnlWatcher() {
   // Inflight guard: if a previous tick is still running, skip this one so
   // overlapping ticks can't process stale data or race position closes.
   if (_tickRunning) return;
+  // Shutdown drain in progress: start no new work (no new closes).
+  if (dep("isDraining", isDraining)()) return;
   _tickRunning = true;
+  maybePingHealthcheck();
   try {
     // Skip while other agent flows are already active.
     if (dep("isBusy", isBusy)() || dep("isManagementBusy", isManagementBusy)() || dep("isScreeningBusy", isScreeningBusy)()) return;
@@ -187,9 +196,7 @@ export async function runPnlWatcher() {
         log("pnl_watcher", `Closed ${label} | PnL: ${override.pnl_pct}% ($${override.pnl_usd})${decision.onchain ? ` on-chain (API said ${p.pnl_pct}%)` : ""}`);
 
         try {
-          const state = loadState();
-          state.recentAutoCloses = state.recentAutoCloses || [];
-          state.recentAutoCloses.push({
+          recordAutoClose({
             position: p.position,
             pair: p.pair,
             reason,
@@ -197,8 +204,6 @@ export async function runPnlWatcher() {
             ...(decision.onchain && { api_pnl_pct: p.pnl_pct }),
             ts: new Date().toISOString(),
           });
-          state.recentAutoCloses = state.recentAutoCloses.slice(-20);
-          saveState(state);
         } catch (stateErr) {
           log("pnl_watcher_error", `Failed to record auto-close in state: ${stateErr.message}`);
         }
@@ -227,6 +232,10 @@ export async function runPnlWatcher() {
 }
 
 export function startPnlWatcher(intervalSec = 30) {
+  if (isDraining()) {
+    log("pnl_watcher", "Not starting: shutdown drain in progress");
+    return;
+  }
   if (_intervalHandle) {
     log("pnl_watcher", "Already running - stopping previous instance");
     clearInterval(_intervalHandle);

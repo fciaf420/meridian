@@ -12,6 +12,32 @@ if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
+// logs/bot.logpath: absolute path of the current agent log, rewritten when the
+// daily file rotates, so operators (and `tail -f "$(cat logs/bot.logpath)"`)
+// never have to work out the file name. Enabled by index.js at startup only.
+let _logPathFile = null;
+let _lastLogFile = null;
+
+export function currentLogFile(date = new Date()) {
+  return path.resolve(logFileFor(date.toISOString().split("T")[0]));
+}
+
+function syncLogPath(logFile) {
+  if (!_logPathFile || logFile === _lastLogFile) return;
+  _lastLogFile = logFile;
+  try { fs.writeFileSync(_logPathFile, path.resolve(logFile) + "\n"); } catch { /* best effort */ }
+}
+
+function logFileFor(dateStr) {
+  return path.join(LOG_DIR, `agent-${dateStr}.log`);
+}
+
+export function enableLogPathFile(file = path.join(LOG_DIR, "bot.logpath")) {
+  _logPathFile = file;
+  _lastLogFile = null;
+  syncLogPath(logFileFor(new Date().toISOString().split("T")[0]));
+}
+
 /**
  * General log function.
  */
@@ -30,8 +56,9 @@ export function log(category, message) {
 
   // File output (daily rotation)
   const dateStr = timestamp.split("T")[0];
-  const logFile = path.join(LOG_DIR, `agent-${dateStr}.log`);
+  const logFile = logFileFor(dateStr);
   fs.appendFileSync(logFile, line + "\n");
+  syncLogPath(logFile);
 }
 
 /**
