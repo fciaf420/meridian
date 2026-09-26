@@ -22,7 +22,7 @@ import { createTelegramUI, BOT_COMMANDS, readRecentErrors } from "./telegram-ui.
 import { lookupToken, parseMint } from "./tools/token-lookup.js";
 import { isScreeningPaused, setScreeningPaused } from "./state.js";
 import { usdcModeEnabled } from "./tools/usdc-mode.js";
-import { generateBriefing } from "./briefing.js";
+import { generateBriefing, recordBriefing, latestBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
@@ -170,6 +170,7 @@ async function runBriefing() {
     deduplicateLessons();
     const briefing = await generateBriefing();
     emit("briefing", { html: briefing });
+    recordBriefing(briefing);
     setLastBriefingDate();
   } catch (error) {
     log("cron_error", `Morning briefing failed: ${error.message}`);
@@ -995,7 +996,7 @@ const TELEGRAM_HELP = [
   "/token <mint> (or just paste a mint) — SOL DLMM pools, token signals and your screening filters (✅/❌), with Deploy via the same picker",
   "auto — agent picks the best pool and deploys (asks for confirmation)",
   "go — start autonomous cycles",
-  "/briefing — last-24h briefing",
+  "/briefing — latest daily briefing (/briefing now builds a fresh one)",
   "/thresholds — screening thresholds + performance",
   "/learn [pool] — study top LPers (all top pools, or one address)",
   "/evolve — evolve thresholds from performance",
@@ -1118,6 +1119,10 @@ const tgUI = createTelegramUI({
   parseMint,
   executeTool,
   runExclusive: tryExclusive,
+  // /briefing (latest stored) and /briefing now (fresh; lastBriefingDate untouched).
+  generateBriefing: () => generateBriefing(),
+  recordBriefing,
+  latestBriefing: () => latestBriefing(),
   autoDeploy: autoDeployViaAgent,
   afterDeploy: () => launchCron({ announce: true }),
   runScreeningNow: () => runScreeningCycle({ manual: true }),
@@ -1215,14 +1220,6 @@ async function handleTelegramCommand(rawText, ctx = {}) {
     const arg = text.slice(5).trim().toLowerCase();
     if (arg === "on" || arg === "off") await setUsdcMode(arg === "on");
     return tgSend(usdcStatusText());
-  }
-
-  // ── Briefing (uses the same HTML path as notifications) ──
-  if (text === "/briefing") {
-    return runRemote(async () => {
-      const briefing = await generateBriefing();
-      emit("briefing", { html: briefing });
-    });
   }
 
   // ── Thresholds (read-only) ──

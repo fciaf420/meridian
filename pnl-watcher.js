@@ -87,6 +87,7 @@ function onchainOverride(p, tracked, onchain, pct) {
     collected_fees_usd: p.collected_fees_usd,
     unclaimed_fees_usd: p.unclaimed_fees_usd,
     pnl_source: "onchain",
+    pnl_sol: onchain?.pnlSol ?? null,
   };
 }
 
