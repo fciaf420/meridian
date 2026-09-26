@@ -30,7 +30,7 @@ import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
-import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, rawToUiString } from "./close-swap.js";
+import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, expectedClaimFeeRaw, rawToUiString } from "./close-swap.js";
 import { computeOnchainPnl, binPrice, onchainPctForUnit, feesValue } from "./onchain-pnl.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS, fitDeployAmount } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
@@ -2157,6 +2157,22 @@ export async function claimFees({ position_address }) {
     // add it back: getOnchainPnl reads total_fees_claimed_sol.
     const claimed = claimedFeesValue(pool, positionData, position_address);
 
+    // Claimed token-X fees land in the wallet as the position's base token. Sell
+    // exactly what this claim adds — only this position's token (pool token X),
+    // only the on-chain balance delta, clamped to the claimable fee — never other
+    // tokens or balances the wallet already held.
+    const claimBaseMint = pool.lbPair?.tokenXMint?.toBase58?.() ?? null;
+    const swapClaimed = !!claimBaseMint && claimBaseMint !== WSOL_MINT;
+    let preClaimRaw = null;
+    const expectedFeeRaw = swapClaimed ? expectedClaimFeeRaw(pool, positionData, claimBaseMint) : null;
+    if (swapClaimed && expectedFeeRaw != null && expectedFeeRaw > 0n) {
+      try {
+        preClaimRaw = (await getOnchainTokenBalance(claimBaseMint)).raw;
+      } catch (e) {
+        log("claim_warn", `Pre-claim balance for ${claimBaseMint.slice(0, 8)} unknown (${e.message}); the claimed token fees won't be auto-sold`);
+      }
+    }
+
     const txs = await pool.claimSwapFee({
       owner: wallet.publicKey,
       position: positionData,
@@ -2174,11 +2190,26 @@ export async function claimFees({ position_address }) {
     recordClaim(position_address, claimed?.usd ?? undefined, claimed?.sol ?? undefined);
     if (claimed) log("claim", `Claimed ≈ ${claimed.sol} SOL${claimed.usd != null ? ` (~$${claimed.usd})` : ""} of fees`);
 
+    let swapOutcome = null;
+    if (swapClaimed && expectedFeeRaw != null && expectedFeeRaw > 0n) {
+      const tracked = getTrackedPosition(position_address);
+      const sb = await swapBackWithdrawnBase({
+        baseMint: claimBaseMint,
+        symbol: tracked?.pool_name?.split("-")[0] || null,
+        preRaw: preClaimRaw,
+        expectedRaw: expectedFeeRaw,
+      });
+      txHashes.push(...sb.txs);
+      swapOutcome = sb.swapOutcome;
+    }
+
     return {
       success: true,
       position: position_address,
       tx: txHash,
+      txs: txHashes,
       ...(claimed && { claimed_fees: { sol: claimed.sol, usd: claimed.usd } }),
+      ...(swapOutcome && { swap: swapOutcome }),
     };
   } catch (error) {
     log("claim_error", error.message);
