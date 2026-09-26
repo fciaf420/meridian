@@ -68,6 +68,47 @@ export function setScreeningBusy(val) {
 }
 
 // ---------------------------------------------------------------------------
+// Shutdown drain — set on SIGINT/SIGTERM. While draining, cron ticks, the PnL
+// watcher and fund-moving tools start no new work; in-flight work finishes.
+// ---------------------------------------------------------------------------
+
+let _draining = false;
+
+export function isDraining() {
+  return _draining;
+}
+
+export function setDraining(val) {
+  const prev = _draining;
+  _draining = Boolean(val);
+  if (prev !== _draining) {
+    emit("status", { flag: "draining", value: _draining });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// In-flight fund-moving operations (deploys, closes, swaps, claims) started
+// through executeTool. The shutdown drain waits for this to empty.
+// ---------------------------------------------------------------------------
+
+let _opSeq = 0;
+const _inflightOps = new Map(); // id -> { name, startedAt }
+
+/** Track `promise` as an in-flight operation until it settles. Returns it. */
+export function trackInflightOp(name, promise) {
+  const id = ++_opSeq;
+  _inflightOps.set(id, { name, startedAt: Date.now() });
+  const done = () => { _inflightOps.delete(id); };
+  Promise.resolve(promise).then(done, done);
+  return promise;
+}
+
+/** Names of the in-flight operations, e.g. ["deploy_position"]. */
+export function getInflightOps() {
+  return [..._inflightOps.values()].map((o) => o.name);
+}
+
+// ---------------------------------------------------------------------------
 // Management close reasons: the code pre-check knows which hard rule fired for
 // each position ("rule 5: yield dead"); close_position records it instead of a
 // generic "agent decision". Set for the duration of one management cycle.

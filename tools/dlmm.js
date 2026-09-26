@@ -2181,6 +2181,11 @@ export function isCloseInflight(position_address) {
   return closeInflight.has(normalizeMint(position_address));
 }
 
+/** Addresses of every close currently running (the shutdown drain waits for them). */
+export function getInflightCloses() {
+  return [...closeInflight.keys()];
+}
+
 // _close_reason: internal override for the recorded close reason (code-driven
 // closes such as the OOR fallback); the LLM-facing tool schema does not expose it.
 export async function closePosition({ position_address, _pnlOverride = null, _close_reason = null }) {

@@ -10,6 +10,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { writeJsonAtomicSync } from "./atomic-write.js";
 import { config, reloadScreeningThresholds } from "./config.js";
 import { recordPoolDeploy } from "./pool-memory.js";
 import { recalculateWeights } from "./signal-weights.js";
@@ -30,7 +31,15 @@ function readUserConfig() {
 
 /** Write user-config.json — called once after all evolution passes complete. */
 function writeUserConfig(userConfig) {
-  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+  // readUserConfig() returns {} for an unparseable file; writing that back
+  // would wipe every setting (RPC, wallet key). Refuse instead.
+  if (fs.existsSync(USER_CONFIG_PATH)) {
+    try { JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch (err) {
+      log("lessons_error", `Skipping user-config.json write: the file on disk is unparseable (${err.message}). Fix it by hand.`);
+      return;
+    }
+  }
+  writeJsonAtomicSync(USER_CONFIG_PATH, userConfig);
 }
 
 // Set when the persisted lessons file is present but unparseable. While
@@ -69,7 +78,7 @@ function save(data) {
     log("lessons_error", "Skipping lessons.json save: file is in degraded (corrupt) state. Restore or remove the corrupt backup to re-enable saves.");
     return;
   }
-  fs.writeFileSync(LESSONS_FILE, JSON.stringify(data, null, 2));
+  writeJsonAtomicSync(LESSONS_FILE, data);
 }
 
 // ─── Record Position Performance ──────────────────────────────
