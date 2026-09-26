@@ -275,68 +275,94 @@ test("management gate: rule 3 on a false API TP is held; rule 4 and non-PnL clos
 });
 
 // ─── History correction script ───
-test("fix-false-tp-2026-09-26: rewrites the e/acc record and is idempotent", () => {
+test("fix-false-tp-2026-09-26: rewrites both e/acc false TPs and is idempotent", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-fix-tp-"));
-  const P = fixScript.POSITION;
+  const [A, B] = fixScript.CORRECTIONS;
+  const preferRule = "PREFER: e/acc-SOL-type pools (volatility=12.24, bin_step=125) with strategy=\"bid_ask\" — 100% in-range efficiency, PnL +33.03%.";
   fs.writeFileSync(path.join(root, "lessons.json"), JSON.stringify({
     lessons: [
       { id: 1, rule: "WORKED: e/acc-SOL, strategy=bid_ask → PnL +7.39%, range efficiency 50%.", outcome: "good", created_at: "2026-09-26T00:07:10.332Z" },
-      { id: 2, rule: "PREFER: something else", outcome: "good", created_at: "2026-09-26T00:23:09.243Z" },
+      { id: 2, rule: preferRule, tags: ["bid_ask", "efficient"], outcome: "good", pnl_pct: 33.03, created_at: "2026-09-26T00:23:09.243Z", update_count: 3 },
+      { id: 3, rule: "PREFER: something else", outcome: "good", created_at: "2026-09-20T00:00:00.000Z" },
     ],
     performance: [
       { position: "Other", pnl_pct: 1, pnl_usd: 1 },
-      { position: P, pool: fixScript.POOL, pnl_pct: 7.39, pnl_usd: 55.55, actual_pnl_pct: 7.39, actual_pnl_usd: 55.55, final_value_usd: 806.93, fees_earned_usd: 0.07, initial_value_usd: 754.97 },
+      { position: A.position, pool: fixScript.POOL, pnl_pct: 7.39, pnl_usd: 55.55, actual_pnl_pct: 7.39, actual_pnl_usd: 55.55, final_value_usd: 806.93, initial_value_usd: 754.97 },
+      { position: B.position, pool: fixScript.POOL, pnl_pct: 33.03, pnl_usd: 249.74, actual_pnl_pct: 33.03, actual_pnl_usd: 249.74, final_value_usd: 1002.65, initial_value_usd: 752 },
     ],
   }));
   fs.writeFileSync(path.join(root, "pool-memory.json"), JSON.stringify({
     [fixScript.POOL]: {
       deploys: [
-        { deployed_at: fixScript.DEPLOYED_AT, pnl_pct: 7.39, pnl_usd: 55.55 },
-        { deployed_at: "2026-09-26T00:21:04.569Z", pnl_pct: -3, pnl_usd: -20 },
+        { deployed_at: "2026-09-25T23:01:46.639Z", pnl_pct: -2, pnl_usd: -3 },
+        { deployed_at: A.deployedAt, pnl_pct: 7.39, pnl_usd: 55.55 },
+        { deployed_at: B.deployedAt, pnl_pct: 33.03, pnl_usd: 249.74 },
       ],
-      avg_pnl_pct: 2.2, win_rate: 0.5, last_outcome: "loss",
+      avg_pnl_pct: 12.81, win_rate: 0.67, last_outcome: "profit",
     },
   }));
   fs.writeFileSync(path.join(root, "state.json"), JSON.stringify({
-    positions: { [P]: { position: P, notes: ["Closed at …: agent decision (OOR upside)"] } },
-    recentAutoCloses: [{ position: P, reason: "FIXED_TP: PnL 7.4% >= take profit (7%)", pnl_pct: 7.39 }],
+    positions: {
+      [A.position]: { position: A.position, notes: ["Closed at …: agent decision (OOR upside)"] },
+      [B.position]: { position: B.position, notes: ["Closed at …: agent decision"] },
+    },
+    recentAutoCloses: [
+      { position: A.position, reason: "FIXED_TP: PnL 7.4% >= take profit (7%)", pnl_pct: 7.39 },
+      { position: B.position, reason: "FIXED_TP: PnL 33.0% >= take profit (7%)", pnl_pct: 33.03 },
+    ],
   }));
   fs.mkdirSync(path.join(root, "knowledge/pools"), { recursive: true });
+  fs.mkdirSync(path.join(root, "knowledge/lessons"), { recursive: true });
   fs.writeFileSync(path.join(root, "knowledge/pools/e-acc-sol.md"),
-    "## Deploy History\n\n- **WIN** 2026-09-26T00:23: PnL 33.0%, held 2min\n\n- **WIN** 2026-09-26T00:07: PnL 7.4%, held 4min, strategy: bid_ask\n");
-  fs.writeFileSync(path.join(root, "knowledge/LOG.md"), "- 2026-09-26T00:07:10 CLOSE WIN: e/acc-SOL PnL 7.4%, strategy=bid_ask\n");
+    "## Deploy History\n\n- **WIN** 2026-09-26T00:23: PnL 33.0%, held 2min\n\n- **WIN** 2026-09-26T00:07: PnL 7.4%, held 4min, strategy: bid_ask\n\n- **WIN** 2026-09-25T23:33: PnL 0.2%, held 31min\n");
+  fs.writeFileSync(path.join(root, "knowledge/lessons/bid-ask-patterns.md"),
+    "## Recent Results\n\n- 2026-09-26T00:23 e/acc-SOL: WIN 33.0%, held 2min\n- 2026-09-26T00:07 e/acc-SOL: WIN 7.4%, held 4min\n- 2026-09-26T00:23 OTHER-SOL: WIN 33.0%, held 9min\n");
+  fs.writeFileSync(path.join(root, "knowledge/LOG.md"), "- 2026-09-26T00:07:10 CLOSE WIN: e/acc-SOL PnL 7.4%, strategy=bid_ask\n- 2026-09-26T00:23:09 CLOSE WIN: e/acc-SOL PnL 33.0%, strategy=bid_ask\n");
+  const files = ["lessons.json", "pool-memory.json", "state.json", "knowledge/pools/e-acc-sol.md", "knowledge/lessons/bid-ask-patterns.md", "knowledge/LOG.md"];
 
   const quiet = () => {};
   const preview = fixScript.applyCorrections(root, { apply: false, log: quiet });
-  assert.ok(preview.changes.length >= 6);
+  assert.ok(preview.changes.length >= 12);
   assert.equal(preview.written.length, 0);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "lessons.json"))).performance[1].pnl_pct, 7.39, "preview writes nothing");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "lessons.json"))).performance[2].pnl_pct, 33.03, "preview writes nothing");
 
   const first = fixScript.applyCorrections(root, { apply: true, log: quiet });
-  assert.equal(first.written.length, 5);
+  assert.equal(first.written.length, files.length);
+  for (const f of files) assert.ok(fs.existsSync(path.join(root, `${f}.bak-fix-false-tp`)), `backup of ${f}`);
+
   const lessons = JSON.parse(fs.readFileSync(path.join(root, "lessons.json")));
-  const rec = lessons.performance[1];
-  assert.equal(rec.pnl_pct, 0.01);
-  assert.equal(rec.pnl_usd, 0.11);
-  assert.equal(rec.corrected, fixScript.CORRECTED);
-  assert.equal(rec.original.pnl_pct, 7.39);
-  assert.deepEqual(lessons.lessons.map((l) => l.id), [2], "WORKED lesson removed");
+  const [, recA, recB] = lessons.performance;
+  assert.deepEqual([recA.pnl_pct, recA.pnl_usd, recA.original.pnl_pct], [0.01, 0.11, 7.39]);
+  assert.deepEqual([recB.pnl_pct, recB.pnl_usd, recB.original.pnl_pct], [0, -0.01, 33.03]);
+  assert.equal(recB.corrected, B.corrected);
+  assert.deepEqual(lessons.lessons.map((l) => l.id), [2, 3], "WORKED lesson removed");
+  const prefer = lessons.lessons[0];
+  assert.equal(prefer.outcome, "neutral", "PREFER demoted so it no longer counts as a win");
+  assert.match(prefer.rule, /^\[CORRECTED — not a win\]/);
+  assert.equal(prefer.original.rule, preferRule);
+  assert.equal(lessons.lessons[1].rule, "PREFER: something else", "unrelated lesson untouched");
+
   const pm = JSON.parse(fs.readFileSync(path.join(root, "pool-memory.json")))[fixScript.POOL];
-  assert.equal(pm.deploys[0].pnl_pct, 0.01);
-  assert.equal(pm.avg_pnl_pct, -1.49); // (0.01 − 3) / 2, rounded like pool-memory.js
-  assert.equal(pm.win_rate, 0.5);
+  assert.deepEqual(pm.deploys.map((d) => d.pnl_pct), [-2, 0.01, 0]);
+  assert.equal(pm.avg_pnl_pct, -0.66); // (−2 + 0.01 + 0) / 3
+  assert.equal(pm.win_rate, 0.67);
+  assert.equal(pm.last_outcome, "profit");
+
   const st = JSON.parse(fs.readFileSync(path.join(root, "state.json")));
-  assert.equal(st.recentAutoCloses[0].pnl_pct, 0.01);
-  assert.ok(st.positions[P].notes.at(-1).startsWith("Corrected:"));
-  const kb = fs.readFileSync(path.join(root, "knowledge/pools/e-acc-sol.md"), "utf8");
-  assert.match(kb, /2026-09-26T00:07: PnL 0\.0%.*\[corrected: false TP 7\.4%/);
-  assert.match(kb, /00:23: PnL 33\.0%, held 2min\n/, "other closes untouched");
-  const snapshot = ["lessons.json", "pool-memory.json", "state.json", "knowledge/pools/e-acc-sol.md", "knowledge/LOG.md"]
-    .map((f) => fs.readFileSync(path.join(root, f), "utf8"));
+  assert.deepEqual(st.recentAutoCloses.map((a) => a.pnl_pct), [0.01, 0]);
+  assert.ok(st.positions[B.position].notes.at(-1).startsWith("Corrected:"));
+
+  const pool = fs.readFileSync(path.join(root, "knowledge/pools/e-acc-sol.md"), "utf8");
+  assert.match(pool, /00:07: PnL 0\.0%.*\[corrected: false TP 7\.4%/);
+  assert.match(pool, /00:23: PnL 0\.0%.*\[corrected: false TP 33\.03%/);
+  assert.match(pool, /23:33: PnL 0\.2%, held 31min\n/, "other closes untouched");
+  const concept = fs.readFileSync(path.join(root, "knowledge/lessons/bid-ask-patterns.md"), "utf8");
+  assert.match(concept, /00:23 e\/acc-SOL: WIN 0\.0%.*\[corrected:/);
+  assert.match(concept, /OTHER-SOL: WIN 33\.0%, held 9min\n/, "another pool's line with the same stamp is untouched");
+  const snapshot = files.map((f) => fs.readFileSync(path.join(root, f), "utf8"));
 
   const second = fixScript.applyCorrections(root, { apply: true, log: quiet });
   assert.equal(second.changes.length, 0, "second run changes nothing");
   assert.equal(second.written.length, 0);
-  assert.deepEqual(["lessons.json", "pool-memory.json", "state.json", "knowledge/pools/e-acc-sol.md", "knowledge/LOG.md"]
-    .map((f) => fs.readFileSync(path.join(root, f), "utf8")), snapshot);
+  assert.deepEqual(files.map((f) => fs.readFileSync(path.join(root, f), "utf8")), snapshot);
 });
