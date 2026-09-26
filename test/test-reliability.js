@@ -17,6 +17,7 @@ import path from "path";
 const REPO = process.cwd();
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-reliability-"));
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 process.env.DRY_RUN = "true";
 for (const k of Object.keys(process.env)) if (k.startsWith("LPAGENT")) delete process.env[k];
 delete process.env.HEALTHCHECK_URL;

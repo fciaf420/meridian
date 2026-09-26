@@ -15,6 +15,7 @@ process.env.JUPITER_API_KEY = "test-key";
 delete process.env.DRY_RUN;
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 const jt = await import("../tools/jup-tokens.js");

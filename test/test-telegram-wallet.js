@@ -9,6 +9,7 @@ import path from "path";
 process.env.DRY_RUN = "true";
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-wallet-"));
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 const ui = await import("../telegram-ui.js");
