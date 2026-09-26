@@ -7,19 +7,22 @@
  */
 
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { log } from "./logger.js";
-import { config, reloadScreeningThresholds } from "./config.js";
+import { config, reloadScreeningThresholds, USER_CONFIG_PATH } from "./config.js";
 import { recordPoolDeploy } from "./pool-memory.js";
 import { recalculateWeights } from "./signal-weights.js";
 import { filePositionClose } from "./knowledge-base.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+import {
+  classifyRecord,
+  exclusionReason,
+  isExcludedLesson,
+  learnableRecords,
+  recordPnlPct,
+} from "./learning-data.js";
 
 const LESSONS_FILE = "./lessons.json";
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
+const LESSON_STRONG_PCT    = 5;   // |PnL| a win/loss needs before it becomes a lesson rule
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 
 /** Read user-config.json once — shared across evolution passes to avoid double reads. */
@@ -127,8 +130,11 @@ export async function recordPerformance(perf) {
 
   data.performance.push(entry);
 
-  // Derive and store a lesson (with deduplication)
-  const lesson = derivLesson(entry);
+  // Derive and store a lesson (with deduplication). A record excluded from
+  // learning (learning-data.js) teaches nothing.
+  const excluded = exclusionReason(entry);
+  if (excluded) log("lessons", `Close ${entry.position?.slice?.(0, 8) ?? "?"} excluded from learning: ${excluded}`);
+  const lesson = excluded ? null : derivLesson(entry);
   if (lesson) {
     const dupeIdx = findDuplicate(data.lessons, lesson);
     if (dupeIdx >= 0) {
@@ -178,6 +184,7 @@ export async function recordPerformance(perf) {
         sol_split_pct: perf.sol_split_pct ?? null,
         volatility: perf.volatility,
         price_range_pct: deployRangePct,
+        ...(excluded && { exclude_from_learning: excluded }),
       });
     } catch (e) {
       log("pool-memory", `Failed to record pool deploy: ${e.message}`);
@@ -247,13 +254,13 @@ function derivLesson(perf) {
   if (perf.pnl_unknown) return null; // placeholder 0% PnL: not an outcome to learn from
   const tags = [];
 
-  // Categorize outcome
-  const outcome = perf.pnl_pct >= 5 ? "good"
-    : perf.pnl_pct >= 0 ? "neutral"
-    : perf.pnl_pct >= -5 ? "poor"
-    : "bad";
-
-  if (outcome === "neutral") return null; // nothing interesting to learn
+  // Categorize outcome with the shared classifier (learning-data.js): only a
+  // win (> +1%) or a loss (< −1%) can teach, and a lesson rule needs a clear
+  // one (±LESSON_STRONG_PCT). Break-even closes never become WORKED/PREFER.
+  const cls = classifyRecord(perf);
+  if (cls !== "win" && cls !== "loss") return null;
+  if (Math.abs(recordPnlPct(perf)) < LESSON_STRONG_PCT) return null; // not clear enough to be a rule
+  const outcome = cls === "win" ? "good" : "bad";
 
   // Parse OOR direction from close_reason (e.g. "agent decision (OOR upside)")
   const oorDir = perf.close_reason?.match(/OOR (upside|downside)/)?.[1] || null;
@@ -372,14 +379,30 @@ export function evolveOhlcvBuffer(perfData, config) {
 }
 
 export function evolveThresholds(perfData, config, { userConfig, lessonsData } = {}) {
-  if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
+  const computed = computeThresholdChanges(perfData, config);
+  if (!computed) return null;
+  const { changes, rationale } = computed;
+  return persistThresholdChanges(perfData, config, changes, rationale, { userConfig, lessonsData });
+}
 
-  const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < -5);
+/**
+ * The threshold changes evolution would make from these performance records,
+ * without writing anything. Null when there is too little data.
+ *
+ * Wins and losses come from the shared classifier (learning-data.js): > +1% is
+ * a winner, < −1% a loser, and break-even closes are neither. Records excluded
+ * from learning (known-bad, corrupt, corrected) are dropped first.
+ */
+export function computeThresholdChanges(perfData, config) {
+  const learnable = learnableRecords(perfData);
+  if (learnable.length < MIN_EVOLVE_POSITIONS) return null;
+
+  const winners = learnable.filter((p) => classifyRecord(p) === "win");
+  const losers  = learnable.filter((p) => classifyRecord(p) === "loss");
 
   // The depth buffer learns from how positions ended, not from win/loss PnL,
   // so it is evaluated even when the PnL signal below is too thin.
-  const bufferEvo = evolveOhlcvBuffer(perfData, config);
+  const bufferEvo = evolveOhlcvBuffer(learnable, config);
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
@@ -621,6 +644,10 @@ export function evolveThresholds(perfData, config, { userConfig, lessonsData } =
     }
   }
 
+  return { changes, rationale };
+}
+
+function persistThresholdChanges(perfData, config, changes, rationale, { userConfig, lessonsData } = {}) {
   // ── Persist changes to user-config.json ───────────────────────
   // Use shared userConfig if provided by caller (avoids redundant read/write
   // when evolveThresholds + evolveFromLessons run back-to-back).
@@ -708,6 +735,7 @@ function findDuplicate(lessons, candidate) {
 
   for (let i = lessons.length - 1; i >= 0; i--) {
     const existing = lessons[i];
+    if (isExcludedLesson(existing)) continue; // never refresh a lesson from a known-bad record
 
     // Method 1: Tag + outcome match
     if (existing.outcome === candidate.outcome && tagsMatch(existing.tags, candidate.tags)) {
@@ -735,7 +763,8 @@ function findDuplicate(lessons, candidate) {
  * @param {Object} [opts.lessonsData] - Pre-loaded lessons.json data (avoids extra load/save)
  */
 export function evolveFromLessons(lessons, config, { userConfig, lessonsData } = {}) {
-  if (!lessons || lessons.length < 5) return null;
+  lessons = (lessons || []).filter((l) => !isExcludedLesson(l));
+  if (lessons.length < 5) return null;
 
   const recent = lessons.slice(-30); // last 30 lessons
   const changes = {};
@@ -1034,7 +1063,9 @@ export function getLessonRecordsForPrompt(opts = {}) {
   if (typeof opts === "number") opts = { maxLessons: opts };
 
   const { agentType = "GENERAL", maxLessons = 35 } = opts;
-  const data = load();
+  const loaded = load();
+  // Lessons derived from known-bad records (learning-data.js) stay out of the prompt.
+  const data = { ...loaded, lessons: (loaded.lessons || []).filter((l) => !isExcludedLesson(l)) };
   if (data.lessons.length === 0) {
     return { pinned: [], roleMatched: [], recent: [], selected: [] };
   }

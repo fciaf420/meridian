@@ -287,10 +287,12 @@ test("inactive sections are skipped under evil_panda; OOR upside is attributed b
   assert.deepEqual(ar.eligibleSections({ strategy: { activeStrategy: "evil_panda" } }).includes("range_selection"), false);
   assert.ok(ar.eligibleSections({ strategy: { activeStrategy: "bid_ask" } }).includes("range_selection"));
 
-  const oorUpside = { pnl_usd: -1, close_reason: "agent decision (OOR upside)", strategy: "spot", sol_split_pct: 100, range_efficiency: 5 };
-  const lowEff = { pnl_usd: -1, close_reason: "agent decision", strategy: "spot", range_efficiency: 10 };
+  const oorUpside = { pnl_usd: -1, pnl_pct: -2, close_reason: "agent decision (OOR upside)", strategy: "spot", sol_split_pct: 100, range_efficiency: 5 };
+  const lowEff = { pnl_usd: -1, pnl_pct: -2, close_reason: "agent decision", strategy: "spot", range_efficiency: 10 };
   const unknown = { pnl_usd: -1, pnl_unknown: true, close_reason: "agent decision" };
-  const losses = ar.attributeLosses([oorUpside, oorUpside, lowEff, unknown]);
+  const breakeven = { pnl_usd: -0.1, pnl_pct: -0.4, close_reason: "agent decision", strategy: "spot", range_efficiency: 10 };
+  const knownBad = { position: "AT5nG76yVJNftdTnd2HHmN5rvRgsRFtSZ6weVq2GEwji", pnl_usd: -85.89, pnl_pct: -66.44, close_reason: "agent decision", range_efficiency: 10 };
+  const losses = ar.attributeLosses([oorUpside, oorUpside, lowEff, unknown, breakeven, knownBad]);
   assert.equal(losses.screener_criteria.length, 2, "single-sided OOR upside goes to the screener even with low range efficiency");
   assert.equal(losses.range_selection.length, 1);
   assert.equal(losses.manager_logic.length, 0);

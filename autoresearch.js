@@ -31,6 +31,7 @@ import {
   clearExperimentCandidate,
 } from "./prompt.js";
 import { loadWeights, getWeightsSummary } from "./signal-weights.js";
+import { classifyRecord, isExcludedFromLearning } from "./learning-data.js";
 import {
   getDefaultModelForProvider,
   getChatCompletionsEndpoint,
@@ -620,8 +621,9 @@ export function eligibleSections(cfg = config) {
 export function attributeLosses(recent) {
   const sectionLosses = { screener_criteria: [], manager_logic: [], range_selection: [] };
   for (const p of recent) {
-    if ((p.pnl_usd ?? 0) >= 0) continue; // skip winners
     if (p.pnl_unknown) continue;          // a 0 placeholder, not a measured loss
+    if (isExcludedFromLearning(p)) continue; // known-bad / corrected record
+    if (classifyRecord(p) !== "loss") continue; // wins and break-even (±1%) aren't losses
 
     const reason = (p.close_reason || "").toLowerCase();
 
