@@ -1088,6 +1088,19 @@ export async function deployPosition({
   // Calculate amounts
   // If amount_y is not provided but amount_sol is, use amount_sol (for backward compatibility)
   const finalAmountY = amount_y ?? amount_sol ?? 0;
+  // USD value at deploy, for PnL history. The screener passes it; manual Telegram
+  // deploys don't, which left it 0 and made the close fall back to the final
+  // value (PnL 0%). Estimate it from the SOL committed (before any auto-swap).
+  if (!(Number(initial_value_usd) > 0)) {
+    const solCommitted = totalSolAmount > 0 ? totalSolAmount : finalAmountY;
+    try {
+      const solPrice = (await getWalletBalances()).sol_price || 0;
+      if (solPrice > 0 && solCommitted > 0) {
+        initial_value_usd = Math.round(solCommitted * solPrice * 100) / 100;
+        log("deploy", `initial_value_usd not provided — estimated $${initial_value_usd} (${solCommitted} SOL × $${solPrice})`);
+      }
+    } catch { /* best-effort; the close path still has a fallback */ }
+  }
   const finalAmountX = amount_x ?? 0;
 
   // Decimal-safe UI -> raw integer BN (string-based; avoids JS float precision
