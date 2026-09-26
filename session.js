@@ -66,3 +66,23 @@ export function setScreeningBusy(val) {
     emit("status", { flag: "screeningBusy", value: _screeningBusy });
   }
 }
+
+// ---------------------------------------------------------------------------
+// Management close reasons: the code pre-check knows which hard rule fired for
+// each position ("rule 5: yield dead"); close_position records it instead of a
+// generic "agent decision". Set for the duration of one management cycle.
+// ---------------------------------------------------------------------------
+
+let _mgmtCloseReasons = new Map();
+
+export function setManagementCloseReasons(entries) {
+  _mgmtCloseReasons = new Map(entries || []);
+}
+
+export function getManagementCloseReason(positionAddress) {
+  return positionAddress ? _mgmtCloseReasons.get(positionAddress) ?? null : null;
+}
+
+export function clearManagementCloseReasons() {
+  _mgmtCloseReasons = new Map();
+}

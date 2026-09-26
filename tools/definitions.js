@@ -304,6 +304,10 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
           position_address: {
             type: "string",
             description: "The position public key to close"
+          },
+          reason: {
+            type: "string",
+            description: "Short close reason for the history, e.g. \"rule 5: yield dead\" or \"Judgment: yield dying on the 1h view\". Hard-rule closes are labelled automatically; give the reason for judgment closes."
           }
         },
         required: ["position_address"]
