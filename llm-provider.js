@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdtempSync, realpathSync } from "fs";
 import { homedir, tmpdir } from "os";
 import path from "path";
 import OpenAI from "openai";
@@ -247,9 +247,50 @@ function killChildProcess(child) {
   }
 }
 
+// Codex runs from an empty private directory, never the repo: its tool shell
+// must not be able to reach the bot's .env, state or keys.
+let _codexWorkDir = null;
+export function codexWorkDir() {
+  if (!_codexWorkDir || !existsSync(_codexWorkDir)) {
+    _codexWorkDir = realpathSync(mkdtempSync(path.join(tmpdir(), "meridian-codex-")));
+  }
+  return _codexWorkDir;
+}
+
+const CODEX_PERMISSION_PROFILE = "meridian_llm";
+
+/** TOML string literal for a -c value. */
+function tomlString(s) {
+  return JSON.stringify(String(s));
+}
+
+/**
+ * Codex permission profile (macOS seatbelt) that denies file reads outside
+ * the platform basics (`:minimal`), the empty work dir and the codex binary's
+ * own directories (its fs helper re-executes the binary). Returns the extra
+ * `-c` args, or null when the binary can't be located (fall back to
+ * --sandbox read-only). Only used on darwin, where it was verified: a
+ * command in this profile gets "Operation not permitted" reading the repo.
+ */
+export function codexPermissionArgs(command, workDir, { platform = process.platform, locate = findExecutableOnPath } = {}) {
+  if (platform !== "darwin") return null;
+  const bin = command && path.isAbsolute(command) ? command : locate(command || "codex");
+  if (!bin) return null;
+  const roots = new Set([workDir, path.dirname(bin)]);
+  try {
+    roots.add(path.dirname(realpathSync(bin)));
+  } catch {
+    return null;
+  }
+  const entries = [`":minimal"="read"`, ...[...roots].map((r) => `${tomlString(r)}="read"`)];
+  return [
+    "-c", `default_permissions=${tomlString(CODEX_PERMISSION_PROFILE)}`,
+    "-c", `permissions.${CODEX_PERMISSION_PROFILE}={filesystem={${entries.join(", ")}}}`,
+  ];
+}
+
 export function runCodexExec(model, prompt, {
   timeoutMs = 180000,
-  cwd = process.cwd(),
   config = {},
   sandbox = "read-only",
   skipGitRepoCheck = true,
@@ -259,6 +300,7 @@ export function runCodexExec(model, prompt, {
     const stdoutChunks = [];
     const stderrChunks = [];
     const { command, viaCmd } = resolveCodexLaunch();
+    const cwd = codexWorkDir();
     const args = [
       "exec",
       "--model",
@@ -266,12 +308,17 @@ export function runCodexExec(model, prompt, {
     ];
 
     if (outputSchemaPath) {
-      args.push("--output-schema", outputSchemaPath);
+      // Absolute: the CLI runs from the empty work dir, not the repo.
+      args.push("--output-schema", path.resolve(outputSchemaPath));
     }
 
+    // Prefer a read-restricting permission profile; else the read-only sandbox
+    // (which can still read any file, but the cwd holds nothing).
+    const permissionArgs = viaCmd ? null : codexPermissionArgs(command, cwd);
+    if (permissionArgs) args.push(...permissionArgs);
+    else args.push("--sandbox", sandbox);
+
     args.push(
-      "--sandbox",
-      sandbox,
       "--json",
       "-",
     );

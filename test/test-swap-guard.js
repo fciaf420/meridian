@@ -30,7 +30,7 @@ process.chdir(TMP);
 test.after(() => { process.chdir(REPO); fs.rmSync(TMP, { recursive: true, force: true }); });
 
 const { buildCliEnv } = await import("../child-env.js");
-const { runCodexExec, runClaudeCli } = await import("../llm-provider.js");
+const { runCodexExec, runClaudeCli, codexPermissionArgs } = await import("../llm-provider.js");
 const { gmgnSpawnOptions } = await import("../tools/gmgn.js");
 const { checkAgentSwap, CLOSE_EXPOSURE_WINDOW_MS, AMBIGUOUS_SWAP_WINDOW_MS, SOL_MINT } = await import("../tools/swap-guard.js");
 const { swapBackWithdrawnBase } = await import("../tools/close-swap.js");
@@ -93,7 +93,7 @@ function fakeCli(kind) {
 let d = "";
 process.stdin.on("data", (c) => { d += c; });
 process.stdin.on("end", () => {
-  const text = JSON.stringify({ keys: Object.keys(process.env), leaked: Object.values(process.env).some((v) => String(v).includes(${JSON.stringify(SENTINEL)})) });
+  const text = JSON.stringify({ cwd: process.cwd(), argv: process.argv.slice(2), keys: Object.keys(process.env), leaked: Object.values(process.env).some((v) => String(v).includes(${JSON.stringify(SENTINEL)})) });
   if (${JSON.stringify(kind)} === "codex") console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }));
   else console.log(JSON.stringify({ type: "result", result: text }));
 });
@@ -115,10 +115,39 @@ test("the env handed to the real Codex/Claude spawns never contains WALLET_PRIVA
       for (const k of Object.keys(SECRET_ENV)) assert.ok(!seen.keys.includes(k), `${name} got ${k}`);
       assert.ok(seen.keys.includes("PATH") && seen.keys.includes("HOME"), `${name} keeps PATH/HOME`);
     }
+    // Codex runs from an empty private temp dir, never the repo or the caller's cwd.
+    assert.notEqual(fs.realpathSync(codex.cwd), fs.realpathSync(REPO));
+    assert.notEqual(fs.realpathSync(codex.cwd), fs.realpathSync(TMP));
+    assert.match(path.basename(codex.cwd), /^meridian-codex-/);
+    assert.deepEqual(fs.readdirSync(codex.cwd), []);
+    if (process.platform === "darwin") {
+      // Read-restricting permission profile instead of the read-anything read-only sandbox.
+      assert.ok(codex.argv.includes('default_permissions="meridian_llm"'));
+      assert.ok(!codex.argv.includes("--sandbox"));
+      const perms = codex.argv.find((a) => a.startsWith("permissions.meridian_llm="));
+      assert.ok(perms.includes('":minimal"="read"'));
+      assert.ok(perms.includes(JSON.stringify(codex.cwd)));
+      assert.ok(!perms.includes(JSON.stringify(REPO)));
+    }
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);
   }
+});
+
+test("codexPermissionArgs grants reads only to :minimal, the work dir and the codex binary dirs", () => {
+  const bin = process.execPath; // any real absolute executable
+  const args = codexPermissionArgs(bin, "/tmp/meridian-codex-x", { platform: "darwin" });
+  assert.equal(args[0], "-c");
+  assert.equal(args[1], 'default_permissions="meridian_llm"');
+  const fsSpec = args[3];
+  assert.match(fsSpec, /^permissions\.meridian_llm=\{filesystem=\{":minimal"="read", /);
+  assert.ok(fsSpec.includes('"/tmp/meridian-codex-x"="read"'));
+  assert.ok(fsSpec.includes(`${JSON.stringify(path.dirname(bin))}="read"`));
+  assert.ok(!/"write"|"\/"=/.test(fsSpec), "no write grants, no whole-disk read");
+  // Other platforms and an unlocatable binary fall back to --sandbox read-only.
+  assert.equal(codexPermissionArgs(bin, "/tmp/x", { platform: "linux" }), null);
+  assert.equal(codexPermissionArgs("codex", "/tmp/x", { platform: "darwin", locate: () => null }), null);
 });
 
 test("gmgn-cli gets GMGN_API_KEY only and runs outside the repo (no .env pickup)", () => {
@@ -291,14 +320,37 @@ test("close-swap records the attributable unsold amount and whether its swap is 
   const unk = await swapBackWithdrawnBase({ baseMint: MINT, preRaw: null, expectedRaw: 1n }, closeHarness({ balances: [1], swapResults: [] }));
   assert.equal(unk.exposure.unsold_raw, "0");
 
-  // A price-impact refusal is terminal: one attempt, no retries.
-  let calls = 0;
-  const h = closeHarness({ balances: [721233237], swapResults: [{ success: false, price_impact_refused: true, error: "Swap refused: price impact 9.00% exceeds maxSwapPriceImpactPct 5%" }] });
+});
+
+test("close swap-backs ask for the close price-impact cap; a refusal above it stays exposure, logged with the impact", async () => {
+  const calls = [];
+  const logs = [];
+  const h = closeHarness({ balances: [721233237], swapResults: [{ success: false, price_impact_refused: true, price_impact_pct: 31.2, max_price_impact_pct: 25, price_impact_cap_key: "maxCloseSwapPriceImpactPct", error: "Swap refused: price impact 31.20% exceeds maxCloseSwapPriceImpactPct 25%" }] });
   const swap = h.swap;
-  h.swap = async (a) => { calls++; return swap(a); };
-  const pi = await swapBackWithdrawnBase({ baseMint: MINT, preRaw: 0n, expectedRaw: 721233237n }, h);
-  assert.equal(calls, 1);
-  assert.equal(pi.exposure.unsold_raw, "721233237");
+  h.swap = async (a, opts) => { calls.push(opts); return swap(a); };
+  h.log = (cat, msg) => logs.push({ cat, msg });
+  const r = await swapBackWithdrawnBase({ baseMint: MINT, symbol: "BAG", preRaw: 0n, expectedRaw: 721233237n }, h);
+  assert.deepEqual(calls, [{ impactCap: "close" }], "one attempt, with the close cap; no retries");
+  assert.equal(r.exposureFlag, true);
+  assert.equal(r.exposure.unsold_raw, "721233237");
+  assert.equal(r.swapOutcome.price_impact_refused, true);
+  assert.equal(r.swapOutcome.price_impact_pct, 31.2);
+  assert.equal(r.swapOutcome.max_price_impact_pct, 25);
+  assert.ok(logs.some((l) => l.cat === "close_warn" && /REFUSED on price impact: 31\.2% > maxCloseSwapPriceImpactPct 25% for 721\.233237 BAG.*success_with_exposure/.test(l.msg)));
+
+  // Under the close cap (e.g. the live 5.307% exit), the swap-back simply succeeds.
+  const ok = await swapBackWithdrawnBase({ baseMint: MINT, preRaw: 0n, expectedRaw: 721233237n }, closeHarness({ balances: [721233237, 0], swapResults: [{ success: true, tx: "S" }] }));
+  assert.equal(ok.exposureFlag, false);
+});
+
+test("the LLM can't change either price-impact cap through update_config", async () => {
+  const { config } = await import("../config.js");
+  const before = { ...config.risk };
+  const r = await executeTool("update_config", { changes: { maxSwapPriceImpactPct: 50, maxCloseSwapPriceImpactPct: 90 }, reason: "test" });
+  assert.equal(r.success, false);
+  assert.deepEqual(r.unknown.sort(), ["maxCloseSwapPriceImpactPct", "maxSwapPriceImpactPct"]);
+  assert.equal(config.risk.maxSwapPriceImpactPct, before.maxSwapPriceImpactPct);
+  assert.equal(config.risk.maxCloseSwapPriceImpactPct, 25);
 });
 
 // ─── state.js persistence ──────────────────────────────────────

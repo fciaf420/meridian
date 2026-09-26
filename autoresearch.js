@@ -1147,7 +1147,6 @@ Return a JSON object: {"hypothesis": one sentence on what you changed (added, re
     fs.writeFileSync(schemaPath, JSON.stringify(schema));
     const content = await runCodexExec(model, `${systemMsg}\n\n${userMsg}`, {
       timeoutMs: AUTORESEARCH_LLM_TIMEOUT_MS,
-      cwd: process.cwd(),
       sandbox: "read-only",
       skipGitRepoCheck: true,
       outputSchemaPath: schemaPath,
