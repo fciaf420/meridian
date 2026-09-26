@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent that supervises the Meridian bot. Install steps: ops/README.md.
+  Paths assume the repo lives at /Users/frankciafardini/projects/meridian;
+  edit the four absolute paths below if it moves.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.meridian.bot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/frankciafardini/projects/meridian/ops/run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/frankciafardini/projects/meridian</string>
+
+  <!-- Start at login/load. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart only on a non-zero exit (crash, forced exit, uncaught error).
+       A clean exit 0 (graceful SIGTERM drain, Telegram /stop) stays stopped. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- At most one restart every 30s, so a crash loop can't hammer RPC/LLM APIs. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!-- launchd SIGKILLs a job this long after SIGTERM (default 20s). Must exceed
+       the bot's drain timeout (SHUTDOWN_DRAIN_TIMEOUT_SEC, default 90). -->
+  <key>ExitTimeOut</key>
+  <integer>120</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/frankciafardini/projects/meridian/logs/launchd-out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/frankciafardini/projects/meridian/logs/launchd-err.log</string>
+</dict>
+</plist>
