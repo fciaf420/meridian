@@ -50,7 +50,7 @@ import { startServer } from "./server.js";
 import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
 import { getScreeningThresholdSummary, getStartupMode, screeningCronGate } from "./runtime-helpers.js";
-import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal } from "./prompt.js";
+import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal, formatRunnerPrecheck } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
 log("startup", "DLMM LP Agent starting...");
@@ -736,6 +736,7 @@ function startCronJobs() {
           return; // finally{} still releases the lock and emits the report
         }
         log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
+        memoryHints += formatRunnerPrecheck(ruleHits);
         mgmtRuleFired = ruleHits.some((h) => /: rule [3-6]$/.test(h));
       }
 

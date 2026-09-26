@@ -25,7 +25,11 @@
  */
 
 import { execFile } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { log } from "../logger.js";
+import { buildCliEnv } from "../child-env.js";
 
 const GMGN_BIN = "gmgn-cli";
 const CHAIN = "sol";
@@ -33,6 +37,20 @@ const CHAIN = "sol";
 // Spawn limits.
 const SPAWN_TIMEOUT_MS = 15_000;
 const SPAWN_MAX_BUFFER = 8 * 1024 * 1024; // 8MB — kline/track feeds can be large.
+
+// gmgn-cli runs dotenv on `.env` in its cwd. From the repo root that would load
+// the bot's .env (wallet key included) into the CLI, so it runs from an empty
+// private directory instead, with only GMGN_API_KEY passed in (child-env.js).
+let _gmgnCwd = null;
+function gmgnCwd() {
+  if (!_gmgnCwd) _gmgnCwd = mkdtempSync(path.join(tmpdir(), "meridian-gmgn-"));
+  return _gmgnCwd;
+}
+
+/** Spawn options for gmgn-cli: minimal env, empty cwd. Exported for tests. */
+export function gmgnSpawnOptions() {
+  return { timeout: SPAWN_TIMEOUT_MS, maxBuffer: SPAWN_MAX_BUFFER, env: buildCliEnv("gmgn"), cwd: gmgnCwd() };
+}
 
 // Caches (mirror okx.js TTLs).
 const TOKEN_INFO_TTL = 60_000;
@@ -128,7 +146,7 @@ export function spawnGmgn(args) {
         execFile(
           GMGN_BIN,
           fullArgs,
-          { timeout: SPAWN_TIMEOUT_MS, maxBuffer: SPAWN_MAX_BUFFER },
+          gmgnSpawnOptions(),
           (error, stdout, stderr) => {
             if (error) {
               const blob = `${stderr || ""}${error.message || ""}`;

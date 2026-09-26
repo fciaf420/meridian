@@ -6,6 +6,8 @@
   "deployAmountSol": 0.1,
   "maxPositions": 3,
   "maxDeployAmount": 50,
+  "maxSwapPriceImpactPct": 5,
+  "maxCloseSwapPriceImpactPct": 25,
   "minSolToOpen": 0.1,
 
   "managementIntervalMin": 3,

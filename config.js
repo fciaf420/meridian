@@ -63,6 +63,12 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // Refuse a swap whose quoted price impact is above this (%): agent swap_token,
+    // deploy auto-swap, USDC entry (wallet.js swapToken).
+    maxSwapPriceImpactPct: u.maxSwapPriceImpactPct ?? 5,
+    // Looser cap for post-close swap-backs (close-swap.js, sync-close, USDC settle):
+    // leaving the withdrawn bag is worse than the slippage. Owner-only (not in update_config).
+    maxCloseSwapPriceImpactPct: u.maxCloseSwapPriceImpactPct ?? 25,
   },
 
   // ─── Pool Screening Thresholds ───────────
