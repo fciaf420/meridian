@@ -315,8 +315,15 @@ function startCloseBinsSnapshot(positionAddress) {
 /**
  * Execute a tool call with safety checks and logging.
  */
-export async function executeTool(name, args) {
+export async function executeTool(name, args, { manual = false } = {}) {
   const startTime = Date.now();
+  // `_manual` (skip the token-age window) is only honoured for owner-initiated
+  // Telegram deploys, which pass { manual: true }; strip it from anything else
+  // so the LLM can't set it through tool arguments.
+  if (name === "deploy_position" && args && typeof args === "object") {
+    const { _manual, ...rest } = args;
+    args = manual ? { ...rest, _manual: true } : rest;
+  }
 
   // ─── Validate tool exists ─────────────────
   const fn = toolMap[name];

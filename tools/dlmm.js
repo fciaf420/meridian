@@ -520,6 +520,7 @@ export async function deployPosition({
   organic_score,
   initial_value_usd,
   study_avg_hold_hours,
+  _manual = false, // set only by executeTool for owner-initiated Telegram deploys (never from the LLM)
 }) {
   pool_address = normalizeMint(pool_address);
   let activeStrategy = strategy || config.strategy.strategy;
@@ -567,7 +568,9 @@ export async function deployPosition({
   // Age is the base token's creation time (Meteora token_x.created_at, else
   // GMGN creation/open timestamp), never the pool's. A known age outside the
   // window refuses; an unknown age is allowed with a warning (tools/token-age.js).
-  {
+  if (_manual) {
+    log("deploy", "Manual (owner) deploy — token-age window not applied");
+  } else {
     const { checkDeployTokenAge, fmtAgeHours } = await import("./token-age.js");
     const age = await checkDeployTokenAge({
       mint: base_mint || null,
