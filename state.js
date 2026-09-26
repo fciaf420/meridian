@@ -105,6 +105,7 @@ export function trackPosition({
     out_of_range_since: null,
     last_claim_at: null,
     total_fees_claimed_usd: 0,
+    total_fees_claimed_sol: 0,
     rebalance_count: 0,
     peak_pnl_pct: 0,
     trailing_active: false,
@@ -216,15 +217,36 @@ export function minutesOutOfRange(position_address) {
 }
 
 /**
- * Record a fee claim event.
+ * Record a fee claim event: the claimed amount in USD and in SOL.
+ *
+ * On-chain PnL (tools/onchain-pnl.js) adds fees claimed earlier back to the
+ * position's value in SOL, so the SOL figure is what keeps a mid-position
+ * claim from reading as a loss. A claim with a USD amount but no SOL amount
+ * is kept in fees_claimed_usd_unpriced and converted at read time.
  */
-export function recordClaim(position_address, fees_usd) {
+export function recordClaim(position_address, fees_usd, fees_sol) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos) return;
+  const usd = Number(fees_usd);
+  const sol = Number(fees_sol);
+  const hasUsd = fees_usd != null && Number.isFinite(usd) && usd >= 0;
+  const hasSol = fees_sol != null && Number.isFinite(sol) && sol >= 0;
   pos.last_claim_at = new Date().toISOString();
-  pos.total_fees_claimed_usd = (pos.total_fees_claimed_usd || 0) + (fees_usd || 0);
-  pos.notes.push(`Claimed ~${fees_usd?.toFixed(2) || "?"} USD fees at ${pos.last_claim_at}`);
+  // A record from before the SOL total existed: its USD claims have no SOL figure.
+  if (pos.total_fees_claimed_sol == null && Number(pos.total_fees_claimed_usd) > 0) {
+    pos.fees_claimed_usd_unpriced = (Number(pos.fees_claimed_usd_unpriced) || 0) + Number(pos.total_fees_claimed_usd);
+  }
+  if (pos.total_fees_claimed_sol == null) pos.total_fees_claimed_sol = 0;
+  pos.total_fees_claimed_usd = Math.round(((pos.total_fees_claimed_usd || 0) + (hasUsd ? usd : 0)) * 1e6) / 1e6;
+  if (hasSol) {
+    pos.total_fees_claimed_sol = Math.round(((Number(pos.total_fees_claimed_sol) || 0) + sol) * 1e9) / 1e9;
+  } else if (hasUsd && usd > 0) {
+    pos.fees_claimed_usd_unpriced = (Number(pos.fees_claimed_usd_unpriced) || 0) + usd;
+  }
+  if (!Array.isArray(pos.notes)) pos.notes = [];
+  const parts = [hasSol ? `${sol.toFixed(6)} SOL` : null, hasUsd ? `~${usd.toFixed(2)} USD` : null].filter(Boolean);
+  pos.notes.push(`Claimed ${parts.length ? parts.join(" / ") : "? (amount unknown)"} fees at ${pos.last_claim_at}`);
   save(state);
 }
 
