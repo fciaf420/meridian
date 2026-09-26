@@ -860,6 +860,7 @@ function lookupDeps(over = {}) {
     isBlacklisted: () => false,
     readMint: async () => null, // hermetic: no mint RPC (entry-safety lines show ❔)
     poolEntryState: async () => null, // hermetic: no pool RPC
+    jupiterInfo: async () => new Map(), // hermetic: no Jupiter Tokens API
     ...over,
   };
 }

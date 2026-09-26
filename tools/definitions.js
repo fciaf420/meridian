@@ -417,7 +417,7 @@ Risk-relevant numeric keys are bounds-checked and out-of-range values are refuse
 
 Entry-safety filters (blockTransferFeeAbovePct, blockTransferHook, blockPermanentDelegate,
 blockFreezeAuthority, blockMintAuthority, blockPausable, blockNonTransferable, solFeePoolsOnly,
-twapSpikeMaxPct, twapWindowMinutes) can only be TIGHTENED by you (turn a block on, lower a limit).
+twapSpikeMaxPct, twapWindowMinutes, blockJupiterSuspicious) can only be TIGHTENED by you (turn a block on, lower a limit).
 Disabling a guard or raising a limit is refused — only the user can loosen them.
 
 Always provide a reason. This is logged as a lesson and visible in future cycles.`,

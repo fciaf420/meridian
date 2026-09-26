@@ -7,6 +7,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { poolAggregates } from "./learning-data.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
 
@@ -67,23 +68,19 @@ export function recordPoolDeploy(poolAddress, deployData) {
     sol_split_pct: deployData.sol_split_pct ?? null,
     volatility_at_deploy: deployData.volatility ?? null,
     price_range_pct: deployData.price_range_pct ?? null,
+    ...(deployData.exclude_from_learning && { exclude_from_learning: deployData.exclude_from_learning }),
   };
 
   entry.deploys.push(deploy);
   entry.total_deploys = entry.deploys.length;
   entry.last_deployed_at = deploy.closed_at;
-  entry.last_outcome = deploy.pnl_pct == null ? "unknown" : deploy.pnl_pct >= 0 ? "profit" : "loss";
 
-  // Recompute aggregates
-  const withPnl = entry.deploys.filter((d) => d.pnl_pct != null);
-  if (withPnl.length > 0) {
-    entry.avg_pnl_pct = Math.round(
-      (withPnl.reduce((s, d) => s + d.pnl_pct, 0) / withPnl.length) * 100
-    ) / 100;
-    entry.win_rate = Math.round(
-      (withPnl.filter((d) => d.pnl_pct >= 0).length / withPnl.length) * 100
-    ) / 100;
-  }
+  // Aggregates via the shared classifier (learning-data.js): excluded deploys
+  // don't count and break-even (±1%) is neither a win nor a loss.
+  const agg = poolAggregates(entry.deploys, poolAddress);
+  entry.avg_pnl_pct = agg.avg_pnl_pct;
+  entry.win_rate = agg.win_rate;
+  entry.last_outcome = agg.last_outcome ?? "unknown";
 
   if (deployData.base_mint && !entry.base_mint) {
     entry.base_mint = deployData.base_mint;
@@ -109,16 +106,18 @@ export function getPoolMemory({ pool_address }) {
     };
   }
 
+  // Recomputed on read: stored aggregates may predate the shared classifier.
+  const agg = poolAggregates(entry.deploys, pool_address);
   return {
     pool_address,
     known: true,
     name: entry.name,
     base_mint: entry.base_mint,
     total_deploys: entry.total_deploys,
-    avg_pnl_pct: entry.avg_pnl_pct,
-    win_rate: entry.win_rate,
+    avg_pnl_pct: agg.avg_pnl_pct,
+    win_rate: agg.win_rate,
     last_deployed_at: entry.last_deployed_at,
-    last_outcome: entry.last_outcome,
+    last_outcome: agg.last_outcome ?? entry.last_outcome,
     notes: entry.notes,
     history: entry.deploys.slice(-10),
   };
@@ -188,7 +187,9 @@ export function recallForPool(poolAddress) {
     const splitInfo = lastDeploy?.sol_split_pct != null && lastDeploy.sol_split_pct < 100
       ? ` (two-sided, split=${lastDeploy.sol_split_pct}%)`
       : "";
-    lines.push(`${entry.name}: ${entry.total_deploys} deploys, avg PnL ${entry.avg_pnl_pct}%, win rate ${(entry.win_rate * 100).toFixed(0)}%${rangeInfo}, last: ${entry.last_outcome}${splitInfo}`);
+    const agg = poolAggregates(entry.deploys, poolAddress);
+    const winRate = agg.win_rate == null ? "n/a (no close beyond ±1%)" : `${(agg.win_rate * 100).toFixed(0)}%`;
+    lines.push(`${entry.name}: ${entry.total_deploys} deploys, avg PnL ${agg.avg_pnl_pct}%, win rate ${winRate}${rangeInfo}, last: ${agg.last_outcome ?? entry.last_outcome}${splitInfo}`);
   }
 
   // Recent trend from snapshots (last 6 = ~30 min at 5-min intervals)

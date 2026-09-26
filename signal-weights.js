@@ -12,6 +12,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
+import { classifyRecord, learnableRecords } from "./learning-data.js";
 
 const WEIGHTS_FILE = "./signal-weights.json";
 const LESSONS_FILE = "./lessons.json";
@@ -185,7 +186,8 @@ export function recalculateWeights(perfData, cfg = {}) {
   cutoff.setDate(cutoff.getDate() - windowDays);
   const cutoffISO = cutoff.toISOString();
 
-  const recent = perfData.filter((p) => {
+  // Known-bad / corrected records never teach the weights (learning-data.js).
+  const recent = learnableRecords(perfData).filter((p) => {
     const ts = p.recorded_at || p.closed_at || p.deployed_at;
     return ts && ts >= cutoffISO;
   });
@@ -195,9 +197,10 @@ export function recalculateWeights(perfData, cfg = {}) {
     return { changes: [], weights };
   }
 
-  // Classify wins and losses
-  const wins  = recent.filter((p) => (p.pnl_usd ?? 0) > 0);
-  const losses = recent.filter((p) => (p.pnl_usd ?? 0) <= 0);
+  // Classify wins and losses with the shared classifier: > +1% win, < −1% loss.
+  // Break-even and unknown-PnL closes are neither and stay out of the lift.
+  const wins  = recent.filter((p) => classifyRecord(p) === "win");
+  const losses = recent.filter((p) => classifyRecord(p) === "loss");
 
   if (wins.length === 0 || losses.length === 0) {
     log("signal_weights", `Need both wins (${wins.length}) and losses (${losses.length}) to compute lift, skipping`);
@@ -504,7 +507,7 @@ function loadSignalCalibration(windowDays = CALIBRATION_WINDOW_DAYS) {
     }
 
     const raw = JSON.parse(fs.readFileSync(LESSONS_FILE, "utf8"));
-    const perfData = raw.performance || [];
+    const perfData = learnableRecords(raw.performance || []);
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - windowDays);
     const cutoffISO = cutoff.toISOString();

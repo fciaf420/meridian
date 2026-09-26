@@ -24,6 +24,7 @@ test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 const age = await import("../tools/token-age.js");
 const es = await import("../tools/entry-safety.js");
+es._setJupiterLookupForTest(async () => new Map()); // hermetic: no Jupiter Tokens API calls
 const { config } = await import("../config.js");
 const dlmm = await import("../tools/dlmm.js");
 const { condensePool } = await import("../tools/screening.js");

@@ -195,6 +195,8 @@ export const config = {
     // Don't open bid_ask when price is > N% above the on-chain oracle TWAP; null = off.
     twapSpikeMaxPct:          nullable("twapSpikeMaxPct", 15),
     twapWindowMinutes:        u.twapWindowMinutes        ?? 60,
+    // Jupiter Tokens API scam flag (audit.isSus present, or banned); lookup failure = allow.
+    blockJupiterSuspicious:   u.blockJupiterSuspicious   ?? true,
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -594,6 +596,8 @@ export function reloadScreeningThresholds() {
     if (fresh.stopLossPct           != null) m.stopLossPct           = fresh.stopLossPct;
     if (fresh.takeProfitFeePct      != null) m.takeProfitFeePct      = fresh.takeProfitFeePct;
     if (fresh.outOfRangeWaitMinutes != null) m.outOfRangeWaitMinutes = fresh.outOfRangeWaitMinutes;
+    if (fresh.trailingTriggerPct    != null) m.trailingTriggerPct    = fresh.trailingTriggerPct; // evolved by lessons.js
+    if (fresh.trailingDropPct       != null) m.trailingDropPct       = fresh.trailingDropPct;    // evolved by lessons.js
     if (fresh.ohlcvBufferMult       != null) config.strategy.ohlcvBufferMult = fresh.ohlcvBufferMult; // evolved by lessons.js
   } catch { /* ignore */ }
   // Refresh GMGN screening keys from gmgn-config.json (mirrors the gmgn block above)

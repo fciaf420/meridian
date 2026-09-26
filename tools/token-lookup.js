@@ -133,6 +133,12 @@ async function defaultPoolEntryState(poolAddress, opts) {
   return readPoolEntryState(poolAddress, opts);
 }
 
+/** Jupiter Tokens API info for the mint: Map<mint, info> or null on failure (see entry-safety.js). */
+async function defaultJupiterInfo(mint) {
+  const { jupiterLookup } = await import("./entry-safety.js");
+  return jupiterLookup([mint]);
+}
+
 async function defaultIsBlacklisted(mint) {
   const { isBlacklisted } = await import("../token-blacklist.js");
   return isBlacklisted(mint);
@@ -190,6 +196,7 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
     score = defaultScore,
     readMint = defaultReadMint,
     poolEntryState = defaultPoolEntryState,
+    jupiterInfo = defaultJupiterInfo,
   } = deps;
   const started = now();
   const remaining = () => Math.max(0, timeoutMs - (now() - started));
@@ -242,7 +249,12 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
       return null;
     });
 
-  const [pools, gmgn, mintFacts] = await Promise.all([meteoraTask, gmgnTask, mintTask]);
+  // Jupiter Tokens API: organic score / verified (display) + scam flag (entry filter).
+  // null = lookup failed; a Map without the mint = unknown to Jupiter.
+  const jupTask = withTimeout(Promise.resolve().then(() => jupiterInfo(mint)), remaining(), "Jupiter lookup")
+    .catch(() => null);
+
+  const [pools, gmgn, mintFacts, jupInfos] = await Promise.all([meteoraTask, gmgnTask, mintTask, jupTask]);
   out.gmgn = gmgn;
 
   const cmp = compare || (await defaultCompare());
@@ -292,10 +304,21 @@ export async function lookupToken(mint, { deps = {}, timeoutMs = LOOKUP_TIMEOUT_
   // pool-discovery API's token_program / authority flags. deployPosition
   // re-checks from the pool's own mint, so this is display + early warning.
   {
-    const { evaluateTokenGuards, mintFactsFromApi, currentEntryFilters } = await import("./entry-safety.js");
+    const { evaluateTokenGuards, mintFactsFromApi, currentEntryFilters, evaluateJupiterGuard, jupiterSummary } = await import("./entry-safety.js");
     const facts = mintFacts || mintFactsFromApi(sorted[0]?.base, mint);
-    out.token_safety = evaluateTokenGuards(facts, entryFilters || currentEntryFilters());
-    for (const p of out.pools) p.checks = { ...p.checks, safety: out.token_safety.checks };
+    const filters = entryFilters || currentEntryFilters();
+    out.token_safety = evaluateTokenGuards(facts, filters);
+    // Jupiter scam flag (blockJupiterSuspicious) joins the entry-filter lines.
+    const jupInfo = jupInfos?.get?.(mint) ?? null;
+    out.jupiter = jupiterSummary(jupInfo);
+    out.jupiter_error = jupInfos ? null : "lookup failed";
+    const jg = evaluateJupiterGuard(jupInfo, filters);
+    out.token_safety = {
+      ...out.token_safety,
+      pass: out.token_safety.pass && jg.pass,
+      reasons: jg.reason ? [...out.token_safety.reasons, jg.reason] : out.token_safety.reasons,
+      checks: [...out.token_safety.checks, jg.check],
+    };    for (const p of out.pools) p.checks = { ...p.checks, safety: out.token_safety.checks };
   }
 
   // Token-level checks even with no pool (mcap/holders/age from GMGN).

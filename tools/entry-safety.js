@@ -6,8 +6,9 @@
  * few async helpers only read accounts. Thresholds come from
  * config.entryFilters (user-config.json keys, see config.js).
  *
- * Token guards (Token-2022 extensions + authorities) apply in screening,
- * in the token lookup card and as a hard check in deployPosition.
+ * Token guards (Token-2022 extensions + authorities) and the Jupiter scam flag
+ * (blockJupiterSuspicious) apply in screening, in the token lookup card and as
+ * a hard check in deployPosition.
  */
 
 import { config } from "../config.js";
@@ -49,6 +50,9 @@ export const ENTRY_FILTER_DEFAULTS = Object.freeze({
   solFeePoolsOnly: false,
   twapSpikeMaxPct: 15, // null = off
   twapWindowMinutes: 60,
+  // Jupiter Tokens API: block audit.isSus (present = flagged) or banned tokens.
+  // A failed lookup / unknown token is allowed with a warning.
+  blockJupiterSuspicious: true,
 });
 
 export const TOKEN_GUARD_BOOL_KEYS = [
@@ -537,6 +541,93 @@ let _apiRowFetcher = (poolAddress) => fetchPoolApiRow(poolAddress);
 /** Test hook: replace the pool-discovery row fetcher used by deploy checks. */
 export function _setApiRowFetcherForTest(fn) { _apiRowFetcher = fn || ((a) => fetchPoolApiRow(a)); }
 
+/* ============================== Jupiter scam flag ============================== */
+
+/**
+ * Jupiter Tokens API lookup for many mints: Map<mint, info> (unknown mints
+ * absent) or null when the lookup failed. Replaceable for tests.
+ */
+async function defaultJupiterLookup(mints) {
+  const { getTokensInfo } = await import("./jup-tokens.js");
+  return getTokensInfo(mints);
+}
+let _jupiterLookup = defaultJupiterLookup;
+/** Test hook: replace the Jupiter Tokens lookup used by screening and deploy checks. */
+export function _setJupiterLookupForTest(fn) { _jupiterLookup = fn || defaultJupiterLookup; }
+/** The current Jupiter lookup (mints → Map | null); used by the token lookup card too. */
+export function jupiterLookup(mints) { return _jupiterLookup(mints); }
+
+/** The informational Jupiter fields carried on candidates (no gating on these). */
+export function jupiterSummary(info) {
+  if (!info) return null;
+  return {
+    organic_score: info.organic_score != null ? Math.round(info.organic_score * 10) / 10 : null,
+    verified: info.is_verified ?? null,
+    sus: !!info.is_sus,
+    banned: !!info.banned,
+  };
+}
+
+/**
+ * blockJupiterSuspicious: block when Jupiter flags the token (audit.isSus
+ * present) or lists it as banned. `info` undefined/null = unknown token or a
+ * failed lookup → allowed (never block on an API outage).
+ * Returns { pass, reason, check: { key, pass, off?, text }, unknown }.
+ */
+export function evaluateJupiterGuard(info, filters = currentEntryFilters()) {
+  const f = { ...ENTRY_FILTER_DEFAULTS, ...(filters || {}) };
+  const enabled = !!f.blockJupiterSuspicious;
+  if (!info) {
+    return { pass: true, reason: null, unknown: true, check: { key: "jupiter_flag", pass: null, off: !enabled, text: `Jupiter scam flag: unknown (lookup failed or token unknown)${enabled ? " — allowed" : " — guard off"}` } };
+  }
+  const flags = [];
+  if (info.is_sus || info.sus) flags.push("suspicious (audit.isSus)");
+  if (info.banned) flags.push("banned");
+  const bad = flags.length > 0;
+  const text = bad ? `Jupiter scam flag: ${flags.join(" + ")}` : "Jupiter scam flag: none";
+  if (!enabled) return { pass: true, reason: null, unknown: false, check: { key: "jupiter_flag", pass: bad ? null : true, off: true, text: `${text} — guard off` } };
+  return {
+    pass: !bad,
+    reason: bad ? `Jupiter flags the token as ${flags.join(" + ")} (blockJupiterSuspicious)` : null,
+    unknown: false,
+    check: { key: "jupiter_flag", pass: !bad, text },
+  };
+}
+
+/**
+ * Screening step: one batched Jupiter lookup, tag every candidate with
+ * `jupiter` (organic score / verified, informational), and drop flagged tokens
+ * when blockJupiterSuspicious is on. A failed lookup keeps everything.
+ */
+export async function screenJupiterFlags(pools, { filters = currentEntryFilters(), jupiterLookup = _jupiterLookup } = {}) {
+  const f = { ...ENTRY_FILTER_DEFAULTS, ...(filters || {}) };
+  const mints = pools.map((p) => p.base?.mint ?? p.base_mint).filter(Boolean);
+  let infos = null;
+  if (mints.length) {
+    try {
+      infos = await jupiterLookup(mints);
+    } catch (e) {
+      log("screening_warn", `Jupiter token lookup threw: ${e.message}`);
+    }
+    if (!infos) log("screening_warn", `Jupiter token lookup failed (${mints.length} mints): scam-flag filter skipped, candidates allowed`);
+  }
+  const kept = [];
+  const dropped = [];
+  for (const p of pools) {
+    const mint = p.base?.mint ?? p.base_mint;
+    const info = infos?.get(mint) ?? null;
+    const tagged = { ...p, jupiter: jupiterSummary(info) };
+    const r = evaluateJupiterGuard(info, f);
+    if (!r.pass) {
+      dropped.push({ pool: p.pool, name: p.name, reasons: [r.reason] });
+      log("screening", `Entry filter dropped ${p.name ?? p.pool}: ${r.reason}`);
+      continue;
+    }
+    kept.push(tagged);
+  }
+  return { kept, dropped };
+}
+
 /* ============================== screening ============================== */
 
 let _screenConn = null;
@@ -642,7 +733,8 @@ export async function screenEntryCandidates(pools, opts = {}) {
     feeOk.push(tagged);
   }
   const tok = await screenTokenGuards(feeOk, opts);
-  return { kept: tok.kept, dropped: [...dropped, ...tok.dropped] };
+  const jup = await screenJupiterFlags(tok.kept, { filters, ...(opts.jupiterLookup ? { jupiterLookup: opts.jupiterLookup } : {}) });
+  return { kept: jup.kept, dropped: [...dropped, ...tok.dropped, ...jup.dropped] };
 }
 
 /**
@@ -657,11 +749,32 @@ export async function runDeployEntryChecks({
   filters = currentEntryFilters(),
   apiRow = undefined, // injectable; undefined = fetch the pool-discovery row
   nowSec = Math.floor(Date.now() / 1000),
+  jupiterLookup = _jupiterLookup, // injectable Jupiter Tokens lookup (mints → Map | null)
 } = {}) {
   const notes = [];
   const token = deployTokenCheck(pool, filters);
   if (!token.pass) return { pass: false, reason: token.reason, notes, token };
   if (token.facts?.transferFee) notes.push(`transfer fee ${token.facts.transferFee.pct}% (limit ${filters.blockTransferFeeAbovePct ?? "off"})`);
+
+  // Jupiter scam flag (blockJupiterSuspicious). A failed lookup or an unknown
+  // token is allowed with a warning: never block a deploy on an API outage.
+  let jupiter = null;
+  if ({ ...ENTRY_FILTER_DEFAULTS, ...(filters || {}) }.blockJupiterSuspicious) {
+    const mint = token.facts?.mint ?? b58(pool?.lbPair?.tokenXMint);
+    let infos;
+    try { infos = mint ? await jupiterLookup([mint]) : null; } catch { infos = null; }
+    const info = infos?.get(mint) ?? null;
+    jupiter = jupiterSummary(info);
+    const jg = evaluateJupiterGuard(info, filters);
+    if (!jg.pass) return { pass: false, reason: `Token safety: ${jg.reason}`, notes, token, jupiter };
+    if (!infos) {
+      log("deploy_warn", `Jupiter scam-flag check skipped for ${mint ?? "unknown mint"}: Tokens API lookup failed; allowing deploy`);
+      notes.push("Jupiter scam flag: lookup failed — allowed");
+    } else if (!info) {
+      log("deploy_warn", `Jupiter scam-flag check: ${mint} unknown to the Tokens API; allowing deploy`);
+      notes.push("Jupiter scam flag: token unknown to Jupiter — allowed");
+    }
+  }
 
   // Pool status (always on).
   const row = apiRow !== undefined ? apiRow : (pool_address ? await _apiRowFetcher(pool_address) : null);
@@ -693,13 +806,13 @@ export async function runDeployEntryChecks({
   if (!tg.pass) return { pass: false, reason: `TWAP spike: ${tg.reason}`, notes, token, status, feeMode, twap };
   if (tg.note) notes.push(tg.note);
 
-  return { pass: true, reason: null, notes, token, status, feeMode, twap };
+  return { pass: true, reason: null, notes, token, status, feeMode, twap, jupiter };
 }
 
 /* ============================== changes ============================== */
 
 export const ENTRY_FILTER_KEYS = Object.keys(ENTRY_FILTER_DEFAULTS);
-const BOOL_KEYS = new Set([...TOKEN_GUARD_BOOL_KEYS, "solFeePoolsOnly"]);
+const BOOL_KEYS = new Set([...TOKEN_GUARD_BOOL_KEYS, "solFeePoolsOnly", "blockJupiterSuspicious"]);
 const NULLABLE_PCT_KEYS = { blockTransferFeeAbovePct: [0, 100], twapSpikeMaxPct: [0, 1000] };
 
 /** Normalize a requested value ("off"/"null" → null, "true"/"false" → bool, numeric strings → number). */

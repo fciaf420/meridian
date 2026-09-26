@@ -16,6 +16,7 @@ import {
   markInRange,
   recordActiveBin,
   depthUseAtClose,
+  trailingAtClose,
   recordClaim,
   recordClose,
   recordCloseExposure,
@@ -30,7 +31,7 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, rawToUiString } from "./close-swap.js";
-import { computeOnchainPnl, binPrice, onchainPctForUnit } from "./onchain-pnl.js";
+import { computeOnchainPnl, binPrice, onchainPctForUnit, feesValue } from "./onchain-pnl.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS, fitDeployAmount } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
 import { getDepthForDeploy } from "./ohlcv.js";
@@ -2152,6 +2153,9 @@ export async function claimFees({ position_address }) {
 
     const positionPubKey = new PublicKey(position_address);
     const positionData = await pool.getPosition(positionPubKey);
+    // What this claim takes out, valued now (before the tx) so on-chain PnL can
+    // add it back: getOnchainPnl reads total_fees_claimed_sol.
+    const claimed = claimedFeesValue(pool, positionData, position_address);
 
     const txs = await pool.claimSwapFee({
       owner: wallet.publicKey,
@@ -2167,9 +2171,15 @@ export async function claimFees({ position_address }) {
     const txHash = txHashes[0];
     log("claim", `SUCCESS tx: ${txHash}`);
     _positionsCacheAt = 0; // invalidate cache after claim
-    recordClaim(position_address);
+    recordClaim(position_address, claimed?.usd ?? undefined, claimed?.sol ?? undefined);
+    if (claimed) log("claim", `Claimed ≈ ${claimed.sol} SOL${claimed.usd != null ? ` (~$${claimed.usd})` : ""} of fees`);
 
-    return { success: true, position: position_address, tx: txHash };
+    return {
+      success: true,
+      position: position_address,
+      tx: txHash,
+      ...(claimed && { claimed_fees: { sol: claimed.sol, usd: claimed.usd } }),
+    };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -2459,7 +2469,10 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
     const closeReason = typeof _close_reason === "string" && _close_reason.trim()
       ? _close_reason.trim().slice(0, 120)
       : oorDir ? `agent decision (OOR ${oorDir})` : "agent decision";
-    if (claimedAtClose) recordClaim(position_address, unclaimedFeesUsd ?? undefined);
+    if (claimedAtClose) {
+      const v = claimedFeesValue(pool, positionData, position_address);
+      recordClaim(position_address, unclaimedFeesUsd ?? v?.usd ?? undefined, v?.sol ?? undefined);
+    }
     recordClose(position_address, closeReason);
     if (tracked) {
       const deployedAt = new Date(tracked.deployed_at).getTime();
@@ -2511,6 +2524,7 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         minutes_held: minutesHeld,
         close_reason: closeReason,
         ...depthUseAtClose(tracked, closeReason),
+        ...trailingAtClose(tracked, closeReason, config.management),
         deployed_at: tracked.deployed_at,
         signal_snapshot: tracked.signal_snapshot || null,
         ...(tracked.experiment_id && { experiment_id: tracked.experiment_id, experiment_arm: tracked.experiment_arm }),
@@ -2613,6 +2627,27 @@ export function reconcileChunkResults(results, funded) {
     else out.unknown.push(i);
   });
   return out;
+}
+
+/**
+ * SOL / USD value of a position's unclaimed fees (what a claim, or the remove
+ * txs at close, will take out). Price: the pool's active bin; SOL price from
+ * the positions cache. Null when it can't be valued. Never throws.
+ */
+function claimedFeesValue(pool, position, position_address) {
+  try {
+    const activeId = Number(pool?.lbPair?.activeId);
+    if (!Number.isFinite(activeId)) return null;
+    const v = feesValue({
+      pool,
+      positionData: position?.positionData,
+      activePrice: binPrice(activeId, pool.lbPair?.binStep, pool.tokenX?.mint?.decimals, pool.tokenY?.mint?.decimals),
+      solPriceUsd: _positionsCache?.positions?.find((p) => p.position === position_address)?.sol_price ?? null,
+    });
+    return v && v.sol > 0 ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
