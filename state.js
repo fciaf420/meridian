@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { writeJsonAtomicSync } from "./atomic-write.js";
 
 const STATE_FILE = "./state.json";
 
@@ -19,25 +20,67 @@ const PNL_MISMATCH_PTS = 2;
 
 const MAX_RECENT_EVENTS = 20;
 
+// Set when state.json is present but unparseable. While degraded, reads return
+// an empty state (so on-chain management keeps running) but every save() is
+// refused: persisting that empty state would wipe the recoverable file. Cleared
+// automatically once the file parses again (e.g. the operator restored it).
+let _stateDegraded = false;
+
+function emptyState() {
+  return { positions: {}, recentEvents: [], lastUpdated: null };
+}
+
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
+    return emptyState();
   }
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    raw = fs.readFileSync(STATE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("top-level value is not an object");
+    }
+    if (_stateDegraded) {
+      _stateDegraded = false;
+      log("state", "state.json parses again — leaving degraded mode, saves re-enabled");
+    }
+    if (!parsed.positions || typeof parsed.positions !== "object") parsed.positions = {};
+    return parsed;
   } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
+    if (!_stateDegraded) {
+      _stateDegraded = true;
+      const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
+      try {
+        fs.copyFileSync(STATE_FILE, backup);
+        log("state_error", `!!! state.json is CORRUPT (${err.message}); preserved as ${backup}. Refusing to save state (and blocking deploys) until it is restored or removed. !!!`);
+      } catch (backupErr) {
+        log("state_error", `!!! state.json is CORRUPT (${err.message}) and the backup failed (${backupErr.message}). Refusing to save state until it is restored or removed. !!!`);
+      }
+    }
+    return emptyState();
   }
 }
 
 function save(state) {
+  if (_stateDegraded) {
+    log("state_error", "Skipping state.json save: file is in degraded (corrupt) state. Restore it from the .corrupt-<ts> backup, or delete it, to re-enable saves.");
+    return false;
+  }
   try {
     state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    writeJsonAtomicSync(STATE_FILE, state);
+    return true;
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
+    return false;
   }
+}
+
+/** True while state.json is present but unparseable (saves are refused). */
+export function isStateDegraded() {
+  if (_stateDegraded) load(); // re-check: the operator may have fixed the file
+  return _stateDegraded;
 }
 
 // ─── Position Registry ─────────────────────────────────────────
@@ -579,10 +622,26 @@ export function setScreeningPaused(paused, by = "operator") {
  */
 const SYNC_GRACE_MS = 1 * 60_000; // don't auto-close positions deployed < 1 min ago
 
-export async function syncOpenPositions(active_addresses) {
+// One sync at a time: two overlapping syncs would both see the same missing
+// position and both run its post-close swap.
+let _syncInflight = null;
+
+export function syncOpenPositions(active_addresses) {
+  if (_syncInflight) return _syncInflight;
+  _syncInflight = syncOpenPositionsOnce(active_addresses).finally(() => { _syncInflight = null; });
+  return _syncInflight;
+}
+
+// The sync awaits network calls (LP Agent, lessons, swaps) between its load()
+// and its save(), and other writers (trackPosition, the PnL watcher, recordClose)
+// keep saving state meanwhile. So it records only ITS OWN changes per position
+// and merges them into a fresh load() at the end instead of saving the stale
+// snapshot, which used to roll back every concurrent update.
+async function syncOpenPositionsOnce(active_addresses) {
   const state = load();
   const activeSet = new Set(active_addresses);
   let changed = false;
+  const changes = new Map(); // posId -> { closed_at, notes: [], exposure? }
 
   // Collect positions that need closing first to batch the LP Agent fetch
   const toClose = [];
@@ -614,9 +673,8 @@ export async function syncOpenPositions(active_addresses) {
 
   for (const posId of toClose) {
     const pos = state.positions[posId];
-    pos.closed = true;
-    pos.closed_at = new Date().toISOString();
-    pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
+    const mine = { closed_at: new Date().toISOString(), notes: [`Auto-closed during state sync (not found on-chain)`] };
+    changes.set(posId, mine);
     changed = true;
     log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
 
@@ -664,7 +722,7 @@ export async function syncOpenPositions(active_addresses) {
           ...(pos.experiment_id && { experiment_id: pos.experiment_id, experiment_arm: pos.experiment_arm }),
         });
 
-        pos.notes.push(`LP Agent PnL: ${closedData.pnl_pct}% ($${closedData.pnl_usd})`);
+        mine.notes.push(`LP Agent PnL: ${closedData.pnl_pct}% ($${closedData.pnl_usd})`);
         log("state", `Recorded performance for externally closed ${posId}: PnL ${closedData.pnl_pct}%`);
       }
     } catch (e) {
@@ -689,8 +747,8 @@ export async function syncOpenPositions(active_addresses) {
             : null;
 
         if (preBal == null) {
-          pos.exposure = { mint: baseMint, reason: "pre-close base balance unknown; auto-swap skipped" };
-          pos.notes.push(`Leftover base-token exposure (${baseMint.slice(0, 8)}): pre-close balance unknown, swap manually`);
+          mine.exposure = { mint: baseMint, reason: "pre-close base balance unknown; auto-swap skipped" };
+          mine.notes.push(`Leftover base-token exposure (${baseMint.slice(0, 8)}): pre-close balance unknown, swap manually`);
           log("state_warn", `Post-sync-close swap skipped for ${baseMint}: pre-close balance unknown — leftover exposure flagged.`);
         } else {
           const walletBals = await getWalletBalances();
@@ -710,7 +768,7 @@ export async function syncOpenPositions(active_addresses) {
             if (swapResult?.success) {
               log("state", `Post-sync-close swap OK: tx ${swapResult.tx}`);
             } else {
-              pos.exposure = { mint: baseMint, reason: swapResult?.error || "swap failed" };
+              mine.exposure = { mint: baseMint, reason: swapResult?.error || "swap failed" };
               log("state_warn", `Post-sync-close swap failed: ${swapResult?.error || "unknown"}`);
             }
           }
@@ -721,5 +779,26 @@ export async function syncOpenPositions(active_addresses) {
     }
   }
 
-  if (changed) save(state);
+  if (!changed) return;
+
+  // Merge onto the CURRENT file, not the snapshot taken before the awaits.
+  const fresh = load();
+  for (const [posId, mine] of changes) {
+    const cur = fresh.positions[posId];
+    if (!cur) continue; // removed meanwhile: nothing to merge into
+    if (!cur.closed) {
+      cur.closed = true;
+      cur.closed_at = mine.closed_at;
+    }
+    cur.notes = [...(Array.isArray(cur.notes) ? cur.notes : []), ...mine.notes];
+    if (mine.exposure) cur.exposure = mine.exposure;
+  }
+  save(fresh);
+}
+
+/** Append a PnL-watcher auto-close to state.recentAutoCloses (last 20 kept). */
+export function recordAutoClose(entry) {
+  const state = load();
+  state.recentAutoCloses = [...(state.recentAutoCloses || []), entry].slice(-20);
+  save(state);
 }

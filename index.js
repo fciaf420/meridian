@@ -4,8 +4,8 @@ import path from "path";
 import cron from "node-cron";
 import readline from "readline";
 import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./agent.js";
-import { log } from "./logger.js";
-import { getMyPositions, isCloseInflight } from "./tools/dlmm.js";
+import { log, enableLogPathFile } from "./logger.js";
+import { getMyPositions, isCloseInflight, getInflightCloses } from "./tools/dlmm.js";
 import { llmHealth, isLlmUnavailableError } from "./llm-health.js";
 import { runManagementWithOorFallback, formatOorFallbackReport } from "./oor-fallback.js";
 import { getPositionBins } from "./tools/bin-visual.js";
@@ -29,7 +29,8 @@ import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
 import { emit, on } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
-import { startPnlWatcher, stopPnlWatcher } from "./pnl-watcher.js";
+import { startPnlWatcher, stopPnlWatcher, isPnlTickRunning } from "./pnl-watcher.js";
+import { createShutdownController, installCrashHandlers, drainTimeoutMsFromEnv } from "./shutdown.js";
 import { recordPositionSnapshot as recordPoolSnapshot, recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
@@ -43,17 +44,35 @@ import {
   isScreeningBusy, setScreeningBusy,
   setManagementCloseReasons,
   clearManagementCloseReasons,
+  isDraining, setDraining, getInflightOps,
 } from "./session.js";
 import { startServer } from "./server.js";
 import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
 import { getScreeningThresholdSummary, getStartupMode, screeningCronGate } from "./runtime-helpers.js";
-import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal } from "./prompt.js";
+import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal, formatRunnerPrecheck } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${config.llm.managementModel} (provider: ${process.env.LLM_PROVIDER || "openrouter"})`);
+
+// Crash handlers first, so a throw anywhere below is logged, alerted and exits 1
+// (the launchd supervisor restarts on a non-zero exit). The alert is resolved
+// lazily: Telegram may not be configured, and is only usable once loaded.
+installCrashHandlers({
+  alert: async (msg) => { if (telegramEnabled()) await sendMessage(msg); },
+});
+
+// Let operators find this process and its log without guessing (ops/README.md).
+const PID_FILE = path.join("logs", "bot.pid");
+try {
+  fs.mkdirSync("logs", { recursive: true });
+  fs.writeFileSync(PID_FILE, `${process.pid}\n`);
+  enableLogPathFile(path.join("logs", "bot.logpath"));
+} catch (e) {
+  log("startup_warn", `Could not write logs/bot.pid / logs/bot.logpath: ${e.message}`);
+}
 
 // One-time lesson dedup on startup
 deduplicateLessons();
@@ -87,11 +106,7 @@ function deployDirective() {
 async function setUsdcMode(enabled) {
   config.usdc.enabled = !!enabled;
   try {
-    const cfgPath = new URL("./user-config.json", import.meta.url);
-    const fs = await import("fs");
-    const cur = fs.existsSync(cfgPath) ? JSON.parse(fs.readFileSync(cfgPath, "utf8")) : {};
-    cur.usdcMode = config.usdc.enabled;
-    fs.writeFileSync(cfgPath, JSON.stringify(cur, null, 2));
+    persistUserConfig({ usdcMode: config.usdc.enabled });
   } catch (e) {
     log("config", `Failed to persist usdcMode: ${e.message}`);
   }
@@ -213,6 +228,9 @@ on("deploy", () => { _fundEvents++; });
 on("close", () => { _fundEvents++; });
 
 function runScreeningCycle({ manual = false } = {}) {
+  if (isDraining()) {
+    return { started: false, reason: "shutting down", done: Promise.resolve(null) };
+  }
   const gate = screeningCronGate({
     paused: isScreeningPaused(),
     busy: isBusy(),
@@ -544,8 +562,10 @@ ${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
 
 function startCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
+  if (isDraining()) return; // shutting down: never (re)start cycles
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
+    if (isDraining()) return;
     if (isBusy()) {
       timers.managementLastRun = Date.now();
       log("cron", "Management deferred — position action in progress");
@@ -716,6 +736,7 @@ function startCronJobs() {
           return; // finally{} still releases the lock and emits the report
         }
         log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
+        memoryHints += formatRunnerPrecheck(ruleHits);
         mgmtRuleFired = ruleHits.some((h) => /: rule [3-6]$/.test(h));
       }
 
@@ -857,13 +878,38 @@ function startCronJobs() {
 // ═══════════════════════════════════════════
 //  GRACEFUL SHUTDOWN
 // ═══════════════════════════════════════════
-async function shutdown(signal) {
-  log("shutdown", `Received ${signal}. Shutting down...`);
-  stopPnlWatcher();
-  stopPolling();
-  const positions = await getMyPositions();
-  log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);
-  process.exit(0);
+// What the drain still waits for. A close started by the PnL watcher shows up
+// only in getInflightCloses(); one started via executeTool shows up in both.
+function pendingWork() {
+  const pending = [];
+  for (const addr of getInflightCloses()) pending.push(`close ${addr.slice(0, 8)}`);
+  for (const op of getInflightOps()) pending.push(op);
+  if (isBusy()) pending.push("position action");
+  if (isManagementBusy()) pending.push("management cycle");
+  if (isScreeningBusy()) pending.push("screening cycle");
+  if (isPnlTickRunning()) pending.push("PnL watcher tick");
+  return pending;
+}
+
+const shutdownController = createShutdownController({
+  timeoutMs: drainTimeoutMsFromEnv(),
+  stopIntake: () => {
+    setDraining(true);  // executeTool refuses new deploys; the watcher and crons start nothing
+    stopCronJobs();     // also stops the PnL watcher interval
+    stopPolling();      // no new Telegram commands
+  },
+  getPending: pendingWork,
+  onDrained: async () => {
+    const positions = await getMyPositions().catch(() => null);
+    log("shutdown", `Open positions at shutdown: ${positions?.total_positions ?? "unknown"}`);
+    try {
+      if (fs.readFileSync(PID_FILE, "utf8").trim() === String(process.pid)) fs.unlinkSync(PID_FILE);
+    } catch { /* already gone */ }
+  },
+});
+
+function shutdown(signal, opts) {
+  return shutdownController.handleSignal(signal, opts);
 }
 
 process.on("SIGINT",  () => shutdown("SIGINT"));
@@ -902,7 +948,7 @@ let cronStarted = false;
 let serverStarted = false;
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
-registerCronRestarter(() => { if (cronStarted) startCronJobs(); });
+registerCronRestarter(() => { if (cronStarted && !isDraining()) startCronJobs(); });
 
 function ensureServerStarted() {
   if (serverStarted || !runtimeMode.startServer) return;
@@ -1127,8 +1173,8 @@ async function handleTelegramCommand(rawText, ctx = {}) {
 
   // ── Shutdown ──
   if (text === "/stop") {
-    await tgSend("🛑 Shutting down the agent…");
-    await shutdown("telegram /stop");
+    await tgSend("🛑 Shutting down the agent (finishing in-flight work first)…");
+    await shutdown("telegram /stop", { force: false });
     return;
   }
 
@@ -1425,7 +1471,7 @@ Commands:
     }
 
     // ── Slash commands ───────────────────────
-    if (input === "/stop") { await shutdown("user command"); return; }
+    if (input === "/stop") { await shutdown("user command", { force: false }); return; }
 
     if (input === "/status") {
       await runBusy(async () => {
@@ -1585,7 +1631,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 
   rl.on("close", () => {
     clearInterval(promptInterval);
-    shutdown("stdin closed");
+    shutdown("stdin closed", { force: false });
   });
 
 } else {

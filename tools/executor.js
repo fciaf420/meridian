@@ -13,9 +13,9 @@ import { getWalletBalances, swapToken } from "./wallet.js";
 import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap } from "../state.js";
+import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded } from "../state.js";
 import { checkAgentSwap } from "./swap-guard.js";
-import { isManagementBusy, getManagementCloseReason } from "../session.js";
+import { isManagementBusy, getManagementCloseReason, isDraining, trackInflightOp } from "../session.js";
 import { managementPnlCloseGate } from "../pnl-confirm.js";
 import { getOnchainPnl } from "./onchain-pnl.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
@@ -354,7 +354,26 @@ function startCloseBinsSnapshot(positionAddress) {
 /**
  * Execute a tool call with safety checks and logging.
  */
+// Fund-moving tools: tracked as in-flight so the shutdown drain waits for them.
+const FUND_TOOLS = new Set(["deploy_position", "close_position", "swap_token", "claim_fees"]);
+
 export async function executeTool(name, args, { manual = false } = {}) {
+  // Gate new exposure BEFORE anything runs (the USDC-mode entry swaps first).
+  if (name === "deploy_position") {
+    if (isDraining()) {
+      log("safety_block", "deploy_position blocked: shutdown drain in progress");
+      return { blocked: true, reason: "Bot is shutting down (drain in progress); no new deploys." };
+    }
+    if (isStateDegraded()) {
+      log("safety_block", "deploy_position blocked: state.json is corrupt (degraded mode)");
+      return { blocked: true, reason: "state.json is corrupt and saves are disabled, so a new position could not be tracked. Restore state.json first." };
+    }
+  }
+  if (FUND_TOOLS.has(name)) return trackInflightOp(name, executeToolInner(name, args, { manual }));
+  return executeToolInner(name, args, { manual });
+}
+
+async function executeToolInner(name, args, { manual = false } = {}) {
   const startTime = Date.now();
   // `_manual` (skip the token-age window) is only honoured for owner-initiated
   // Telegram deploys, which pass { manual: true }; strip it from anything else
