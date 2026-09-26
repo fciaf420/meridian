@@ -35,7 +35,9 @@ export const POLL_DELAYS_MS = [0, 500, 1000, 1500, 2000, 2500, 3000, 4500];
 /** Delay before the balance re-read of attempt N (index 0 is the poll above). */
 export const RETRY_BACKOFF_MS = [0, 1500, 3000];
 
-const TERMINAL_SWAP_ERROR = /no route|route not found|unsupported|invalid mint|mint not found/i;
+// A price-impact refusal (wallet.js maxSwapPriceImpactPct) is terminal too: an
+// immediate retry would quote the same thin route.
+const TERMINAL_SWAP_ERROR = /no route|route not found|unsupported|invalid mint|mint not found|price impact/i;
 
 /** Integer part of a BN / integer string / decimal string as a bigint, else null. */
 export function toRawBigInt(v) {
@@ -104,6 +106,8 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
     return {
       exposureFlag: true,
       txs,
+      // Nothing is attributable without a pre-close balance: the agent may not sell any of it.
+      exposure: { mint: baseMint, decimals: null, pre_raw: null, unsold_raw: "0", ambiguous: false },
       swapOutcome: {
         success: false,
         mint: baseMint,
@@ -261,10 +265,23 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
     ...(unsoldOverExpectedRaw > 0n && decimals != null && { unsold_over_expected_ui: rawToUiString(unsoldOverExpectedRaw, decimals) }),
   };
 
+  // What a later agent swap_token may sell for this close (tools/swap-guard.js):
+  // the unsold withdrawn delta, clamped to the expected withdrawal minus what
+  // was already sold. Zero when nothing is attributable.
+  const exposureOf = (unsoldRaw) => ({
+    mint: baseMint,
+    decimals,
+    pre_raw: preRaw.toString(),
+    unsold_raw: (unsoldRaw > 0n ? unsoldRaw : 0n).toString(),
+    ambiguous,
+  });
+
   if (noDelta) {
     return {
       exposureFlag: true,
       txs,
+      // The withdrawal never showed on-chain, so any balance of this mint is not attributable.
+      exposure: exposureOf(0n),
       swapOutcome: {
         success: false,
         mint: baseMint,
@@ -287,9 +304,15 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
   }
 
   log("close_warn", `Post-close swap failed after ${attempts} attempt(s); withdrawn base token remains in wallet: ${baseMint}`);
+  let attributableRaw = lastDelta != null && lastDelta > 0n && decimals != null ? lastDelta : 0n;
+  if (capRaw != null) {
+    const remainingCap = capRaw > soldRaw ? capRaw - soldRaw : 0n;
+    if (attributableRaw > remainingCap) attributableRaw = remainingCap;
+  }
   return {
     exposureFlag: true,
     txs,
+    exposure: exposureOf(attributableRaw),
     swapOutcome: {
       success: false,
       mint: baseMint,
@@ -297,6 +320,8 @@ export async function swapBackWithdrawnBase({ baseMint, symbol = null, preRaw, e
       error: lastError,
       ...(ambiguous && { ambiguous: true }),
       ...(lastDelta != null && lastDelta > 0n && decimals != null && { unsold_ui: rawToUiString(lastDelta, decimals) }),
+      // The most a follow-up swap_token may sell for this close (0 = none).
+      ...(decimals != null && { exposure_ui: rawToUiString(attributableRaw, decimals) }),
       ...extra,
     },
   };

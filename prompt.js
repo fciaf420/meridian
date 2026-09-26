@@ -300,7 +300,7 @@ STEPS:
    - If no rule triggers: HOLD, unless a judgment close applies (see JUDGMENT CLOSES).
 3. If closing: ${usdcMode
     ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
-    : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result reports a failed swap or status "success_with_exposure".`}
+    : `close_position swaps the withdrawn base tokens to SOL itself; use swap_token only if its result has status "success_with_exposure" and swap.exposure_ui > 0, for at most that amount, to SOL, and not before swap.retry_not_before. The runner refuses any other swap_token call.`}
 4. After closing a LOSING position — check POOL CONTEXT and the lessons in your memory brief for patterns:
    - If 3+ similar losses (same pool type, volatility range, or strategy) → use update_config to adjust the threshold that would have prevented it
    - Examples: tighten maxVolatility, raise minOrganic, adjust stopLossPct, raise minVolume
@@ -338,7 +338,7 @@ Capital is held in USDC. Funding and exit settlement are handled AUTOMATICALLY i
 1. PATIENCE IS PROFIT: DLMM LPing is about capturing fees over time. Avoid "paper-handing" or closing positions for tiny gains/losses.
 2. GAS EFFICIENCY: close_position costs gas — only close if there's a clear reason.${config.usdc.enabled
   ? ` In USDC mode, post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : ` close_position already swaps the base tokens that close withdrew back to SOL (dust under $0.10 is left). Call swap_token after a close only when the close result shows the swap failed or status "success_with_exposure", and then only for that close's withdrawn amount — other wallet balances are not the agent's to sell.`}
+  : ` close_position already swaps the base tokens that close withdrew back to SOL (dust under $0.10 is left). Call swap_token after a close only when the close result has status "success_with_exposure" and swap.exposure_ui > 0, and then sell at most swap.exposure_ui of that token to SOL — other wallet balances are not the agent's to sell. The runner enforces this in code: it refuses SOL→token buys, other tokens, swaps while the close's own swap may still land (swap.retry_not_before), and any swap with price impact above ${config.risk.maxSwapPriceImpactPct}%; it clamps larger amounts. A refused swap is reported to the owner, not retried.`}
 3. DATA-DRIVEN AUTONOMY: You decide within the rules below. Lines marked HARD RULE / HARD SKIP are binding; everything else is a heuristic to weigh. Call the tools whose data would change the decision, and name that data when you act.
 4. POST-DEPLOY INTERVAL: Pass the pool's volatility to deploy_position; the runner sets the management interval from it.
 
@@ -452,7 +452,7 @@ ${_sectionOverrides.manager_logic || _defaultManagerLogic()}
 
 ${config.usdc.enabled
   ? `After ANY close: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : `After ANY close: close_position has already swapped the withdrawn base tokens to SOL. Only if its result shows swap.success=false or status "success_with_exposure", swap that position's withdrawn amount with swap_token.`}
+  : `After ANY close: close_position has already swapped the withdrawn base tokens to SOL. Only if its result has status "success_with_exposure" and swap.exposure_ui > 0, sell at most swap.exposure_ui of that token to SOL with swap_token (not before swap.retry_not_before).`}
 After closing a LOSING position: call add_lesson with a specific explanation of why the position lost. Include what signal you missed and what to do differently. Generic stats-only lessons are not useful.
 SELF-TUNING: After closing a losing position, check POOL CONTEXT, get_pool_memory and your lessons for patterns. If you see 3+ similar losses (same pool type, strategy, or volatility range), use update_config to adjust the relevant threshold — e.g., tighten maxVolatility, raise minOrganic, adjust stopLossPct. Only change thresholds you have evidence for.
 `;
@@ -468,7 +468,7 @@ INTENT DETECTION — before acting, determine whether the user is:
 If (a): Execute immediately and autonomously — do NOT ask for confirmation. The user's instruction IS the confirmation.
 ${config.usdc.enabled
   ? `  After ANY close_position: post-close settlement to USDC is automatic — do NOT call swap_token yourself.`
-  : `  After ANY close_position: the close already swaps the withdrawn base tokens to SOL. Only if its result shows swap.success=false or status "success_with_exposure", swap that position's withdrawn amount with swap_token.`}
+  : `  After ANY close_position: the close already swaps the withdrawn base tokens to SOL. Only if its result has status "success_with_exposure" and swap.exposure_ui > 0, sell at most swap.exposure_ui of that token to SOL with swap_token (not before swap.retry_not_before). Other swap requests are refused in code: the agent can't buy tokens with SOL or sell tokens a recent close didn't leave behind.`}
 If (b): Answer the question with useful context. Do NOT take any on-chain actions (deploy, close, swap, claim). Only use read-only tools (get_my_positions, get_pool_detail, etc.) to inform your answer.
 If UNCLEAR: Ask the user to clarify — e.g. "Would you like me to do this now, or are you just exploring the idea?" Do NOT default to taking action when intent is ambiguous.
 
