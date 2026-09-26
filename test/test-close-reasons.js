@@ -35,3 +35,10 @@ test("session holds reasons for one management cycle", () => {
   session.clearManagementCloseReasons();
   assert.equal(session.getManagementCloseReason("P9"), null);
 });
+
+test("a Telegram close is recorded as a manual owner close", async () => {
+  const fs = await import("fs");
+  const src = fs.readFileSync(new URL("../telegram-ui.js", import.meta.url), "utf8");
+  assert.match(src, /executeTool\("close_position", \{ position_address: params\.position_address, _close_reason: "manual \(owner, Telegram\)" \}\)/);
+  assert.equal(withCloseReason({ position_address: "P1", _close_reason: "manual (owner, Telegram)" }, lookup({ P1: "rule 4" }))._close_reason, "manual (owner, Telegram)");
+});
