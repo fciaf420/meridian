@@ -791,7 +791,7 @@ const checkMark = (ch) => (ch.pass === false ? "❌" : ch.off ? "➖" : ch.pass 
 export function failedFilterLines(c) {
   return [...(c?.checks?.token || []), ...(c?.checks?.pool || []), ...(c?.checks?.safety || [])]
     .filter((ch) => ch.pass === false)
-    .map((ch) => `❌ ${ch.text}${ch.key === "bin_step" ? " (deploy_position blocks bin steps outside this range)" : ch.key === "age" ? " (deploy_position refuses tokens outside the age window)" : ""}`);
+    .map((ch) => `❌ ${ch.text}${ch.key === "bin_step" ? " (deploy_position blocks bin steps outside this range)" : ch.key === "age" ? " (outside your age window — the bot skips it, but a manual deploy is allowed)" : ""}`);
 }
 
 function fmtPct(v) {
@@ -1116,7 +1116,8 @@ export function tokenAgeLine(tokenAge) {
   const src = source ? ` · ${source}` : "";
   if (!check?.configured) return hours != null ? `🕒 Token age: ${fmtAgeHours(hours)}${src}` : null;
   if (check.unknown) return `❔ Token age: unknown (window ${fmtWindow(check.window)}) — deploy_position allows it and logs a warning`;
-  return `${check.pass ? "✅" : "⛔"} Token age: ${fmtAgeHours(hours)} (window ${fmtWindow(check.window)}${src})`;
+  if (!check.pass) return `⚠️ Token age: ${fmtAgeHours(hours)} — outside your ${fmtWindow(check.window)} window (manual deploy, not blocked${src})`;
+  return `✅ Token age: ${fmtAgeHours(hours)} (window ${fmtWindow(check.window)}${src})`;
 }
 
 export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "meteora", warnings = [], ttlMs = CONFIRM_TTL_MS, entryState = null, entryFilters = null, tokenAge = null } = {}) {
@@ -1349,8 +1350,9 @@ export function createTelegramUI(deps) {
       wallet, config: deps.config, computeDeployAmount: deps.computeDeployAmount, sizing, usdcMode, strategy, priceRangePct,
     });
     if (plan.error) return { view: { text: `⚠️ ${escapeHtml(plan.error)}`, keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]] } };
-    // Token-age window: the same check deploy_position enforces as a hard block,
-    // so a token outside it gets no Confirm button. Unknown age is shown and allowed.
+    // Token-age window: shown on the card for information. Manual deploys are the
+    // owner's call, so an out-of-window token keeps its Confirm button (the bot's
+    // own deploys are still refused by deploy_position).
     let tokenAge = null;
     if (deps.tokenAge) {
       const info = await Promise.race([
@@ -1361,15 +1363,8 @@ export function createTelegramUI(deps) {
       const hours = info?.hours ?? null;
       tokenAge = { hours, source: info?.source ?? null, check: { ...evaluateTokenAgeWindow(hours, window), window } };
       if (tokenAge.check.pass === false) {
-        logf("telegram", `Manual deploy blocked for ${candidate.name || candidate.pool}: ${tokenAge.check.reason}`);
-        return { view: {
-          text: [
-            `⛔ <b>Token age outside your window</b>`,
-            `<b>${escapeHtml(candidate.name ?? shortAddr(candidate.pool))}</b>: ${escapeHtml(tokenAge.check.reason)} (window ${escapeHtml(fmtWindow(window))}${tokenAge.source ? `, source ${escapeHtml(tokenAge.source)}` : ""}).`,
-            "deploy_position refuses tokens outside minTokenAgeHours/maxTokenAgeHours, so no deploy is offered.",
-          ].join("\n"),
-          keyboard: [[btn("🔍 Candidates", "ca:0"), btn("⬅ Menu", "m")]],
-        } };
+        // Manual deploys are the owner's call: show the age, don't block.
+        logf("telegram", `Manual deploy outside the age window for ${candidate.name || candidate.pool}: ${tokenAge.check.reason} (allowed)`);
       }
     }
     // Read-only entry preview (pool status, fee mode, TWAP) for the card; best
@@ -1731,7 +1726,7 @@ export function createTelegramUI(deps) {
 
     if (action === "deploy") {
       await edit(`⏳ Deploying into ${escapeHtml(params.label)}…`, []);
-      const r = await deps.runExclusive(() => deps.executeTool("deploy_position", { ...params.args }), { screening: true });
+      const r = await deps.runExclusive(() => deps.executeTool("deploy_position", { ...params.args }, { manual: true }), { screening: true });
       if (r.busy) return busyRetry("deploy", params, "deployed");
       try { await deps.afterDeploy?.(); } catch { /* best-effort */ }
       return edit(renderExecResult("deploy", params.label, r.value));
