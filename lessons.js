@@ -23,6 +23,10 @@ import {
 
 const LESSONS_FILE = "./lessons.json";
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
+// Every evolveThresholds rule needs at least this many of the closes it is
+// based on (the wins or losses it looks at; a rule comparing winners with
+// losers needs this many on each side) before it moves a setting.
+export const MIN_RULE_SAMPLES = 5;
 const LESSON_STRONG_PCT    = 5;   // |PnL| a win/loss needs before it becomes a lesson rule
 const MAX_CHANGE_PER_STEP  = 0.20; // never shift a threshold more than 20% at once
 
@@ -349,7 +353,7 @@ function derivLesson(perf) {
 export const OHLCV_BUFFER_MIN = 1.0;
 export const OHLCV_BUFFER_MAX = 1.8;
 export const OHLCV_BUFFER_STEP = 0.1;
-const OHLCV_BUFFER_MIN_CLOSES = 5;
+const OHLCV_BUFFER_MIN_CLOSES = MIN_RULE_SAMPLES;
 
 /**
  * Evolve strategy.ohlcvBufferMult (candle range depth = drawdown × buffer) from
@@ -391,8 +395,8 @@ export function evolveOhlcvBuffer(perfData, config) {
 
 export const TRAILING_TRIGGER_BOUNDS = { min: 1.5, max: 15, step: 0.5 };
 export const TRAILING_DROP_BOUNDS    = { min: 1.0, max: 8,  step: 0.5 };
-const TRAILING_MIN_CLOSES = 5;   // relevant closes since the parameter last changed
-const TRAILING_MIN_EXITS  = 3;   // trailing exits needed by the raise-trigger / widen-drop rules
+const TRAILING_MIN_CLOSES = MIN_RULE_SAMPLES; // relevant closes since the parameter last changed
+const TRAILING_MIN_EXITS  = MIN_RULE_SAMPLES; // trailing exits every exit-based rule needs
 const TRAILING_MIN_GAP    = 0.5; // keep trigger − drop ≥ 0.5 so the trail level stays above break-even
 
 const isTrailingExit = (p) => p.trailing_exit === true || /TRAILING_TP/i.test(String(p.close_reason || ""));
@@ -410,15 +414,16 @@ const step1 = (n) => Number(n.toFixed(1));
  * One 0.5 step per parameter per run. Wins/non-wins use the shared classifier.
  *
  * Trigger (1.5–15):
- *   lower  when ≥ 40% of non-winning closes (PnL ≤ +1%) peaked at
+ *   lower  when ≥ 40% of ≥ 5 non-winning closes (PnL ≤ +1%) peaked at
  *          ≥ 0.5 × trigger but < trigger: profits that were never protected.
- *   raise  when most (> 50%, ≥ 3) trailing exits closed within 1pt of the
+ *   raise  when most (> 50%, ≥ 5) trailing exits closed within 1pt of the
  *          PnL where trailing armed: the trail is too twitchy.
  * Drop (1–8):
- *   tighten when trailing exits give back more than the peak: median exit
- *           PnL < 0, or median give-back (peak − exit) ≥ drop + 2.
- *   widen   when ≥ 60% (≥ 3) of trailing exits still closed above +2% while
+ *   tighten when ≥ 5 trailing exits give back more than the peak: median
+ *           exit PnL < 0, or median give-back (peak − exit) ≥ drop + 2.
+ *   widen   when ≥ 60% of ≥ 5 trailing exits still closed above +2% while
  *           in range and earning fees: they were cut early.
+ * (5 = MIN_RULE_SAMPLES.)
  * Conflicting rules for one parameter cancel out. trigger − drop ≥ 0.5 is
  * kept where the current values allow it, and the trigger is not raised to
  * the fixed take profit or above.
@@ -444,7 +449,7 @@ export function evolveTrailing(perfData, config) {
   if (relT.length >= TRAILING_MIN_CLOSES) {
     const nonWinners = relT.filter((p) => classifyRecord(p) !== "win");
     const unprotected = nonWinners.filter((p) => p.peak_pnl_pct >= 0.5 * trigger && p.peak_pnl_pct < trigger);
-    const lower = nonWinners.length > 0 && unprotected.length / nonWinners.length >= 0.4;
+    const lower = nonWinners.length >= MIN_RULE_SAMPLES && unprotected.length / nonWinners.length >= 0.4;
 
     const exits = relT.filter(isTrailingExit);
     const armLevel = (p) => (isFiniteNum(p.trailing_armed_pct) ? p.trailing_armed_pct : trigger);
@@ -475,7 +480,7 @@ export function evolveTrailing(perfData, config) {
     const giveBacks = exits.map((p) => p.peak_pnl_pct - recordPnlPct(p));
     const medExit = exits.length ? median(exitPnls) : null;
     const medGive = exits.length ? median(giveBacks) : null;
-    const tighten = exits.length > 0 && (medExit < 0 || medGive >= drop + 2);
+    const tighten = exits.length >= TRAILING_MIN_EXITS && (medExit < 0 || medGive >= drop + 2);
 
     const cutEarly = exits.filter((p) => recordPnlPct(p) > 2 && p.in_range_at_close === true && Number(p.fees_earned_usd) > 0);
     const widen = exits.length >= TRAILING_MIN_EXITS && cutEarly.length / exits.length >= 0.6;
@@ -538,8 +543,8 @@ export function computeThresholdChanges(perfData, config) {
   const bufferEvo = evolveOhlcvBuffer(learnable, config);
   const trailingEvo = evolveTrailing(learnable, config);
 
-  // Need at least some signal in both directions before adjusting
-  const hasSignal = winners.length >= 2 || losers.length >= 2;
+  // Every rule below needs MIN_RULE_SAMPLES of the wins/losses it relies on.
+  const hasSignal = winners.length >= MIN_RULE_SAMPLES || losers.length >= MIN_RULE_SAMPLES;
   if (!hasSignal && !bufferEvo && !trailingEvo) return null;
 
   const changes   = {};
@@ -562,7 +567,7 @@ export function computeThresholdChanges(perfData, config) {
     const loserVols  = losers.map((p) => p.volatility).filter(isFiniteNum);
     const current    = config.screening.maxVolatility;
 
-    if (loserVols.length >= 2) {
+    if (loserVols.length >= MIN_RULE_SAMPLES) {
       // 25th percentile of loser volatilities — this is where things start going wrong
       const loserP25 = percentile(loserVols, 25);
       if (loserP25 < current) {
@@ -575,7 +580,7 @@ export function computeThresholdChanges(perfData, config) {
           rationale.maxVolatility = `Losers clustered at volatility ~${loserP25.toFixed(1)} — tightened from ${current} → ${rounded}`;
         }
       }
-    } else if (winnerVols.length >= 3 && losers.length === 0) {
+    } else if (winnerVols.length >= MIN_RULE_SAMPLES && losers.length === 0) {
       // All winners so far — loosen conservatively so we don't miss good pools
       const winnerP75 = percentile(winnerVols, 75);
       if (winnerP75 > current * 1.1) {
@@ -597,7 +602,7 @@ export function computeThresholdChanges(perfData, config) {
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const current    = config.screening.minFeeActiveTvlRatio;
 
-    if (winnerFees.length >= 2) {
+    if (winnerFees.length >= MIN_RULE_SAMPLES) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
       const minWinnerFee = Math.min(...winnerFees);
       if (minWinnerFee > current * 1.2) {
@@ -611,11 +616,11 @@ export function computeThresholdChanges(perfData, config) {
       }
     }
 
-    if (loserFees.length >= 2) {
+    if (loserFees.length >= MIN_RULE_SAMPLES && winnerFees.length >= MIN_RULE_SAMPLES) {
       // If losers all had high fee/TVL, that's noise (pumps then crash) — don't raise min
       // But if losers had low fee/TVL, raise min
       const maxLoserFee = Math.max(...loserFees);
-      if (maxLoserFee < current * 1.5 && winnerFees.length > 0) {
+      if (maxLoserFee < current * 1.5) {
         const minWinnerFee = Math.min(...winnerFees);
         if (minWinnerFee > maxLoserFee) {
           const target  = maxLoserFee * 1.2;
@@ -637,7 +642,7 @@ export function computeThresholdChanges(perfData, config) {
     const winnerOrganics = winners.map((p) => p.organic_score).filter(isFiniteNum);
     const current        = config.screening.minOrganic;
 
-    if (loserOrganics.length >= 2 && winnerOrganics.length >= 1) {
+    if (loserOrganics.length >= MIN_RULE_SAMPLES && winnerOrganics.length >= MIN_RULE_SAMPLES) {
       const avgLoserOrganic  = avg(loserOrganics);
       const avgWinnerOrganic = avg(winnerOrganics);
       // Only raise if there's a clear gap (winners consistently more organic)
@@ -663,7 +668,7 @@ export function computeThresholdChanges(perfData, config) {
     const currentMin = config.screening.minBinStep ?? 1;
     const currentMax = config.screening.maxBinStep ?? 200;
 
-    if (loserBinSteps.length >= 2 && winnerBinSteps.length >= 2) {
+    if (loserBinSteps.length >= MIN_RULE_SAMPLES && winnerBinSteps.length >= MIN_RULE_SAMPLES) {
       const loserP25 = percentile(loserBinSteps, 25);
       const winnerMin = Math.min(...winnerBinSteps);
       const winnerMax = Math.max(...winnerBinSteps);
@@ -694,7 +699,7 @@ export function computeThresholdChanges(perfData, config) {
     const oorUpWinners = winners.filter(p => p.close_reason?.includes("OOR upside"));
 
     // If downside OOR losers waited too long → shorten wait
-    if (oorDownLosers.length >= 2) {
+    if (oorDownLosers.length >= MIN_RULE_SAMPLES) {
       const avgHeld = avg(oorDownLosers.map(p => p.minutes_held).filter(isFiniteNum));
       if (avgHeld > current * 1.5) {
         const newVal = clamp(Math.round(nudge(current, current * 0.8, MAX_CHANGE_PER_STEP)), 3, 30);
@@ -705,7 +710,7 @@ export function computeThresholdChanges(perfData, config) {
       }
     }
     // If upside OOR positions recovered and won → lengthen wait
-    if (oorUpWinners.length >= 2 && oorDownLosers.length === 0) {
+    if (oorUpWinners.length >= MIN_RULE_SAMPLES && oorDownLosers.length === 0) {
       const newVal = clamp(Math.round(nudge(current, current * 1.2, MAX_CHANGE_PER_STEP)), 3, 30);
       if (newVal > current) {
         changes.outOfRangeWaitMinutes = newVal;
@@ -728,14 +733,14 @@ export function computeThresholdChanges(perfData, config) {
       return ath != null && ath >= current;
     });
 
-    if (losersNearAth.length >= 2 && winnersNearAth.length === 0) {
+    if (losersNearAth.length >= MIN_RULE_SAMPLES && winnersNearAth.length === 0) {
       const target = current - 3;
       const newVal = clamp(Math.round(nudge(current, target, MAX_CHANGE_PER_STEP)), 75, 98);
       if (newVal < current) {
         changes.athTopThresholdPct = newVal;
         rationale.athTopThresholdPct = `${losersNearAth.length} near-ATH losses, 0 wins — tightened from ${current}% → ${newVal}%`;
       }
-    } else if (winnersNearAth.length >= 2 && losersNearAth.length === 0) {
+    } else if (winnersNearAth.length >= MIN_RULE_SAMPLES && losersNearAth.length === 0) {
       const target = current + 2;
       const newVal = clamp(Math.round(nudge(current, target, MAX_CHANGE_PER_STEP)), 75, 98);
       if (newVal > current) {

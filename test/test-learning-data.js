@@ -100,6 +100,8 @@ test("isExcludedLesson: the lesson derived from COLLECT (same pool, created_at =
 });
 
 // ─── Threshold evolution ───
+const times = (k, fn) => Array.from({ length: k }, () => fn());
+
 test("evolution: break-even OOR-upside closes no longer lengthen outOfRangeWaitMinutes (the 12 → 14 → 17 → 20 drift)", () => {
   const perf = [
     close(0.004, { close_reason: "agent decision (OOR upside)" }),
@@ -111,30 +113,60 @@ test("evolution: break-even OOR-upside closes no longer lengthen outOfRangeWaitM
     collectRecord(), // the only "loser" the old tuner saw
   ];
   // Under the old rule (pnl > 0 = winner) the four OOR-upside closes above 0 were "winners".
-  const res = lessons.computeThresholdChanges(perf, mgmtCfg());
-  assert.equal(res, null, "no wins, no losses → no signal → no change");
+  assert.equal(lessons.computeThresholdChanges(perf, mgmtCfg()), null, "no wins, no losses → no change");
 
-  // Real upside winners still extend the wait.
-  const real = [...perf, close(3.2, { close_reason: "agent decision (OOR upside)" }), close(2.1, { close_reason: "agent decision (OOR upside)" })];
-  const res2 = lessons.computeThresholdChanges(real, mgmtCfg());
-  assert.equal(res2.changes.outOfRangeWaitMinutes, 14);
+  // The live case: two real upside-OOR wins are not enough any more…
+  const upWin = () => close(3, { close_reason: "agent decision (OOR upside)" });
+  assert.equal(lessons.computeThresholdChanges([...perf, ...times(2, upWin)], mgmtCfg())?.changes?.outOfRangeWaitMinutes, undefined);
+  // …five are.
+  assert.equal(lessons.computeThresholdChanges([...perf, ...times(5, upWin)], mgmtCfg()).changes.outOfRangeWaitMinutes, 14);
 });
 
 test("evolution: the known-bad COLLECT record is not a loser, and losers are < −1%", () => {
   const vol = (v, pnl) => close(pnl, { volatility: v });
-  // Two losers at high volatility would tighten maxVolatility; COLLECT (vol 11) alone must not.
-  const onlyCollect = [collectRecord(), collectRecord(), vol(4, 2), vol(4, 3), vol(4, 0), vol(4, 0.5)];
+  // Five losers at volatility ≤ 6 tighten maxVolatility; five COLLECT copies (excluded) must not.
+  const onlyCollect = [...times(5, collectRecord), ...times(5, () => vol(4, 2))];
   assert.equal(lessons.computeThresholdChanges(onlyCollect, mgmtCfg())?.changes?.maxVolatility, undefined);
   // −0.5% closes are break-even, not losers; −3% closes are.
-  const mild = [vol(6, -0.5), vol(6, -0.6), vol(6, -0.7), vol(3, 2), vol(3, 3)];
+  const mild = [...times(5, () => vol(6, -0.5)), ...times(2, () => vol(3, 2))];
   assert.equal(lessons.computeThresholdChanges(mild, mgmtCfg())?.changes?.maxVolatility, undefined);
-  const real = [vol(6, -3), vol(6, -4), vol(6, -5), vol(3, 2), vol(3, 3)];
+  const real = [...times(5, () => vol(6, -3)), ...times(2, () => vol(3, 2))];
   assert.ok(lessons.computeThresholdChanges(real, mgmtCfg()).changes.maxVolatility < 10);
+});
+
+test("evolution: every rule needs MIN_RULE_SAMPLES (5) of the wins/losses it relies on — 4 don't move it, 5 do", () => {
+  assert.equal(lessons.MIN_RULE_SAMPLES, 5);
+  const W = (extra = {}) => close(3, extra);   // a win
+  const L = (extra = {}) => close(-3, extra);  // a loss
+  // [setting, config overrides, build(nRelied) → perf]. Each rule is fed exactly the
+  // side(s) it relies on; a two-sided rule gets 5 on one side and n on the other.
+  const cases = [
+    ["maxVolatility (losers → tighten)", "maxVolatility", {}, (n) => times(n, () => L({ volatility: 4 }))],
+    ["maxVolatility (all winners → loosen)", "maxVolatility", {}, (n) => times(n, () => W({ volatility: 14 }))],
+    ["minFeeActiveTvlRatio (winners' floor)", "minFeeActiveTvlRatio", {}, (n) => times(n, () => W({ fee_tvl_ratio: 1 }))],
+    ["minFeeActiveTvlRatio (losers vs winners)", "minFeeActiveTvlRatio", { screening: { minFeeActiveTvlRatio: 0.5 } },
+      (n) => [...times(5, () => L({ fee_tvl_ratio: 0.45 })), ...times(n, () => W({ fee_tvl_ratio: 0.55 }))]],
+    ["minOrganic (losers vs winners)", "minOrganic", {}, (n) => [...times(n, () => L({ organic_score: 60 })), ...times(5, () => W({ organic_score: 90 }))]],
+    ["minBinStep (losers vs winners)", "minBinStep", { screening: { minBinStep: 20 } }, (n) => [...times(5, () => L({ bin_step: 40 })), ...times(n, () => W({ bin_step: 100 }))]],
+    ["maxBinStep (losers vs winners)", "maxBinStep", { screening: { maxBinStep: 250 } }, (n) => [...times(n, () => L({ bin_step: 200 })), ...times(5, () => W({ bin_step: 100 }))]],
+    ["outOfRangeWaitMinutes (downside losers → shorten)", "outOfRangeWaitMinutes", {}, (n) => times(n, () => L({ close_reason: "agent decision (OOR downside)", minutes_held: 100 }))],
+    ["outOfRangeWaitMinutes (upside winners → lengthen)", "outOfRangeWaitMinutes", {}, (n) => times(n, () => W({ close_reason: "agent decision (OOR upside)" }))],
+    ["athTopThresholdPct (near-ATH losers → tighten)", "athTopThresholdPct", {}, (n) => times(n, () => L({ signal_snapshot: { ath_proximity: 95 } }))],
+    ["athTopThresholdPct (near-ATH winners → loosen)", "athTopThresholdPct", {}, (n) => times(n, () => W({ signal_snapshot: { ath_proximity: 95 } }))],
+  ];
+  for (const [label, key, over, build] of cases) {
+    const c = mgmtCfg();
+    Object.assign(c.screening, over.screening || {});
+    // Pad with break-evens so the 5-record evolution minimum is never what blocks the rule.
+    const pad = times(5, () => close(0));
+    assert.equal(lessons.computeThresholdChanges([...pad, ...build(4)], c)?.changes?.[key], undefined, `${label}: 4 samples must not move it`);
+    assert.notEqual(lessons.computeThresholdChanges([...pad, ...build(5)], c)?.changes?.[key], undefined, `${label}: 5 samples move it`);
+  }
 });
 
 test("evolution never touches takeProfitFeePct or stopLossPct (the operator's), even on data that used to move them", () => {
   // Old section 4: ≥3 losers well above the −40% stop → tighten. Old section 5: winners' p75 ≪ TP → lower TP.
-  const perf = [close(-3), close(-4), close(-5), close(2), close(2.5), close(3), close(2.2)];
+  const perf = [...times(5, () => close(-3)), ...times(5, () => close(2.5))];
   const res = lessons.computeThresholdChanges(perf, mgmtCfg());
   assert.ok(res, "there is signal");
   assert.equal("stopLossPct" in res.changes, false);
