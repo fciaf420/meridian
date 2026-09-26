@@ -1750,7 +1750,7 @@ export function createTelegramUI(deps) {
 
     if (action === "close") {
       await edit(`⏳ Closing ${escapeHtml(params.label)}…`, []);
-      const r = await deps.runExclusive(() => deps.executeTool("close_position", { position_address: params.position_address }));
+      const r = await deps.runExclusive(() => deps.executeTool("close_position", { position_address: params.position_address, _close_reason: "manual (owner, Telegram)" }));
       if (r.busy) return busyRetry("close", params, "closed");
       return edit(renderExecResult("close", params.label, r.value));
     }
