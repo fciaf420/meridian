@@ -52,7 +52,7 @@ export const ENTRY_FILTER_DEFAULTS = Object.freeze({
   twapWindowMinutes: 60,
   // Jupiter Tokens API: block audit.isSus (present = flagged) or banned tokens.
   // A failed lookup / unknown token is allowed with a warning.
-  blockJupiterSuspicious: true,
+  blockJupiterSuspicious: false,
 });
 
 export const TOKEN_GUARD_BOOL_KEYS = [
