@@ -272,14 +272,14 @@ async function openDeploy(u, edits) {
   return edits.at(-1);
 }
 
-test("telegram: the candidate list shows the age; an out-of-window deploy gets no Confirm button", async () => {
+test("telegram: an out-of-window token is a manual override — warning shown, Confirm kept", async () => {
   const { u, edits } = makeUI();
   const card = await openDeploy(u, edits);
   assert.match(edits[0].text, /age 682h/);
-  assert.match(card.text, /Token age outside your window/);
-  assert.match(card.text, /token age 682h &gt; 72h max \(window 2h–72h, source meteora\)/);
+  assert.match(card.text, /Deploy into this pool\?/);
+  assert.match(card.text, /⚠️ Token age: 682h — outside your 2h–72h window \(manual deploy, not blocked · meteora\)/);
   const data = card.extra.reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
-  assert.ok(!data.some((d) => d?.startsWith("y:")), "no confirm button");
+  assert.ok(data.some((d) => d?.startsWith("y:")), "confirm button kept");
 });
 
 test("telegram: in-window and unknown ages reach the confirm card with the age line", async () => {
@@ -294,7 +294,15 @@ test("telegram: in-window and unknown ages reach the confirm card with the age l
   assert.match(c2.text, /❔ Token age: unknown .* deploy_position allows it/);
 });
 
-test("telegram: /token lookup's age check says deploy_position refuses it", () => {
+test("telegram: /token lookup's age check says a manual deploy is allowed", () => {
   const lines = ui.failedFilterLines({ checks: { token: [{ key: "age", pass: false, text: "age 682h (2h–72h)" }], pool: [] } });
-  assert.deepEqual(lines, ["❌ age 682h (2h–72h) (deploy_position refuses tokens outside the age window)"]);
+  assert.deepEqual(lines, ["❌ age 682h (2h–72h) (outside your age window — the bot skips it, but a manual deploy is allowed)"]);
+});
+
+test("executeTool honours _manual only for owner-initiated deploys", async () => {
+  const src = fs.readFileSync(new URL("../tools/executor.js", import.meta.url), "utf8");
+  assert.match(src, /export async function executeTool\(name, args, \{ manual = false \} = \{\}\)/);
+  assert.match(src, /args = manual \? \{ \.\.\.rest, _manual: true \} : rest;/);
+  const ui = fs.readFileSync(new URL("../telegram-ui.js", import.meta.url), "utf8");
+  assert.match(ui, /executeTool\("deploy_position", \{ \.\.\.params\.args \}, \{ manual: true \}\)/);
 });
