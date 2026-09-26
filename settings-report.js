@@ -233,6 +233,7 @@ export function buildSettingsReport({ color = false } = {}) {
     ["WALLET_PRIVATE_KEY", true], ["RPC_URL", true],
     ["GMGN_API_KEY", gmgnActive], ["DEEPSEEK_API_KEY", u.llmProvider === "deepseek"],
     ["TELEGRAM_BOT_TOKEN", false], ["JUPITER_API_KEY", false], ["HELIUS_API_KEY", false],
+    ["BALANCE_RPC_URL", false],
     ["LPAGENT_API_KEY", false], ["DASHBOARD_TOKEN", false],
   ];
   for (const [k, required] of need) {

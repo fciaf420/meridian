@@ -9,12 +9,17 @@ import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
 import { basePriorityPrice, cappedPriorityPrice, sendAndConfirmSigned, MAX_CU_LIMIT } from "./tx-send.js";
+import { getTokensInfo } from "./jup-tokens.js";
+import { countRpc, instrumentConnection } from "./rpc-stats.js";
+import { WALLET_BALANCES_TTL_MS, walletCacheState, invalidateWalletBalances } from "./wallet-cache.js";
+
+export { invalidateWalletBalances };
 
 let _connection = null;
 let _wallet = null;
 
 function getConnection() {
-  if (!_connection) _connection = new Connection(process.env.RPC_URL, "confirmed");
+  if (!_connection) _connection = instrumentConnection(new Connection(process.env.RPC_URL, "confirmed"));
   return _connection;
 }
 
@@ -73,74 +78,276 @@ async function jupiterFetch(url, options = {}, { timeoutMs = 15000, maxRetries =
   throw lastErr;
 }
 
+// ─── Wallet balances (RPC + Jupiter; no Helius Wallet API) ─────
+// The Helius Wallet API costs 100 credits per call and was ~97% of the plan's
+// spend (the positions scan called it every 30–60s just for the SOL price).
+// Balances now come from 3 RPC calls (getBalance + parsed token accounts for
+// Token and Token-2022), prices from Jupiter Price v3 and symbols from
+// Jupiter Tokens v2. USE_HELIUS_WALLET_API=true restores the old source.
+//
+// BALANCE_RPC_URL (optional) routes ONLY these balance reads to a separate RPC
+// (e.g. Flux). Everything else — position scans, sends, simulations, on-chain
+// PnL, close-swap balance reads — stays on RPC_URL. It must serve
+// getTokenAccountsByOwner (PublicNode's free endpoint refuses it).
+
+const TOKEN_PROGRAM_IDS = [
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
+];
+const PRICE_BATCH = 50; // Jupiter Price v3 max ids per request
+export const SOL_PRICE_TTL_MS = 60_000;
+const BALANCE_RPC_TIMEOUT_MS = 5_000;
+const BALANCE_RPC_WARN_INTERVAL_MS = 3_600_000;
+
+let _balanceConnection = null;
+let _balanceRpcWarnAt = 0;
+let _solPrice = null; // { at, price }
+let _solPriceInflight = null;
+const _symbols = new Map(); // mint -> symbol | null (null = Jupiter doesn't know it)
+let _testDeps = null;
+
 /**
- * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
- * Returns USD-denominated values provided by Helius.
+ * Test seam: { connection, balanceConnection, owner, balanceRpcTimeoutMs }
+ * replace the main RPC connection, the BALANCE_RPC_URL connection, the wallet
+ * address and the balance-RPC timeout. Also clears every balance/price/symbol
+ * cache. Pass null to restore.
  */
-export async function getWalletBalances() {
-  let walletAddress;
-  try {
-    walletAddress = getWallet().publicKey.toString();
-  } catch {
-    return { wallet: null, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Wallet not configured" };
-  }
+export function _setWalletTestDeps(deps) {
+  _testDeps = deps;
+  _solPrice = null;
+  _solPriceInflight = null;
+  _symbols.clear();
+  _balanceRpcWarnAt = 0;
+  invalidateWalletBalances();
+}
 
-  const HELIUS_KEY = process.env.HELIUS_API_KEY;
-  if (!HELIUS_KEY) {
-    log("wallet_error", "HELIUS_API_KEY not set in .env");
-    return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
-  }
+function rpcHost(url) {
+  try { return new URL(url).hostname; } catch { return "(invalid url)"; }
+}
 
-  try {
-    const url = `https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`;
-    const res = await fetch(url);
-    
-    if (!res.ok) {
-      throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
+/** Connection for balance reads from BALANCE_RPC_URL, or null when unset. */
+function getBalanceConnection() {
+  if (_testDeps) return _testDeps.balanceConnection ?? null;
+  const url = process.env.BALANCE_RPC_URL;
+  if (!url) return null;
+  if (!_balanceConnection) _balanceConnection = instrumentConnection(new Connection(url, "confirmed"));
+  return _balanceConnection;
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/** SOL lamports + per-mint token totals (Token + Token-2022) from one RPC. */
+async function readHoldings(connection, owner) {
+  const [lamports, ...tokenResults] = await Promise.all([
+    connection.getBalance(owner, "confirmed"),
+    ...TOKEN_PROGRAM_IDS.map((programId) =>
+      connection.getParsedTokenAccountsByOwner(owner, { programId: new PublicKey(programId) }, "confirmed")),
+  ]);
+  if (lamports == null || !Number.isFinite(Number(lamports))) throw new Error("getBalance returned no value");
+  const byMint = new Map(); // mint -> { raw: bigint, decimals }
+  for (const res of tokenResults) {
+    if (!res || !Array.isArray(res.value)) throw new Error("getParsedTokenAccountsByOwner returned no value");
+    for (const { account } of res.value) {
+      const info = account?.data?.parsed?.info;
+      const amt = info?.tokenAmount;
+      if (!info?.mint || amt?.amount == null || !/^\d+$/.test(String(amt.amount))) continue;
+      const cur = byMint.get(info.mint) ?? { raw: 0n, decimals: Number.isInteger(amt.decimals) ? amt.decimals : 0 };
+      cur.raw += BigInt(amt.amount);
+      byMint.set(info.mint, cur);
     }
+  }
+  return { lamports: Number(lamports), byMint };
+}
 
-    const data = await res.json();
-    const balances = data.balances || [];
+/**
+ * Holdings via BALANCE_RPC_URL when set; on error or ~5s timeout, retried once
+ * on the main RPC (logged at most once per hour, hostname only).
+ */
+async function readHoldingsRouted(owner) {
+  const balanceConn = getBalanceConnection();
+  const mainConn = _testDeps?.connection ?? getConnection();
+  if (!balanceConn) return readHoldings(mainConn, owner);
+  try {
+    const timeoutMs = _testDeps?.balanceRpcTimeoutMs ?? BALANCE_RPC_TIMEOUT_MS;
+    return await withTimeout(readHoldings(balanceConn, owner), timeoutMs, "balance RPC");
+  } catch (e) {
+    const now = Date.now();
+    if (now - _balanceRpcWarnAt >= BALANCE_RPC_WARN_INTERVAL_MS) {
+      _balanceRpcWarnAt = now;
+      const host = _testDeps ? "test" : rpcHost(process.env.BALANCE_RPC_URL);
+      log("wallet_warn", `Balance RPC ${host} failed (${e.message}); retrying on the main RPC (logged at most hourly)`);
+    }
+    return readHoldings(mainConn, owner);
+  }
+}
 
-    // ─── Find SOL and USDC ────────────────────────────────────
-    const solEntry = balances.find(b => b.mint === config.tokens.SOL || b.symbol === "SOL");
-    const usdcEntry = balances.find(b => b.mint === config.tokens.USDC || b.symbol === "USDC");
+/** USD prices from Jupiter Price v3, batched. Missing/failed mints are absent. */
+async function fetchJupiterPrices(mints) {
+  const out = new Map();
+  const ids = [...new Set(mints.filter(Boolean))];
+  for (let i = 0; i < ids.length; i += PRICE_BATCH) {
+    const chunk = ids.slice(i, i + PRICE_BATCH);
+    try {
+      const res = await jupiterFetch(`${JUPITER_PRICE_API}?ids=${chunk.join(",")}`, {
+        headers: { "x-api-key": JUPITER_API_KEY },
+      }, { timeoutMs: 5000, maxRetries: 1 });
+      if (!res.ok) {
+        log("wallet_warn", `Jupiter price request failed: HTTP ${res.status}`);
+        continue;
+      }
+      const body = await res.json();
+      for (const m of chunk) {
+        const p = Number(body?.[m]?.usdPrice);
+        if (Number.isFinite(p) && p > 0) out.set(m, p);
+      }
+    } catch (e) {
+      log("wallet_warn", `Jupiter price request failed: ${e.message}`);
+    }
+  }
+  if (out.has(SOL_MINT)) _solPrice = { at: Date.now(), price: out.get(SOL_MINT) };
+  return out;
+}
 
-    const solBalance = solEntry?.balance || 0;
-    const solPrice = solEntry?.pricePerToken || 0;
-    const solUsd = solEntry?.usdValue || 0;
-    const usdcBalance = usdcEntry?.balance || 0;
+/**
+ * SOL/USD from Jupiter Price v3, cached 60s (concurrent callers share one
+ * request). On failure returns the last known price, or 0 if there is none.
+ */
+export async function getSolPrice() {
+  if (_solPrice && Date.now() - _solPrice.at < SOL_PRICE_TTL_MS) return _solPrice.price;
+  if (_solPriceInflight) return _solPriceInflight;
+  const p = fetchJupiterPrices([SOL_MINT])
+    .then((prices) => prices.get(SOL_MINT) ?? _solPrice?.price ?? 0)
+    .finally(() => { if (_solPriceInflight === p) _solPriceInflight = null; });
+  _solPriceInflight = p;
+  return p;
+}
 
-    // ─── Map all tokens ───────────────────────────────────────
-    const enrichedTokens = balances.map(b => ({
+/** Best-effort symbols from Jupiter Tokens v2 (cached for the process). */
+async function resolveSymbols(mints) {
+  const need = mints.filter((m) => !_symbols.has(m));
+  if (need.length) {
+    try {
+      const info = await getTokensInfo(need);
+      if (info) for (const m of need) _symbols.set(m, info.get(m)?.symbol || null);
+    } catch { /* fall back to mint prefix */ }
+  }
+  return (m) => _symbols.get(m) || m.slice(0, 8);
+}
+
+const round2 = (n) => Math.round(n * 100) / 100;
+
+async function readWalletBalances(walletAddress) {
+  const { lamports, byMint } = await readHoldingsRouted(new PublicKey(walletAddress));
+  const held = [...byMint.entries()].filter(([, v]) => v.raw > 0n);
+  const mints = held.map(([m]) => m);
+  const [prices, symbolOf] = await Promise.all([
+    fetchJupiterPrices([SOL_MINT, ...mints]),
+    resolveSymbols(mints),
+  ]);
+
+  const solPrice = prices.get(SOL_MINT) ?? _solPrice?.price ?? 0;
+  const sol = lamports / LAMPORTS_PER_SOL;
+  const solUsd = sol * solPrice;
+  // Native SOL first, as the Helius Wallet API listed it (consumers skip it).
+  const tokens = [{ mint: SOL_MINT, symbol: "SOL", balance: sol, usd: solPrice > 0 ? round2(solUsd) : null }];
+  let totalUsd = solUsd;
+  let usdc = 0;
+  for (const [mint, { raw, decimals }] of held) {
+    const balance = Number(raw) / 10 ** decimals;
+    const price = prices.get(mint);
+    const usd = price != null ? balance * price : null;
+    if (usd != null) totalUsd += usd;
+    if (mint === config.tokens.USDC) usdc = balance;
+    tokens.push({
+      mint,
+      symbol: mint === SOL_MINT ? "WSOL" : symbolOf(mint),
+      balance,
+      usd: usd == null ? null : round2(usd),
+    });
+  }
+
+  return {
+    wallet: walletAddress,
+    sol: Math.round(sol * 1e6) / 1e6,
+    sol_price: round2(solPrice),
+    sol_usd: round2(solUsd),
+    usdc: round2(usdc),
+    tokens,
+    total_usd: round2(totalUsd),
+  };
+}
+
+/** Legacy source (opt-in via USE_HELIUS_WALLET_API=true): 100 credits/call. */
+async function readHeliusWalletBalances(walletAddress) {
+  const HELIUS_KEY = process.env.HELIUS_API_KEY;
+  if (!HELIUS_KEY) throw new Error("Helius API key missing");
+  countRpc("helius:wallet_balances");
+  const res = await fetch(`https://api.helius.xyz/v1/wallet/${walletAddress}/balances?api-key=${HELIUS_KEY}`);
+  if (!res.ok) throw new Error(`Helius API error: ${res.status} ${res.statusText}`);
+  const data = await res.json();
+  const balances = data.balances || [];
+  const solEntry = balances.find((b) => b.mint === config.tokens.SOL || b.symbol === "SOL");
+  const usdcEntry = balances.find((b) => b.mint === config.tokens.USDC || b.symbol === "USDC");
+  if (solEntry?.pricePerToken > 0) _solPrice = { at: Date.now(), price: solEntry.pricePerToken };
+  return {
+    wallet: walletAddress,
+    sol: Math.round((solEntry?.balance || 0) * 1e6) / 1e6,
+    sol_price: round2(solEntry?.pricePerToken || 0),
+    sol_usd: round2(solEntry?.usdValue || 0),
+    usdc: round2(usdcEntry?.balance || 0),
+    tokens: balances.map((b) => ({
       mint: b.mint,
       symbol: b.symbol || b.mint.slice(0, 8),
       balance: b.balance,
-      usd: b.usdValue ? Math.round(b.usdValue * 100) / 100 : null,
-    }));
+      usd: b.usdValue ? round2(b.usdValue) : null,
+    })),
+    total_usd: round2(data.totalUsdValue || 0),
+  };
+}
 
-    return {
-      wallet: walletAddress,
-      sol: Math.round(solBalance * 1e6) / 1e6,
-      sol_price: Math.round(solPrice * 100) / 100,
-      sol_usd: Math.round(solUsd * 100) / 100,
-      usdc: Math.round(usdcBalance * 100) / 100,
-      tokens: enrichedTokens,
-      total_usd: Math.round((data.totalUsdValue || 0) * 100) / 100,
-    };
-  } catch (error) {
-    log("wallet_error", error.message);
-    return {
-      wallet: walletAddress,
-      sol: 0,
-      sol_price: 0,
-      sol_usd: 0,
-      usdc: 0,
-      tokens: [],
-      total_usd: 0,
-      error: error.message,
-    };
+const emptyBalances = (wallet, error) => ({ wallet, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error });
+
+/**
+ * Wallet balances: { wallet, sol, sol_price, sol_usd, usdc,
+ * tokens: [{ mint, symbol, balance, usd }], total_usd } or the same shape with
+ * `error` on failure. Cached for WALLET_BALANCES_TTL_MS (20s); every send
+ * invalidates the cache (tx-send.js, swapToken). Pass { fresh: true } to skip
+ * the cache when the read feeds a decision about moving funds.
+ */
+export async function getWalletBalances(opts) {
+  const fresh = opts?.fresh === true;
+  let walletAddress;
+  try {
+    walletAddress = _testDeps?.owner ?? getWallet().publicKey.toString();
+  } catch {
+    return emptyBalances(null, "Wallet not configured");
   }
+
+  const c = walletCacheState();
+  if (!fresh && c.entry && Date.now() - c.entry.at < WALLET_BALANCES_TTL_MS) return structuredClone(c.entry.value);
+  if (!fresh && c.inflight) return c.inflight.then((v) => structuredClone(v));
+
+  const gen = c.generation;
+  const useHelius = process.env.USE_HELIUS_WALLET_API === "true";
+  const p = (useHelius ? readHeliusWalletBalances(walletAddress) : readWalletBalances(walletAddress))
+    .then((value) => {
+      // Don't cache a read that raced a send (it may predate the send).
+      if (c.generation === gen) c.entry = { at: Date.now(), value };
+      return value;
+    })
+    .catch((error) => {
+      log("wallet_error", error.message);
+      return emptyBalances(walletAddress, error.message);
+    })
+    .finally(() => { if (c.inflight === p) c.inflight = null; });
+  if (!fresh) c.inflight = p;
+  return p.then((v) => structuredClone(v));
 }
 
 /**
@@ -598,6 +805,10 @@ export async function swapToken({
   } catch (error) {
     log("swap_error", error.message);
     return { success: false, error: error.message };
+  } finally {
+    // Any live swap attempt may have moved funds: the next balance read must
+    // come from chain, not the 20s cache.
+    invalidateWalletBalances();
   }
 }
 

@@ -25,6 +25,7 @@ import { log } from "./logger.js";
 import { classifyOutcome, exclusionReason, recordPnlPct } from "./learning-data.js";
 import { claimedFeesSol } from "./tools/onchain-pnl.js";
 import { computePortfolioSol, resolveSolPrice, valueDlmmPositions } from "./portfolio-value.js";
+import { getRpcStats, formatRpcStatsLine } from "./tools/rpc-stats.js";
 
 const STATE_FILE = "./state.json";
 const LESSONS_FILE = "./lessons.json";
@@ -234,6 +235,7 @@ const defaultDeps = {
   getWalletBalances: async () => (await import("./tools/wallet.js")).getWalletBalances(),
   getOnchainPnl: async (p) => (await import("./tools/onchain-pnl.js")).getOnchainPnl(p),
   getLpOverview: async () => (await import("./tools/lp-overview.js")).getLpOverview(),
+  getRpcStats,
 };
 
 /**
@@ -284,6 +286,9 @@ export async function generateBriefing({ now = new Date(), deps = {} } = {}) {
   }));
 
   const lpLine = formatLpOverviewLine(lpOverview);
+  // Helius bills per RPC call: calls per method since the process started.
+  let rpcLine = null;
+  try { rpcLine = formatRpcStatsLine(await d.getRpcStats()); } catch { /* optional line */ }
   const lines = [
     `<b>Morning Briefing</b> — ${new Date(nowMs).toISOString().slice(0, 16).replace("T", " ")} UTC`,
     "",
@@ -302,6 +307,7 @@ export async function generateBriefing({ now = new Date(), deps = {} } = {}) {
     "",
     ...formatPortfolio({ wallet, positionsResult, onchain, walletError }),
     ...(lpLine ? ["", lpLine] : []),
+    ...(rpcLine ? ["", `<i>${escapeHtml(rpcLine)}</i>`] : []),
   ];
   return lines.join("\n");
 }

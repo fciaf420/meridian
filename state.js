@@ -809,7 +809,7 @@ async function syncOpenPositionsOnce(active_addresses) {
           mine.notes.push(`Leftover base-token exposure (${baseMint.slice(0, 8)}): pre-close balance unknown, swap manually`);
           log("state_warn", `Post-sync-close swap skipped for ${baseMint}: pre-close balance unknown — leftover exposure flagged.`);
         } else {
-          const walletBals = await getWalletBalances();
+          const walletBals = await getWalletBalances({ fresh: true });
           const baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
           const currentBal = baseToken?.balance ?? 0;
           const swapAmount = Math.max(0, currentBal - preBal);

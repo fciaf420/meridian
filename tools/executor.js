@@ -674,7 +674,7 @@ async function runSafetyChecks(name, args, { manual = false } = {}) {
 
       // Check SOL balance — must have enough to deploy + gas reserve.
       // In USDC mode the USDC→SOL swap has already run, so the acquired SOL is present.
-      const balance = await getWalletBalances();
+      const balance = await getWalletBalances({ fresh: true });
       const gasReserve = usdc ? config.usdc.gasReserveSol : (config.management.gasReserve ?? 0.05);
       const minRequired = getRequiredSolBalance({ deployAmountSol: amountY, gasReserve });
       if (balance.sol < minRequired) {

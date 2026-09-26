@@ -64,7 +64,7 @@ export async function prepareUsdcEntry({ amountUsd } = {}) {
     return { ok: false, reason: `Deploy amount $${usd} exceeds the per-position cap of $${config.usdc.maxDeployUsd}.` };
   }
 
-  const bal = await getWalletBalances();
+  const bal = await getWalletBalances({ fresh: true });
   if (bal.error) {
     return { ok: false, reason: `Could not read wallet balances: ${bal.error}` };
   }
@@ -136,7 +136,7 @@ export async function settleToUsdc() {
     return { dry_run: true, settled: 0, results: [] };
   }
 
-  const bal = await getWalletBalances();
+  const bal = await getWalletBalances({ fresh: true });
   if (bal.error) {
     log("usdc", `Settle skipped — balance read failed: ${bal.error}`);
     return { settled: 0, results: [], error: bal.error };
@@ -171,7 +171,7 @@ export async function settleToUsdc() {
   // double-swap that tries to send more SOL than the wallet holds).
   let currentSol = bal.sol ?? 0;
   try {
-    const fresh = await getWalletBalances();
+    const fresh = await getWalletBalances({ fresh: true });
     if (!fresh.error && typeof fresh.sol === "number") currentSol = fresh.sol;
   } catch { /* fall back to initial balance read */ }
   const surplusSol = currentSol - reserve;
