@@ -14,7 +14,7 @@ import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js"
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction, getTrackedPosition, recordPnlHold } from "../state.js";
-import { isManagementBusy } from "../session.js";
+import { isManagementBusy, getManagementCloseReason } from "../session.js";
 import { managementPnlCloseGate } from "../pnl-confirm.js";
 import { getOnchainPnl } from "./onchain-pnl.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
@@ -304,6 +304,24 @@ function validateConfigUpdate(args) {
 
 const CLOSE_BINS_WAIT_MS = 1_500;
 
+/**
+ * Close-reason label for history/learning. A code-driven close already carries
+ * _close_reason (PnL watcher, OOR fallback). Otherwise use the hard rule the
+ * management pre-check found for this position, plus the model's own `reason`
+ * (judgment closes). Falls through to closePosition's "agent decision" default.
+ */
+export function withCloseReason(args, lookup = getManagementCloseReason) {
+  const { reason, ...rest } = args || {};
+  if (typeof rest._close_reason === "string" && rest._close_reason.trim()) return rest;
+  const rule = lookup(rest.position_address);
+  const said = typeof reason === "string" ? reason.trim().replace(/\s+/g, " ").slice(0, 100) : "";
+  let label = null;
+  if (rule && said && !said.toLowerCase().startsWith(rule.toLowerCase())) label = `${rule} — ${said}`;
+  else if (rule) label = rule;
+  else if (said) label = /^(judgment|rule \d)/i.test(said) ? said : `Judgment: ${said}`;
+  return label ? { ...rest, _close_reason: label } : rest;
+}
+
 /** Read-only bins of a tracked position for the close alert; null (never a throw) when unknown or failing. */
 function startCloseBinsSnapshot(positionAddress) {
   try {
@@ -380,6 +398,7 @@ export async function executeTool(name, args, { manual = false } = {}) {
     // Close alert chart: a read-only bin snapshot started alongside the close.
     // It is never awaited before the close and can never fail it.
     const preCloseBins = name === "close_position" ? startCloseBinsSnapshot(args.position_address) : null;
+    if (name === "close_position") args = withCloseReason(args);
     const result = await fn(args);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;

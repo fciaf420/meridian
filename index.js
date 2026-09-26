@@ -41,6 +41,8 @@ import {
   isBusy, setBusy,
   isManagementBusy, setManagementBusy,
   isScreeningBusy, setScreeningBusy,
+  setManagementCloseReasons,
+  clearManagementCloseReasons,
 } from "./session.js";
 import { startServer } from "./server.js";
 import { buildSettingsReport } from "./settings-report.js";
@@ -690,21 +692,24 @@ function startCronJobs() {
       if (precheckedPositions?.length && !exitAlerts) {
         const m = config.management;
         const ruleHits = [];
+        const closeReasons = []; // [position, label] for the close history (tools/executor.js withCloseReason)
         for (const p of precheckedPositions) {
-          if (getTrackedPosition(p.position)?.instruction) ruleHits.push(`${p.pair}: instruction`);
+          if (getTrackedPosition(p.position)?.instruction) { ruleHits.push(`${p.pair}: instruction`); closeReasons.push([p.position, "rule 1: instruction met"]); }
           else if (p.pnl_pct == null) ruleHits.push(`${p.pair}: pnl unknown`);
-          else if (p.pnl_pct >= m.takeProfitFeePct) ruleHits.push(`${p.pair}: rule 3`);
-          else if ((p.minutes_out_of_range ?? 0) >= m.outOfRangeWaitMinutes) ruleHits.push(`${p.pair}: rule 4`);
-          else if (p.pnl_pct <= m.emergencyPriceDropPct) ruleHits.push(`${p.pair}: rule 6`);
+          else if (p.pnl_pct >= m.takeProfitFeePct) { ruleHits.push(`${p.pair}: rule 3`); closeReasons.push([p.position, `rule 3: take profit (${p.pnl_pct}% ≥ ${m.takeProfitFeePct}%)`]); }
+          else if ((p.minutes_out_of_range ?? 0) >= m.outOfRangeWaitMinutes) { ruleHits.push(`${p.pair}: rule 4`); closeReasons.push([p.position, `rule 4: OOR timeout${p.oor_direction ? ` (OOR ${p.oor_direction})` : ""}`]); }
+          else if (p.pnl_pct <= m.emergencyPriceDropPct) { ruleHits.push(`${p.pair}: rule 6`); closeReasons.push([p.position, `rule 6: emergency stop (${p.pnl_pct}%)`]); }
           else if (!p.pool) ruleHits.push(`${p.pair}: pool unknown`);
           else {
             const d = await getPoolDetail({ pool_address: p.pool, timeframe: config.screening.timeframe || "5m" }).catch(() => null);
             if (!d || !Number.isFinite(d.fee_active_tvl_ratio) || !Number.isFinite(d.volume)) ruleHits.push(`${p.pair}: rule 5 unverified`);
             else if (d.fee_active_tvl_ratio < config.screening.minFeeActiveTvlRatio && d.volume < config.screening.minVolume) {
               ruleHits.push(`${p.pair}: rule 5`);
+              closeReasons.push([p.position, "rule 5: yield dead"]);
             }
           }
         }
+        setManagementCloseReasons(closeReasons);
         if (ruleHits.length === 0) {
           log("cron", `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD (LLM skipped)`);
           mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD.`;
@@ -752,6 +757,7 @@ function startCronJobs() {
       emit("cycle_error", { cycle: "Management", error: error.message });
     } finally {
       setManagementBusy(false);
+      clearManagementCloseReasons();
       // Routine = nothing happened (code-only HOLD, or the LLM ran and changed
       // nothing without a close rule firing). Routine reports aren't pushed to Telegram.
       // An LLM-down cycle is routine unless the OOR fallback tried to close something.
