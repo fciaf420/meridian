@@ -164,6 +164,21 @@ test("evolution: every rule needs MIN_RULE_SAMPLES (5) of the wins/losses it rel
   }
 });
 
+test("evolveFromLessons: tag-count rules need MIN_RULE_SAMPLES (5) lessons — 4 don't move it, 5 do", () => {
+  const lesson = (i, tags) => ({ id: i, rule: `FAILED ${i}`, tags, outcome: "bad" });
+  const run = (k, tags) => {
+    const c = mgmtCfg();
+    c.screening.minVolume = 10000;
+    // Pad to ≥5 lessons with unrelated tags so the function's own minimum isn't what blocks it.
+    const ls = [...times(k, () => lesson(Math.random(), tags)), ...times(5, () => lesson(Math.random(), ["worked"]))];
+    return lessons.evolveFromLessons(ls, c, { userConfig: {}, lessonsData: { lessons: [], performance: [] } }).changes;
+  };
+  assert.equal(run(4, ["volume_collapse"]).minVolume, undefined);
+  assert.equal(run(5, ["volume_collapse"]).minVolume, 12000);
+  assert.equal(run(4, ["failed", "volatility_4"]).maxVolatility, undefined);
+  assert.equal(run(5, ["failed", "volatility_4"]).maxVolatility, 4.4);
+});
+
 test("evolution never touches takeProfitFeePct or stopLossPct (the operator's), even on data that used to move them", () => {
   // Old section 4: ≥3 losers well above the −40% stop → tighten. Old section 5: winners' p75 ≪ TP → lower TP.
   const perf = [...times(5, () => close(-3)), ...times(5, () => close(2.5))];

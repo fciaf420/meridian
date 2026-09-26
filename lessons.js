@@ -890,7 +890,7 @@ export function evolveFromLessons(lessons, config, { userConfig, lessonsData } =
 
   // 2. Volume collapse pattern → raise minVolume
   const volCollapseCount = tagCounts["volume_collapse"] || 0;
-  if (volCollapseCount >= 3) {
+  if (volCollapseCount >= MIN_RULE_SAMPLES) {
     const current = config.screening.minVolume ?? 10000;
     const newVal = clamp(Math.round(current * 1.2), 5000, 100000);
     if (newVal > current) {
@@ -902,7 +902,7 @@ export function evolveFromLessons(lessons, config, { userConfig, lessonsData } =
   // 3. High failure rate at specific volatility levels (from tags like "volatility_4")
   const volTags = Object.entries(tagCounts).filter(([t]) => t.startsWith("volatility_"));
   for (const [tag, count] of volTags) {
-    if (count >= 3) {
+    if (count >= MIN_RULE_SAMPLES) {
       const vol = parseFloat(tag.replace("volatility_", ""));
       const current = config.screening.maxVolatility ?? 10;
       if (vol < current) {
