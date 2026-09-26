@@ -137,7 +137,7 @@ STRATEGIES:
 - 'spot': Uniform liquidity distribution. Can be used THREE ways:
   (a) SOL-only spot: Only provide amount_y (SOL), no amount_x. Bins go BELOW active bin only (bins_below = range, bins_above = 0). Same direction as bid_ask but spot distribution instead of bid_ask curve.
   (b) Token-only spot: Only provide amount_x (base token), no amount_y. Bins go ABOVE active bin only (bins_below = 0, bins_above = range). You are selling the token as price rises.
-  (c) Two-sided spot: Just provide total SOL as amount_y + sol_split_pct. Token is auto-swapped. The executor swaps the token portion via Jupiter and deploys with both sides. sol_split_pct controls conviction: 100 = pure SOL, 80 = mostly SOL / 20% token, 50 = equal, 25 = mostly token (bullish).
+  (c) Two-sided spot: Just provide total SOL as amount_y + sol_split_pct. Token is auto-swapped. The executor swaps the token portion via Jupiter and deploys with both sides. sol_split_pct is the % kept as SOL (100 = pure SOL). Unless the user gives a split, use 85-90.
 Only 'bid_ask' and 'spot' are accepted; any other strategy is rejected.
 
 SPOT BIN DIRECTION:
@@ -156,7 +156,7 @@ SINGLE-SIDED (bid_ask) vs TWO-SIDED (spot):
 
 WHEN TO USE WHICH:
 - Meme tokens, new tokens, unproven tokens → ALWAYS bid_ask single-sided. Never take two-sided exposure on tokens you don't trust.
-- High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token. Set sol_split_pct based on conviction level.
+- High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token, with sol_split_pct 85-90.
 - High volatility, trending, pumping → bid_ask. You earn fees from the sell pressure without holding the bag.
 - Stable, range-bound, high volume → spot two-sided. More fee capture from both sides.
 - When unsure → for autonomous runs use the active strategy from your instructions.
@@ -207,7 +207,7 @@ This sends a real on-chain transaction unless the runner is in DRY_RUN mode.`,
           },
           sol_split_pct: {
             type: "number",
-            description: "For two-sided spot only: % of total SOL to keep as SOL (below active bin). The rest is auto-swapped to base token via Jupiter. E.g. 80 = keep 80% as SOL / auto-swap 20% to token. Default 50 (equal split). For bid_ask or SOL-only spot, omit this. Bins are split proportionally."
+            description: "For two-sided spot only: % of total SOL to keep as SOL (below active bin). The rest is auto-swapped to base token via Jupiter. E.g. 88 = keep 88% as SOL / auto-swap 12% to token. Unless the user gives a split, use 85-90. If omitted with both amount_x and amount_y, bins split 50/50. For bid_ask or SOL-only spot, omit this. Bins are split proportionally."
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
@@ -364,20 +364,26 @@ Use to check available capital before deploying positions.`,
     type: "function",
     function: {
       name: "swap_token",
-      description: `Swap tokens via the Jupiter aggregator (real on-chain transaction).
-Use it when the user asks for a swap, or after close_position when that close's result shows swap.success=false or status "success_with_exposure": then swap only the amount that close withdrew. Other wallet balances are not the agent's to sell.
-Not needed around deploys or normal closes: deploy_position swaps the token side of two-sided spot itself, close_position already swaps its withdrawn base tokens back to SOL, and in USDC mode the runner settles to USDC automatically.
-Returns success, the tx signature and the amounts in and out. A SOL swap that would leave less than the gas reserve is refused.`,
+      description: `Sell a closed position's leftover base token back to SOL via Jupiter (real on-chain transaction).
+Use it only after close_position returned status "success_with_exposure" with swap.exposure_ui > 0: sell at most swap.exposure_ui of that close's base token, to SOL.
+Limits enforced in code (a refused call returns blocked: true with the reason; report it to the owner instead of retrying):
+- input_mint must be a token a close in the last 2h left unsold. Other wallet balances are not the agent's to sell.
+- output_mint must be SOL. SOL→token buys are refused: deploy_position buys the token side of two-sided spot itself.
+- The amount is clamped to what that close left unsold and is still in the wallet.
+- Refused while that close's own swap has an unknown outcome and may still land (until swap.retry_not_before).
+- Any swap whose price impact is above maxSwapPriceImpactPct (default 5%) is refused.
+Not needed around deploys or normal closes: close_position already swaps its withdrawn base tokens back to SOL, and in USDC mode the runner settles to USDC automatically.
+Returns success, the tx signature and the amounts in and out.`,
       parameters: {
         type: "object",
         properties: {
           input_mint: {
             type: "string",
-            description: "Mint address of the token to sell"
+            description: "Mint address of the closed position's base token to sell"
           },
           output_mint: {
             type: "string",
-            description: "Mint address of the token to buy"
+            description: "Must be SOL (So11111111111111111111111111111111111111112)"
           },
           amount: {
             type: "number",

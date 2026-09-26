@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { writeJsonAtomicSync } from "./atomic-write.js";
 import { getEffectiveMinSolToOpen, normalizeScreeningSource, worstCaseDeployOverheadSol } from "./runtime-helpers.js";
 import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 import { computePortfolioSol } from "./portfolio-value.js";
@@ -62,6 +63,12 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // Refuse a swap whose quoted price impact is above this (%): agent swap_token,
+    // deploy auto-swap, USDC entry (wallet.js swapToken).
+    maxSwapPriceImpactPct: u.maxSwapPriceImpactPct ?? 5,
+    // Looser cap for post-close swap-backs (close-swap.js, sync-close, USDC settle):
+    // leaving the withdrawn bag is worse than the slippage. Owner-only (not in update_config).
+    maxCloseSwapPriceImpactPct: u.maxCloseSwapPriceImpactPct ?? 25,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -467,10 +474,12 @@ function findSection(key) {
 export function persistUserConfig(changes, extra = {}) {
   let userConfig = {};
   if (fs.existsSync(USER_CONFIG_PATH)) {
-    try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /**/ }
+    // An unreadable file is an error, not {}: rewriting it would drop the RPC
+    // URL, wallet key and every other setting.
+    userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
   }
   Object.assign(userConfig, changes, extra);
-  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+  writeJsonAtomicSync(USER_CONFIG_PATH, userConfig);
   return userConfig;
 }
 
@@ -486,7 +495,7 @@ export function persistGmgnConfig(changes) {
     gmgnConfig = JSON.parse(fs.readFileSync(GMGN_CONFIG_PATH, "utf8"));
   }
   Object.assign(gmgnConfig, changes);
-  fs.writeFileSync(GMGN_CONFIG_PATH, JSON.stringify(gmgnConfig, null, 2));
+  writeJsonAtomicSync(GMGN_CONFIG_PATH, gmgnConfig);
   return gmgnConfig;
 }
 
@@ -536,7 +545,7 @@ export function applyConfigChanges({ changes = {}, source = "manual", reason = "
         ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
         : {};
       Object.assign(existing, applied);
-      fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(existing, null, 2));
+      writeJsonAtomicSync(USER_CONFIG_PATH, existing);
     } catch { /* best effort */ }
   }
 

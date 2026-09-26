@@ -19,6 +19,7 @@ import {
   trailingAtClose,
   recordClaim,
   recordClose,
+  recordCloseExposure,
   updateTrackedPosition,
   getTrackedPosition,
   getTrackedPositions,
@@ -29,7 +30,7 @@ import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
-import { swapBackWithdrawnBase, expectedBaseWithdrawRaw } from "./close-swap.js";
+import { swapBackWithdrawnBase, expectedBaseWithdrawRaw, rawToUiString } from "./close-swap.js";
 import { computeOnchainPnl, binPrice, onchainPctForUnit, feesValue } from "./onchain-pnl.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS, fitDeployAmount } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
@@ -2191,6 +2192,11 @@ export function isCloseInflight(position_address) {
   return closeInflight.has(normalizeMint(position_address));
 }
 
+/** Addresses of every close currently running (the shutdown drain waits for them). */
+export function getInflightCloses() {
+  return [...closeInflight.keys()];
+}
+
 // _close_reason: internal override for the recorded close reason (code-driven
 // closes such as the OOR fallback); the LLM-facing tool schema does not expose it.
 export async function closePosition({ position_address, _pnlOverride = null, _close_reason = null }) {
@@ -2542,6 +2548,19 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         txHashes.push(...sb.txs);
         swapOutcome = sb.swapOutcome;
         exposureFlag = sb.exposureFlag;
+        // Persist the unsold amount: it is the most an agent swap_token may
+        // sell for this mint afterwards (tools/swap-guard.js).
+        if (exposureFlag && sb.exposure) {
+          try {
+            const rec = recordCloseExposure(position_address, sb.exposure);
+            if (rec && swapOutcome) {
+              swapOutcome.exposure_ui = rec.decimals != null ? rawToUiString(rec.unsold_raw, rec.decimals) : "0";
+              if (rec.ambiguous_until) swapOutcome.retry_not_before = rec.ambiguous_until;
+            }
+          } catch (e) {
+            log("close_warn", `Could not record close exposure for ${position_address}: ${e.message}`);
+          }
+        }
       }
 
       return {

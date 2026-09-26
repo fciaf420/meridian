@@ -17,6 +17,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { writeJsonAtomicSync } from "./atomic-write.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -63,7 +64,7 @@ function saveChatIdToConfig(id) {
       ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
       : {};
     cfg.telegramChatId = id;
-    fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    writeJsonAtomicSync(USER_CONFIG_PATH, cfg);
   } catch (e) {
     log("telegram_error", `Failed to persist owner chat id: ${e.message}`);
   }

@@ -13,8 +13,9 @@ import { getWalletBalances, swapToken } from "./wallet.js";
 import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, getTrackedPosition, recordPnlHold } from "../state.js";
-import { isManagementBusy, getManagementCloseReason } from "../session.js";
+import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded } from "../state.js";
+import { checkAgentSwap } from "./swap-guard.js";
+import { isManagementBusy, getManagementCloseReason, isDraining, trackInflightOp } from "../session.js";
 import { managementPnlCloseGate } from "../pnl-confirm.js";
 import { getOnchainPnl } from "./onchain-pnl.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
@@ -305,6 +306,23 @@ export function validateConfigUpdate(args) {
 
 const CLOSE_BINS_WAIT_MS = 1_500;
 
+// Mints with an LLM swap_token currently executing.
+const agentSwapsInFlight = new Set();
+
+/**
+ * Book an agent swap against its close exposure: what it sold, or a fresh
+ * in-flight window when the outcome is unknown. A dry run books nothing.
+ */
+function settleAgentSwap(guard, result) {
+  try {
+    if (result?.dry_run) return;
+    if (result?.success) noteAgentExposureSwap(guard.position, { soldRaw: guard.sell_raw });
+    else if (result?.ambiguous) noteAgentExposureSwap(guard.position, { ambiguous: true });
+  } catch (e) {
+    log("error", `Could not record agent swap against close exposure: ${e.message}`);
+  }
+}
+
 /**
  * Close-reason label for history/learning. A code-driven close already carries
  * _close_reason (PnL watcher, OOR fallback). Otherwise use the hard rule the
@@ -337,7 +355,26 @@ function startCloseBinsSnapshot(positionAddress) {
 /**
  * Execute a tool call with safety checks and logging.
  */
+// Fund-moving tools: tracked as in-flight so the shutdown drain waits for them.
+const FUND_TOOLS = new Set(["deploy_position", "close_position", "swap_token", "claim_fees"]);
+
 export async function executeTool(name, args, { manual = false } = {}) {
+  // Gate new exposure BEFORE anything runs (the USDC-mode entry swaps first).
+  if (name === "deploy_position") {
+    if (isDraining()) {
+      log("safety_block", "deploy_position blocked: shutdown drain in progress");
+      return { blocked: true, reason: "Bot is shutting down (drain in progress); no new deploys." };
+    }
+    if (isStateDegraded()) {
+      log("safety_block", "deploy_position blocked: state.json is corrupt (degraded mode)");
+      return { blocked: true, reason: "state.json is corrupt and saves are disabled, so a new position could not be tracked. Restore state.json first." };
+    }
+  }
+  if (FUND_TOOLS.has(name)) return trackInflightOp(name, executeToolInner(name, args, { manual }));
+  return executeToolInner(name, args, { manual });
+}
+
+async function executeToolInner(name, args, { manual = false } = {}) {
   const startTime = Date.now();
   // `_manual` (skip the token-age window) is only honoured for owner-initiated
   // Telegram deploys, which pass { manual: true }; strip it from anything else
@@ -383,6 +420,7 @@ export async function executeTool(name, args, { manual = false } = {}) {
   }
 
   // ─── Pre-execution safety checks ──────────
+  let swapGuard = null;
   if (WRITE_TOOLS.has(name)) {
     const safetyCheck = await runSafetyChecks(name, args, { manual });
     if (!safetyCheck.pass) {
@@ -392,6 +430,20 @@ export async function executeTool(name, args, { manual = false } = {}) {
         reason: safetyCheck.reason,
       };
     }
+    // swap_token: the guard may clamp the amount to the sellable exposure.
+    if (safetyCheck.args) args = safetyCheck.args;
+    if (safetyCheck.guard) swapGuard = safetyCheck.guard;
+  }
+
+  if (swapGuard) {
+    // One agent swap per mint at a time, so two calls can't both pass the check.
+    if (agentSwapsInFlight.has(swapGuard.mint)) {
+      const reason = `swap_token refused: another swap of ${swapGuard.mint} is already running.`;
+      log("safety_block", reason);
+      return { blocked: true, reason };
+    }
+    agentSwapsInFlight.add(swapGuard.mint);
+    if (swapGuard.clamped) log("safety_block", `swap_token amount clamped to the close's sellable exposure: ${swapGuard.sellable_ui} of ${swapGuard.mint}`);
   }
 
   // ─── Execute ──────────────────────────────
@@ -400,7 +452,18 @@ export async function executeTool(name, args, { manual = false } = {}) {
     // It is never awaited before the close and can never fail it.
     const preCloseBins = name === "close_position" ? startCloseBinsSnapshot(args.position_address) : null;
     if (name === "close_position") args = withCloseReason(args);
-    const result = await fn(args);
+    let result;
+    try {
+      result = await fn(args);
+    } finally {
+      if (swapGuard) agentSwapsInFlight.delete(swapGuard.mint);
+    }
+    if (swapGuard) {
+      settleAgentSwap(swapGuard, result);
+      if (swapGuard.clamped && result && typeof result === "object") {
+        result.clamped_to_exposure = { amount: swapGuard.sellable_ui, reason: "requested amount exceeded what the close left unsold" };
+      }
+    }
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
 
@@ -625,9 +688,11 @@ async function runSafetyChecks(name, args, { manual = false } = {}) {
     }
 
     case "swap_token": {
-      // Basic check — prevent swapping when DRY_RUN is true
-      // (handled inside swapToken itself, but belt-and-suspenders)
-      return { pass: true };
+      // Owner-initiated swaps (manual) are not limited here. Every LLM swap
+      // must be the unsold remainder of a recent close (tools/swap-guard.js).
+      // DRY_RUN is enforced inside swapToken itself.
+      if (manual) return { pass: true };
+      return checkAgentSwap(args);
     }
 
     case "update_config":

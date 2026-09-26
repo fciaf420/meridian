@@ -258,7 +258,6 @@ function normalizeCodexToolCalls(toolCalls, step) {
 async function createCodexMessage(messages, model, agentType, step) {
   const prompt = buildCodexAgentPrompt(messages, agentType);
   const content = await runCodexExec(model, prompt, {
-    cwd: process.cwd(),
     sandbox: "read-only",
     skipGitRepoCheck: true,
     outputSchemaPath: getAgentPlanSchemaPath(agentType),
@@ -390,7 +389,6 @@ function buildCodexLightChatPrompt(messages) {
 async function requestLightChatContent(messages, model) {
   if (PROVIDER === "codex") {
     return runCodexExec(model, buildCodexLightChatPrompt(messages), {
-      cwd: process.cwd(),
       sandbox: "read-only",
       skipGitRepoCheck: true,
       config: {
