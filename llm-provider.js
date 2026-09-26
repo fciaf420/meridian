@@ -5,6 +5,7 @@ import path from "path";
 import OpenAI from "openai";
 import { log } from "./logger.js";
 import { codexFailureMessage, extractCodexJsonError, isBenignCodexItemError } from "./llm-health.js";
+import { buildCliEnv } from "./child-env.js";
 
 const DEFAULT_PROVIDER = "codex";
 
@@ -118,6 +119,7 @@ export function createLlmClient(provider = getLlmProvider()) {
 function findExecutableOnPath(binName) {
   const lookup = process.platform === "win32" ? "where.exe" : "which";
   const result = spawnSync(lookup, [binName], {
+    env: buildCliEnv("codex"),
     encoding: "utf8",
     windowsHide: true,
   });
@@ -284,8 +286,9 @@ export function runCodexExec(model, prompt, {
 
     const spawnCommand = viaCmd ? (process.env.ComSpec || "cmd.exe") : command;
     const spawnArgs = viaCmd ? ["/d", "/c", command, ...args] : args;
+    // Allowlisted env only: the wallet key and API keys never reach the CLI.
     const child = spawn(spawnCommand, spawnArgs, {
-      env: { ...process.env },
+      env: buildCliEnv("codex"),
       windowsHide: true,
       cwd,
     });
@@ -532,8 +535,9 @@ export function runClaudeCli(model, prompt, {
 
     const spawnCommand = viaCmd ? (process.env.ComSpec || "cmd.exe") : command;
     const spawnArgs = viaCmd ? ["/d", "/c", command, ...args] : args;
+    // Allowlisted env only: the wallet key and API keys never reach the CLI.
     const child = spawn(spawnCommand, spawnArgs, {
-      env: { ...process.env },
+      env: buildCliEnv("claude"),
       windowsHide: true,
     });
 
