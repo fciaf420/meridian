@@ -58,6 +58,7 @@ export const CONFIG_KEY_MAP = {
   solFeePoolsOnly: ["entryFilters", "solFeePoolsOnly"],
   twapSpikeMaxPct: ["entryFilters", "twapSpikeMaxPct"],
   twapWindowMinutes: ["entryFilters", "twapWindowMinutes"],
+  blockJupiterSuspicious: ["entryFilters", "blockJupiterSuspicious"],
 };
 
 /**

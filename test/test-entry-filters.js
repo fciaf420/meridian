@@ -24,6 +24,7 @@ process.chdir(TMP);
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
 const es = await import("../tools/entry-safety.js");
+es._setJupiterLookupForTest(async () => new Map()); // hermetic: no Jupiter Tokens API calls
 const { config } = await import("../config.js");
 const dlmm = await import("../tools/dlmm.js");
 config.strategy.activeStrategy = "classic"; // Evil Panda's GMGN gate would run first
@@ -658,4 +659,89 @@ test("LLM update_config: tightening is applied; disabling a guard or raising a l
   config.entryFilters.twapSpikeMaxPct = null;
   assert.equal(checkAgentEntryFilterChange("twapSpikeMaxPct", 20).ok, true);
   config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+});
+
+// ─── Jupiter scam flag (blockJupiterSuspicious) ──────────────────
+const jupMap = (info) => async (mints) => new Map(mints.map((m) => [m, { mint: m, ...info }]));
+const splPool = () => mockPool({ tokenX: reserve({ program: es.TOKEN_PROGRAM_ID }) });
+
+test("deploy: Jupiter audit.isSus / banned blocks before any tx; absent passes", async () => {
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  assert.equal(es.ENTRY_FILTER_DEFAULTS.blockJupiterSuspicious, true);
+  try {
+    es._setJupiterLookupForTest(jupMap({ is_sus: true, banned: false, organic_score: 12, is_verified: false }));
+    const pool = splPool();
+    const r = await deployInto(pool);
+    assert.equal(r.blocked_by, "entry_filter");
+    assert.match(r.error, /Jupiter flags the token as suspicious \(audit\.isSus\) \(blockJupiterSuspicious\)/);
+    assert.deepEqual(pool.calls, []);
+
+    es._setJupiterLookupForTest(jupMap({ is_sus: false, banned: true }));
+    const banned = await deployInto(splPool());
+    assert.match(banned.error, /banned/);
+
+    es._setJupiterLookupForTest(jupMap({ is_sus: false, banned: false, organic_score: 90, is_verified: true }));
+    await assert.rejects(deployInto(splPool()), /PAST_ENTRY_CHECKS/);
+  } finally {
+    es._setJupiterLookupForTest(async () => new Map());
+  }
+});
+
+test("deploy: a Jupiter lookup failure or unknown token allows the deploy (never block on an outage)", async () => {
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  try {
+    es._setJupiterLookupForTest(async () => null); // API down
+    await assert.rejects(deployInto(splPool()), /PAST_ENTRY_CHECKS/);
+    es._setJupiterLookupForTest(async () => { throw new Error("boom"); });
+    await assert.rejects(deployInto(splPool()), /PAST_ENTRY_CHECKS/);
+    es._setJupiterLookupForTest(async () => new Map()); // unknown to Jupiter
+    const r = await es.runDeployEntryChecks({ pool: splPool(), apiRow: null, strategy: "spot" });
+    assert.equal(r.pass, true);
+    assert.ok(r.notes.some((n) => /token unknown to Jupiter — allowed/.test(n)));
+    const down = await es.runDeployEntryChecks({ pool: splPool(), apiRow: null, strategy: "spot", jupiterLookup: async () => null });
+    assert.equal(down.pass, true);
+    assert.ok(down.notes.some((n) => /lookup failed — allowed/.test(n)));
+    // Guard off: the lookup is skipped entirely.
+    config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: false };
+    let called = false;
+    const off = await es.runDeployEntryChecks({ pool: splPool(), apiRow: null, strategy: "spot", jupiterLookup: async () => { called = true; return null; } });
+    assert.equal(off.pass, true);
+    assert.equal(called, false);
+  } finally {
+    config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+    es._setJupiterLookupForTest(async () => new Map());
+  }
+});
+
+test("screening: Jupiter-flagged tokens are dropped; others carry organic/verified; lookup failure keeps all", async () => {
+  const pools = [
+    { pool: "S", name: "SUS", base: { mint: "MS", token_program: es.TOKEN_PROGRAM_ID } },
+    { pool: "G", name: "GOOD", base: { mint: "MG", token_program: es.TOKEN_PROGRAM_ID } },
+    { pool: "U", name: "UNKNOWN", base: { mint: "MU", token_program: es.TOKEN_PROGRAM_ID } },
+  ];
+  const lookup = async () => new Map([
+    ["MS", { mint: "MS", is_sus: true, banned: false, organic_score: 3, is_verified: null }],
+    ["MG", { mint: "MG", is_sus: false, banned: false, organic_score: 87.345, is_verified: true }],
+  ]);
+  const base = { filters: es.ENTRY_FILTER_DEFAULTS, readMints: async () => new Map(), jupiterLookup: lookup };
+  const r = await es.screenEntryCandidates(pools, base);
+  assert.deepEqual(r.kept.map((p) => p.pool), ["G", "U"]);
+  assert.match(r.dropped.find((d) => d.pool === "S").reasons[0], /suspicious \(audit\.isSus\)/);
+  assert.deepEqual(r.kept[0].jupiter, { organic_score: 87.3, verified: true, sus: false, banned: false });
+  assert.equal(r.kept[1].jupiter, null);
+
+  const off = await es.screenEntryCandidates(pools, { ...base, filters: { ...es.ENTRY_FILTER_DEFAULTS, blockJupiterSuspicious: false } });
+  assert.equal(off.kept.length, 3);
+  assert.equal(off.kept[0].jupiter.sus, true);
+
+  const down = await es.screenEntryCandidates(pools, { ...base, jupiterLookup: async () => null });
+  assert.equal(down.kept.length, 3);
+});
+
+test("blockJupiterSuspicious: user toggle normalizes; turning it off is a loosening the agent can't make", () => {
+  assert.deepEqual(es.normalizeEntryFilterValue("blockJupiterSuspicious", "false"), { value: false });
+  assert.equal(es.isLooseningChange("blockJupiterSuspicious", true, false), true);
+  config.entryFilters = { ...es.ENTRY_FILTER_DEFAULTS };
+  assert.equal(es.checkAgentEntryFilterChange("blockJupiterSuspicious", false).ok, false);
+  assert.equal(es.fmtFilterValue("blockJupiterSuspicious", true), "block");
 });

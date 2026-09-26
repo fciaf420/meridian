@@ -746,7 +746,19 @@ function candidateBlock(c, i, fallbackSource) {
   else if (c.token_age_unknown) metrics.push("age ?");
   const fm = feeModeOf(c);
   if (fm) metrics.push(fm.solFees ? "fees SOL" : fm.mode === "InputOnly" ? "fees token" : "fees ?");
+  const jup = jupiterText(c.jupiter);
+  if (jup) metrics.push(jup);
   return `<b>${i + 1}. ${escapeHtml(c.name ?? shortAddr(c.pool))}</b> [${escapeHtml(candidateSourceTag(c, fallbackSource))}]\n${escapeHtml(metrics.join(" · "))}`;
+}
+
+/** Jupiter Tokens API info (informational): "jup organic 87.3 · verified". Plain text; null when unknown. */
+export function jupiterText(j) {
+  if (!j) return null;
+  const parts = [`jup organic ${j.organic_score ?? "?"}`];
+  parts.push(j.verified === true ? "verified" : j.verified === false ? "unverified" : "verified ?");
+  if (j.sus) parts.push("⚠️ SUS");
+  if (j.banned) parts.push("⛔ BANNED");
+  return parts.join(" · ");
 }
 
 export function renderCandidates(list, { page = 0, refs, source = "meteora", fetchedAt = null, now = Date.now(), meta = null } = {}) {
@@ -840,6 +852,8 @@ export function renderTokenCard(r, { tokenRef, poolRefs = [], source = "meteora"
     `24h ${fmtPct(price?.change_24h)}`,
   ];
   lines.push(`Token: ${escapeHtml(tokenFacts.join(" · "))}`);
+  if (r.jupiter) lines.push(`Jupiter: ${escapeHtml(jupiterText(r.jupiter).replace(/^jup /, ""))}`);
+  else if (r.jupiter_error) lines.push(`⚠️ Jupiter data unavailable (${escapeHtml(r.jupiter_error)})`);
   if (r.gmgn) {
     const g = [];
     if (signal) g.push(`smart money ${signal.smart_money_count_30m ?? 0}`, `KOL ${signal.kol_count_30m ?? 0}`);
@@ -930,6 +944,7 @@ export const ENTRY_TOGGLES = [
   ["fp", "blockPausable", "Pausable"],
   ["fn", "blockNonTransferable", "Non-transferable"],
   ["fs", "solFeePoolsOnly", "SOL-fee pools only"],
+  ["fj", "blockJupiterSuspicious", "Jupiter scam flag"],
 ];
 export const ENTRY_PRESETS = {
   tf: { key: "blockTransferFeeAbovePct", label: "Transfer fee >", values: [null, 0.5, 1, 2, 5] },
