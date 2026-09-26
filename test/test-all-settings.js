@@ -20,6 +20,7 @@ process.env.RPC_URL = "http://127.0.0.1:9";
 process.env.DRY_RUN = "true";
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => { process.env.DRY_RUN = "true"; fs.rmSync(TMP, { recursive: true, force: true }); });
 
 const cfgMod = await import("../config.js");

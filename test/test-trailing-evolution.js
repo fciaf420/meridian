@@ -22,6 +22,7 @@ import path from "path";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-trailing-evo-"));
 process.chdir(TMP);
+delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 // Evolution writes user-config.json: point config.js (and lessons.js) at a scratch copy.
 const USER_CONFIG = path.join(TMP, "user-config.json");
 process.env.MERIDIAN_USER_CONFIG_PATH = USER_CONFIG;
