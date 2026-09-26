@@ -137,7 +137,7 @@ STRATEGIES:
 - 'spot': Uniform liquidity distribution. Can be used THREE ways:
   (a) SOL-only spot: Only provide amount_y (SOL), no amount_x. Bins go BELOW active bin only (bins_below = range, bins_above = 0). Same direction as bid_ask but spot distribution instead of bid_ask curve.
   (b) Token-only spot: Only provide amount_x (base token), no amount_y. Bins go ABOVE active bin only (bins_below = 0, bins_above = range). You are selling the token as price rises.
-  (c) Two-sided spot: Just provide total SOL as amount_y + sol_split_pct. Token is auto-swapped. The executor swaps the token portion via Jupiter and deploys with both sides. sol_split_pct controls conviction: 100 = pure SOL, 80 = mostly SOL / 20% token, 50 = equal, 25 = mostly token (bullish).
+  (c) Two-sided spot: Just provide total SOL as amount_y + sol_split_pct. Token is auto-swapped. The executor swaps the token portion via Jupiter and deploys with both sides. sol_split_pct is the % kept as SOL (100 = pure SOL). Unless the user gives a split, use 85-90.
 Only 'bid_ask' and 'spot' are accepted; any other strategy is rejected.
 
 SPOT BIN DIRECTION:
@@ -156,7 +156,7 @@ SINGLE-SIDED (bid_ask) vs TWO-SIDED (spot):
 
 WHEN TO USE WHICH:
 - Meme tokens, new tokens, unproven tokens → ALWAYS bid_ask single-sided. Never take two-sided exposure on tokens you don't trust.
-- High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token. Set sol_split_pct based on conviction level.
+- High organic score (>85), strong holders, proven token → spot two-sided is OK if you believe in the token, with sol_split_pct 85-90.
 - High volatility, trending, pumping → bid_ask. You earn fees from the sell pressure without holding the bag.
 - Stable, range-bound, high volume → spot two-sided. More fee capture from both sides.
 - When unsure → for autonomous runs use the active strategy from your instructions.
@@ -207,7 +207,7 @@ This sends a real on-chain transaction unless the runner is in DRY_RUN mode.`,
           },
           sol_split_pct: {
             type: "number",
-            description: "For two-sided spot only: % of total SOL to keep as SOL (below active bin). The rest is auto-swapped to base token via Jupiter. E.g. 80 = keep 80% as SOL / auto-swap 20% to token. Default 50 (equal split). For bid_ask or SOL-only spot, omit this. Bins are split proportionally."
+            description: "For two-sided spot only: % of total SOL to keep as SOL (below active bin). The rest is auto-swapped to base token via Jupiter. E.g. 88 = keep 88% as SOL / auto-swap 12% to token. Unless the user gives a split, use 85-90. If omitted with both amount_x and amount_y, bins split 50/50. For bid_ask or SOL-only spot, omit this. Bins are split proportionally."
           },
           pool_name: { type: "string", description: "Human-readable pool name for record-keeping" },
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },

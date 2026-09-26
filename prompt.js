@@ -14,7 +14,8 @@
  * @returns {string} - Complete system prompt
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { config } from "./config.js";
+import { config, computeDeploySizing, getPositionSizeBase } from "./config.js";
+import { computePortfolioSol } from "./portfolio-value.js";
 import { MIN_RANGE_PCT } from "./runtime-helpers.js";
 
 // ─── Section Override System (used by autoresearch) ──────────
@@ -260,6 +261,16 @@ const SPOT_BIN_DIRECTION = `SPOT STRATEGY BIN DIRECTION:
 `;
 
 /**
+ * The runner's code-side rule pre-check (index.js) as a goal context block.
+ * `ruleHits` are "PAIR: rule 3" / "PAIR: pnl unknown" / … entries; a position
+ * not listed passed every hard rule, rule 5 included, on the same data.
+ */
+export function formatRunnerPrecheck(ruleHits = []) {
+  if (!ruleHits.length) return "";
+  return `\n\nRUNNER PRE-CHECK (hard rules evaluated in code on Open Positions; a position not listed passed all of them, rule 5 included):\n${ruleHits.join("\n")}\n`;
+}
+
+/**
  * The management cycle goal (user turn). `context` is the pre-loaded blocks the
  * runner gathered (memory hints, EXIT ALERTS, auto-closes, KB), inserted as-is.
  * Hard rules first; judgment closes on the manager_logic decision factors are
@@ -293,10 +304,10 @@ A judgment close needs a stated reason: start its Reason line with "Judgment:" a
 Without a hard rule, an exit alert or a stated judgment reason → HOLD.
 
 STEPS:
-1. get_my_positions — check all open positions.
+1. Open Positions in CURRENT STATE is this cycle's get_my_positions result (pnl_pct, in_range, oor_direction, minutes_out_of_range, fees, age_minutes, pool per position). Use it; do not call get_my_positions again.
 2. For each position:
-   - Call get_position_pnl.
-   - Apply HARD CLOSE RULES above in order. First match → close, stop checking.
+   - Apply HARD CLOSE RULES above in order on that data. First match → close, stop checking.
+   - Call a tool only for data it lacks: get_position_pnl to confirm fresh PnL before a close on rule 1, 3 or 6, or when pnl_pct is null; get_pool_detail for rule 5 or a yield judgment, unless RUNNER PRE-CHECK already cleared that position.
    - If no rule triggers: HOLD, unless a judgment close applies (see JUDGMENT CLOSES).
 3. If closing: ${usdcMode
     ? `do NOT swap manually — the system auto-settles all recovered tokens and surplus SOL back to USDC after the close.`
@@ -313,6 +324,22 @@ REPORT FORMAT (Strictly follow this for each position — use ${pnlUnit} values)
 
 FAILURE ANALYSIS: After closing a LOSING position (negative PnL), call add_lesson with one lesson that names what went wrong, the signal that was missed or under-weighted, and what to do differently next time. The runner already records the raw stats of every close, so the lesson is only useful for the why.
       `;
+}
+
+/**
+ * GENERAL's default deploy size, computed in code the way deploy_position
+ * defaults an omitted amount (resolveDeploySizing), from the wallet and
+ * positions agentLoop already loaded for this prompt.
+ */
+export function generalDeploySizingText(portfolio, positions) {
+  if (config.usdc.enabled) return `$${config.usdc.deployAmountUsd} per position (USDC mode, funded automatically); omit the amount.`;
+  const walletSol = portfolio && !portfolio.error ? Number(portfolio.sol) : NaN;
+  if (!Number.isFinite(walletSol)) return "unknown (wallet balance not loaded); omit the amount and deploy_position sizes it.";
+  const total = getPositionSizeBase() === "total"
+    ? computePortfolioSol({ walletSol, wallet: portfolio, positionsResult: positions })
+    : null;
+  const s = computeDeploySizing(walletSol, total);
+  return s.skip ? `none (${s.reason})` : s.label;
 }
 
 export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, unifiedMemory = null, perfSummary = null, signalWeights = null) {
@@ -402,7 +429,6 @@ WHY EVIL PANDA IS DEFAULT:
 
    When using two-sided spot:
    - sol_split_pct MUST be 85-90% (mostly SOL, minimal token exposure)
-   - Never go below sol_split_pct = 80% (too much token risk)
    - Pass sol_split_pct with the deploy. The executor auto-swaps the token portion via Jupiter, so there is no need to pre-buy tokens: provide total SOL as amount_y + sol_split_pct.
 
 ${SPOT_BIN_DIRECTION}
@@ -474,16 +500,11 @@ If UNCLEAR: Ask the user to clarify — e.g. "Would you like me to do this now, 
 
 OVERRIDE RULE: When the user explicitly specifies deploy parameters (strategy, bins, amount, pool), use those EXACTLY. Do not substitute with lessons, active strategy defaults, or past preferences. Lessons are heuristics for autonomous decisions — they are overridden by direct user instruction.
 
-DEPLOY SIZING: If the user does NOT specify an amount, use this formula:
-  base = ${String(config.management.positionSizeBase).toLowerCase() === "wallet" ? "free wallet SOL" : "total = free wallet SOL + SOL value of all open positions (value + unclaimed fees; if any value is unknown, use free wallet SOL)"}
-  amount = (base - gasReserve (${config.management.gasReserve})) × positionSizePct (${config.management.positionSizePct}), at most ceiling ${config.risk.maxDeployAmount} SOL
-  and at most free wallet SOL - gasReserve. If amount < floor ${config.management.deployAmountSol} SOL, do NOT deploy (tell the user why).
-  Do NOT deploy more than this calculated amount. Check get_wallet_balance${String(config.management.positionSizeBase).toLowerCase() === "wallet" ? "" : " and get_my_positions"} first.
+DEPLOY SIZING: If the user does NOT specify an amount, use "Default deploy amount" in CURRENT STATE (computed in code from the configured sizing), or omit the amount and deploy_position computes it from the live wallet. Do NOT deploy more than that default. If it says none, do NOT deploy; tell the user the reason it gives.
 
 TWO-SIDED SPOT WITH AUTO-SWAP:
-- For two-sided spot: pass sol_split_pct (your conviction level). 100 = pure SOL (same as bid_ask). 80 = mostly SOL, 20% token exposure. 50 = equal. 25 = mostly token (bullish). The executor auto-swaps the token portion.
+- sol_split_pct is the % of total SOL kept as SOL; the executor auto-swaps the rest to the token. Use the user's split when they give one; otherwise sol_split_pct must be 85-90 (mostly SOL, minimal token exposure).
 - You do NOT need to pre-buy tokens. Just provide total SOL as amount_y + sol_split_pct. The executor handles the Jupiter swap and deploys both sides.
-- The key principle: you decide conviction via sol_split_pct, the executor handles execution.
 
 KNOWLEDGE BASE: For complex questions about performance, strategy patterns, or historical analysis, use kb_read (start with INDEX.md) and kb_search to find relevant compiled articles. The knowledge base contains synthesized analysis beyond raw data. Use kb_write to file new observations or analysis results.
 `;
@@ -522,7 +543,7 @@ Portfolio: ${JSON.stringify(portfolio, null, 2)}
 Open Positions: ${JSON.stringify(positions, null, 2)}
 State: ${JSON.stringify(stateSummary, null, 2)}
 Performance: ${perfSummary ? JSON.stringify(perfSummary, null, 2) : "No closed positions yet"}
-Timestamp: ${new Date().toISOString()}
+${agentType === "GENERAL" ? `Default deploy amount: ${generalDeploySizingText(portfolio, positions)}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;
 
   return prompt;
