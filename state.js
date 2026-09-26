@@ -13,6 +13,10 @@ import { log } from "./logger.js";
 
 const STATE_FILE = "./state.json";
 
+// Points of API vs on-chain PnL disagreement above which the API reading is
+// treated as wrong (same value as PNL_MISMATCH_PTS in pnl-confirm.js).
+const PNL_MISMATCH_PTS = 2;
+
 const MAX_RECENT_EVENTS = 20;
 
 function load() {
@@ -300,7 +304,7 @@ export function setPositionInstruction(position_address, instruction) {
  * Update peak PnL and check trailing take profit / stop loss.
  * Returns an action string if a threshold is hit, or null.
  */
-export function updatePnlAndCheckExits(position_address, currentPnlPct, config) {
+export function updatePnlAndCheckExits(position_address, currentPnlPct, config, { onchainPct = null } = {}) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
@@ -346,18 +350,26 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config) 
     return action;
   }
 
-  // Track peak PnL
-  if (currentPnlPct > (pos.peak_pnl_pct || 0)) {
-    pos.peak_pnl_pct = currentPnlPct;
+  // Track peak PnL. When the caller has an on-chain reading (pnl-watcher) that
+  // disagrees with the API by more than 2 points, the on-chain value sets the
+  // peak and arms trailing: a bad API reading must not become the trailing peak.
+  let peakCandidate = currentPnlPct;
+  const oc = onchainPct == null ? NaN : Number(onchainPct);
+  if (Number.isFinite(oc)) {
+    if (oc > (pos.peak_onchain_pnl_pct ?? -Infinity)) pos.peak_onchain_pnl_pct = oc;
+    if (Math.abs(oc - currentPnlPct) > PNL_MISMATCH_PTS) peakCandidate = oc;
+  }
+  if (peakCandidate > (pos.peak_pnl_pct || 0)) {
+    pos.peak_pnl_pct = peakCandidate;
   }
 
   // Trailing take profit
   if (mgmt.trailingTakeProfit) {
     // Activate trailing once profit exceeds trigger
-    if (!pos.trailing_active && currentPnlPct >= mgmt.trailingTriggerPct) {
+    if (!pos.trailing_active && peakCandidate >= mgmt.trailingTriggerPct) {
       pos.trailing_active = true;
-      pos.notes.push(`Trailing TP activated at ${currentPnlPct.toFixed(1)}%`);
-      log("state", `Position ${position_address} trailing TP activated (peak: ${currentPnlPct.toFixed(1)}%)`);
+      pos.notes.push(`Trailing TP activated at ${peakCandidate.toFixed(1)}%`);
+      log("state", `Position ${position_address} trailing TP activated (peak: ${peakCandidate.toFixed(1)}%)`);
     }
 
     // Check if profit has dropped from peak by trailingDropPct.
@@ -379,6 +391,34 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config) 
 
   save(state);
   return action;
+}
+
+/**
+ * A PnL exit that on-chain PnL did not confirm (pnl-confirm.js). Replaces the
+ * exit note updatePnlAndCheckExits just pushed with a HELD note, so a later
+ * close isn't recorded as that exit (depthUseAtClose reads STOP_LOSS notes).
+ * When the stored peak is more than 2 points above the on-chain reading, the
+ * peak came from a bad API reading: pull it down to the best on-chain reading
+ * seen, and disarm trailing if that is below the trigger.
+ */
+export function recordPnlHold(position_address, action, detail, { onchainPct = null, config = null } = {}) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return;
+  if (!Array.isArray(pos.notes)) pos.notes = [];
+  if (action && pos.notes[pos.notes.length - 1] === action) pos.notes.pop();
+  // One HELD note per position (the latest): a hold repeats every tick.
+  pos.notes = pos.notes.filter((n) => !String(n).startsWith("HELD (on-chain PnL did not confirm)"));
+  pos.notes.push(`HELD (on-chain PnL did not confirm): ${action || "PnL exit"} — ${detail} [${new Date().toISOString()}]`);
+  const oc = onchainPct == null ? NaN : Number(onchainPct);
+  if (Number.isFinite(oc) && (pos.peak_pnl_pct || 0) > oc + PNL_MISMATCH_PTS) {
+    const before = Number(pos.peak_pnl_pct);
+    pos.peak_pnl_pct = Math.max(0, oc, pos.peak_onchain_pnl_pct ?? -Infinity);
+    const trigger = Number(config?.management?.trailingTriggerPct);
+    if (pos.trailing_active && Number.isFinite(trigger) && pos.peak_pnl_pct < trigger) pos.trailing_active = false;
+    log("state", `Position ${position_address} peak PnL ${before.toFixed(1)}% not backed on-chain — reset to ${pos.peak_pnl_pct.toFixed(1)}%${pos.trailing_active ? "" : " (trailing off)"}`);
+  }
+  save(state);
 }
 
 /**

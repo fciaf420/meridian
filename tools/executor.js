@@ -13,7 +13,10 @@ import { getWalletBalances, swapToken } from "./wallet.js";
 import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, getTrackedPosition } from "../state.js";
+import { setPositionInstruction, getTrackedPosition, recordPnlHold } from "../state.js";
+import { isManagementBusy } from "../session.js";
+import { managementPnlCloseGate } from "../pnl-confirm.js";
+import { getOnchainPnl } from "./onchain-pnl.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
@@ -362,7 +365,7 @@ export async function executeTool(name, args, { manual = false } = {}) {
 
   // ─── Pre-execution safety checks ──────────
   if (WRITE_TOOLS.has(name)) {
-    const safetyCheck = await runSafetyChecks(name, args);
+    const safetyCheck = await runSafetyChecks(name, args, { manual });
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       return {
@@ -520,10 +523,38 @@ async function checkDeployEligibility(args) {
 }
 
 /**
+ * Management close_position on a PnL rule (3 take profit, 6 emergency stop,
+ * trailing / stop-loss exit alerts): hold unless on-chain PnL confirms it.
+ */
+async function confirmManagementPnlClose(args) {
+  try {
+    return await managementPnlCloseGate({
+      position_address: args?.position_address,
+      mgmt: config.management,
+      getPositions: () => getMyPositions(),
+      getTracked: getTrackedPosition,
+      getOnchain: getOnchainPnl,
+      onHold: (cls, decision) => recordPnlHold(args.position_address, null, `${cls.rule}: ${decision.why}`, { onchainPct: decision.onchainPct, config }),
+    });
+  } catch (e) {
+    // The gate itself failing must not block an exit: same as today.
+    log("pnl_confirm", `Management close gate error (${e.message}) — allowing the close`);
+    return { pass: true };
+  }
+}
+
+/**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args) {
+async function runSafetyChecks(name, args, { manual = false } = {}) {
   switch (name) {
+    case "close_position":
+      // Management closes on rule 3 (take profit) / rule 6 (emergency stop) and
+      // EXIT ALERTS read pnl_pct from the PnL API; confirm those on-chain first.
+      // Owner closes (Telegram, REPL) never run inside a management cycle.
+      if (manual || !isManagementBusy()) return { pass: true };
+      return confirmManagementPnlClose(args);
+
     case "deploy_position": {
       const elig = await checkDeployEligibility(args);
       if (!elig.pass) return elig;
