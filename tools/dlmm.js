@@ -29,6 +29,7 @@ import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { getExperimentTag } from "../prompt.js";
 import { normalizeMint, getWalletBalances, swapToken, getOnchainTokenBalance } from "./wallet.js";
 import { swapBackWithdrawnBase, expectedBaseWithdrawRaw } from "./close-swap.js";
+import { computeOnchainPnl, binPrice, onchainPctForUnit } from "./onchain-pnl.js";
 import { calculateBinsForPriceRange, splitRangeBins, lpaCurrentValueUsd, MIN_RANGE_PCT, MIN_BINS, fitDeployAmount } from "../runtime-helpers.js";
 import { fetchGmgnPriceInfo } from "./gmgn.js";
 import { getDepthForDeploy } from "./ohlcv.js";
@@ -2271,6 +2272,41 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
       }
     }
     } // end of !_pnlOverride
+
+    // ─── On-chain PnL wins over the PnL API when it can be read ───
+    // The APIs misreport young positions (e/acc-SOL recorded +7.4% on a flat
+    // close). positionData and the freshly loaded pool are already in hand, so
+    // this costs no extra RPC. The watcher's override is already on-chain based
+    // when it carries pnl_source "onchain".
+    if (_pnlOverride?.pnl_source !== "onchain" && trackedPre) {
+      try {
+        const cachedSolPrice = _positionsCache?.positions?.find((p) => p.position === position_address)?.sol_price;
+        const activeId = Number(pool.lbPair?.activeId);
+        const oc = Number.isFinite(activeId)
+          ? computeOnchainPnl({
+            pool,
+            positionData: positionData?.positionData,
+            activePrice: binPrice(activeId, pool.lbPair?.binStep, pool.tokenX?.mint?.decimals, pool.tokenY?.mint?.decimals),
+            tracked: trackedPre,
+            solPriceUsd: cachedSolPrice,
+          })
+          : null;
+        const ocPct = oc ? onchainPctForUnit(oc, config.management.pnlUnit) : null;
+        if (ocPct != null) {
+          const initialUsd = Number(trackedPre.initial_value_usd) || 0;
+          log("close", `On-chain PnL ${ocPct}% (value ${oc.valueSol} + fees ${oc.feesSol} SOL vs deposit ${oc.depositSol} SOL) replaces API ${pnlPct ?? "unknown"}%`);
+          pnlPct = ocPct;
+          if (initialUsd > 0) {
+            pnlUsd = Math.round(initialUsd * ocPct) / 100;
+            finalValueUsd = Math.round((initialUsd + pnlUsd) * 100) / 100;
+          } else if (Number(cachedSolPrice) > 0) {
+            pnlUsd = Math.round(oc.pnlSol * Number(cachedSolPrice) * 100) / 100;
+          }
+        }
+      } catch (e) {
+        log("close_warn", `On-chain PnL snapshot failed, keeping API PnL: ${e.message}`);
+      }
+    }
 
     const txHashes = [];
 
