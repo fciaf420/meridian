@@ -125,6 +125,7 @@ export function buildSettingsReport({ color = false } = {}) {
   }
   row("max positions", config.risk.maxPositions, "maxPositions");
   row("max swap price impact", `${config.risk.maxSwapPriceImpactPct}%`, "maxSwapPriceImpactPct");
+  row("max close swap-back impact", `${config.risk.maxCloseSwapPriceImpactPct}%`, "maxCloseSwapPriceImpactPct");
   row("position size %", `${(config.management.positionSizePct * 100).toFixed(0)}%`, "positionSizePct");
   row("position size basis", String(config.management.positionSizeBase).toLowerCase() === "wallet" ? "free wallet SOL" : "total (wallet SOL + open positions)", "positionSizeBase");
 

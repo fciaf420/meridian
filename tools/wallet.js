@@ -254,29 +254,48 @@ export function parsePriceImpactPercent(order) {
 }
 
 export const DEFAULT_MAX_SWAP_PRICE_IMPACT_PCT = 5;
+export const DEFAULT_MAX_CLOSE_SWAP_PRICE_IMPACT_PCT = 25;
 
-/** Effective price-impact cap in percent (config.risk.maxSwapPriceImpactPct, default 5). */
+/**
+ * Price-impact caps, in percent. "default" (maxSwapPriceImpactPct, 5) covers
+ * agent swap_token calls, the deploy auto-swap and USDC-mode entry. "close"
+ * (maxCloseSwapPriceImpactPct, 25) covers post-close swap-backs, where leaving
+ * the withdrawn bag is worse than the slippage. The kind is chosen by code
+ * callers through swapToken's second (deps) argument, never by tool args.
+ */
+const IMPACT_CAPS = {
+  default: { key: "maxSwapPriceImpactPct", fallback: DEFAULT_MAX_SWAP_PRICE_IMPACT_PCT },
+  close: { key: "maxCloseSwapPriceImpactPct", fallback: DEFAULT_MAX_CLOSE_SWAP_PRICE_IMPACT_PCT },
+};
+
+/** Effective cap for `kind` from config.risk, or its default when unset/invalid. */
+export function priceImpactCap(kind = "default") {
+  const c = IMPACT_CAPS[kind] ?? IMPACT_CAPS.default;
+  const v = Number(config.risk?.[c.key]);
+  return { key: c.key, cap: Number.isFinite(v) && v > 0 ? v : c.fallback };
+}
+
+/** Back-compat: the default cap in percent. */
 export function maxSwapPriceImpactPct() {
-  const v = Number(config.risk?.maxSwapPriceImpactPct);
-  return Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_SWAP_PRICE_IMPACT_PCT;
+  return priceImpactCap("default").cap;
 }
 
 /**
- * Refusal result when |impactPct| exceeds the cap, else null. An unknown
- * impact (null) is allowed and logged: the field is undocumented on Swap v2,
- * and blocking every swap if Jupiter dropped it would strand close exits.
+ * Refusal result when |impactPct| exceeds the cap of `kind`, else null. An
+ * unknown impact (null) is allowed and logged: the field is undocumented on
+ * Swap v2, and blocking every swap if Jupiter dropped it would strand exits.
  */
-export function checkPriceImpact(impactPct, { input_mint, output_mint } = {}) {
-  const cap = maxSwapPriceImpactPct();
+export function checkPriceImpact(impactPct, { input_mint, output_mint, kind = "default" } = {}) {
+  const { key, cap } = priceImpactCap(kind);
   if (impactPct == null) {
-    log("swap", `Price impact unknown for ${input_mint} → ${output_mint}; the ${cap}% cap could not be checked`);
+    log("swap", `Price impact unknown for ${input_mint} → ${output_mint}; the ${cap}% ${key} cap could not be checked`);
     return null;
   }
   const abs = Math.abs(impactPct);
   if (abs <= cap) return null;
-  const error = `Swap refused: price impact ${abs.toFixed(2)}% exceeds maxSwapPriceImpactPct ${cap}%`;
+  const error = `Swap refused: price impact ${abs.toFixed(2)}% exceeds ${key} ${cap}%`;
   log("swap", `${error} (${input_mint} → ${output_mint})`);
-  return { success: false, price_impact_refused: true, price_impact_pct: Math.round(abs * 100) / 100, max_price_impact_pct: cap, input_mint, output_mint, error };
+  return { success: false, price_impact_refused: true, price_impact_pct: Math.round(abs * 100) / 100, max_price_impact_pct: cap, price_impact_cap_key: key, input_mint, output_mint, error };
 }
 
 /** Documented Swap v2 /execute `code` values. */
@@ -380,8 +399,9 @@ export function normalizeMint(mint) {
 
 /**
  * @param {object} params
- * @param {object} [deps] Test seam only: { connection, wallet, statusPollMs,
- *   statusPollAttempts }. Production callers pass nothing.
+ * @param {object} [deps] { impactCap: "close" } selects the post-close
+ *   price-impact cap (code callers only; executeTool never passes deps).
+ *   Test seam: { connection, wallet, statusPollMs, statusPollAttempts }.
  */
 export async function swapToken({
   input_mint,
@@ -485,7 +505,7 @@ export async function swapToken({
     );
     // Nothing is signed yet, so a refusal here can't leave anything in flight.
     // No fallback to swap/v1 either: that would quote the same thin route.
-    const impactRefusal = checkPriceImpact(impact, { input_mint, output_mint });
+    const impactRefusal = checkPriceImpact(impact, { input_mint, output_mint, kind: deps.impactCap });
     if (impactRefusal) return impactRefusal;
 
     const { transaction: unsignedTx, requestId } = order;
@@ -594,7 +614,7 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   const v1Impact = quote.priceImpactPct != null && quote.priceImpactPct !== "" && Number.isFinite(Number(quote.priceImpactPct))
     ? Number(quote.priceImpactPct) * 100
     : null;
-  const impactRefusal = checkPriceImpact(v1Impact, { input_mint, output_mint });
+  const impactRefusal = checkPriceImpact(v1Impact, { input_mint, output_mint, kind: deps.impactCap });
   if (impactRefusal) return impactRefusal;
 
   // ─── Get swap tx ───────────────────────────────────────────

@@ -706,7 +706,7 @@ export async function syncOpenPositions(active_addresses) {
               input_mint: baseMint,
               output_mint: SOL,
               amount: swapAmount,
-            });
+            }, { impactCap: "close" }); // post-close swap-back: maxCloseSwapPriceImpactPct
             if (swapResult?.success) {
               log("state", `Post-sync-close swap OK: tx ${swapResult.tx}`);
             } else {
