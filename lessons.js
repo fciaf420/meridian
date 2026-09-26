@@ -1236,6 +1236,18 @@ function fmtLessons(lessons) {
   }).join("\n");
 }
 
+/** Win / loss / break-even counts of performance records, excluded records left out. */
+function winLossCounts(records) {
+  const counts = { wins: 0, losses: 0, breakeven: 0 };
+  for (const r of learnableRecords(records)) {
+    const c = classifyRecord(r);
+    if (c === "win") counts.wins++;
+    else if (c === "loss") counts.losses++;
+    else if (c === "breakeven") counts.breakeven++;
+  }
+  return counts;
+}
+
 /**
  * Get individual performance records filtered by time window.
  */
@@ -1247,9 +1259,8 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
 
   const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
 
-  const filtered = p
-    .filter((r) => r.recorded_at >= cutoff)
-    .slice(-limit)
+  const windowed = p.filter((r) => r.recorded_at >= cutoff).slice(-limit);
+  const filtered = windowed
     .map((r) => ({
       pool_name: r.pool_name,
       pool: r.pool,
@@ -1264,13 +1275,19 @@ export function getPerformanceHistory({ hours = 24, limit = 50 } = {}) {
     }));
 
   const totalPnl = filtered.reduce((s, r) => s + (r.pnl_usd ?? 0), 0);
-  const wins = filtered.filter((r) => r.pnl_usd > 0).length;
+  // Win rate: the shared classifier (learning-data.js) — > +1% win, < −1%
+  // loss, break-even in between and left out of the rate. Records excluded
+  // from learning (known-bad / corrected) and unknown PnL don't count.
+  const outcomes = winLossCounts(windowed);
 
   return {
     hours,
     count: filtered.length,
     total_pnl_usd: Math.round(totalPnl * 100) / 100,
-    win_rate_pct: filtered.length > 0 ? Math.round((wins / filtered.length) * 100) : null,
+    win_rate_pct: outcomes.wins + outcomes.losses > 0 ? Math.round((outcomes.wins / (outcomes.wins + outcomes.losses)) * 100) : null,
+    wins: outcomes.wins,
+    losses: outcomes.losses,
+    breakeven: outcomes.breakeven,
     positions: filtered,
   };
 }
@@ -1289,7 +1306,10 @@ export function getPerformanceSummary() {
   const totalPnl = known.reduce((s, x) => s + x.pnl_usd, 0);
   const avgPnlPct = known.length ? known.reduce((s, x) => s + x.pnl_pct, 0) / known.length : 0;
   const avgRangeEfficiency = p.reduce((s, x) => s + x.range_efficiency, 0) / p.length;
-  const wins = known.filter((x) => x.pnl_usd > 0).length;
+  // Win rate: wins / (wins + losses) by the shared classifier (learning-data.js);
+  // break-even closes (±1%) and records excluded from learning don't count.
+  const outcomes = winLossCounts(p);
+  const decisive = outcomes.wins + outcomes.losses;
 
   return {
     total_positions_closed: p.length,
@@ -1297,7 +1317,10 @@ export function getPerformanceSummary() {
     total_pnl_usd: Math.round(totalPnl * 100) / 100,
     avg_pnl_pct: Math.round(avgPnlPct * 100) / 100,
     avg_range_efficiency_pct: Math.round(avgRangeEfficiency * 10) / 10,
-    win_rate_pct: known.length ? Math.round((wins / known.length) * 100) : 0,
+    win_rate_pct: decisive ? Math.round((outcomes.wins / decisive) * 100) : 0,
+    wins: outcomes.wins,
+    losses: outcomes.losses,
+    breakeven: outcomes.breakeven,
     total_lessons: data.lessons.length,
   };
 }
