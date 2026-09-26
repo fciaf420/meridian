@@ -363,6 +363,7 @@ async function screeningCycleBody() {
 
         let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
         block += ` | token_age: ${c.token_age_hours != null ? `${c.token_age_hours}h (${c.token_age_source ?? "?"})` : "unknown"}`;
+        if (c.jupiter) block += ` | jup_organic: ${c.jupiter.organic_score ?? "?"}/100 | jup_verified: ${c.jupiter.verified ?? "?"}`; // Jupiter Tokens API, informational
         if (ohlcvDepthOn) block += ` | ohlcv_depth: ${c.ohlcv_depth ? `${c.ohlcv_depth.depthPct}% (${c.ohlcv_depth.basis})` : "n/a (use volatility table)"}`;
         const srcTag = formatCandidateSources(c);
         if (srcTag) block += ` | ${srcTag}`;
