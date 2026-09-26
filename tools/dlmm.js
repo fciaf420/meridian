@@ -593,6 +593,19 @@ export async function deployPosition({
     }
   }
 
+  // The pool's own token X is the base mint. A model-supplied base_mint can be
+  // wrong (it has passed the pool address), which would slip past the
+  // duplicate-token and blacklist guards and aim candle depth at the wrong address.
+  try {
+    const poolMint = (await getPool(pool_address)).lbPair.tokenXMint.toBase58();
+    if (poolMint && poolMint !== WSOL_MINT) {
+      if (base_mint && base_mint !== poolMint) {
+        log("deploy_warn", `base_mint ${base_mint.slice(0, 8)} is not the pool's token; using ${poolMint.slice(0, 8)}`);
+      }
+      base_mint = poolMint;
+    }
+  } catch { /* pool unreadable here — keep the caller's base_mint */ }
+
   // Evil Panda is a named policy mapped onto the executor's supported
   // single-sided SOL spot primitive. Enforce its entry criteria here so the
   // model cannot accidentally bypass the strategy with a weaker prompt-only check.
