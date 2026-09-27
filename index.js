@@ -718,6 +718,9 @@ function startCronJobs() {
         for (const p of precheckedPositions) {
           if (getTrackedPosition(p.position)?.instruction) { ruleHits.push(`${p.pair}: instruction`); closeReasons.push([p.position, "rule 1: instruction met"]); }
           else if (p.pnl_pct == null) ruleHits.push(`${p.pair}: pnl unknown`);
+          // A PnL the warm-up guard (state.js) is holding as a likely spike is not a
+          // take-profit signal; the PnL watcher re-checks it on its next tick.
+          else if (p.pnl_pct >= m.takeProfitFeePct && getTrackedPosition(p.position)?._pnl_pending_extreme) { /* warm-up spike: hold */ }
           else if (p.pnl_pct >= m.takeProfitFeePct) { ruleHits.push(`${p.pair}: rule 3`); closeReasons.push([p.position, `rule 3: take profit (${p.pnl_pct}% ≥ ${m.takeProfitFeePct}%)`]); }
           else if ((p.minutes_out_of_range ?? 0) >= m.outOfRangeWaitMinutes) { ruleHits.push(`${p.pair}: rule 4`); closeReasons.push([p.position, `rule 4: OOR timeout${p.oor_direction ? ` (OOR ${p.oor_direction})` : ""}`]); }
           else if (p.pnl_pct <= m.emergencyPriceDropPct) { ruleHits.push(`${p.pair}: rule 6`); closeReasons.push([p.position, `rule 6: emergency stop (${p.pnl_pct}%)`]); }
