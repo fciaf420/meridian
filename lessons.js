@@ -286,6 +286,7 @@ function derivLesson(perf) {
     `volatility=${perf.volatility}`,
     `fee_tvl_ratio=${perf.fee_tvl_ratio}`,
     `organic=${perf.organic_score}`,
+    Number.isFinite(Number(perf.signal_snapshot?.mcap)) ? `entry_mcap=$${Math.round(Number(perf.signal_snapshot.mcap) / 1000)}k` : null,
     `bin_range=${typeof perf.bin_range === 'object' ? JSON.stringify(perf.bin_range) : perf.bin_range}`,
     perf.sol_split_pct != null ? `sol_split_pct=${perf.sol_split_pct}` : null,
   ].filter(Boolean).join(", ");
