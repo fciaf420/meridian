@@ -347,3 +347,23 @@ test("fix-learning-data script: previews by default, flags the known-bad records
   assert.equal(second.changes.length, 0, "idempotent");
   assert.equal(second.written.length, 0);
 });
+
+test("lesson context carries entry market cap when the signal snapshot has it", async () => {
+  const prevKb = config.knowledgeBase;
+  config.knowledgeBase = { ...prevKb, enabled: false };
+  try {
+    fs.writeFileSync("lessons.json", JSON.stringify({ lessons: [], performance: [] }));
+    fs.writeFileSync("pool-memory.json", "{}");
+    const base = { strategy: "bid_ask", bin_step: 100, volatility: 7, fee_tvl_ratio: 0.4, organic_score: 75, amount_sol: 8, initial_value_usd: 1000, fees_earned_usd: 5, minutes_held: 90, minutes_in_range: 90, close_reason: "STOP_LOSS" };
+    await lessons.recordPerformance({ ...base, position: "l1", pool: "poolL", pool_name: "LOW-SOL", final_value_usd: 842, actual_pnl_pct: -15.8, actual_pnl_usd: -158, signal_snapshot: { mcap: 205057 } });
+    let rules = JSON.parse(fs.readFileSync("lessons.json", "utf8")).lessons.map(l => l.rule);
+    assert.ok(rules.some(r => r.includes("LOW-SOL") && r.includes("entry_mcap=$205k")), rules.join("\n"));
+
+    fs.writeFileSync("lessons.json", JSON.stringify({ lessons: [], performance: [] }));
+    await lessons.recordPerformance({ ...base, position: "l2", pool: "poolN", pool_name: "NOCAP-SOL", final_value_usd: 842, actual_pnl_pct: -15.8, actual_pnl_usd: -158 });
+    rules = JSON.parse(fs.readFileSync("lessons.json", "utf8")).lessons.map(l => l.rule);
+    assert.ok(rules.some(r => r.includes("NOCAP-SOL") && !r.includes("entry_mcap")), rules.join("\n"));
+  } finally {
+    config.knowledgeBase = prevKb;
+  }
+});
