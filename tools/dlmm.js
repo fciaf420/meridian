@@ -50,6 +50,9 @@ import {
 } from "./tx-send.js";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
+// Post-close account check: reads and spacing before reporting close_unconfirmed.
+const CLOSE_VERIFY_READS = 4;
+const CLOSE_VERIFY_DELAY_MS = 1500;
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
@@ -2500,9 +2503,16 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
     // the position account was actually closed (a partial remove, a not-yet-empty
     // account, or an unconfirmed close can all leave the account alive). Refetch
     // pool state and read the account directly before recording a clean win.
+    // An RPC node can lag the confirmed close by a moment (seen live: moin-SOL
+    // 2026-09-28 12:10 read "still exists", the retry then failed with 3007 on
+    // the already-closed account). Re-read a few times before calling it open.
     try { await pool.refetchStates(); } catch { /* best-effort */ }
-    const info = await getConnection().getAccountInfo(positionPubKey);
-    const actuallyClosed = info === null;
+    let actuallyClosed = false;
+    for (let attempt = 0; attempt < CLOSE_VERIFY_READS; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, CLOSE_VERIFY_DELAY_MS));
+      const info = await getConnection().getAccountInfo(positionPubKey, "confirmed");
+      if (info === null) { actuallyClosed = true; break; }
+    }
     if (!actuallyClosed) {
       log("close_warn", `Close txs confirmed but position account ${position_address} still exists — not recording as closed`);
       return {
