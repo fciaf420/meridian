@@ -3,6 +3,7 @@ import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
 import { instrumentConnection } from "./rpc-stats.js";
 import { scoreSignalSnapshot } from "../signal-weights.js";
+import { meteoraGateMode } from "./gmgn-policy.js";
 import { fetchGmgnSignalMap, attachGmgnSignals, gmgnSignalBooleans } from "./gmgn-signals.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -88,7 +89,18 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
+// Concurrent callers (screening cycle, dashboard, deploy-request path, the LLM get_top_candidates
+// tool) with the same limit share ONE in-flight run instead of each re-spending GMGN weight.
+const _topInflight = new Map();
+export function getTopCandidates({ limit = 10 } = {}) {
+  const key = String(limit);
+  if (_topInflight.has(key)) return _topInflight.get(key);
+  const p = getTopCandidatesUncached({ limit }).finally(() => _topInflight.delete(key));
+  _topInflight.set(key, p);
+  return p;
+}
+
+async function getTopCandidatesUncached({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
 
   // Route to the opt-in GMGN screening source. Defaults to Meteora when
@@ -148,9 +160,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     gmgnGate = await gateMeteoraSourceCandidates(open, { limit });
     open = gmgnGate.kept;
   } catch (e) {
-    // The gate module itself failing is unknown data: do not wave candidates through.
-    log("gmgn_gate", `Safety gate failed (${e?.message || e}); dropping non-GMGN candidates this cycle`);
-    open = open.filter((p) => p.gmgn || p.gmgn_gated);
+    // The gate module itself failing is unknown data. Hard mode: do not wave candidates through.
+    // Shadow mode (default) never drops, so keep them; either way the operator hears once.
+    log("gmgn_gate", `Safety gate failed (${e?.message || e}); ${meteoraGateMode(config) === "hard" ? "dropping non-GMGN candidates this cycle" : "shadow mode: keeping candidates"}`);
+    try {
+      const { reportGmgnOutage } = await import("./gmgn-outage.js");
+      reportGmgnOutage(`Meteora-source GMGN gate crashed: ${String(e?.message || e).slice(0, 160)}`);
+    } catch { /* best effort */ }
+    if (meteoraGateMode(config) === "hard") open = open.filter((p) => p.gmgn || p.gmgn_gated);
   }
 
   const eligible = rankCandidatesByDarwin(open);
@@ -161,6 +178,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     total_screened: screenedCount,
     entry_filtered: entry.dropped.length,
     gmgn_gate_dropped: gmgnGate?.dropped?.length ?? 0,
+    gmgn_gate_would_drop: gmgnGate?.would_drop?.length ?? 0,
+    gmgn_gate_outage: gmgnGate?.outage ?? false,
     gmgn_gate_rate_limited: gmgnGate?.rate_limited ?? false,
   };
 }
@@ -232,10 +251,12 @@ const GMGN_RISK_LOG_KEYS = [
   "gmgn_creator_created_count", "gmgn_creator_token_status", "gmgn_pool_liquidity_ratio",
   "gmgn_renounced_mint", "gmgn_renounced_freeze", "gmgn_lp_burned", "gmgn_lp_locked", "gmgn_buy_tax", "gmgn_sell_tax",
   "gmgn_security_status", "gmgn_risk_log_only_flags", "gmgn_sniper_supply_share_pct", "gmgn_sniper_row_rate_pct",
+  // Meteora-source GMGN gate verdict (shadow mode records it without dropping).
+  "gmgn_gate_would_drop", "gmgn_gate_would_drop_reasons", "gmgn_gate_would_drop_kind",
 ];
 
 function gmgnRiskLogOnly(c) {
-  if (c?.gmgn_security_status == null) return null;
+  if (c?.gmgn_security_status == null && c?.gmgn_gate_would_drop == null) return null;
   const out = {};
   for (const k of GMGN_RISK_LOG_KEYS) if (c[k] !== undefined) out[k] = c[k];
   return out;

@@ -133,7 +133,11 @@ export const config = {
     // whether Meteora-source candidates also run the GMGN safety gates (needs a GMGN key).
     plan:              gmgnValue("plan",              "gmgnPlan",              "free"),
     finalistLimit:     gmgnValue("finalistLimit",     "gmgnFinalistLimit",     5),
-    gateMeteoraSource: gmgnValue("gateMeteoraSource", "gmgnGateMeteoraSource", true),
+    // "shadow" (default: record gmgn_gate_would_drop, never drop) | "hard" | "off" (true/false accepted).
+    gateMeteoraSource: gmgnValue("gateMeteoraSource", "gmgnGateMeteoraSource", "shadow"),
+    // Separate thresholds for the Meteora-source gate (see METEORA_GATE_DEFAULTS in tools/gmgn-policy.js).
+    meteoraGate:       (gmgnUserConfig.meteoraGate && typeof gmgnUserConfig.meteoraGate === "object") ? gmgnUserConfig.meteoraGate : {},
+    outageMinCandidates: gmgnValue("outageMinCandidates", "gmgnOutageMinCandidates", 3),
     // Stage-3 holders/traders enrichment + KOL config
     holdersLimit:           gmgnValue("holdersLimit",           "gmgnHoldersLimit",           100),
     maxSniperHoldRate:      gmgnValue("maxSniperHoldRate",      "gmgnMaxSniperHoldRate",      0.3),
@@ -147,7 +151,10 @@ export const config = {
       const r = gmgnUserConfig.indicatorRules || {};
       return {
         requireBullishSupertrend: r.requireBullishSupertrend ?? true,
-        rejectAlreadyAtBottom:    r.rejectAlreadyAtBottom    ?? false, // was dead code (bb_lower never existed): log-only until validated
+        // Legacy key: dead code before (bb_lower never existed), so it stays log-only to preserve the
+        // effective behavior of configs that set it true. Enforcement is the new explicit opt-in below.
+        rejectAlreadyAtBottom:    r.rejectAlreadyAtBottom    ?? false,
+        enforceAlreadyAtBottom:   r.enforceAlreadyAtBottom   ?? false,
         requireAboveSupertrend:   r.requireAboveSupertrend   ?? false,
         minRsi:                   r.minRsi                   ?? null,
         maxRsi:                   r.maxRsi                   ?? null,
@@ -612,4 +619,10 @@ export function reloadScreeningThresholds() {
     }
     if (freshGmgn.apiKey) g.apiKey = freshGmgn.apiKey;
   } catch { /* ignore */ }
+}
+
+// rejectAlreadyAtBottom=true used to be a silent no-op (bb_lower was never computed). It is still a no-op;
+// say so once instead of letting it flip into a live hard reject. Opt in with indicatorRules.enforceAlreadyAtBottom.
+if ((gmgnUserConfig.indicatorRules || {}).rejectAlreadyAtBottom === true && (gmgnUserConfig.indicatorRules || {}).enforceAlreadyAtBottom !== true) {
+  console.warn("[config] gmgn indicatorRules.rejectAlreadyAtBottom=true is log-only (it never fired before either). Set indicatorRules.enforceAlreadyAtBottom=true to actually reject.");
 }

@@ -34,11 +34,14 @@ import { config } from "../config.js";
 import { log } from "../logger.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import {
-  spawnGmgnResult, fetchGmgnTokenInfoResult, fetchGmgnSecurityResult, fetchGmgnPriceInfoResult, GMGN_STATUS,
+  spawnGmgnResult, fetchGmgnTokenInfoResult, fetchGmgnSecurityResult, fetchGmgnPriceInfoResult,
+  fetchGmgnHoldersResult, getGmgnTransportState, GMGN_STATUS,
 } from "./gmgn.js";
 import {
   numOrNull, isStatUnpopulated, summarizeInfoRisk, summarizeSecurity, riskSnapshotFields, gmgnSetting,
+  meteoraGateMode, meteoraGateThresholds,
 } from "./gmgn-policy.js";
+import { reportGmgnOutage, clearGmgnOutage } from "./gmgn-outage.js";
 
 const CHAIN = "sol";
 const METEORA_DLMM_API = "https://dlmm.datapi.meteora.ag";
@@ -237,18 +240,22 @@ function analyzeTokenInfo(info = {}, g = config.gmgn) {
     }
   }
 
-  const holderCount = need("holder_count", info.holder_count);
-  if (holderCount != null && holderCount < g.minHolders) reasons.push(`holders ${holderCount} < ${g.minHolders}`);
-  const totalFeeSol = need("total_fee", info.total_fee);
-  if (totalFeeSol != null && totalFeeSol < g.minTotalFeeSol) reasons.push(`total fee ${totalFeeSol} SOL < ${g.minTotalFeeSol} SOL`);
+  // A null threshold makes the field log-only (used by the Meteora-source gate for total_fee).
+  const holderCount = g.minHolders != null ? need("holder_count", info.holder_count) : optionalNum(info.holder_count);
+  if (holderCount != null && g.minHolders != null && holderCount < g.minHolders) reasons.push(`holders ${holderCount} < ${g.minHolders}`);
+  const totalFeeSol = g.minTotalFeeSol != null ? need("total_fee", info.total_fee) : optionalNum(info.total_fee);
+  if (totalFeeSol != null && g.minTotalFeeSol != null && totalFeeSol < g.minTotalFeeSol) reasons.push(`total fee ${totalFeeSol} SOL < ${g.minTotalFeeSol} SOL`);
 
-  const statUnpopulated = isStatUnpopulated(info.stat);
+  // contract-dd: take the non-zero of stat vs the dev block's top_10_holder_rate (same info payload).
+  const nz = (v) => (optionalNum(v) > 0 ? optionalNum(v) : null);
+  const top10Raw = nz(stat.top_10_holder_rate) ?? nz(info.dev?.top_10_holder_rate) ?? stat.top_10_holder_rate;
+  const statUnpopulated = isStatUnpopulated(info.stat, info);
   if (statUnpopulated) {
     unknown.push("stat");
     reasons.push("stat block unpopulated (all risk metrics 0/absent)");
   } else {
-    const top10 = need("top_10_holder_rate", stat.top_10_holder_rate, { zeroIsUnknown: true });
-    if (top10 != null && top10 > g.maxTop10HolderRate) reasons.push(`top10 ${ratioPct(top10)}%`);
+    const top10 = need("top_10_holder_rate", top10Raw, { zeroIsUnknown: true });
+    if (top10 != null && g.maxTop10HolderRate != null && top10 > g.maxTop10HolderRate) reasons.push(`top10 ${ratioPct(top10)}%`);
     if (g.maxDevTeamHoldRate != null) {
       const v = need("dev_team_hold_rate", stat.dev_team_hold_rate);
       if (v != null && v > g.maxDevTeamHoldRate) reasons.push(`dev team ${ratioPct(v)}%`);
@@ -281,7 +288,7 @@ function analyzeTokenInfo(info = {}, g = config.gmgn) {
     priceVsAthPct,
     tradeFeeSol,
     totalFeeSol,
-    top10HolderPct: ratioPct(stat.top_10_holder_rate),
+    top10HolderPct: ratioPct(top10Raw),
     devTeamHoldPct: ratioPct(stat.dev_team_hold_rate),
     botDegenCount: num(stat.bot_degen_count),
     botDegenPct: ratioPct(stat.bot_degen_rate),
@@ -325,16 +332,25 @@ function analyzeHoldersAndTraders(holdersRaw = [], traders = [], g = config.gmgn
   // Row-count share (legacy metric, kept so the gate never loosens) and the real
   // thing: sniper-tagged share of TOTAL SUPPLY (amount_percentage is a 0-1 fraction).
   const sniperRowRate = holders.length > 0 ? sniperTopHolders.length / holders.length : 0;
-  const sniperSupplyShare = sniperTopHolders.reduce((sum, entry) => sum + (optionalNum(entry.amount_percentage) ?? 0), 0);
-  const sniperHoldRate = Math.max(sniperRowRate, sniperSupplyShare);
+  // No real row carrying amount_percentage => supply share is UNKNOWN (null), never 0.
+  const supplyShareKnown = holders.some((entry) => optionalNum(entry.amount_percentage) != null);
+  const sniperSupplyShare = supplyShareKnown
+    ? sniperTopHolders.reduce((sum, entry) => sum + (optionalNum(entry.amount_percentage) ?? 0), 0)
+    : null;
+  const sniperHoldRate = Math.max(sniperRowRate, sniperSupplyShare ?? 0);
 
   const reasons = [];
+  // A non-empty list whose rows are all DEX/burn leaves nothing to judge: unknown, not a 0/0 pass.
+  const noRealHolders = holders.length === 0;
+  if (noRealHolders) reasons.push("no real holder rows after excluding DEX/burn (fail closed)");
   if (sniperRowRate > g.maxSniperHoldRate) reasons.push(`sniper top-holder row rate ${(sniperRowRate * 100).toFixed(1)}%`);
-  if (sniperSupplyShare > g.maxSniperHoldRate) reasons.push(`sniper supply share ${(sniperSupplyShare * 100).toFixed(1)}%`);
+  if (sniperSupplyShare != null && sniperSupplyShare > g.maxSniperHoldRate) reasons.push(`sniper supply share ${(sniperSupplyShare * 100).toFixed(1)}%`);
 
   return {
     passed: reasons.length === 0,
     reasons,
+    noRealHolders,
+    supplyShareKnown,
     kolHolding,
     kolHolderNames: kolHolders.map((entry) => entryName(entry)).filter(Boolean).slice(0, 12),
     kolProfitNames: kolTraders
@@ -470,10 +486,10 @@ function checkBounceSetup(priceRes, g = config.gmgn) {
   if (rules.requireBullishSupertrend !== false && !isBullish) {
     reasons.push(`no bounce support: ${dir} supertrend`);
   }
-  // bb_lower used to be undefined, so this rule never fired. It is now computable,
-  // but stays LOG-ONLY (signal.alreadyAtBottom) unless explicitly set to true: no
-  // new hard gate from untagged data.
-  if (rules.rejectAlreadyAtBottom === true && alreadyAtBottom) {
+  // bb_lower used to be undefined, so rejectAlreadyAtBottom never fired (even when a user set it
+  // true). To preserve that effective behavior, the LEGACY key stays log-only forever; enforcement
+  // needs the new explicit opt-in `enforceAlreadyAtBottom` (config.js warns once on legacy true).
+  if (rules.enforceAlreadyAtBottom === true && alreadyAtBottom) {
     reasons.push(`already at bottom: RSI ${rsi.toFixed(1)}, price below lower BB — dump done`);
   }
   if (rules.requireAboveSupertrend && !priceAboveSupertrend) {
@@ -633,6 +649,7 @@ function defaultDeps(cfg = config) {
     fetchInfo: fetchGmgnTokenInfoResult,
     fetchSecurity: fetchGmgnSecurityResult,
     fetchPrice: fetchGmgnPriceInfoResult,
+    fetchHolders: fetchGmgnHoldersResult,
     fetchPools: fetchTopMeteoraDlmmPoolsForMint,
     fetchPoolDetail: fetchPoolDetailDirect,
   };
@@ -761,10 +778,7 @@ export async function discoverGmgnPools({ limit = 10, deps = {} } = {}) {
       deferRest(5, finalists.slice(i), "GMGN rate limited (retry next cycle)");
       break;
     }
-    const hRes = await d.call([
-      "token", "holders", "--chain", CHAIN, "--address", mint,
-      "--limit", String(g.holdersLimit || 100), "--order-by", "amount_percentage", "--direction", "desc",
-    ]);
+    const hRes = await d.fetchHolders(mint, g.holdersLimit || 100);
     if (hRes.status === GMGN_STATUS.RATE_LIMITED) {
       rateLimited = true;
       deferRest(5, finalists.slice(i), "GMGN rate limited (retry next cycle)");
@@ -787,7 +801,7 @@ export async function discoverGmgnPools({ limit = 10, deps = {} } = {}) {
     // Traders only feed soft signals (smart/KOL activity); missing => empty, flagged.
     const traders = tRes.status === GMGN_STATUS.OK ? unwrap(tRes.data, "list") : [];
     const holdersCheck = analyzeHoldersAndTraders(holders, traders, g);
-    if (!holdersCheck.passed) { note(5, token, holdersCheck.reasons.join(", ")); continue; }
+    if (!holdersCheck.passed) { note(5, token, holdersCheck.reasons.join(", "), holdersCheck.noRealHolders ? "unknown" : undefined); continue; }
     const infoRisk = summarizeInfoRisk(entry.info);
     const security = sec.status === GMGN_STATUS.OK ? summarizeSecurity(sec.security) : null;
     const riskFields = riskSnapshotFields({ infoRisk, security, securityStatus: sec.status === GMGN_STATUS.OK ? "ok" : sec.status });
@@ -844,85 +858,129 @@ export async function discoverGmgnPools({ limit = 10, deps = {} } = {}) {
 
 /* ====================== Meteora-source safety gates ====================== */
 
-/** True when the GMGN safety gates should run on Meteora-source candidates. */
+/** True when the GMGN safety checks should run on Meteora-source candidates (mode !== "off" and a key exists). */
 export function gmgnGatesAvailable(cfg = config) {
-  if (gmgnSetting(cfg, "gateMeteoraSource") === false) return false;
+  if (meteoraGateMode(cfg) === "off") return false;
   return !!(cfg.gmgn?.apiKey || process.env.GMGN_API_KEY);
 }
 
 /**
- * Run the SAME GMGN safety gates the GMGN path applies (token-info concentration
- * / fee / stat-population gates, then the sniper supply-share holders gate) on
- * candidates that did NOT come from the GMGN pipeline (the default Meteora source,
- * and Meteora-only rows in "both"). Fail closed: unknown data drops the candidate
- * for this cycle; a rate limit defers the rest (kind "deferred"), it never passes.
- * Token info is the shared cached fetch, so the later per-candidate enrichment
- * (index.js) reuses it with no extra spawn. Security (log-only) + holders (weight 5)
- * run only until `limit` candidates have been verified.
+ * Run the GMGN safety checks on candidates that did NOT come from the GMGN pipeline (the default
+ * Meteora source, and Meteora-only rows in "both"), using the SEPARATE `meteoraGateThresholds`
+ * (never the trending-pipeline values).
  *
- * Skipped entirely (candidates pass untouched) when no GMGN key is configured or
- * gmgn.gateMeteoraSource is false; there is nothing to fail closed against.
+ * Modes (gmgn.gateMeteoraSource):
+ *   "shadow" (default)  evaluate everything but NEVER drop: each candidate gets
+ *                       gmgn_gate_would_drop (bool) + gmgn_gate_would_drop_reasons[] + _kind, recorded in
+ *                       the signal snapshot so would-drop can be compared with realized outcomes per
+ *                       origin before any hard gate exists.
+ *   "hard"              unknown data drops the candidate for this cycle (fail closed); a rate limit
+ *                       defers the rest (kind "deferred"), never passes.
+ *   "off"               skipped.
+ * Outage detector: gmgn-cli missing / bad key, or >= outageMinCandidates candidates whose token info
+ * failed at the transport level (status error/empty) with none healthy => one notification per outage
+ * (tools/gmgn-outage.js) and `outage: true` on the result. In hard mode the cycle still fails closed.
+ * Skipped entirely (candidates pass untouched) when no GMGN key is configured or mode is "off".
  */
 export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {} } = {}) {
   const d = { ...defaultDeps(deps.cfg || config), ...deps };
-  const dropped = [];
   const input = Array.isArray(pools) ? pools : [];
-  if (!deps.force && !gmgnGatesAvailable(d.cfg)) return { kept: input, dropped, rate_limited: false, skipped: true };
+  if (!deps.force && !gmgnGatesAvailable(d.cfg)) return { kept: input, dropped: [], would_drop: [], rate_limited: false, skipped: true, mode: "off", outage: false };
 
-  const g = d.cfg.gmgn;
+  const mode = deps.mode || meteoraGateMode(d.cfg);
+  const shadow = mode === "shadow";
+  const g = meteoraGateThresholds(d.cfg);
+  const dropped = [];
+  const wouldDrop = [];
   const label = (p) => p.base?.symbol || p.name || p.pool;
-  const drop = (p, reason, kind) => {
-    dropped.push({ pool: p.pool, symbol: label(p), source: "meteora", reason, kind });
-    log("gmgn_gate", `dropped ${label(p)} (${(p.pool || "").slice(0, 8)}) [${kind}]: ${reason}`);
-  };
   const out = [];
   const pending = [];
   let rateLimited = false;
+  let healthyInfo = 0;
+  let transportFailures = 0;
+  let evaluated = 0;
+  let preGated = 0;
+
+  // Hard mode drops; shadow mode keeps the candidate and records what hard mode would have done.
+  const reject = (p, reason, kind, extra = {}) => {
+    const entry = { pool: p.pool, symbol: label(p), source: "meteora", reason, kind };
+    if (shadow) {
+      wouldDrop.push(entry);
+      out.push({ ...p, gmgn_gate_would_drop: true, gmgn_gate_would_drop_reasons: String(reason).split(", "), gmgn_gate_would_drop_kind: kind, ...extra });
+      log("gmgn_gate", `SHADOW would drop ${label(p)} (${(p.pool || "").slice(0, 8)}) [${kind}]: ${reason}`);
+    } else {
+      dropped.push(entry);
+      log("gmgn_gate", `dropped ${label(p)} (${(p.pool || "").slice(0, 8)}) [${kind}]: ${reason}`);
+    }
+  };
 
   // Phase A: token-info gates for everything not already gated by the GMGN pipeline.
   for (let i = 0; i < input.length; i++) {
     const p = input[i];
-    if (p.gmgn || p.gmgn_gated) { out.push(p); continue; }
+    if (p.gmgn || p.gmgn_gated) { out.push(p); preGated += 1; continue; }
     const mint = p.base?.mint;
-    if (!mint) { drop(p, "no base mint to check (fail closed)", "unknown"); continue; }
+    if (!mint) { reject(p, "no base mint to check (fail closed)", "unknown"); continue; }
+    evaluated += 1;
     const infoRes = await d.fetchInfo(mint);
     if (infoRes.status === GMGN_STATUS.RATE_LIMITED) {
       rateLimited = true;
-      for (const rest of input.slice(i)) if (!(rest.gmgn || rest.gmgn_gated)) drop(rest, "GMGN rate limited (retry next cycle)", "deferred");
+      for (const rest of input.slice(i)) if (!(rest.gmgn || rest.gmgn_gated)) reject(rest, "GMGN rate limited (retry next cycle)", "deferred");
       break;
     }
-    if (!infoRes.info) { drop(p, `token info unavailable (${infoRes.status}) (fail closed)`, "unknown"); continue; }
+    if (!infoRes.info) {
+      if (infoRes.status === GMGN_STATUS.ERROR || infoRes.status === GMGN_STATUS.EMPTY) transportFailures += 1;
+      reject(p, `token info unavailable (${infoRes.status}) (fail closed)`, "unknown");
+      continue;
+    }
+    healthyInfo += 1;
     const check = analyzeTokenInfo(infoRes.info, g);
-    if (!check.passed) { drop(p, check.reasons.join(", "), check.unknown.length ? "unknown" : "reject"); continue; }
+    if (!check.passed) { reject(p, check.reasons.join(", "), check.unknown.length ? "unknown" : "reject"); continue; }
     pending.push({ p, info: infoRes.info, check });
   }
 
+  // Outage detection (cycle-wide): never a per-candidate event.
+  const minN = Math.max(1, Number(gmgnSetting(d.cfg, "outageMinCandidates")) || 3);
+  const transport = getGmgnTransportState();
+  let outage = false;
+  let outageReason = null;
+  if (transport.binaryMissing) outageReason = "gmgn-cli is missing (ENOENT)";
+  else if (transport.authFailed) outageReason = "GMGN rejected the API key (401)";
+  else if (evaluated >= minN && healthyInfo === 0 && transportFailures >= minN && transportFailures === evaluated) {
+    outageReason = `${transportFailures}/${evaluated} token-info lookups failed with no data (gmgn-cli broken or unreachable)`;
+  }
+  if (outageReason && !rateLimited) {
+    outage = true;
+    reportGmgnOutage(`${outageReason}; Meteora-source GMGN gate is ${shadow ? "in shadow mode (candidates kept, would-drop recorded)" : "failing closed: no Meteora candidates will pass"}`, { detail: { mode } });
+  } else if (healthyInfo > 0) {
+    clearGmgnOutage();
+  }
+
   // Phase B: security (log-only) + holders sniper gate, until `limit` are verified.
-  const need = Math.max(1, limit - out.length);
+  const need = Math.max(1, limit - preGated);
   let verified = 0;
   for (let i = 0; i < pending.length; i++) {
     const { p, info, check } = pending[i];
     if (rateLimited || verified >= need) {
-      drop(p, rateLimited ? "GMGN rate limited (retry next cycle)" : "not needed this cycle (limit reached)", "deferred");
+      reject(p, rateLimited ? "GMGN rate limited (retry next cycle)" : "not needed this cycle (limit reached)", "deferred");
       continue;
     }
     const mint = p.base.mint;
     const sec = await d.fetchSecurity(mint);
-    let hRes = sec.status === GMGN_STATUS.RATE_LIMITED
+    const hRes = sec.status === GMGN_STATUS.RATE_LIMITED
       ? { status: GMGN_STATUS.RATE_LIMITED }
-      : await d.call([
-          "token", "holders", "--chain", CHAIN, "--address", mint,
-          "--limit", String(g.holdersLimit || 100), "--order-by", "amount_percentage", "--direction", "desc",
-        ]);
+      : await d.fetchHolders(mint, g.holdersLimit || 100);
     if (hRes.status === GMGN_STATUS.RATE_LIMITED) {
       rateLimited = true;
-      drop(p, "GMGN rate limited (retry next cycle)", "deferred");
+      reject(p, "GMGN rate limited (retry next cycle)", "deferred");
       continue;
     }
     const holders = hRes.status === GMGN_STATUS.OK ? unwrap(hRes.data, "list") : [];
-    if (!holders.length) { drop(p, `holders unavailable (${hRes.status === GMGN_STATUS.OK ? "empty list" : hRes.status}) (fail closed)`, "unknown"); continue; }
+    if (!holders.length) { reject(p, `holders unavailable (${hRes.status === GMGN_STATUS.OK ? "empty list" : hRes.status}) (fail closed)`, "unknown"); continue; }
     const hCheck = analyzeHoldersAndTraders(holders, [], g);
-    if (!hCheck.passed) { drop(p, hCheck.reasons.join(", "), "reject"); continue; }
+    if (hCheck.noRealHolders) { reject(p, hCheck.reasons.join(", "), "unknown"); continue; }
+    // On this path the supply share is the ONLY holder gate: absent amount_percentage is unknown.
+    if (!hCheck.supplyShareKnown) { reject(p, "holder amount_percentage missing: sniper supply share unknown (fail closed)", "unknown"); continue; }
+    if (!hCheck.passed) { reject(p, hCheck.reasons.join(", "), "reject"); continue; }
     verified += 1;
     const infoRisk = summarizeInfoRisk(info);
     const security = sec.status === GMGN_STATUS.OK ? summarizeSecurity(sec.security) : null;
@@ -931,6 +989,7 @@ export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {}
     out.push({
       ...p,
       gmgn_gated: true,
+      ...(shadow ? { gmgn_gate_would_drop: false, gmgn_gate_would_drop_reasons: [], gmgn_gate_would_drop_kind: null } : {}),
       gmgn_total_fee_sol: num(check.totalFeeSol),
       gmgn_token_info_top10_pct: check.top10HolderPct,
       gmgn_dev_team_hold_pct: check.devTeamHoldPct,
@@ -942,8 +1001,8 @@ export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {}
       ...riskFields,
     });
   }
-  log("gmgn_gate", `Meteora-source safety gates: ${input.length} in → ${out.length} kept, ${dropped.length} dropped${rateLimited ? " (GMGN rate limited)" : ""}`);
-  return { kept: out, dropped, rate_limited: rateLimited, skipped: false };
+  log("gmgn_gate", `Meteora-source GMGN gate [${mode}]: ${input.length} in → ${out.length} kept, ${dropped.length} dropped, ${wouldDrop.length} would-drop${rateLimited ? " (GMGN rate limited)" : ""}${outage ? " (OUTAGE)" : ""}`);
+  return { kept: out, dropped, would_drop: wouldDrop, rate_limited: rateLimited, skipped: false, mode, outage };
 }
 
 /** Human-readable one-shot summary of a GMGN candidate (verbatim port). */

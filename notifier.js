@@ -15,6 +15,8 @@ const emitter = new EventEmitter();
 //   deploy_partial   — wide-range deploy failed partway; position kept open
 //   briefing         — morning briefing HTML
 //   status           — busy state changes
+//   gmgn_outage      — GMGN transport outage (once per outage; tools/gmgn-outage.js)
+//   fee_data_down    — every screening candidate skipped: global_fees fetch failed
 //   llm_unavailable  — LLM provider + fallback both failed (deduped in llm-health.js)
 
 export function emit(event, data) {

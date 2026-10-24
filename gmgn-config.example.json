@@ -29,7 +29,8 @@
 
   "plan": "free",
   "finalistLimit": 5,
-  "gateMeteoraSource": true,
+  "gateMeteoraSource": "shadow",
+  "meteoraGate": { "minHolders": 200, "minTotalFeeSol": null, "maxTop10HolderRate": 0.6 },
   "maxRugRatio": 0.3,
   "maxSniperCount": 20,
 
@@ -43,7 +44,8 @@
   "indicatorFilter": true,
   "indicatorRules": {
     "requireBullishSupertrend": true,
-    "rejectAlreadyAtBottom": true,
+    "rejectAlreadyAtBottom": false,
+    "enforceAlreadyAtBottom": false,
     "requireAboveSupertrend": false,
     "minRsi": null,
     "maxRsi": null,
