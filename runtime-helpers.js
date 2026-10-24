@@ -220,3 +220,29 @@ export function fitDeployAmount({ freeSol, reserve, amount, totalBins }) {
   if (Number(amount) <= fitted + 1e-9) return { amount: Number(amount), shrunk: false, overhead, available };
   return { amount: fitted, shrunk: true, overhead, available };
 }
+
+/**
+ * Why is a candidate's global_fees_sol unknown? "fetch_failed" = the holders/fees request threw
+ * (datapi/Jupiter down, 429, 5xx); "not_indexed" = it answered but had no fee figure for this token.
+ * Returns null when the fee is known.
+ */
+export function classifyGlobalFeesUnknown({ holdersSettled, holdResult } = {}) {
+  if (holdResult?.global_fees_sol != null) return null;
+  if (!holdersSettled || holdersSettled.status === "rejected" || holdResult == null) return "fetch_failed";
+  return "not_indexed";
+}
+
+/**
+ * Fail-closed fee hard skip (unknown fees are NOT a pass). Pure so it is testable.
+ * `c._globalFeesSol` null => skip; below minimum => skip.
+ */
+export function globalFeesHardSkipReason(c, minTokenFeesSol) {
+  if (c?._globalFeesSol == null) return `global_fees unknown (${c?._feesUnknownReason ?? "unknown"}) (fail closed)`;
+  if (c._globalFeesSol < minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${minTokenFeesSol}`;
+  return null;
+}
+
+/** True when EVERY candidate was skipped because its fee fetch failed (a data outage, not a verdict on tokens). */
+export function allSkippedForFeeFetchFailure(candidates = []) {
+  return candidates.length > 0 && candidates.every((c) => c?._globalFeesSol == null && c?._feesUnknownReason === "fetch_failed");
+}
