@@ -55,3 +55,4 @@ signal-weights.json
 # Crash-safety artifacts: corrupt-file backups and atomic-write temp files
 *.corrupt-*
 .*.tmp
+config-state.json
