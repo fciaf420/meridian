@@ -67,7 +67,7 @@ test("lock: release never removes someone else's lock", () => {
 test("isLiveInstance: a recycled pid running something else is stale; unreadable command fails closed", () => {
   const exists = () => true;
   assert.equal(isLiveInstance(10, { exists, command: () => "/usr/bin/some-other-daemon" }), false);
-  assert.equal(isLiveInstance(10, { exists, command: () => "node /opt/meridian/index.js" }), true);
+  assert.equal(isLiveInstance(10, { exists, entry: "/opt/meridian/index.js", command: () => "node /opt/meridian/index.js" }), true);
   assert.equal(isLiveInstance(10, { exists, command: () => null }), true);
   assert.equal(isLiveInstance(10, { exists: () => false, command: () => "node index.js" }), false);
 });
@@ -294,11 +294,73 @@ test("checkpoint: begin -> submitting blocks the pool and mint until resolved", 
   assert.equal(cp.findBlockingAttempt({ pool: "POOL1" }), null);
 });
 
-test("checkpoint: unreadable file fails closed for the eligibility lookup", () => {
+test("checkpoint: corrupt JSON self-heals to .corrupt-<ts>, alerts, and continues empty (finding 4)", () => {
   const f = process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE;
-  fs.writeFileSync(f, "{ not json");
+  const alerts = [];
+  cp.setCorruptionHandler((a) => alerts.push(a));
+  for (const bad of ["{ not json", JSON.stringify({ nope: 1 }), "[]"]) {
+    fs.writeFileSync(f, bad);
+    assert.equal(cp.findBlockingAttempt({ pool: "X" }), null, "does not refuse every deploy");
+    assert.ok(fs.readdirSync(path.dirname(f)).some((n) => n.startsWith("deploy-attempts.json.corrupt-")), "backup kept");
+    assert.doesNotThrow(() => cp.markAttempt(cp.beginAttempt({ pool: "X", position: "Y" }), "entered"));
+    fs.rmSync(f, { force: true });
+  }
+  assert.equal(alerts.length, 3);
+  assert.match(alerts[0].backup, /\.corrupt-\d+$/);
+  cp.setCorruptionHandler(null);
+});
+
+test("checkpoint: real I/O errors (not corruption) still fail closed", () => {
+  const f = process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE;
+  fs.rmSync(f, { force: true });
+  fs.mkdirSync(f); // reading a directory -> EISDIR, not a parse error
   assert.equal(cp.findBlockingAttempt({ pool: "X" }).status, "unreadable");
   assert.throws(() => cp.beginAttempt({ pool: "X", position: "Y" }), /unreadable/);
+  fs.rmdirSync(f);
+});
+
+test("checkpoint: clearAttempt resolves only unresolved attempts; periodic re-reconcile resolves an earlier 'uncertain' (finding 3)", async () => {
+  const id = cp.beginAttempt({ pool: "PC", mint: "MC", position: "POS_CLEAR_001" });
+  cp.markAttempt(id, "uncertain", { error: "rpc" });
+  // first pass: chain unreadable -> stays blocking; a later pass (next management tick) resolves it
+  await cp.reconcileAttempts({ positionExists: async () => null, log: () => {} });
+  assert.equal(cp.findBlockingAttempt({ pool: "PC" }).id, id);
+  await cp.reconcileAttempts({ positionExists: async () => false, log: () => {} });
+  assert.equal(cp.findBlockingAttempt({ pool: "PC" }), null);
+  const id2 = cp.beginAttempt({ pool: "PC2", mint: "MC2", position: "POS_CLEAR_002" });
+  assert.equal(cp.clearAttempt("nope"), null);
+  assert.equal(cp.clearAttempt(id2).status, "cleared_manual");
+  assert.equal(cp.findBlockingAttempt({ pool: "PC2" }), null);
+  assert.equal(cp.clearAttempt(id2), null, "already resolved");
+});
+
+test("index.js wires periodic reconcile into the management tick and a /reconcile command", () => {
+  const src = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  const tick = src.indexOf("const mgmtTask = cron.schedule");
+  const call = src.indexOf('reconcileDeployAttemptsNow({ source: "periodic" })');
+  const earlyReturn = src.indexOf("Management skipped — no open positions");
+  assert.ok(tick > 0 && call > tick && call < earlyReturn, "runs before the no-positions early return");
+  assert.ok(src.includes('text === "/reconcile"') && src.includes('input === "/reconcile"'));
+  assert.ok(src.includes("setCorruptionHandler"));
+});
+
+// ─── instance lock identity (finding 6) ───────────────────────────
+test("entryMatches: own entry script only; relative argv resolved via the process cwd", () => {
+  const entry = "/opt/meridian/index.js";
+  const m = (cmd, cwd) => isLiveInstance(10, { exists: () => true, entry, command: () => cmd, cwdOf: () => cwd });
+  assert.equal(m("node /opt/meridian/index.js", null), true, "absolute path");
+  assert.equal(m("node index.js", "/opt/meridian"), true, "relative, same cwd (how it is usually started)");
+  assert.equal(m("node index.js", "/Users/dev/other-app"), false, "someone else's index.js");
+  assert.equal(m("node /Users/dev/other-app/index.js", null), false);
+  assert.equal(m("node index.js", null), true, "relative and cwd unreadable: fail closed");
+  assert.equal(m("/usr/bin/vim notes.txt", null), false);
+  assert.equal(isLiveInstance(10, { exists: () => true, entry: null, command: () => "node whatever/index.js" }), true, "no argv[1]: legacy index.js match");
+});
+
+test("lock refusal explains the unverifiable case (EPERM sandboxes)", () => {
+  const f = path.join(tmp, "unverifiable.pid");
+  fs.writeFileSync(f, "4242\n");
+  assert.throws(() => acquireInstanceLock(f, { pid: 1, isLive: () => true, command: () => null }), /MERIDIAN_SKIP_INSTANCE_LOCK=1/);
   fs.rmSync(f);
 });
 

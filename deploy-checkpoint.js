@@ -19,7 +19,12 @@
  *   failed                errored; chain confirms the position account does not exist
  *   landed_unconfirmed    errored but the position account EXISTS on-chain (needs management/adoption)
  *   reconciled_landed     boot: position account exists on-chain
- *   reconciled_absent     boot: no position account; nothing was created
+ *   reconciled_absent     boot/periodic: no position account; nothing was created
+ *   cleared_manual        operator cleared it after checking the chain themselves
+ *
+ * A corrupt (unparsable) file is moved aside to deploy-attempts.json.corrupt-<ts>
+ * and the checkpoint continues empty, like state.js; an I/O error (EACCES, EIO,
+ * EISDIR...) still fails closed. See setCorruptionHandler().
  */
 
 import fs from "fs";
@@ -34,15 +39,37 @@ function filePath() {
   return process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE || path.resolve("deploy-attempts.json");
 }
 
+let onCorrupt = null;
+/** fn({ file, backup, error }) is called (sync, best-effort) when a corrupt file was moved aside. */
+export function setCorruptionHandler(fn) { onCorrupt = typeof fn === "function" ? fn : null; }
+
+function healCorrupt(file, why) {
+  const backup = `${file}.corrupt-${Date.now()}`;
+  try { fs.renameSync(file, backup); } catch (e) {
+    // Cannot even move it aside: stay fail-closed rather than overwrite evidence.
+    throw new Error(`deploy-attempts file corrupt (${why}) and could not be moved aside: ${e.message}`, { cause: e });
+  }
+  defaultLog("deploy_warn", `deploy-attempts.json was corrupt (${why}); moved to ${path.basename(backup)} and continuing with an empty checkpoint. Any in-flight deploy recorded there is NOT tracked: check your wallet positions.`);
+  try { onCorrupt?.({ file, backup, error: why }); } catch { /* alert is best-effort */ }
+  return { attempts: {} };
+}
+
 function load() {
+  const file = filePath();
+  let text;
   try {
-    const raw = JSON.parse(fs.readFileSync(filePath(), "utf8"));
-    return raw && typeof raw === "object" && raw.attempts ? raw : { attempts: {} };
+    text = fs.readFileSync(file, "utf8");
   } catch (e) {
     if (e.code === "ENOENT") return { attempts: {} };
-    // Unreadable file: do not pretend there is no history.
+    // Unreadable file (permissions, I/O): do not pretend there is no history.
     throw new Error(`deploy-attempts file unreadable: ${e.message}`, { cause: e });
   }
+  let raw;
+  try { raw = JSON.parse(text); } catch (e) { return healCorrupt(file, e.message); }
+  if (!raw || typeof raw !== "object" || !raw.attempts || typeof raw.attempts !== "object" || Array.isArray(raw.attempts)) {
+    return healCorrupt(file, "unexpected structure");
+  }
+  return raw;
 }
 
 function save(db) {
@@ -75,6 +102,19 @@ export function markAttempt(id, status, extra = {}) {
   } catch (e) {
     defaultLog("deploy_warn", `Could not update deploy attempt ${id}: ${e.message}`);
   }
+}
+
+/**
+ * Operator override: mark an unresolved attempt resolved after checking the chain
+ * themselves. Returns the attempt or null when the id is not an unresolved one.
+ */
+export function clearAttempt(id, note = "cleared by operator") {
+  const db = load();
+  const a = db.attempts[id];
+  if (!a || !UNRESOLVED.has(a.status)) return null;
+  Object.assign(a, { status: "cleared_manual", note, updatedAt: new Date().toISOString() });
+  save(db);
+  return a;
 }
 
 export function getUnresolvedAttempts() {

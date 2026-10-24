@@ -47,6 +47,7 @@ export const BOT_COMMANDS = [
   { command: "autoresearch", description: "Prompt overrides: status, list, approve, reject" },
   { command: "thresholds", description: "Screening thresholds + performance" },
   { command: "briefing", description: "Latest daily briefing (/briefing now = fresh)" },
+  { command: "reconcile", description: "Re-check unresolved deploy attempts on-chain" },
   { command: "help", description: "All commands" },
 ];
 
@@ -515,6 +516,8 @@ export function renderStatus(info, now = Date.now()) {
     `Screening: every ${info.screeningIntervalMin}m · ${info.paused ? "<b>⏸ PAUSED</b>" : info.screeningBusy ? "running" : `next in ${escapeHtml(info.nextScreening ?? "?")}`}`,
     `PnL watcher: every ${info.pnlWatcherIntervalSec ?? "?"}s (runs while paused)`,
     `Autonomous cycles: ${info.cronStarted ? "running" : "not started"}${info.busy ? " · ⏳ action in progress" : ""}`,
+    ...(info.deployRefusals ? [`Deploy refusals since boot: ${info.deployRefusals.total}${info.deployRefusals.total ? ` (${Object.entries(info.deployRefusals).filter(([k, v]) => k !== "total" && k !== "last" && v > 0).map(([k, v]) => `${k} ${v}`).join(", ")})` : ""}`] : []),
+    ...(info.unresolvedDeploys > 0 ? [`⚠️ ${info.unresolvedDeploys} unresolved deploy attempt(s) blocking re-entry: /reconcile`] : []),
     ...(info.rpcHosts ? [`RPC: <code>${escapeHtml(info.rpcHosts)}</code> (resolved at boot)`] : []),
   ];
   for (const [label, c] of [["management", info.lastManagement], ["screening", info.lastScreening]]) {

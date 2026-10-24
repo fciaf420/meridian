@@ -18,7 +18,16 @@ import fs from "fs";
 import path from "path";
 import { execFileSync } from "child_process";
 
-/** True if a process with this pid exists (signal 0 delivers nothing). EPERM = exists. */
+
+/**
+ * True if a process with this pid exists (signal 0 delivers nothing).
+ * EPERM means the process EXISTS but belongs to another user, so it counts as
+ * existing. Caveat: in sandboxes/containers where kill(pid, 0) returns EPERM for
+ * EVERY pid, this reports "exists" for any stale pidfile; isLiveInstance() then
+ * falls back to the command-line check, and if `ps` is also unavailable it fails
+ * closed (refuses to start). That is deliberate; set MERIDIAN_SKIP_INSTANCE_LOCK=1
+ * in such environments (see index.js).
+ */
 export function pidExists(pid, kill = process.kill.bind(process)) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -38,16 +47,51 @@ export function readCommand(pid) {
   }
 }
 
+/** Working directory of a pid (macOS/Linux via lsof), or null. */
+export function readCwd(pid) {
+  try {
+    const out = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { encoding: "utf8", timeout: 2000 });
+    const line = out.split("\n").find((l) => l.startsWith("n"));
+    return line ? line.slice(1) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does `cmd` (a `ps` command line) run THIS app's entry script (`entry`, an
+ * absolute path, normally process.argv[1])? `ps` shows the argv as typed, so
+ * `node index.js` is relative: resolve it against that process's cwd (`cwdOf`).
+ * If a relative script cannot be resolved (no cwd), accept it when the basename
+ * matches (fail closed). Absent entry -> legacy /index\.js/ match.
+ */
+export function entryMatches(cmd, pid, { entry = process.argv[1], cwdOf = readCwd } = {}) {
+  if (!entry) return /index\.js/.test(cmd);
+  const abs = path.resolve(entry);
+  const base = path.basename(abs);
+  const tokens = cmd.split(/\s+/).filter((t) => t.endsWith(base));
+  for (const t of tokens) {
+    if (path.isAbsolute(t)) { if (path.resolve(t) === abs) return true; continue; }
+    const cwd = cwdOf(pid);
+    if (cwd == null) return true; // cannot verify the relative path: assume it is us
+    if (path.resolve(cwd, t) === abs) return true;
+  }
+  return false;
+}
+
 /**
  * Is `pid` a live Meridian bot? The pid must exist AND, when its command line is
- * readable, look like this app (node ... index.js). An unreadable command line
- * falls back to "alive" (fail closed: refuse to start rather than double-run).
+ * readable, run this app's own entry script (derived from process.argv[1], so an
+ * unrelated `node .../index.js` after a pid recycle does not look like us). An
+ * unreadable command line falls back to "alive" (fail closed: refuse to start
+ * rather than double-run). `marker` (RegExp) overrides the identity test.
  */
-export function isLiveInstance(pid, { exists = pidExists, command = readCommand, marker = /index\.js/ } = {}) {
+export function isLiveInstance(pid, { exists = pidExists, command = readCommand, marker = null, entry = process.argv[1], cwdOf = readCwd } = {}) {
   if (!exists(pid)) return false;
   const cmd = command(pid);
   if (cmd == null) return true;
-  return marker.test(cmd);
+  if (marker) return marker.test(cmd);
+  return entryMatches(cmd, pid, { entry, cwdOf });
 }
 
 /**
@@ -58,6 +102,7 @@ export function isLiveInstance(pid, { exists = pidExists, command = readCommand,
 export function acquireInstanceLock(file, {
   pid = process.pid,
   isLive = isLiveInstance,
+  command = readCommand,
   log = () => {},
 } = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -73,7 +118,10 @@ export function acquireInstanceLock(file, {
     let other = NaN;
     try { other = Number(fs.readFileSync(file, "utf8").trim()); } catch { /* vanished: retry */ }
     if (Number.isInteger(other) && other > 0 && other !== pid && isLive(other)) {
-      const err = new Error(`Another Meridian instance is running (pid ${other}, ${file}). Refusing to start a second bot on the same wallet.`);
+      const hint = command(other) == null
+        ? " (could not read its command line, so it is assumed to be Meridian; if this is a sandbox or container where the pid probe is unreliable, set MERIDIAN_SKIP_INSTANCE_LOCK=1)"
+        : "";
+      const err = new Error(`Another Meridian instance is running (pid ${other}, ${file}). Refusing to start a second bot on the same wallet.${hint}`);
       err.code = "INSTANCE_LOCKED";
       err.pid = other;
       throw err;
