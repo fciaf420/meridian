@@ -1,0 +1,326 @@
+// Deploy-path safety ports from yunus-0x/meridian: instance lock, crash
+// checkpoint, deploy-time threshold re-check, volatility refusal, pre-submit
+// gate, deposit slippage, RPC host masking.
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-deploy-safety-"));
+process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE = path.join(tmp, "deploy-attempts.json");
+
+const { acquireInstanceLock, releaseInstanceLock, isLiveInstance, pidExists } = await import("../instance-lock.js");
+const { maskRpcUrl, activeRpcHosts, formatRpcHosts } = await import("../rpc-hosts.js");
+const g = await import("../deploy-guards.js");
+const cp = await import("../deploy-checkpoint.js");
+const { config } = await import("../config.js");
+const ex = await import("../tools/executor.js");
+
+// ─── instance lock ────────────────────────────────────────────────
+test("lock: first acquire writes the pid in the legacy file format", () => {
+  const f = path.join(tmp, "a", "bot.pid");
+  const lock = acquireInstanceLock(f, { pid: 4242, isLive: () => false });
+  assert.equal(fs.readFileSync(f, "utf8"), "4242\n");
+  assert.equal(lock.reclaimedStale, false);
+  lock.release();
+  assert.equal(fs.existsSync(f), false);
+});
+
+test("lock: refuses while another live instance holds it", () => {
+  const f = path.join(tmp, "b.pid");
+  fs.writeFileSync(f, "1111\n");
+  assert.throws(() => acquireInstanceLock(f, { pid: 2222, isLive: (p) => p === 1111 }),
+    (e) => e.code === "INSTANCE_LOCKED" && e.pid === 1111);
+  assert.equal(fs.readFileSync(f, "utf8"), "1111\n", "the holder's file is untouched");
+});
+
+test("lock: a stale pidfile is reclaimed (crash / reboot)", () => {
+  const f = path.join(tmp, "c.pid");
+  fs.writeFileSync(f, "1111\n");
+  const lock = acquireInstanceLock(f, { pid: 2222, isLive: () => false });
+  assert.equal(lock.reclaimedStale, true);
+  assert.equal(fs.readFileSync(f, "utf8"), "2222\n");
+});
+
+test("lock: garbage or empty pidfile counts as stale", () => {
+  const f = path.join(tmp, "d.pid");
+  fs.writeFileSync(f, "not-a-pid");
+  assert.equal(acquireInstanceLock(f, { pid: 7, isLive: () => true }).reclaimedStale, true);
+});
+
+test("lock: our own pid in the file is not 'another instance'", () => {
+  const f = path.join(tmp, "e.pid");
+  fs.writeFileSync(f, "99\n");
+  assert.equal(acquireInstanceLock(f, { pid: 99, isLive: () => true }).reclaimedStale, true);
+});
+
+test("lock: release never removes someone else's lock", () => {
+  const f = path.join(tmp, "f.pid");
+  fs.writeFileSync(f, "5\n");
+  releaseInstanceLock(f, { pid: 6 });
+  assert.equal(fs.existsSync(f), true);
+  releaseInstanceLock(f, { pid: 5 });
+  assert.equal(fs.existsSync(f), false);
+});
+
+test("isLiveInstance: a recycled pid running something else is stale; unreadable command fails closed", () => {
+  const exists = () => true;
+  assert.equal(isLiveInstance(10, { exists, command: () => "/usr/bin/some-other-daemon" }), false);
+  assert.equal(isLiveInstance(10, { exists, command: () => "node /opt/meridian/index.js" }), true);
+  assert.equal(isLiveInstance(10, { exists, command: () => null }), true);
+  assert.equal(isLiveInstance(10, { exists: () => false, command: () => "node index.js" }), false);
+});
+
+test("pidExists: signal-0 probe; EPERM means it exists; bad pids don't", () => {
+  assert.equal(pidExists(process.pid), true);
+  assert.equal(pidExists(0), false);
+  assert.equal(pidExists(-3), false);
+  assert.equal(pidExists(5, () => { const e = new Error("x"); e.code = "EPERM"; throw e; }), true);
+  assert.equal(pidExists(5, () => { const e = new Error("x"); e.code = "ESRCH"; throw e; }), false);
+});
+
+// ─── rpc hosts ────────────────────────────────────────────────────
+test("rpc hosts: only hostnames, never keys in path/query/userinfo", () => {
+  assert.equal(maskRpcUrl("https://mainnet.helius-rpc.com/?api-key=SECRETKEY123"), "mainnet.helius-rpc.com");
+  assert.equal(maskRpcUrl("https://user:pw@rpc.example.com:8899/v1/SECRETPATH"), "rpc.example.com");
+  assert.equal(maskRpcUrl("not a url SECRET"), "invalid");
+  assert.equal(maskRpcUrl(""), null);
+  const hosts = activeRpcHosts({ RPC_URL: "https://a.example/k/SECRET1", BALANCE_RPC_URL: "https://b.example/?key=SECRET2" });
+  const out = formatRpcHosts(hosts);
+  assert.equal(out, "main=a.example, balances=b.example");
+  assert.ok(!/SECRET/.test(out));
+  assert.equal(formatRpcHosts([]), "none configured");
+});
+
+// ─── volatility ───────────────────────────────────────────────────
+test("volatility: unknown / non-positive refuses", () => {
+  for (const v of [undefined, null, "", NaN, "abc", 0, -1]) assert.equal(g.checkVolatilityKnown(v).pass, false, String(v));
+  assert.deepEqual(g.checkVolatilityKnown("2.5"), { pass: true, volatility: 2.5 });
+});
+
+// ─── screening thresholds at deploy ───────────────────────────────
+const S = { minTvl: 10_000, maxTvl: 150_000, minVolume: 500, minOrganic: 60, minHolders: 500, minMcap: 150_000, maxMcap: 10_000_000, minBinStep: 80, maxBinStep: 125, maxVolatility: 8, maxPriceChangePct: 300, minFeeActiveTvlRatio: 0.05, timeframe: "5m" };
+const goodPool = () => ({ tvl: 50_000, volume: 2_000, fee_active_tvl_ratio: 0.4, volatility: 3, dlmm_params: { bin_step: 100 }, base_token_holders: 900, token_x: { market_cap: 500_000, organic_score: 80 }, pool_price_change_pct: 5, pool_price: 1.5 });
+
+test("thresholds: a healthy pool passes", () => {
+  const r = g.evaluatePoolThresholds(goodPool(), S);
+  assert.equal(r.pass, true);
+  assert.equal(r.volatility, 3);
+});
+
+test("thresholds: each breached bound is refused with its reason", () => {
+  const cases = [
+    [{ tvl: 5_000 }, /below minTvl/], [{ tvl: 900_000 }, /above maxTvl/], [{ volume: 10 }, /below minVolume/],
+    [{ fee_active_tvl_ratio: 0, active_tvl: 1000, fee: 0.1 }, /minFeeActiveTvlRatio/],
+    [{ volatility: 9 }, /above maxVolatility/], [{ dlmm_params: { bin_step: 20 } }, /below minBinStep/],
+    [{ dlmm_params: { bin_step: 200 } }, /above maxBinStep/], [{ base_token_holders: 10 }, /minHolders/],
+    [{ token_x: { market_cap: 1, organic_score: 80 } }, /minMcap/], [{ token_x: { market_cap: 5e8, organic_score: 80 } }, /maxMcap/],
+    [{ token_x: { market_cap: 500_000, organic_score: 10 } }, /minOrganic/], [{ pool_price_change_pct: -400 }, /maxPriceChangePct/],
+    [{ is_blacklisted: true }, /blacklisted/],
+  ];
+  for (const [patch, re] of cases) {
+    const r = g.evaluatePoolThresholds({ ...goodPool(), ...patch }, S);
+    assert.equal(r.pass, false, JSON.stringify(patch));
+    assert.match(r.reason, re);
+  }
+});
+
+test("thresholds: pool-level gaps fail closed, token-level gaps are skipped with a note", () => {
+  assert.equal(g.evaluatePoolThresholds(null, S).pass, false);
+  for (const k of ["tvl", "volume", "volatility"]) {
+    const p = goodPool(); delete p[k]; delete p.active_tvl;
+    assert.equal(g.evaluatePoolThresholds(p, S).pass, false, k);
+  }
+  const p = goodPool(); delete p.base_token_holders; delete p.token_x;
+  const r = g.evaluatePoolThresholds(p, S);
+  assert.equal(r.pass, true);
+  assert.ok(r.notes.length >= 2);
+});
+
+test("thresholds: null/0 bounds mean no limit", () => {
+  const r = g.evaluatePoolThresholds({ ...goodPool(), tvl: 1e9, volume: 0 }, { ...S, maxTvl: null, minVolume: 0 });
+  assert.equal(r.pass, true);
+});
+
+test("fetchPoolForRecheck: builds a pool_address filter, returns the first row / null, throws on HTTP error", async () => {
+  let url;
+  const mk = (body, ok = true) => async (u) => { url = u; return { ok, status: ok ? 200 : 503, statusText: "x", json: async () => body }; };
+  assert.deepEqual(await g.fetchPoolForRecheck("POOLX", "5m", mk({ data: [{ tvl: 1 }] })), { tvl: 1 });
+  assert.match(url, /filter_by=pool_address%3DPOOLX/);
+  assert.match(url, /timeframe=5m/);
+  assert.equal(await g.fetchPoolForRecheck("POOLX", "5m", mk({ data: [] })), null);
+  await assert.rejects(g.fetchPoolForRecheck("POOLX", "5m", mk({}, false)), /503/);
+});
+
+// ─── executor integration of the two guards ───────────────────────
+function withConfig(patch, fn) {
+  const before = { safety: { ...config.safety }, source: config.screening.source };
+  Object.assign(config.safety, patch.safety || {});
+  if (patch.source) config.screening.source = patch.source;
+  return Promise.resolve(fn()).finally(() => { config.safety = before.safety; config.screening.source = before.source; ex.__setDeployRecheckFetch(null); });
+}
+
+test("executor guard: passes a healthy pool; refuses a threshold breach; fails closed when the fetch fails", async () => {
+  await withConfig({}, async () => {
+    ex.__setDeployRecheckFetch(async () => goodPool());
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: 3 })).pass, true);
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), tvl: 10 }));
+    const bad = await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: 3 });
+    assert.equal(bad.pass, false);
+    assert.match(bad.reason, /Deploy-time screening re-check failed: .*minTvl/);
+    ex.__setDeployRecheckFetch(async () => { throw new Error("boom"); });
+    const down = await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: 3 });
+    assert.equal(down.pass, false);
+    assert.match(down.reason, /Could not verify pool screening thresholds before deploy: boom/);
+  });
+});
+
+test("executor guard: unknown volatility refuses; falls back to the fresh pool's volatility; toggles disable", async () => {
+  await withConfig({}, async () => {
+    ex.__setDeployRecheckFetch(async () => goodPool());
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P" })).pass, true, "fresh pool volatility is used");
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), volatility: 0 }));
+    await withConfig({ safety: { recheckScreeningAtDeploy: false } }, async () => {
+      const r = await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: null });
+      assert.equal(r.pass, false);
+      assert.match(r.reason, /Volatility is/);
+      config.safety.requireKnownVolatility = false;
+      assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P" })).pass, true);
+    });
+  });
+});
+
+test("executor guard: owner-manual deploys are exempt; gmgn source skips the Meteora threshold re-check", async () => {
+  await withConfig({}, async () => {
+    ex.__setDeployRecheckFetch(async () => { throw new Error("must not be called"); });
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P", _manual: true })).pass, true);
+  });
+  await withConfig({ source: "gmgn" }, async () => {
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), tvl: 1 }));
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: 3 })).pass, true);
+  });
+});
+
+// ─── price move + deposit slippage ────────────────────────────────
+test("price move: (1+step)^bins - 1, symmetric sign, limit enforced", () => {
+  assert.ok(Math.abs(g.priceMovePctBetweenBins(100, 0, 5) - 5.101) < 0.01); // 1.01^5
+  assert.ok(g.priceMovePctBetweenBins(100, 5, 0) < 0);
+  assert.equal(g.checkEntryPriceMove({ binStep: 100, fromBinId: 100, toBinId: 104, maxMovePct: 5 }).pass, true);
+  const r = g.checkEntryPriceMove({ binStep: 100, fromBinId: 100, toBinId: 106, maxMovePct: 5 });
+  assert.equal(r.pass, false);
+  assert.match(r.reason, /limit is 5%/);
+  assert.equal(g.checkEntryPriceMove({ binStep: 100, fromBinId: 100, toBinId: 94, maxMovePct: 5 }).pass, false, "downward moves count too");
+  assert.equal(g.checkEntryPriceMove({ binStep: undefined, fromBinId: 1, toBinId: 2, maxMovePct: 5 }).pass, false, "unknown step fails closed");
+});
+
+test("deposit slippage: pct -> SDK active-bin drift = ceil(pct / (binStep/100))", () => {
+  assert.deepEqual(g.depositSlippage(80, 5), { slippagePct: 5, driftBins: 7 });
+  assert.deepEqual(g.depositSlippage(100, 5), { slippagePct: 5, driftBins: 5 });
+  assert.deepEqual(g.depositSlippage(125, 5), { slippagePct: 5, driftBins: 4 });
+  assert.equal(g.depositSlippage(100, 10).driftBins, 10, "the old hard-coded 10% allowed 10 bins at bin step 100");
+  assert.equal(g.depositSlippage(100, 0.2).driftBins, 1, "never below one bin");
+  assert.equal(g.depositSlippage(100, 90).slippagePct, 25, "capped at 25%");
+  assert.equal(g.depositSlippage(100, "junk").slippagePct, 5);
+  assert.equal(g.depositSlippage(null, 5).driftBins, null);
+});
+
+test("deploy source: no hard-coded 10% slippage remains; checkpoint precedes the first send", () => {
+  const src = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  assert.ok(!/slippage:\s*10\b/.test(src));
+  const begin = src.indexOf("beginAttempt({");
+  const gate = src.indexOf("await preSubmitGate({");
+  const create = src.indexOf("pool.createExtendedEmptyPosition(");
+  const std = src.indexOf("pool.initializePositionAndAddLiquidityByStrategy({");
+  assert.ok(begin > 0 && gate > begin && create > gate && std > gate, "checkpoint -> gate -> build/send");
+});
+
+// ─── pre-submit gate ──────────────────────────────────────────────
+const gateArgs = (o = {}) => ({
+  refetch: async () => {}, getActiveId: () => 100, readFreeSol: async () => 5,
+  binStep: 100, loadBinId: 100, anchorBinId: 100, maxMovePct: 5, reserve: 0.2, amount: 1, totalBins: 60, ...o,
+});
+
+test("pre-submit gate: ok when price is steady and funds cover rent + reserve", async () => {
+  const r = await g.preSubmitGate(gateArgs());
+  assert.equal(r.pass, true);
+  assert.equal(r.freeSol, 5);
+});
+
+test("pre-submit gate: refuses a >5% move since load OR since the range anchor", async () => {
+  const a = await g.preSubmitGate(gateArgs({ getActiveId: () => 107 }));
+  assert.equal(a.pass, false); assert.match(a.reason, /price moved/);
+  const b = await g.preSubmitGate(gateArgs({ getActiveId: () => 93, anchorBinId: 99 }));
+  assert.equal(b.pass, false);
+  const cfg = await g.preSubmitGate(gateArgs({ getActiveId: () => 107, maxMovePct: 10 }));
+  assert.equal(cfg.pass, true, "limit is configurable");
+});
+
+test("pre-submit gate: refetch failure, balance failure and insufficient SOL all refuse", async () => {
+  assert.match((await g.preSubmitGate(gateArgs({ refetch: async () => { throw new Error("rpc down"); } }))).reason, /fresh pool read failed/);
+  assert.match((await g.preSubmitGate(gateArgs({ readFreeSol: async () => { throw new Error("nope"); } }))).reason, /balance read unavailable/);
+  assert.match((await g.preSubmitGate(gateArgs({ readFreeSol: async () => NaN }))).reason, /balance read unavailable/);
+  const poor = await g.preSubmitGate(gateArgs({ readFreeSol: async () => 1.1 }));
+  assert.equal(poor.pass, false);
+  assert.match(poor.reason, /insufficient spendable SOL/);
+  assert.equal((await g.preSubmitGate(gateArgs({ amount: 0, readFreeSol: async () => { throw new Error("unused"); } }))).pass, true);
+});
+
+// ─── crash checkpoint ─────────────────────────────────────────────
+test("checkpoint: begin -> submitting blocks the pool and mint until resolved", () => {
+  const id = cp.beginAttempt({ pool: "POOL1", mint: "MINT1", position: "POSITIONAAAA", amountSol: 1 });
+  assert.equal(cp.getUnresolvedAttempts().length, 1);
+  assert.equal(cp.findBlockingAttempt({ pool: "POOL1" }).id, id);
+  assert.equal(cp.findBlockingAttempt({ pool: "OTHER", mint: "MINT1" }).id, id, "same token via a different pool is blocked too");
+  assert.equal(cp.findBlockingAttempt({ pool: "OTHER", mint: "M2" }), null);
+  cp.markAttempt(id, "entered", { txs: 1 });
+  assert.equal(cp.findBlockingAttempt({ pool: "POOL1" }), null);
+});
+
+test("checkpoint: unreadable file fails closed for the eligibility lookup", () => {
+  const f = process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE;
+  fs.writeFileSync(f, "{ not json");
+  assert.equal(cp.findBlockingAttempt({ pool: "X" }).status, "unreadable");
+  assert.throws(() => cp.beginAttempt({ pool: "X", position: "Y" }), /unreadable/);
+  fs.rmSync(f);
+});
+
+test("checkpoint: boot reconcile resolves landed / absent and keeps unverified blocking", async () => {
+  const a = cp.beginAttempt({ pool: "PL", mint: "ML", position: "POS_LANDED_1" });
+  const b = cp.beginAttempt({ pool: "PA", mint: "MA", position: "POS_ABSENT_1", now: Date.now() + 1 });
+  const c = cp.beginAttempt({ pool: "PU", mint: "MU", position: "POS_UNKNOWN_1", now: Date.now() + 2 });
+  const seen = [];
+  const res = await cp.reconcileAttempts({
+    positionExists: async (p) => (p === "POS_LANDED_1" ? true : p === "POS_ABSENT_1" ? false : null),
+    log: () => {},
+    notify: async (r) => seen.push(r.map((x) => x.outcome)),
+  });
+  assert.deepEqual(res.map((r) => r.outcome).sort(), ["absent", "landed", "unverified"]);
+  assert.equal(cp.findBlockingAttempt({ pool: "PL" }), null);
+  assert.equal(cp.findBlockingAttempt({ pool: "PA" }), null);
+  assert.equal(cp.findBlockingAttempt({ pool: "PU" }).id, c);
+  assert.equal(seen.length, 1);
+  void a; void b;
+  // a thrown read counts as unknown, not as absent
+  const d = cp.beginAttempt({ pool: "PT", position: "POS_THROWS_1", now: Date.now() + 3 });
+  const r2 = await cp.reconcileAttempts({ positionExists: async () => { throw new Error("rpc"); }, log: () => {} });
+  assert.ok(r2.every((x) => x.outcome === "unverified"));
+  assert.equal(cp.findBlockingAttempt({ pool: "PT" }).id, d);
+});
+
+test("checkpoint: eligibility refuses a pool with an unreconciled interrupted deploy", async () => {
+  cp.beginAttempt({ pool: "BLOCKED_POOL", mint: "BLOCKED_MINT", position: "POS_BLK_1", now: Date.now() + 10 });
+  const r = await ex.checkDeployEligibility({ pool_address: "BLOCKED_POOL", bin_step: 100, base_mint: "BLOCKED_MINT" });
+  assert.equal(r.pass, false);
+  assert.match(r.reason, /interrupted and not yet reconciled/);
+});
+
+test("checkpoint: resolved history is pruned to a bounded size", () => {
+  for (let i = 0; i < 70; i++) {
+    const id = cp.beginAttempt({ pool: `PR${i}`, position: `POS_PRUNE_${i}`, now: Date.now() + 100 + i });
+    cp.markAttempt(id, "failed");
+  }
+  const db = JSON.parse(fs.readFileSync(process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE, "utf8"));
+  const resolved = Object.values(db.attempts).filter((x) => !["submitting", "uncertain"].includes(x.status));
+  assert.ok(resolved.length <= 50);
+});
