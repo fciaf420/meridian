@@ -82,7 +82,7 @@ test("key list comes from what config.js reads (CONFIG_KEY_MAP keys, gmgn keys, 
   const keys = new Set(svc.entries.map((e) => e.key));
   for (const k of Object.keys(CONFIG_KEY_MAP)) assert.ok(keys.has(k), `CONFIG_KEY_MAP key ${k} listed`);
   for (const k of ["dryRun", "llmProvider", "screeningSource", "priorityFeeLevel", "llmReasoningEffort", "evilPandaMinMcap", "darwinianWeights", "autoresearch", "webPort", "gmgnSignalsEnabled"]) assert.ok(keys.has(k), k);
-  assert.ok(svc.entries.some((e) => e.key === "requireKol" && e.file === "gmgn"));
+  assert.ok(svc.entries.some((e) => e.key === "finalistLimit" && e.file === "gmgn"));
   const labels = svc.groups().map((g) => g.label);
   for (const l of ["Capital & sizing", "Exits", "Strategy", "Screening (Meteora)", "Screening (GMGN)", "Schedule", "LLM", "Learning", "USDC mode"]) assert.ok(labels.includes(l), l);
   assert.equal(svc.find("maxPositions").group, "cap");

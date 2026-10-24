@@ -136,15 +136,32 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
-  const eligible = rankCandidatesByDarwin(
-    pools.filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
-  );
+  let open = pools.filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint));
+
+  // GMGN safety gates for candidates that did NOT come through the GMGN pipeline
+  // (default Meteora source + Meteora-only rows in "both"). Fail closed on unknown
+  // data; skipped when no GMGN key is configured. Runs after the occupied-pool
+  // filter so no weighted GMGN calls are spent on pools we already hold.
+  let gmgnGate = null;
+  try {
+    const { gateMeteoraSourceCandidates } = await import("./gmgn-screen.js");
+    gmgnGate = await gateMeteoraSourceCandidates(open, { limit });
+    open = gmgnGate.kept;
+  } catch (e) {
+    // The gate module itself failing is unknown data: do not wave candidates through.
+    log("gmgn_gate", `Safety gate failed (${e?.message || e}); dropping non-GMGN candidates this cycle`);
+    open = open.filter((p) => p.gmgn || p.gmgn_gated);
+  }
+
+  const eligible = rankCandidatesByDarwin(open);
 
   return {
     candidates: eligible.slice(0, limit).map(normalizeCandidateForUi),
     total_eligible: eligible.length,
     total_screened: screenedCount,
     entry_filtered: entry.dropped.length,
+    gmgn_gate_dropped: gmgnGate?.dropped?.length ?? 0,
+    gmgn_gate_rate_limited: gmgnGate?.rate_limited ?? false,
   };
 }
 
@@ -196,12 +213,32 @@ export function getCandidateSignalSnapshot(candidate) {
     volatility: c.volatility ?? null,
     ath_proximity: c._gmgnResult?.ath_proximity_pct ?? c.ath_proximity ?? null,
     volume_trend: c._gmgnResult?.candles?.volume_trend ?? c.volume_trend ?? null,
-    gmgn_signal_present: c._gmgnSignal ? ((c._gmgnSignal.signal_count_30m || 0) > 0) : c.gmgn_signal_present ?? null,
+    // Series continuity: this signal has always meant "tagged smart/KOL/whale holders present"
+    // (signal_count_30m was a holder snapshot, not a 30m event count). tagged_holder_count is the
+    // honest name for the same number; the legacy field is the fallback for older snapshots.
+    gmgn_signal_present: c._gmgnSignal ? (((c._gmgnSignal.tagged_holder_count ?? c._gmgnSignal.signal_count_30m) || 0) > 0) : c.gmgn_signal_present ?? null,
     change_1h: c._gmgnResult?.change_1h ?? c.change_1h ?? null,
     candle_price_range: c._gmgnResult?.candles?.price_range_pct ?? c.candle_price_range ?? null,
     // GMGN market-signal feed (tools/gmgn-signals.js); null = not fetched.
     ...gmgnSignalBooleans(c.gmgn_signals),
+    // LOG-ONLY GMGN risk fields (security + extra stat/pool metrics): recorded for later
+    // per-origin analysis, NEVER read by scoreSignalSnapshot or any gate.
+    gmgn_risk_log_only: gmgnRiskLogOnly(c),
   };
+}
+
+const GMGN_RISK_LOG_KEYS = [
+  "gmgn_creator_hold_pct", "gmgn_top70_sniper_hold_pct", "gmgn_entrapment_trader_pct", "gmgn_private_vault_hold_pct",
+  "gmgn_creator_created_count", "gmgn_creator_token_status", "gmgn_pool_liquidity_ratio",
+  "gmgn_renounced_mint", "gmgn_renounced_freeze", "gmgn_lp_burned", "gmgn_lp_locked", "gmgn_buy_tax", "gmgn_sell_tax",
+  "gmgn_security_status", "gmgn_risk_log_only_flags", "gmgn_sniper_supply_share_pct", "gmgn_sniper_row_rate_pct",
+];
+
+function gmgnRiskLogOnly(c) {
+  if (c?.gmgn_security_status == null) return null;
+  const out = {};
+  for (const k of GMGN_RISK_LOG_KEYS) if (c[k] !== undefined) out[k] = c[k];
+  return out;
 }
 
 export function rankCandidatesByDarwin(candidates = []) {

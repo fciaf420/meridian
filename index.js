@@ -429,7 +429,9 @@ async function screeningCycleBody() {
       // code so the model only judges the survivors (narrative, momentum, pick-or-skip).
       // Unknown values (null) never cause a skip here; the model still sees them.
       const hardSkipReason = (c) => {
-        if (c._globalFeesSol != null && c._globalFeesSol < config.screening.minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${config.screening.minTokenFeesSol}`;
+        // Fail closed: unknown global fees (Jupiter datapi down / token not indexed) is NOT a pass.
+        if (c._globalFeesSol == null) return "global_fees unknown (fail closed)";
+        if (c._globalFeesSol < config.screening.minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${config.screening.minTokenFeesSol}`;
         if (Number.isFinite(c._top10Pct) && c._top10Pct > 60) return `top10 ${c._top10Pct}% > 60%`;
         if (config.strategy.activeStrategy === "evil_panda" && c._evilPandaPass === false) return "Evil Panda entry FAIL";
         return null;

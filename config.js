@@ -126,11 +126,14 @@ export const config = {
     maxRatTraderRate:    gmgnValue("maxRatTraderRate",    "gmgnMaxRatTraderRate",    0.2),
     athFilterPct:        gmgnValue("athFilterPct",        "gmgnAthFilterPct",        null),
     // Optional Stage-1/2 gates (read from trending row where available)
-    minSmartDegenCount:  gmgnValue("minSmartDegenCount",  "gmgnMinSmartDegenCount",  1),
-    requireKol:          gmgnValue("requireKol",          "gmgnRequireKol",          true),
-    minKolCount:         gmgnValue("minKolCount",         "gmgnMinKolCount",         1),
+    // (minSmartDegenCount / requireKol / minKolCount were removed: nothing ever read them.)
     maxRugRatio:         gmgnValue("maxRugRatio",         "gmgnMaxRugRatio",         0.3),
     maxSniperCount:      gmgnValue("maxSniperCount",      "gmgnMaxSniperCount",      20),
+    // Reliability (tools/gmgn-policy.js): pacing plan, holders/traders finalist cap, and
+    // whether Meteora-source candidates also run the GMGN safety gates (needs a GMGN key).
+    plan:              gmgnValue("plan",              "gmgnPlan",              "free"),
+    finalistLimit:     gmgnValue("finalistLimit",     "gmgnFinalistLimit",     5),
+    gateMeteoraSource: gmgnValue("gateMeteoraSource", "gmgnGateMeteoraSource", true),
     // Stage-3 holders/traders enrichment + KOL config
     holdersLimit:           gmgnValue("holdersLimit",           "gmgnHoldersLimit",           100),
     maxSniperHoldRate:      gmgnValue("maxSniperHoldRate",      "gmgnMaxSniperHoldRate",      0.3),
@@ -144,7 +147,7 @@ export const config = {
       const r = gmgnUserConfig.indicatorRules || {};
       return {
         requireBullishSupertrend: r.requireBullishSupertrend ?? true,
-        rejectAlreadyAtBottom:    r.rejectAlreadyAtBottom    ?? true,
+        rejectAlreadyAtBottom:    r.rejectAlreadyAtBottom    ?? false, // was dead code (bb_lower never existed): log-only until validated
         requireAboveSupertrend:   r.requireAboveSupertrend   ?? false,
         minRsi:                   r.minRsi                   ?? null,
         maxRsi:                   r.maxRsi                   ?? null,
