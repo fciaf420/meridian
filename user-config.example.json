@@ -10,5 +10,13 @@
   "activeStrategy": "classic",
   "strategy": "bid_ask",
 
-  "llmProvider": "claude"
+  "llmProvider": "claude",
+
+  "_bidAskFlip_mode_options": "off | shadow | live  # shadow = plan + simulate + log, never signs (recommended first); live = sign and send",
+  "bidAskFlip": {
+    "mode": "shadow",
+    "fillPct": 30,
+    "reflipStepPct": 20,
+    "minTrancheSol": 0.05
+  }
 }

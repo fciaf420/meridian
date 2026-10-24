@@ -450,6 +450,19 @@ export const config = {
     maxArticles:               u.knowledgeBase?.maxArticles ?? 500,
   },
 
+  // ─── Bid-Ask flip (tools/bidask-flip.js) ─
+  // Once ≥ fillPct % of a single-sided SOL bid_ask position's SOL has converted
+  // to token, move that token from the bins just above active into a
+  // top-weighted ask that tops out at the original band top, in one atomic
+  // rebalance_liquidity tx. "shadow" = plan + simulate + log only (default);
+  // "live" = also sign/send; "off" = nothing runs.
+  bidAskFlip: {
+    mode:          S("bidAskFlipMode"),         // "off" | "shadow" | "live"
+    fillPct:       S("bidAskFlipFillPct"),      // first flip at this % of deposited SOL converted
+    reflipStepPct: S("bidAskFlipReflipStepPct"),// re-flip only a fresh tranche worth ≥ this % of the deposit
+    minTrancheSol: S("bidAskFlipMinTrancheSol"),// never flip a tranche worth less than this
+  },
+
   // ─── Common Token Mints ────────────────
   tokens: {
     SOL:  "So11111111111111111111111111111111111111112",

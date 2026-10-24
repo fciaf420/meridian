@@ -113,6 +113,12 @@ export const SCHEMA = [
   row("oorCooldownTriggerCount", ["exits", "oorCooldownTriggerCount"], "int", 3, { min: 1, max: 100 }),
   row("oorCooldownMinutes", ["exits", "oorCooldownMinutes"], "int", 360, { min: 0, max: 10080, unit: "min" }),
 
+  // ── Bid-ask flip (PR #133). user-config.json may also carry this as a nested "bidAskFlip": {mode, fillPct, ...} object (see NESTED_KEYS) ──
+  row("bidAskFlipMode", ["bidAskFlip", "mode"], "enum", "shadow", { tier: 1, enum: ["off", "shadow", "live"], label: "Bid-ask flip (off | shadow | live)" }),
+  row("bidAskFlipFillPct", ["bidAskFlip", "fillPct"], "float", 30, { min: 1, max: 100, unit: "%" }),
+  row("bidAskFlipReflipStepPct", ["bidAskFlip", "reflipStepPct"], "float", 20, { min: 1, max: 100, unit: "%" }),
+  row("bidAskFlipMinTrancheSol", ["bidAskFlip", "minTrancheSol"], "float", 0.05, { min: 0, unit: "SOL" }),
+
   // ── Entry-safety filters ──
   row("blockTransferFeeAbovePct", ["entryFilters", "blockTransferFeeAbovePct"], "float", 1.0, { tier: 2, gov: true, nullable: true, unit: "%" }),
   row("twapSpikeMaxPct", ["entryFilters", "twapSpikeMaxPct"], "float", 15, { tier: 2, gov: true, nullable: true, unit: "%" }),
@@ -199,6 +205,22 @@ export const SCHEMA = [
   row("autoresearchMaxDiffPct", ["autoresearch", "maxDiffPct"], "int", 30, { unit: "%" }),
 ];
 
+/** Nested user-config.json objects accepted as an alias for flat schema keys (flat key wins). */
+export const NESTED_KEYS = {
+  bidAskFlip: { mode: "bidAskFlipMode", fillPct: "bidAskFlipFillPct", reflipStepPct: "bidAskFlipReflipStepPct", minTrancheSol: "bidAskFlipMinTrancheSol" },
+};
+export function flattenNested(raw = {}) {
+  let out = raw;
+  for (const [obj, map] of Object.entries(NESTED_KEYS)) {
+    const nested = raw?.[obj];
+    if (!nested || typeof nested !== "object") continue;
+    for (const [k, flat] of Object.entries(map)) {
+      if (nested[k] !== undefined && raw[flat] === undefined) { if (out === raw) out = { ...raw }; out[flat] = nested[k]; }
+    }
+  }
+  return out;
+}
+
 export const BY_KEY = new Map(SCHEMA.map((r) => [r.key, r]));
 export const GOVERNED_KEYS = SCHEMA.filter((r) => r.gov).map((r) => r.key);
 
@@ -263,7 +285,8 @@ export function normalizeProfile(name) {
  *   get(key)    → effective value
  *   source(key) → "user" | "profile" | "default"
  */
-export function makeResolver(raw = {}) {
+export function makeResolver(rawIn = {}) {
+  const raw = flattenNested(rawIn);
   const profile = normalizeProfile(raw.profile);
   const preset = PROFILES[profile] ?? {};
   const resolve = (key) => {

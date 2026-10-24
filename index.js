@@ -727,6 +727,7 @@ function startCronJobsInner() {
       // Set only when the exit pre-check below ran to completion; the code-side
       // HOLD gate further down requires it so a partial pre-check never skips the LLM.
       let precheckedPositions = null;
+      const flipExitPositions = new Set(); // positions with a strategy exit alert this tick (the bid-ask flip yields to them)
       try {
         const pos = await getMyPositions();
         const exits = [];
@@ -759,7 +760,7 @@ function startCronJobsInner() {
                 const pnlPositive = (p.pnl_pct ?? 0) > 0;
                 const exitOk = pnlPositive && c.evil_panda_exit_signal;
                 const line = `${p.pair}: Evil Panda exit check - pnl=${p.pnl_pct ?? "?"}% (${pnlPositive ? "positive" : "not positive"}), RSI(2)=${c.rsi_2 ?? "?"}, close>BB_upper=${!!c.close_above_bb_upper}, MACD_first_green=${!!c.macd_first_green_histogram}, exit=${exitOk ? "YES" : "NO"}${c.evil_panda_exit_reason ? ` (${c.evil_panda_exit_reason})` : ""}`;
-                if (exitOk) exits.push(line);
+                if (exitOk) { exits.push(line); flipExitPositions.add(p.position); }
                 else holdTimeHints.push(line);
               }
             } catch { /* GMGN exit context is best-effort */ }
@@ -855,6 +856,19 @@ function startCronJobsInner() {
           .filter((p) => getTrackedPosition(p.position)?.instruction)
           .map((p) => [p.position, "rule 1: instruction met"]));
         if (codeRules.closed.length || codeRules.failed.length) mgmtRuleFired = true;
+        // Bid-Ask flip (tools/bidask-flip.js): runs AFTER the code-fired closes above and
+        // under the management lock; live flips additionally take the wallet lock. Any
+        // exit rule wins: positions just closed, failed to close, held for exit
+        // confirmation, or carrying a strategy exit alert are skipped. "shadow" only
+        // simulates and logs.
+        if (config.bidAskFlip?.mode && config.bidAskFlip.mode !== "off") {
+          const exitBusy = new Set([...codeRules.closed, ...codeRules.failed, ...codeRules.held].map((r) => r.position));
+          for (const id of flipExitPositions) exitBusy.add(id);
+          const flipCandidates = precheckedPositions.filter((p) => !exitBusy.has(p.position));
+          await import("./tools/bidask-flip.js")
+            .then((m) => m.runBidAskFlips(flipCandidates, { config, exitAlerts: exitBusy, isBusy, isCloseInflight, dryRun: isDryRun() }))
+            .catch((e) => log("bidask_flip", `flip pass failed: ${e.message}`));
+        }
         const codeSummary = codeRules.lines.length ? `\n${codeRules.lines.join("\n")}` : "";
         if (ruleHits.length === 0 && !exitAlerts) {
           log("cron", `Management: ${precheckedPositions.length} position(s) checked in code — ${codeRules.closed.length} closed, ${codeRules.held.length} held for confirmation (LLM skipped)`);
