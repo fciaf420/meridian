@@ -44,8 +44,9 @@ const fmt = (n) => (Number.isFinite(Number(n)) ? `${Number(n).toFixed(2)}%` : "?
  * onchainPct: null/undefined when the on-chain read failed.
  * Returns { close, pnlPct (value to record), source, mismatch, why }.
  */
-export function decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dropPct }) {
+export function decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dropPct, mismatchPts = PNL_MISMATCH_PTS }) {
   const tol = PNL_CONFIRM_TOLERANCE_PTS;
+  const mmPts = Number.isFinite(Number(mismatchPts)) ? Number(mismatchPts) : PNL_MISMATCH_PTS;
   const api = Number(apiPct);
   const hasOnchain = onchainPct != null && Number.isFinite(Number(onchainPct));
   if (!hasOnchain) {
@@ -59,7 +60,7 @@ export function decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dr
     };
   }
   const oc = Number(onchainPct);
-  const mismatch = Number.isFinite(api) && Math.abs(oc - api) > PNL_MISMATCH_PTS;
+  const mismatch = Number.isFinite(api) && Math.abs(oc - api) > mmPts;
   let crosses;
   let rule;
   if (kind === "take_profit") {
@@ -86,9 +87,9 @@ export function decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dr
     : !apiAgrees
       ? `API ${fmt(api)} has not dropped to the trail level — holding (both sources must agree)`
     : !close
-      ? `API ${fmt(api)} and on-chain ${fmt(oc)} disagree by more than ${PNL_MISMATCH_PTS}pt — holding`
+      ? `API ${fmt(api)} and on-chain ${fmt(oc)} disagree by more than ${mmPts}pt — holding`
       : `confirmed: ${rule}`;
-  return { close, pnlPct: oc, source: "onchain", mismatch, why };
+  return { close, pnlPct: oc, source: "onchain", mismatch, crosses, apiAgrees, why };
 }
 
 /**
@@ -96,14 +97,14 @@ export function decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dr
  * Logs pnl_mismatch when the two sources disagree by more than 2 points.
  * Returns the decision plus `onchain` (the raw read, or null).
  */
-export async function confirmPnlExit({ position, kind, apiPct, threshold, peakPct, dropPct, label = null, unit = "sol", getOnchain }) {
+export async function confirmPnlExit({ position, kind, apiPct, threshold, peakPct, dropPct, label = null, unit = "sol", getOnchain, mismatchPts }) {
   let onchain;
   try {
     const fn = getOnchain || (await import("./tools/onchain-pnl.js")).getOnchainPnl;
     onchain = await fn(position);
   } catch { onchain = null; }
   const onchainPct = onchainPctForUnit(onchain, unit);
-  const decision = decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dropPct });
+  const decision = decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dropPct, mismatchPts });
   const name = label || String(position?.position ?? position ?? "").slice(0, 8);
   if (decision.mismatch) {
     log("pnl_mismatch", `${name}: API ${fmt(apiPct)} vs on-chain ${fmt(onchainPct)} (value ${onchain?.valueSol ?? "?"} SOL, deposit ${onchain?.depositSol ?? "?"} SOL, fees ${onchain?.feesSol ?? "?"} SOL) — ${kind} ${decision.close ? "exits" : "held"}`);

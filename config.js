@@ -253,7 +253,23 @@ export const config = {
     confirmMinSpacingSec:      u.exitConfirmMinSpacingSec ?? 20,
     // Stop loss whose on-chain read keeps failing: exit on the API value once the
     // signal has persisted this long (and on >= confirmTicks priced ticks).
-    stopLossUnverifiedMaxWaitSec: u.stopLossUnverifiedMaxWaitSec ?? 120,
+    // Default 300s (M5): with a 60s watcher that is 5 priced observations.
+    stopLossUnverifiedMaxWaitSec: u.stopLossUnverifiedMaxWaitSec ?? 300,
+    // H1: force an on-chain PnL read for every tracked position at least this
+    // often, even when the API reading looks harmless, so a stale API cannot
+    // hide a crash the chain already shows.
+    onchainReadIntervalSec:    u.onchainReadIntervalSec ?? 60,
+    // M4: API-vs-on-chain disagreement (points) above which a trailing / take
+    // profit exit is held (stop loss is exempt). Measured via pnl_bias logs.
+    pnlMismatchPts:            u.pnlMismatchPts ?? 2,
+    // Alert after this many consecutive ticks a trailing exit was held only
+    // because the two sources disagree (trailing is effectively disabled).
+    trailingMismatchAlertTicks: u.trailingMismatchAlertTicks ?? 3,
+    // M1: wallet-lock stale-holder alert / hard release (seconds; 0 disables hard release).
+    walletLockWarnSec:         u.walletLockWarnSec ?? 300,
+    walletLockTimeoutSec:      u.walletLockTimeoutSec ?? 900,
+    // M1: bound on a single on-chain / positions read inside the watcher.
+    readTimeoutSec:            u.exitReadTimeoutSec ?? 20,
     // Re-entry cooldowns (pool + base mint), checked at deploy time.
     stopLossCooldownMinutes:   u.stopLossCooldownMinutes ?? 240,
     oorCooldownTriggerCount:   u.oorCooldownTriggerCount ?? 3,

@@ -374,10 +374,12 @@ export function recordClose(position_address, reason) {
 /** "stop_loss" | "oor" | null for a recorded close reason. */
 export function cooldownKindForReason(reason) {
   const r = String(reason || "");
-  if (/^(STOP_LOSS|EMERGENCY)/.test(r) || /^rule 6\b/i.test(r) || /\bstop[ _-]?loss\b/i.test(r) || /emergency stop/i.test(r)) return "stop_loss";
+  // L1: structured prefixes only. Free text ("…stop loss…" inside an LLM
+  // instruction or reason) must not set a 4h cooldown.
+  if (/^(STOP_LOSS|EMERGENCY)/.test(r) || /^rule 6\b/i.test(r)) return "stop_loss";
   // Only the automatic OOR-timeout closes: "(OOR upside)" suffixes on other
   // reasons (FIXED_TP …, agent decision …) are a direction tag, not the cause.
-  if (/^rule 4\b/i.test(r) || /OOR timeout/i.test(r) || /^OOR fallback/i.test(r)) return "oor";
+  if (/^rule 4\b/i.test(r) || /^OOR fallback/i.test(r)) return "oor";
   return null;
 }
 
@@ -502,13 +504,29 @@ export function registerExitTick(position_address, { kind = null, outcome = "cle
 
   const waitedMs = now - Date.parse(st.started_at);
   const fire = st.confirms >= confirmTicks;
+  // M5: the API-only fallback needs at least 3 priced observations (not just
+  // confirmTicks) on top of the wait, so a short RPC outage plus a wrong priced
+  // API reading cannot close a healthy position on two looks.
   const fireOnApi = !fire && kind === "stop_loss" && outcome === "unverified" && !suspicious
-    && st.seen >= confirmTicks && waitedMs >= stopLossUnverifiedMaxWaitMs;
+    && st.seen >= Math.max(confirmTicks, 3) && waitedMs >= stopLossUnverifiedMaxWaitMs;
   const result = { fire, fireOnApi, count: st.confirms, seen: st.seen, kind, waitedMs };
-  if (fire || fireOnApi) delete pos.exit_streak;
-  else pos.exit_streak = st;
+  // H2 (Fable audit): the streak is NOT deleted when it fires. A failed close
+  // (blockhash expiry, oversize tx, RPC error) must retry on the very next tick
+  // with fire:true instead of re-counting confirming ticks from zero. The
+  // streak is cleared by recordClose() on a successful close, or by a
+  // clear / refute tick if the signal goes away.
+  pos.exit_streak = st;
   save(state);
   return result;
+}
+
+/** H1: stamp the time of the last successful on-chain PnL read for a position. */
+export function markOnchainRead(position_address, now = Date.now()) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return;
+  pos.last_onchain_at = new Date(now).toISOString();
+  save(state);
 }
 
 /** Current exit streak for a position (read-only), or null. */
@@ -618,7 +636,7 @@ function exitSettings(config) {
     peakConfirmTicks: ticks(e.peakConfirmTicks, 2),
     // No `exits` block (hand-built test configs): no spacing.
     minSpacingMs: Math.max(0, Number(e.confirmMinSpacingSec ?? 0) * 1000) || 0,
-    stopLossUnverifiedMaxWaitMs: Math.max(0, Number(e.stopLossUnverifiedMaxWaitSec ?? 120) * 1000),
+    stopLossUnverifiedMaxWaitMs: Math.max(0, Number(e.stopLossUnverifiedMaxWaitSec ?? 300) * 1000),
   };
 }
 
@@ -787,7 +805,8 @@ export function recordPnlHold(position_address, action, detail, { onchainPct = n
   pos.notes = pos.notes.filter((n) => !String(n).startsWith("HELD (on-chain PnL did not confirm)"));
   pos.notes.push(`HELD (on-chain PnL did not confirm): ${action || "PnL exit"} — ${detail} [${new Date().toISOString()}]`);
   const oc = onchainPct == null ? NaN : Number(onchainPct);
-  if (Number.isFinite(oc) && (pos.peak_pnl_pct || 0) > oc + PNL_MISMATCH_PTS) {
+  const mismatchPts = Number.isFinite(Number(config?.exits?.pnlMismatchPts)) ? Number(config.exits.pnlMismatchPts) : PNL_MISMATCH_PTS;
+  if (Number.isFinite(oc) && (pos.peak_pnl_pct || 0) > oc + mismatchPts) {
     const before = Number(pos.peak_pnl_pct);
     pos.peak_pnl_pct = Math.max(0, oc, pos.peak_onchain_pnl_pct ?? -Infinity);
     const trigger = Number(config?.management?.trailingTriggerPct);

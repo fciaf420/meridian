@@ -25,6 +25,7 @@ import { log as realLog } from "./logger.js";
 import { onchainPctForUnit } from "./tools/onchain-pnl.js";
 import { confirmPnlExit } from "./pnl-confirm.js";
 import { withWalletLock, WALLET_PRIORITY } from "./wallet-lock.js";
+import { emit as realEmit } from "./notifier.js";
 
 const finite = (v) => v != null && Number.isFinite(Number(v));
 
@@ -45,8 +46,20 @@ export function isUnpriceableTick(p) {
   return { suspicious: false, why: null };
 }
 
-/** Would this API reading move the peak or trip an exit? Only then read on-chain. */
-export function needsOnchain(apiPct, tracked, mgmt) {
+// Slack so a watcher tick landing a hair early (setInterval jitter) still reads.
+const ONCHAIN_READ_SLACK_MS = 5_000;
+
+/**
+ * Would this API reading move the peak or trip an exit? Only then read on-chain
+ * — plus (H1) a forced read at least every `intervalMs` per tracked position,
+ * so a stale API reading that sits harmlessly above the stop cannot hide a
+ * crash the chain already shows. opts: { now, intervalMs }.
+ */
+export function needsOnchain(apiPct, tracked, mgmt, { now = Date.now(), intervalMs = 60_000 } = {}) {
+  if (intervalMs > 0) {
+    const last = tracked?.last_onchain_at ? Date.parse(tracked.last_onchain_at) : NaN;
+    if (!Number.isFinite(last) || now - last >= intervalMs - ONCHAIN_READ_SLACK_MS) return true;
+  }
   const peak = tracked?.peak_pnl_pct || 0;
   if (apiPct > peak) return true;
   if (tracked?.exit_streak) return true; // a streak in progress always re-checks
@@ -69,6 +82,36 @@ function stopSignal(pct, mgmt) {
   return null;
 }
 
+// ─── API vs on-chain bias measurement (M4) ───
+// Rolling window of |API − on-chain| (points) from priced ticks that had an
+// on-chain read. Logged as pnl_bias every 20 samples so the real bias can be
+// read from the logs before tuning exits.pnlMismatchPts.
+const BIAS_WINDOW = 200;
+const biasSamples = [];
+let biasSinceLog = 0;
+export function recordPnlBias(apiPct, onchainPct, log = realLog) {
+  const a = Number(apiPct), o = Number(onchainPct);
+  if (!Number.isFinite(a) || !Number.isFinite(o)) return;
+  biasSamples.push(Math.abs(a - o));
+  if (biasSamples.length > BIAS_WINDOW) biasSamples.shift();
+  if (++biasSinceLog >= 20) {
+    biasSinceLog = 0;
+    const s = getPnlBiasStats();
+    log("pnl_bias", `API vs on-chain |diff| over last ${s.n} ticks: median ${s.median.toFixed(2)}pt, p90 ${s.p90.toFixed(2)}pt, max ${s.max.toFixed(2)}pt`);
+  }
+}
+export function getPnlBiasStats() {
+  const v = [...biasSamples].sort((x, y) => x - y);
+  const q = (p) => (v.length ? v[Math.min(v.length - 1, Math.floor(p * v.length))] : 0);
+  return { n: v.length, median: q(0.5), p90: q(0.9), max: v.length ? v[v.length - 1] : 0 };
+}
+export function _resetBiasForTest() { biasSamples.length = 0; biasSinceLog = 0; trailingMismatchHolds.clear(); noStateWarned.clear(); }
+
+// Consecutive ticks a trailing exit was held ONLY because the two sources
+// disagree; alerts so trailing is never disabled silently (M4).
+const trailingMismatchHolds = new Map();
+const noStateWarned = new Set();
+
 export function exitKind(reason) {
   const r = String(reason || "");
   if (/^STOP_LOSS/.test(r) || /^EMERGENCY/.test(r)) return "stop_loss";
@@ -85,18 +128,27 @@ export function exitKind(reason) {
  *   onchain, onchainPct, fireOnApi, tick, suspicious }.
  */
 export async function evaluatePnlExit(p, deps) {
-  const { config, getTracked, update, register, recordHold, readOnchain, now = Date.now(), source = "watcher" } = deps;
+  const { config, getTracked, update, register, recordHold, readOnchain, markOnchain, now = Date.now(), source = "watcher" } = deps;
+  const emit = deps.emit || realEmit;
   const log = deps.log || realLog;
   const mgmt = config.management;
   const label = p.pair || String(p.position).slice(0, 8);
   const tracked = getTracked(p.position);
   const none = { action: "none", kind: null, reason: null, decision: null, onchain: null, onchainPct: null, fireOnApi: false, tick: null, suspicious: false };
-  if (!tracked || tracked.closed) return none; // untracked: no streak state to confirm against
+  if (!tracked || tracked.closed) {
+    // L3: no state record → no streak to confirm against → no PnL exits at all.
+    if (!tracked && !noStateWarned.has(p.position)) {
+      noStateWarned.add(p.position);
+      log("exit_confirm", `${label}: no state record — PnL exits (stop loss / TP / trailing) are NOT active for this position [${source}]`);
+    }
+    return none;
+  }
 
   let onchain;
   const onchainOnce = async () => {
     if (onchain === undefined) {
       try { onchain = await readOnchain(p); } catch { onchain = null; }
+      if (onchain != null) { try { markOnchain?.(p.position, now); } catch { /* best-effort */ } }
     }
     return onchain;
   };
@@ -138,8 +190,10 @@ export async function evaluatePnlExit(p, deps) {
 
   // ─── Priced tick ───
   const apiPct = Number(p.pnl_pct);
-  if (needsOnchain(apiPct, tracked, mgmt)) await onchainOnce();
+  const readEverySec = Number(config.exits?.onchainReadIntervalSec ?? 60);
+  if (needsOnchain(apiPct, tracked, mgmt, { now, intervalMs: Number.isFinite(readEverySec) ? readEverySec * 1000 : 60_000 })) await onchainOnce();
   const ocPct = onchainPctForUnit(onchain, unit);
+  if (finite(ocPct)) recordPnlBias(apiPct, ocPct, log);
   const exitAction = update(p.position, apiPct, config, { onchainPct: ocPct, strict: true, now });
   const after = getTracked(p.position);
   const warmupHeld = !exitAction && !!after?._pnl_pending_extreme;
@@ -175,7 +229,23 @@ export async function evaluatePnlExit(p, deps) {
     label,
     unit,
     getOnchain: onchainOnce,
+    mismatchPts: config.exits?.pnlMismatchPts,
   });
+
+  // M4: a trailing exit held only because API and on-chain disagree is trailing
+  // effectively disabled for this position. Count it and alert, never silent.
+  if (kind === "trailing" && decision.crosses && decision.apiAgrees && decision.mismatch && !decision.close) {
+    const n = (trailingMismatchHolds.get(p.position) || 0) + 1;
+    trailingMismatchHolds.set(p.position, n);
+    const alertAt = Math.max(1, Math.floor(Number(config.exits?.trailingMismatchAlertTicks ?? 3)));
+    if (n === alertAt || (n > alertAt && (n - alertAt) % 10 === 0)) {
+      const msg = `${label}: trailing take profit is being HELD for ${n} consecutive ticks because API (${Number(apiPct).toFixed(1)}%) and on-chain (${Number(decision.onchainPct ?? decision.pnlPct).toFixed(1)}%) PnL disagree by more than ${config.exits?.pnlMismatchPts ?? 2}pt. Trailing is effectively off for this position; stop loss still active.`;
+      log("exit_confirm", msg);
+      try { emit("ops_alert", { key: `trail:${p.position}`, title: "Trailing TP disabled by PnL source mismatch", text: msg }); } catch { /* alerts are best-effort */ }
+    }
+  } else {
+    trailingMismatchHolds.delete(p.position);
+  }
   const outcome = decision.close ? "confirm" : decision.unverified ? "unverified" : "refute";
   if (!decision.close) recordHold(p.position, reason, decision.why, { onchainPct: decision.onchainPct, config });
   const tick = register(p.position, { kind, outcome, reason, config, now });
@@ -222,7 +292,10 @@ export function onchainOverride(p, tracked, onchain, pct) {
  * Skips (without error) a position that is already closed or whose close is in
  * flight (the watcher and the management cycle may both decide the same exit).
  * deps: { closePosition, getTracked, isCloseInflight, recordAutoClose, emit,
- *   getPositionBins, withTimeout, log, source }
+ *   getPositionBins, withTimeout, postClose, log, source }
+ * postClose(args, result, durationMs) (M3) runs under the lock after a
+ * successful close for parity with the executeTool path: actions log, USDC
+ * settle, signal capture. Its failure never fails the close.
  * Returns { closed, skipped?, result, override }.
  */
 export async function closeForExit(p, res, deps) {
@@ -251,12 +324,18 @@ export async function closeForExit(p, res, deps) {
     const closeReason = `${res.reason}${p.oor_direction ? ` (OOR ${p.oor_direction})` : ""}`;
     log("exit_close", `EXIT TRIGGERED for ${label}: ${closeReason} (on-chain ${res.onchainPct != null ? `${res.onchainPct}%` : "unavailable"}) [${source}]`);
     const preCloseBins = deps.getPositionBins ? Promise.resolve(deps.getPositionBins(p)).catch(() => null) : Promise.resolve(null);
-    const result = await deps.closePosition({ position_address: p.position, _pnlOverride: override, _close_reason: closeReason });
+    const closeArgs = { position_address: p.position, _pnlOverride: override, _close_reason: closeReason };
+    const startedAt = Date.now();
+    const result = await deps.closePosition(closeArgs);
     if (!result?.success) {
       log("pnl_watcher_error", `Failed to close ${String(p.position).slice(0, 8)}: ${result?.error || "unknown error"}`);
       return { closed: false, result, override };
     }
     log("pnl_watcher", `Closed ${label} | PnL: ${override.pnl_pct}% ($${override.pnl_usd})${res.onchainPct != null ? ` on-chain (API said ${p.pnl_pct}%)` : ""} [${source}]`);
+    if (deps.postClose) {
+      try { await deps.postClose(closeArgs, result, Date.now() - startedAt); }
+      catch (postErr) { log("pnl_watcher_error", `Post-close bookkeeping failed for ${label}: ${postErr.message}`); }
+    }
     try {
       deps.recordAutoClose?.({
         position: p.position,
