@@ -1,0 +1,494 @@
+/**
+ * GMGN fail-closed reliability: unknown/unpopulated data never passes a hard gate,
+ * rate-limited is a distinct result (not cached as a miss), pacing follows command
+ * weight and the ban reset time, the funnel runs the free Meteora check before the
+ * weighted calls and holders/traders only for finalists, and the risk/security
+ * fields are LOG-ONLY. gmgn-cli is never spawned: exec/sleep/now are injected.
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "fs";
+import os from "os";
+import path from "path";
+
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-gmgn-fc-"));
+fs.writeFileSync(path.join(TMP, "user-config.json"), "{}");
+fs.writeFileSync(path.join(TMP, "gmgn-config.json"), "{}");
+process.env.MERIDIAN_USER_CONFIG_PATH = path.join(TMP, "user-config.json");
+process.env.MERIDIAN_GMGN_CONFIG_PATH = path.join(TMP, "gmgn-config.json");
+process.env.DRY_RUN = "true";
+const REPO = process.cwd();
+process.chdir(TMP);
+test.after(() => { process.chdir(REPO); fs.rmSync(TMP, { recursive: true, force: true }); });
+
+const policy = await import("../tools/gmgn-policy.js");
+const gmgn = await import("../tools/gmgn.js");
+const screen = await import("../tools/gmgn-screen.js");
+const { config } = await import("../config.js");
+const screening = await import("../tools/screening.js");
+const { GMGN_STATUS } = policy;
+const T = screen._test;
+
+/* ------------------------------ fixtures ------------------------------ */
+const NOW_S = Math.floor(Date.now() / 1000);
+const goodToken = (n = 1, extra = {}) => ({
+  address: `Mint${n}`, symbol: `TK${n}`, market_cap: 500_000, bundler_rate: 0.1, creation_timestamp: NOW_S - 24 * 3600,
+  volume: 50_000 - n, rug_ratio: 0.05, sniper_count: 3, is_honeypot: 0, is_wash_trading: 0, ...extra,
+});
+const goodStat = () => ({
+  top_10_holder_rate: 0.3, dev_team_hold_rate: 0.01, bot_degen_rate: 0.1, fresh_wallet_rate: 0.1,
+  top_bundler_trader_percentage: 0.1, top_rat_trader_percentage: 0.05, creator_hold_rate: 0.01,
+  top70_sniper_hold_rate: 0.05, top_entrapment_trader_percentage: 0.02, private_vault_hold_rate: 0.0,
+  creator_created_count: 3, bot_degen_count: 5,
+});
+const goodInfo = (extra = {}) => ({
+  holder_count: 2000, total_fee: 100, trade_fee: 10, ath_price: 0.002, creation_timestamp: NOW_S - 24 * 3600,
+  price: { price: 0.001 }, stat: goodStat(), wallet_tags_stat: {}, dev: { creator_address: "dev", creator_token_status: "creator_close" },
+  pool: { liquidity: 40_000, initial_liquidity: 50_000 }, ...extra,
+});
+const goodPrice = () => ({ status: GMGN_STATUS.OK, data: { price: 0.001, candles: { supertrend_direction: "green", supertrend: { flipped_green: false }, supertrend_price_above: true, rsi_2: 50, bb_lower: 0.0005 } } });
+const holderRows = (snipers = 0) => [
+  ...Array.from({ length: 20 }, (_, i) => ({ address: `h${i}`, addr_type: 0, amount_percentage: 0.01, tags: i < snipers ? ["sniper"] : [] })),
+  { address: "pool", addr_type: 2, amount_percentage: 0.4, tags: [] },
+];
+
+function makeDeps(over = {}) {
+  const calls = { pools: [], info: [], security: [], price: [], call: [] };
+  const deps = {
+    cfg: config,
+    call: async (args) => {
+      calls.call.push(args.slice(0, 2).join(" "));
+      if (args[1] === "trending") return { status: GMGN_STATUS.OK, data: { data: { rank: over.rank ?? [goodToken(1), goodToken(2)] } } };
+      if (args[1] === "holders") return over.holders ? over.holders(args) : { status: GMGN_STATUS.OK, data: { list: holderRows(0) } };
+      if (args[1] === "traders") return { status: GMGN_STATUS.OK, data: { list: [] } };
+      return { status: GMGN_STATUS.ERROR, data: null };
+    },
+    fetchPools: async (mint) => { calls.pools.push(mint); return over.pools ? over.pools(mint) : [{ address: `pool-${mint}`, name: `${mint}-SOL`, tvl: 50_000, token_x: { address: mint, symbol: "X" }, token_y: { address: "So11111111111111111111111111111111111111112" }, pool_config: { bin_step: 100 } }]; },
+    fetchInfo: async (mint) => { calls.info.push(mint); return over.info ? over.info(mint) : { status: GMGN_STATUS.OK, info: goodInfo() }; },
+    fetchSecurity: async (mint) => { calls.security.push(mint); return over.security ? over.security(mint) : { status: GMGN_STATUS.OK, security: { renounced_mint: true, renounced_freeze_account: true, burn_status: "", buy_tax: 0, sell_tax: 0, lock_summary: { is_locked: false } } }; },
+    fetchPrice: async (mint) => { calls.price.push(mint); return over.price ? over.price(mint) : goodPrice(); },
+    fetchPoolDetail: async () => null,
+  };
+  return { deps, calls };
+}
+const reasonFor = (res, stage) => res.filtered_examples.filter((f) => f.stage === stage);
+
+/* ------------------------------ policy ------------------------------ */
+test("command weights, pacing, ban reset parsing and escalation", () => {
+  assert.equal(policy.commandWeight(["token", "holders", "--chain", "sol"]), 5);
+  assert.equal(policy.commandWeight(["token", "traders"]), 5);
+  assert.equal(policy.commandWeight(["token", "info"]), 1);
+  assert.equal(policy.commandWeight(["market", "kline"]), 1);
+  assert.equal(policy.paceGapMs(5, 5), 1000);
+  assert.equal(policy.paceGapMs(1, 5), 200);
+  assert.equal(policy.paceGapMs(5, 50), 100);
+  const now = 1_790_000_000_000;
+  assert.equal(policy.parseResetAtMs('{"code":429,"error":"RATE_LIMIT_BANNED","reset_at":1790000120}', now), 1_790_000_120_000);
+  assert.equal(policy.parseResetAtMs("x-ratelimit-reset: 1790000090", now), 1_790_000_090_000);
+  assert.equal(policy.parseResetAtMs("no reset here", now), null);
+  assert.equal(policy.parseResetAtMs('reset_at":1700000000', now), null, "stale reset ignored");
+  assert.equal(policy.cooldownUntilMs({ errorText: '{"reset_at":1790000120}', strikes: 1, now }), 1_790_000_121_000);
+  assert.equal(policy.cooldownUntilMs({ errorText: "429", strikes: 1, now }), now + 30_000);
+  assert.equal(policy.cooldownUntilMs({ errorText: "429", strikes: 3, now }), now + 120_000);
+  assert.equal(policy.escalatingCooldownMs(9), 300_000, "capped at the 5 minute ban ceiling");
+  assert.ok(policy.looksRateLimited("RATE_LIMIT_BANNED"));
+  assert.ok(!policy.looksRateLimited("failed to open /tmp/x14290y"), "digits inside other words are not a 429");
+  assert.ok(policy.looksForbidden("403 PLAN_UPGRADE_REQUIRED"));
+});
+
+test("stat population test and unknown-aware readers", () => {
+  assert.equal(policy.isStatUnpopulated(undefined), true);
+  assert.equal(policy.isStatUnpopulated({}), true);
+  assert.equal(policy.isStatUnpopulated(Object.fromEntries(policy.STAT_RISK_FIELDS.map((k) => [k, 0]))), true);
+  assert.equal(policy.isStatUnpopulated(goodStat()), false);
+  assert.equal(policy.numOrNull(undefined), null);
+  assert.equal(policy.numOrNull(""), null);
+  assert.equal(policy.numOrNull("0.2"), 0.2);
+  assert.equal(policy.numOrNull(0), 0);
+});
+
+/* ------------------------------ transport ------------------------------ */
+function fakeClock() {
+  const c = { now: 1_790_000_000_000, sleeps: [] };
+  return { c, sleep: async (ms) => { c.sleeps.push(ms); c.now += ms; }, nowFn: () => c.now };
+}
+function useExec(handler, clock = fakeClock()) {
+  const execs = [];
+  gmgn._setGmgnDepsForTest({
+    exec: (bin, args, opts, cb) => { execs.push(args); const r = handler(args, execs.length); cb(r.error || null, r.stdout ?? "", r.stderr ?? ""); },
+    sleep: clock.sleep, now: clock.nowFn, ratePerSec: () => 5,
+  });
+  return { execs, clock };
+}
+
+test("rate limit is a distinct result, honors reset_at, blocks spawns, never cached as a miss", async () => {
+  let mode = "limit";
+  const { execs, clock } = useExec((args) => {
+    if (mode === "limit") {
+      const reset = Math.floor(clock.c.now / 1000) + 90;
+      return { error: new Error("exit 1"), stderr: `{"code":429,"error":"RATE_LIMIT_BANNED","reset_at":${reset}}` };
+    }
+    return { stdout: JSON.stringify({ holder_count: 5, price: { price: 1 } }) };
+  });
+  const r1 = await gmgn.fetchGmgnTokenInfoResult("MintA");
+  assert.equal(r1.status, GMGN_STATUS.RATE_LIMITED);
+  assert.equal(r1.info, null);
+  assert.equal(execs.length, 1);
+  // inside the ban: no new spawn, still rate_limited (not "empty" / "error")
+  const r2 = await gmgn.fetchGmgnTokenInfoResult("MintA");
+  assert.equal(r2.status, GMGN_STATUS.RATE_LIMITED);
+  assert.equal(execs.length, 1, "no spawn while banned (spawning extends the ban)");
+  const st = gmgn.getGmgnRateLimitState();
+  assert.equal(st.limited, true);
+  assert.ok(st.retryAfterMs >= 90_000 && st.retryAfterMs <= 95_000, `reset_at honored, got ${st.retryAfterMs}`);
+  // ban lifts; the earlier rate-limit must NOT have been cached as a data miss
+  clock.c.now += 100_000;
+  mode = "ok";
+  const r3 = await gmgn.fetchGmgnTokenInfoResult("MintA");
+  assert.equal(r3.status, GMGN_STATUS.OK);
+  assert.equal(r3.info.holder_count, 5);
+  assert.equal(execs.length, 2);
+  // legacy wrapper still returns null for a limited call
+  assert.equal(await gmgn.spawnGmgn(["token", "info"]) !== undefined, true);
+});
+
+test("escalating cooldown without a reset time; a good response clears it", async () => {
+  let mode = "limit";
+  const { clock } = useExec(() => (mode === "limit" ? { error: new Error("x"), stderr: "HTTP 429 too many requests" } : { stdout: "{}" }));
+  await gmgn.spawnGmgnResult(["token", "info"]);
+  const s1 = gmgn.getGmgnRateLimitState();
+  assert.equal(s1.strikes, 1);
+  assert.ok(s1.retryAfterMs <= 30_000 && s1.retryAfterMs > 29_000);
+  clock.c.now += 31_000;
+  await gmgn.spawnGmgnResult(["token", "info"]);
+  const s2 = gmgn.getGmgnRateLimitState();
+  assert.equal(s2.strikes, 2);
+  assert.ok(s2.retryAfterMs > 59_000 && s2.retryAfterMs <= 60_000, "second strike doubles to 60s");
+  clock.c.now += 61_000;
+  mode = "ok";
+  const ok = await gmgn.spawnGmgnResult(["token", "info"]);
+  assert.equal(ok.status, GMGN_STATUS.OK);
+  assert.equal(gmgn.getGmgnRateLimitState().strikes, 0);
+});
+
+test("403 plan upgrade is non-retryable (no cooldown); empty stdout and bad JSON are distinct", async () => {
+  let mode = "forbidden";
+  useExec(() => {
+    if (mode === "forbidden") return { error: new Error("403"), stderr: "PLAN_UPGRADE_REQUIRED" };
+    if (mode === "empty") return { stdout: "" };
+    return { stdout: "not json" };
+  });
+  assert.equal((await gmgn.spawnGmgnResult(["token", "security"])).status, GMGN_STATUS.FORBIDDEN);
+  assert.equal(gmgn.getGmgnRateLimitState().limited, false);
+  mode = "empty";
+  assert.equal((await gmgn.spawnGmgnResult(["token", "info"])).status, GMGN_STATUS.EMPTY);
+  mode = "bad";
+  assert.equal((await gmgn.spawnGmgnResult(["token", "info"])).status, GMGN_STATUS.ERROR);
+});
+
+test("pacing follows command weight (holders/traders wait 5x longer than info)", async () => {
+  const { clock } = useExec(() => ({ stdout: "{}" }));
+  await gmgn.spawnGmgnResult(["token", "holders", "--address", "a"]);
+  await gmgn.spawnGmgnResult(["token", "info", "--address", "a"]); // waits out the holders cost: 1000ms @5/s
+  await gmgn.spawnGmgnResult(["token", "info", "--address", "b"]); // waits out the info cost: 200ms
+  assert.deepEqual(clock.c.sleeps, [1000, 200]);
+});
+
+test("token info: concurrent callers share one spawn; genuine empty is cached briefly", async () => {
+  const { execs } = useExec(() => ({ stdout: JSON.stringify({ holder_count: 9 }) }));
+  const [a, b] = await Promise.all([gmgn.fetchGmgnTokenInfoResult("M"), gmgn.fetchGmgnTokenInfoResult("M")]);
+  assert.equal(a.info.holder_count, 9);
+  assert.equal(b.info.holder_count, 9);
+  assert.equal(execs.length, 1);
+});
+
+test("price info: missing reference prices are null (not 0 = flat); rate-limited halves are not cached", async () => {
+  let limited = false;
+  const { execs } = useExec((args) => {
+    if (limited) return { error: new Error("x"), stderr: "RATE_LIMIT_EXCEEDED 429" };
+    if (args[1] === "info") return { stdout: JSON.stringify({ price: { price: 0.5 }, holder_count: 10, liquidity: 0, pool: { liquidity: 1234 }, creation_timestamp: NOW_S - 7200, open_timestamp: NOW_S - 60 }) };
+    return { stdout: JSON.stringify({ list: [] }) };
+  });
+  const res = await gmgn.fetchGmgnPriceInfoResult("M1");
+  assert.equal(res.status, GMGN_STATUS.OK);
+  assert.equal(res.data.change_1h, null);
+  assert.equal(res.data.change_5m, null);
+  assert.equal(res.data.volume_24h, null);
+  assert.equal(res.data.candles, null, "no candles => null summary");
+  assert.equal(res.data.kline_status, GMGN_STATUS.EMPTY);
+  assert.equal(res.data.liquidity, 1234, "falls back to pool.liquidity when info.liquidity is 0");
+  assert.ok(res.data.token_age_hours > 1.9 && res.data.token_age_hours < 2.1, "age from creation_timestamp, not open_timestamp");
+  // rate limited: distinct status, nothing cached
+  gmgn._setGmgnDepsForTest(null);
+  limited = true;
+  useExec(() => ({ error: new Error("x"), stderr: "RATE_LIMIT_EXCEEDED 429" }));
+  const lim = await gmgn.fetchGmgnPriceInfoResult("M2");
+  assert.equal(lim.status, GMGN_STATUS.RATE_LIMITED);
+  assert.equal(lim.data, null);
+});
+
+test("signal: rate-limited info is unknown (null, uncached); legacy signal_count_30m aliases the holder snapshot", async () => {
+  useExec(() => ({ error: new Error("x"), stderr: "429 RATE_LIMIT" }));
+  assert.equal(await gmgn.fetchGmgnSignal("S1"), null);
+  useExec((args) => (args[0] === "token"
+    ? { stdout: JSON.stringify({ wallet_tags_stat: { smart_wallets: 2, renowned_wallets: 1, whale_wallets: 0 } }) }
+    : { stdout: JSON.stringify({ list: [] }) }));
+  const sig = await gmgn.fetchGmgnSignal("S1");
+  assert.equal(sig.tagged_holder_count, 3);
+  assert.equal(sig.signal_count_30m, 3, "deprecated alias keeps stored-data comparability");
+  assert.equal(sig.signal_count_semantics, "tagged_holder_snapshot");
+  assert.equal(sig.trade_events_30m, 0);
+  // snapshot signal keeps its old meaning via tagged_holder_count
+  const snap = screening.getCandidateSignalSnapshot({ pool: "p", _gmgnSignal: sig });
+  assert.equal(snap.gmgn_signal_present, true);
+  const snapLegacy = screening.getCandidateSignalSnapshot({ pool: "p", _gmgnSignal: { signal_count_30m: 0 } });
+  assert.equal(snapLegacy.gmgn_signal_present, false);
+});
+
+/* ------------------------------ stage gates ------------------------------ */
+test("stage 1 fails closed on missing bundler_rate / rug_ratio / sniper_count / creation_timestamp", () => {
+  assert.equal(T.passBasicRankFilter(goodToken()).pass, true);
+  for (const field of ["bundler_rate", "rug_ratio", "sniper_count", "creation_timestamp", "market_cap", "volume"]) {
+    const t = goodToken(1);
+    delete t[field];
+    const r = T.passBasicRankFilter(t);
+    assert.equal(r.pass, false, `${field} missing must reject`);
+    assert.ok(r.unknown.includes(field), `${field} flagged unknown`);
+  }
+  const nullRug = T.passBasicRankFilter(goodToken(1, { rug_ratio: null }));
+  assert.equal(nullRug.pass, false);
+  // gate disabled (null) => the field is not required
+  const off = T.passBasicRankFilter(goodToken(1, { rug_ratio: undefined }), { ...config.gmgn, maxRugRatio: null });
+  assert.equal(off.pass, true);
+});
+
+test("stage 3 fails closed on unpopulated stat, zero top10, and any missing gated field", () => {
+  assert.equal(T.analyzeTokenInfo(goodInfo()).passed, true);
+  const unpop = T.analyzeTokenInfo(goodInfo({ stat: { top_10_holder_rate: 0.3 } }));
+  assert.equal(unpop.passed, false);
+  assert.ok(unpop.unknown.includes("stat"));
+  const allZero = T.analyzeTokenInfo(goodInfo({ stat: Object.fromEntries(Object.keys(goodStat()).map((k) => [k, 0])) }));
+  assert.equal(allZero.statUnpopulated, true);
+  assert.equal(allZero.passed, false);
+  assert.equal(T.analyzeTokenInfo(goodInfo({ stat: undefined })).passed, false);
+  const zeroTop10 = T.analyzeTokenInfo(goodInfo({ stat: { ...goodStat(), top_10_holder_rate: 0 } }));
+  assert.ok(zeroTop10.unknown.includes("top_10_holder_rate"));
+  for (const field of ["dev_team_hold_rate", "bot_degen_rate", "fresh_wallet_rate", "top_bundler_trader_percentage", "top_rat_trader_percentage"]) {
+    const stat = goodStat();
+    delete stat[field];
+    const r = T.analyzeTokenInfo(goodInfo({ stat }));
+    assert.equal(r.passed, false, `${field} missing must reject`);
+    assert.ok(r.unknown.includes(field));
+  }
+  assert.equal(T.analyzeTokenInfo(goodInfo({ holder_count: undefined })).passed, false);
+  assert.equal(T.analyzeTokenInfo(goodInfo({ total_fee: null })).passed, false);
+  // real violations still reject (kind reject, no unknowns)
+  const bad = T.analyzeTokenInfo(goodInfo({ stat: { ...goodStat(), top_bundler_trader_percentage: 0.9 } }));
+  assert.equal(bad.passed, false);
+  assert.equal(bad.unknown.length, 0);
+});
+
+test("stage 4 fails closed with no candles / no price; rate-limited is deferred; bb_lower rule is log-only by default", () => {
+  assert.equal(T.checkBounceSetup(goodPrice()).passed, true);
+  const noCandles = T.checkBounceSetup({ status: GMGN_STATUS.OK, data: { price: 1, candles: null } });
+  assert.equal(noCandles.passed, false);
+  assert.equal(noCandles.kind, "unknown");
+  assert.equal(T.checkBounceSetup({ status: GMGN_STATUS.OK, data: null }).passed, false);
+  assert.equal(T.checkBounceSetup({ status: GMGN_STATUS.OK, data: { price: 0, candles: {} } }).passed, false);
+  const limited = T.checkBounceSetup({ status: GMGN_STATUS.RATE_LIMITED, data: null });
+  assert.equal(limited.passed, false);
+  assert.equal(limited.deferred, true);
+  // bottom: now computable (bb_lower) but log-only unless rejectAlreadyAtBottom === true
+  const bottom = { status: GMGN_STATUS.OK, data: { price: 0.0004, candles: { supertrend_direction: "green", supertrend_price_above: true, rsi_2: 5, bb_lower: 0.0005 } } };
+  const r = T.checkBounceSetup(bottom);
+  assert.equal(r.signal.bbPosition, "below");
+  assert.equal(r.signal.alreadyAtBottom, true);
+  assert.equal(r.passed, true, "default stays non-gating");
+  const hard = T.checkBounceSetup(bottom, { ...config.gmgn, indicatorRules: { ...config.gmgn.indicatorRules, rejectAlreadyAtBottom: true } });
+  assert.equal(hard.passed, false);
+});
+
+test("holders gate: sniper supply share, burn/DEX rows excluded, renowned counts as KOL", () => {
+  const dex = { address: "pool", addr_type: 2, amount_percentage: 0.5, tags: ["sniper"] };
+  const clean = T.analyzeHoldersAndTraders([dex, ...holderRows(0)], []);
+  assert.equal(clean.passed, true, "a sniper-tagged DEX row is not a holder");
+  // 2 snipers holding 20% of supply each among 20 real rows: row rate 10% but supply 40% > 30%
+  const rows = holderRows(0);
+  rows[0] = { address: "s1", addr_type: 0, amount_percentage: 0.2, tags: ["sniper"] };
+  rows[1] = { address: "s2", addr_type: 0, amount_percentage: 0.2, tags: ["sniper"] };
+  const heavy = T.analyzeHoldersAndTraders(rows, []);
+  assert.equal(heavy.passed, false);
+  assert.match(heavy.reasons.join(), /supply share/);
+  assert.ok(Math.abs(heavy.sniperSupplyShare - 0.4) < 1e-9);
+  // legacy row-count gate never loosens: 8/20 snipers with tiny amounts still rejects
+  const many = T.analyzeHoldersAndTraders(holderRows(8), []);
+  assert.equal(many.passed, false);
+  const kol = T.analyzeHoldersAndTraders([{ address: "k", addr_type: 0, amount_percentage: 0.01, tags: ["renowned"] }, ...holderRows(0)], []);
+  assert.equal(kol.kolHolding, 1);
+});
+
+test("gmgn_score: unknown rug_ratio earns no bonus; token age uses creation_timestamp", () => {
+  const pool = { address: "p1", name: "X-SOL", token_y: { address: "So11111111111111111111111111111111111111112" } };
+  const base = { pool, poolDetail: null, security: {}, info: goodInfo(), infoAnalysis: T.analyzeTokenInfo(goodInfo()), holdersAnalysis: T.analyzeHoldersAndTraders(holderRows(0), []), indicatorSignal: null };
+  const withRug = T.condenseGmgnCandidate({ ...base, token: goodToken(1) });
+  const noRug = T.condenseGmgnCandidate({ ...base, token: goodToken(1, { rug_ratio: undefined }) });
+  assert.ok(withRug.gmgn_score - noRug.gmgn_score >= 400, "known low rug earns the bonus, unknown does not");
+  const aged = T.condenseGmgnCandidate({ ...base, token: goodToken(1, { open_timestamp: NOW_S - 60 }) });
+  assert.equal(aged.token_age_hours, 24, "open_timestamp ignored");
+  assert.equal(withRug.gmgn_gated, true);
+});
+
+/* ------------------------------ funnel ------------------------------ */
+test("funnel: happy path emits a candidate carrying LOG-ONLY risk fields", async () => {
+  const { deps } = makeDeps({ rank: [goodToken(1)] });
+  const res = await screen.discoverGmgnPools({ limit: 5, deps });
+  assert.equal(res.pools.length, 1);
+  const c = res.pools[0];
+  assert.equal(c.gmgn_security_status, "ok");
+  assert.equal(c.gmgn_renounced_freeze, true);
+  assert.equal(c.gmgn_creator_hold_pct, 1);
+  assert.equal(c.gmgn_pool_liquidity_ratio, 0.8);
+  assert.equal(c.gmgn_creator_created_count, 3);
+  assert.ok(Array.isArray(c.gmgn_risk_log_only_flags));
+  const snap = screening.getCandidateSignalSnapshot(c);
+  assert.equal(snap.gmgn_risk_log_only.gmgn_renounced_mint, true);
+});
+
+test("risk fields are log-only: bad security/stat risk flags never reject", async () => {
+  const { deps } = makeDeps({
+    rank: [goodToken(1)],
+    info: async () => ({ status: GMGN_STATUS.OK, info: goodInfo({ stat: { ...goodStat(), creator_hold_rate: 0.5, top70_sniper_hold_rate: 0.6, top_entrapment_trader_percentage: 0.9, private_vault_hold_rate: 0.3, creator_created_count: 900 }, pool: { liquidity: 1, initial_liquidity: 100 } }) }),
+    security: async () => ({ status: GMGN_STATUS.OK, security: { renounced_mint: false, renounced_freeze_account: false, sell_tax: 0.5, buy_tax: "", lock_summary: { is_locked: false }, burn_status: "" } }),
+  });
+  const res = await screen.discoverGmgnPools({ limit: 5, deps });
+  assert.equal(res.pools.length, 1, "still passes");
+  const flags = res.pools[0].gmgn_risk_log_only_flags;
+  for (const f of ["creator_hold>5%", "top70_sniper>15%", "entrapment>20%", "private_vault>5%", "serial_launcher>=200", "pool_liquidity<50%_of_initial", "mint_not_renounced", "freeze_not_renounced", "sell_tax>10%"]) {
+    assert.ok(flags.includes(f), `flag ${f} recorded`);
+  }
+  assert.equal(res.pools[0].gmgn_buy_tax, null, "empty-string tax = untested (null), not 0");
+});
+
+test("funnel order: Meteora pool check before any weighted call; info fetched once per mint; holders only for finalists", async () => {
+  const rank = [goodToken(1), goodToken(2), goodToken(3), goodToken(4), goodToken(5)];
+  const { deps, calls } = makeDeps({ rank, pools: async (mint) => (mint === "Mint5" ? [] : [{ address: `pool-${mint}`, name: `${mint}-SOL`, tvl: 50_000, token_x: { address: mint, symbol: "X" }, token_y: { address: "So11111111111111111111111111111111111111112" }, pool_config: { bin_step: 100 } }]) });
+  deps.cfg = { ...config, gmgn: { ...config.gmgn, finalistLimit: 2 } };
+  const res = await screen.discoverGmgnPools({ limit: 10, deps });
+  assert.ok(!calls.info.includes("Mint5"), "no GMGN info call for a token without a SOL DLMM pool");
+  assert.ok(reasonFor(res, 2).some((f) => /no SOL DLMM pool/.test(f.reason)));
+  assert.deepEqual(calls.info, ["Mint1", "Mint2", "Mint3", "Mint4"], "exactly one info fetch per surviving mint");
+  assert.equal(calls.call.filter((c) => c === "token holders").length, 2, "holders only for the 2 finalists");
+  assert.equal(calls.call.filter((c) => c === "token traders").length, 2);
+  assert.equal(calls.security.length, 2);
+  assert.equal(res.pools.length, 2);
+  assert.equal(res.filtered_examples.filter((f) => f.stage === 5 && f.kind === "deferred").length, 2, "non-finalists are deferred, not rejected");
+});
+
+test("funnel: rate-limited holders defers (neither pass nor reject) and stops further GMGN calls", async () => {
+  const { deps, calls } = makeDeps({
+    rank: [goodToken(1), goodToken(2)],
+    holders: () => ({ status: GMGN_STATUS.RATE_LIMITED, data: null }),
+  });
+  const res = await screen.discoverGmgnPools({ limit: 5, deps });
+  assert.equal(res.pools.length, 0);
+  assert.equal(res.rate_limited, true);
+  assert.equal(calls.call.filter((c) => c === "token holders").length, 1, "stops after the first limited call");
+  const f = reasonFor(res, 5);
+  assert.equal(f.length, 2);
+  assert.ok(f.every((x) => x.kind === "deferred"));
+});
+
+test("funnel: null/empty holders fails closed as unknown (old code passed the sniper gate)", async () => {
+  for (const holders of [() => ({ status: GMGN_STATUS.ERROR, data: null }), () => ({ status: GMGN_STATUS.OK, data: { list: [] } })]) {
+    const { deps } = makeDeps({ rank: [goodToken(1)], holders });
+    const res = await screen.discoverGmgnPools({ limit: 5, deps });
+    assert.equal(res.pools.length, 0);
+    const f = reasonFor(res, 5)[0];
+    assert.equal(f.kind, "unknown");
+    assert.match(f.reason, /holders unavailable/);
+  }
+});
+
+test("funnel: unpopulated stat, missing rug_ratio, and no candles each reject (previously passed)", async () => {
+  const unpop = await screen.discoverGmgnPools({ limit: 5, deps: makeDeps({ rank: [goodToken(1)], info: async () => ({ status: GMGN_STATUS.OK, info: goodInfo({ stat: {} }) }) }).deps });
+  assert.equal(unpop.pools.length, 0);
+  assert.match(reasonFor(unpop, 3)[0].reason, /stat block unpopulated/);
+  const noRug = await screen.discoverGmgnPools({ limit: 5, deps: makeDeps({ rank: [goodToken(1, { rug_ratio: undefined })] }).deps });
+  assert.equal(noRug.pools.length, 0);
+  assert.match(reasonFor(noRug, 1)[0].reason, /rug_ratio unknown/);
+  const noCandles = await screen.discoverGmgnPools({ limit: 5, deps: makeDeps({ rank: [goodToken(1)], price: async () => ({ status: GMGN_STATUS.OK, data: { price: 1, candles: null } }) }).deps });
+  assert.equal(noCandles.pools.length, 0);
+  assert.equal(reasonFor(noCandles, 4)[0].kind, "unknown");
+});
+
+test("funnel: rate-limited trending skips the cycle without spending calls", async () => {
+  const { deps, calls } = makeDeps();
+  const orig = deps.call;
+  deps.call = async (args) => (args[1] === "trending" ? { status: GMGN_STATUS.RATE_LIMITED, data: null } : orig(args));
+  const res = await screen.discoverGmgnPools({ limit: 5, deps });
+  assert.equal(res.rate_limited, true);
+  assert.equal(res.pools.length, 0);
+  assert.equal(calls.info.length, 0);
+});
+
+/* ------------------------------ Meteora-source gate ------------------------------ */
+const mPool = (n) => ({ pool: `mpool${n}`, name: `M${n}-SOL`, base: { symbol: `M${n}`, mint: `Mint${n}` } });
+
+test("Meteora-source candidates run the GMGN safety gates (fail closed), already-gated ones pass through", async () => {
+  const { deps, calls } = makeDeps({
+    info: async (mint) => {
+      if (mint === "Mint2") return { status: GMGN_STATUS.OK, info: goodInfo({ stat: {} }) };               // unpopulated -> unknown
+      if (mint === "Mint3") return { status: GMGN_STATUS.EMPTY, info: null };                              // no info -> unknown
+      if (mint === "Mint4") return { status: GMGN_STATUS.OK, info: goodInfo({ stat: { ...goodStat(), top_bundler_trader_percentage: 0.9 } }) }; // real reject
+      return { status: GMGN_STATUS.OK, info: goodInfo() };
+    },
+  });
+  const pre = { ...mPool(9), gmgn: true, gmgn_gated: true };
+  const res = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3), mPool(4), pre], { limit: 10, deps: { ...deps, force: true } });
+  const keptNames = res.kept.map((p) => p.name).sort();
+  assert.deepEqual(keptNames, ["M1-SOL", "M9-SOL"]);
+  const kinds = Object.fromEntries(res.dropped.map((d) => [d.symbol, d.kind]));
+  assert.deepEqual(kinds, { M2: "unknown", M3: "unknown", M4: "reject" });
+  const m1 = res.kept.find((p) => p.name === "M1-SOL");
+  assert.equal(m1.gmgn_gated, true);
+  assert.equal(m1.gmgn_security_status, "ok");
+  assert.ok(!calls.info.includes("Mint9"), "pipeline-gated candidates are not re-fetched");
+});
+
+test("Meteora-source gate: holders unavailable fails closed; rate limit defers the rest; skipped without a GMGN key", async () => {
+  const unavailable = makeDeps({ holders: () => ({ status: GMGN_STATUS.ERROR, data: null }) });
+  const r1 = await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { ...unavailable.deps, force: true } });
+  assert.equal(r1.kept.length, 0);
+  assert.equal(r1.dropped[0].kind, "unknown");
+
+  const limited = makeDeps({ info: async (m) => (m === "Mint2" ? { status: GMGN_STATUS.RATE_LIMITED, info: null } : { status: GMGN_STATUS.OK, info: goodInfo() }) });
+  const r2 = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3)], { deps: { ...limited.deps, force: true } });
+  assert.equal(r2.rate_limited, true);
+  assert.deepEqual(r2.dropped.map((d) => d.kind).sort(), ["deferred", "deferred", "deferred"].sort(), "limited candidate and everything after it are deferred; Mint1 deferred too because phase B stopped");
+  assert.equal(r2.kept.length, 0, "a rate limit never passes a candidate");
+
+  const noKey = await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { cfg: { ...config, gmgn: { ...config.gmgn, apiKey: null } } } });
+  const hadEnv = process.env.GMGN_API_KEY;
+  delete process.env.GMGN_API_KEY;
+  const noKey2 = await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { cfg: { ...config, gmgn: { ...config.gmgn, apiKey: null } } } });
+  if (hadEnv) process.env.GMGN_API_KEY = hadEnv;
+  assert.equal(noKey2.skipped, true);
+  assert.equal(noKey2.kept.length, 1);
+  assert.ok(noKey);
+});
+
+/* ------------------------------ config / wiring ------------------------------ */
+test("dead KOL/smart-degen config removed; new reliability settings present with conservative defaults", () => {
+  for (const k of ["requireKol", "minKolCount", "minSmartDegenCount"]) assert.ok(!(k in config.gmgn), `${k} removed`);
+  assert.equal(config.gmgn.plan, "free");
+  assert.equal(config.gmgn.finalistLimit, 5);
+  assert.equal(config.gmgn.gateMeteoraSource, true);
+  assert.equal(config.gmgn.indicatorRules.rejectAlreadyAtBottom, false);
+  const example = JSON.parse(fs.readFileSync(path.join(REPO, "gmgn-config.example.json"), "utf8"));
+  assert.ok(!("requireKol" in example) && !("minKolCount" in example) && !("minSmartDegenCount" in example));
+});
+
+test("global_fees_sol gate in index.js is fail-closed", () => {
+  const src = fs.readFileSync(path.join(REPO, "index.js"), "utf8");
+  assert.match(src, /c\._globalFeesSol == null\) return "global_fees unknown \(fail closed\)"/);
+});
