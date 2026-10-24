@@ -13,13 +13,14 @@
 
 import { log } from "./logger.js";
 import { config } from "./config.js";
-import { updatePnlAndCheckExits, getTrackedPosition, recordPnlHold, recordAutoClose, registerExitTick } from "./state.js";
+import { updatePnlAndCheckExits, getTrackedPosition, recordPnlHold, recordAutoClose, registerExitTick, markOnchainRead } from "./state.js";
 import { getMyPositions, closePosition, isCloseInflight } from "./tools/dlmm.js";
 import { getOnchainPnl } from "./tools/onchain-pnl.js";
 import { evaluatePnlExit, closeForExit } from "./exit-engine.js";
 import { emit } from "./notifier.js";
 import { getPositionBins, withTimeout } from "./tools/bin-visual.js";
 import { isDraining } from "./session.js";
+import { finalizeCodeClose } from "./tools/executor.js";
 
 let _intervalHandle = null;
 // Per-tick inflight guard: prevents overlapping setInterval ticks from
@@ -74,16 +75,27 @@ export async function runPnlWatcher() {
     // (LLM + deploy). Closes now serialize through the wallet lock at close
     // priority, and closeForExit skips a position already closed / closing.
     const getPositions = dep("getMyPositions", getMyPositions);
-    const cached = await getPositions();
+    // M1: a hung positions read must not wedge the tick (and with it _tickRunning).
+    const readMs = Math.max(1, Number(config.exits?.readTimeoutSec ?? 20)) * 1000;
+    const bounded = (p) => dep("withTimeout", withTimeout)(p, readMs);
+    const cached = await bounded(getPositions());
     if (!cached?.positions?.length) return;
 
-    const result = await getPositions({ force: true });
+    const result = await bounded(getPositions({ force: true }));
     const positions = result?.positions || [];
     if (positions.length === 0) return;
 
-    const now = dep("now", () => Date.now())();
+    const nowFn = dep("now", () => Date.now());
+    const readOnchain = (pos) => bounded(dep("getOnchainPnl", getOnchainPnl)(pos));
+
+    // M2: two passes. Evaluate EVERY position first (reads + confirming ticks,
+    // no wallet lock needed), then execute the decided closes. A close that is
+    // queued behind a long-running deploy therefore never starves the other
+    // positions of their confirming ticks.
+    const decided = [];
     for (const p of positions) {
       const tracked = getTrackedPosition(p.position);
+      const now = nowFn(); // L2: fresh per position, not once per (possibly long) tick
       if (tracked?.deployed_at) {
         const ageMs = now - new Date(tracked.deployed_at).getTime();
         if (ageMs < 120_000) continue;
@@ -96,11 +108,21 @@ export async function runPnlWatcher() {
           update: updatePnlAndCheckExits,
           register: registerExitTick,
           recordHold: recordPnlHold,
-          readOnchain: dep("getOnchainPnl", getOnchainPnl),
+          readOnchain,
+          markOnchain: markOnchainRead,
           now,
           source: "watcher",
         });
-        if (res.action !== "close") continue;
+        if (res.action === "close") decided.push({ p, res });
+      } catch (posErr) {
+        log("pnl_watcher_error", `Error processing position ${String(p.position).slice(0, 8)}: ${posErr.message}`);
+      }
+    }
+
+    // Closes serialize on the wallet lock (close priority); run them together so
+    // one slow close does not delay the others' lock requests.
+    await Promise.allSettled(decided.map(async ({ p, res }) => {
+      try {
         await closeForExit(p, res, {
           closePosition: dep("closePosition", closePosition),
           getTracked: getTrackedPosition,
@@ -109,12 +131,13 @@ export async function runPnlWatcher() {
           emit: dep("emit", emit),
           getPositionBins: dep("getPositionBins", getPositionBins),
           withTimeout,
+          postClose: dep("postClose", finalizeCodeClose),
           source: "watcher",
         });
       } catch (posErr) {
-        log("pnl_watcher_error", `Error processing position ${String(p.position).slice(0, 8)}: ${posErr.message}`);
+        log("pnl_watcher_error", `Error closing position ${String(p.position).slice(0, 8)}: ${posErr.message}`);
       }
-    }
+    }));
   } catch (err) {
     log("pnl_watcher_error", `Tick failed: ${err.message}`);
   } finally {

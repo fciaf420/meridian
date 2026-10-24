@@ -59,7 +59,14 @@ export async function runManagementCodeRules(positions, deps) {
     }
     if (pnl?.action === "close") {
       const label = ruleLabelForPnlExit(pnl);
-      const r = await closeForExit(p, { ...pnl, reason: label }, { ...deps.closeDeps, source: "management" });
+      let r;
+      try {
+        r = await closeForExit(p, { ...pnl, reason: label }, { ...deps.closeDeps, source: "management" });
+      } catch (e) {
+        // L5: a throwing close must not abort the cycle for the remaining positions.
+        log("cron_error", `Management: close threw for ${pair} (${label}): ${e.message}`);
+        r = { closed: false, result: { error: e.message } };
+      }
       if (r.closed) { out.closed.push({ position: p.position, pair, rule: label }); out.lines.push(`${pair}: CLOSED in code — ${label}`); }
       else if (r.skipped) out.lines.push(`${pair}: ${label} — already closed/closing (${r.skipped})`);
       else { out.failed.push({ position: p.position, pair, rule: label, error: r.result?.error || "close failed" }); out.lines.push(`${pair}: close FAILED — ${label}`); }

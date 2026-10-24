@@ -2395,6 +2395,11 @@ export function createTelegramUI(deps) {
     out_of_range: (d) => alert("out_of_range", d.pair, 6 * 60 * 60_000,
       `⚠️ <b>Out of range</b> ${escapeHtml(d.pair)} for ${escapeHtml(d.minutesOOR)} min`,
       [[positionsBtn()]]),
+    // Generic operational alert (wallet lock stale/abandoned, trailing disabled
+    // by PnL source mismatch). Rate-limited per key.
+    ops_alert: (d) => alert("ops_alert", String(d.key ?? d.title ?? "ops"), 30 * 60_000,
+      `⚠️ <b>${escapeHtml(d.title ?? "Alert")}</b>\n${escapeHtml(String(d.text ?? "").slice(0, 600))}`,
+      [[positionsBtn()]]),
     gas_low: (d) => alert("gas_low", "gas", 2 * 60 * 60_000,
       `⛽ <b>Gas low — deploy paused</b>\n${escapeHtml(d.reason || `Native SOL ${d.sol} is below the gas reserve${d.reserve != null ? ` of ${d.reserve} SOL` : ""}.`)}\nTop up SOL to resume USDC-mode deploys.`,
       [[btn("💰 Wallet", "wa!")]]),

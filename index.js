@@ -16,7 +16,8 @@ import { createAllSettings } from "./all-settings.js";
 import { normalizeEntryFilterValue, isLooseningChange } from "./tools/entry-safety.js";
 import { applyTradingSettings } from "./trading-settings.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
-import { registerCronRestarter, executeTool } from "./tools/executor.js";
+import { registerCronRestarter, executeTool, finalizeCodeClose } from "./tools/executor.js";
+import { setWalletLockOptions } from "./wallet-lock.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, editHTML, answerCallback, setMyCommands, isEnabled as telegramEnabled } from "./telegram.js";
 import { createTelegramUI, BOT_COMMANDS, readRecentErrors } from "./telegram-ui.js";
 import { lookupToken, parseMint } from "./tools/token-lookup.js";
@@ -25,7 +26,7 @@ import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing, recordBriefing, latestBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { updatePnlAndCheckExits, getTrackedPosition, registerExitTick, recordPnlHold, recordAutoClose } from "./state.js";
+import { updatePnlAndCheckExits, getTrackedPosition, registerExitTick, recordPnlHold, recordAutoClose, markOnchainRead } from "./state.js";
 import { runManagementCodeRules, formatCodeRuleResults } from "./management-rules.js";
 import { getOnchainPnl } from "./tools/onchain-pnl.js";
 import { closePosition } from "./tools/dlmm.js";
@@ -723,6 +724,7 @@ function startCronJobs() {
             register: registerExitTick,
             recordHold: recordPnlHold,
             readOnchain: getOnchainPnl,
+            markOnchain: markOnchainRead,
           },
           closeDeps: {
             closePosition,
@@ -732,6 +734,7 @@ function startCronJobs() {
             emit,
             getPositionBins,
             withTimeout,
+            postClose: finalizeCodeClose,
           },
         });
         const ruleHits = codeRules.llmNeeded;
@@ -881,6 +884,19 @@ function startCronJobs() {
   _cronTasks = [mgmtTask, screenTask, briefingTask, briefingWatchdog, kbHealthTask];
 
   // Start lightweight PnL watcher (sub-minute interval, no LLM)
+  // M1: stale / hung wallet-lock holder → Telegram alert, hard release after the timeout.
+  setWalletLockOptions({
+    warnMs: (config.exits?.walletLockWarnSec ?? 300) * 1000,
+    hardMs: (config.exits?.walletLockTimeoutSec ?? 900) * 1000,
+    onAlert: ({ kind, label, heldMs, queued }) => {
+      const secs = Math.round(heldMs / 1000);
+      const text = kind === "abandoned"
+        ? `Wallet lock RELEASED after ${secs}s: "${label}" never finished (hung RPC?). It may still land on chain. ${queued} operation(s) were queued.`
+        : `Wallet lock held ${secs}s by "${label}" (${queued} queued). Closes cannot run until it finishes; check RPC health.`;
+      log("wallet_lock", text);
+      emit("ops_alert", { key: `lock:${kind}`, title: kind === "abandoned" ? "Wallet lock released after timeout" : "Wallet lock held too long", text });
+    },
+  });
   startPnlWatcher(config.schedule.pnlWatcherIntervalSec);
 
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m, pnl watcher every ${config.schedule.pnlWatcherIntervalSec}s`);
