@@ -637,7 +637,7 @@ test("picker: strategy step offers Bid-Ask and Spot, marks the default, no two-s
   const step = await openPicker(u, t);
   assert.match(step.text, /How do you want to deploy AAA-SOL\?/);
   const labels = lastMarkup(step).flat().map((b) => b.text);
-  assert.deepEqual(labels, ["Bid-Ask ✓", "Spot", "✖ Cancel"], "default bid_ask marked; nothing two-sided");
+  assert.deepEqual(labels, ["Bid-Ask ✓", "Spot", "Hybrid", "✖ Cancel"], "default bid_ask marked; nothing two-sided");
   assert.ok(!/two-sided|sol_split/i.test(step.text));
   assert.equal(step.messageId, 50, "edits the Candidates message in place");
   assert.equal(exec.length, 0);

@@ -44,6 +44,7 @@ function stripRemoved(c) {
 function stripAdded(c) {
   const o = structuredClone(c);
   delete o.profile; delete o.learning;
+  delete o.strategy.hybridBidAskPct; delete o.strategy.hybridSpotPct; // hybrid shape settings (added; defaults inert for non-hybrid configs)
   return o;
 }
 

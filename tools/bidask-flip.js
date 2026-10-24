@@ -142,15 +142,18 @@ export function estimateFlipCostLamports({ chunks = 1, maxPriorityFeeLamports = 
 
 /**
  * H1: strict eligibility. Only positions THIS bot deployed as a single-sided
- * SOL Bid-Ask are flip candidates. Auto-adopted positions (which include the
+ * SOL Bid-Ask (or hybrid Bid-Ask + Spot) are flip candidates. Auto-adopted positions (which include the
  * user's manual positions in the same wallet) get strategy "bid_ask" by default
  * and bins_above null, so they must be excluded explicitly. Returns a blocker
  * string, or null when eligible.
  */
 export function flipEligibilityBlocker(tracked) {
   if (!tracked) return "not tracked";
-  if (tracked.strategy !== "bid_ask") return `strategy ${tracked.strategy}`;
-  if (tracked.strategy_type !== "BidAsk") return `strategy_type ${tracked.strategy_type ?? "unset"} (not a bot BidAsk deploy)`;
+  if (tracked.strategy !== "bid_ask" && tracked.strategy !== "hybrid") return `strategy ${tracked.strategy}`;
+  // A bot-recorded strategy_type is required, and it must match the strategy: "BidAsk" for
+  // bid_ask, "Hybrid" for hybrid (one position, Bid-Ask + Spot layers, both single-sided SOL).
+  const wantType = tracked.strategy === "hybrid" ? "Hybrid" : "BidAsk";
+  if (tracked.strategy_type !== wantType) return `strategy_type ${tracked.strategy_type ?? "unset"} (not a bot ${wantType} deploy)`;
   if (tracked.adopted === true) return "auto-adopted position (not deployed by the bot)";
   if (Number(tracked.bin_range?.bins_above) !== 0 || tracked.bin_range?.bins_above == null) return "bins_above is not an explicit 0";
   if (!Number.isFinite(Number(tracked.bin_range?.max))) return "band top unknown";
@@ -196,7 +199,9 @@ export function planBidAskFlip(input) {
 
   if (cfg.mode === "off") return hold("mode off");
   if (input.exitReason) return hold(`exit rule fires this tick (${input.exitReason}) — close path wins`);
-  if (input.strategy && input.strategy !== "bid_ask") return hold(`not a bid_ask position (${input.strategy})`);
+  // hybrid (Bid-Ask + Spot layers) is flip-eligible: the planner reads ACTUAL per-bin token amounts
+  // and moves token only upward, so nothing here depends on the Bid-Ask SOL distribution.
+  if (input.strategy && input.strategy !== "bid_ask" && input.strategy !== "hybrid") return hold(`not a bid_ask/hybrid position (${input.strategy})`);
   // H1: strict — null/undefined bins_above (adopted positions) is NOT single-sided.
   if (input.binsAbove !== 0) return hold(`not single-sided (bins_above ${input.binsAbove ?? "unknown"})`);
   if (input.quoteIsSol === false) return hold("quote token is not SOL");

@@ -74,7 +74,7 @@ test("console: one message, Basics first, tuning/advanced collapsed, secrets nev
   for (const x of d) assert.ok(Buffer.byteLength(x) <= 64, x);
 });
 
-test("tuning index and every section render within limits and list only governed keys", async () => {
+test("tuning index and every section render within limits and list only governed keys (+ the hybrid mix)", async () => {
   const { u, calls } = makeUI();
   await u.handleCallback("kt", ctx());
   const idx = calls.at(-1);
@@ -88,7 +88,8 @@ test("tuning index and every section render within limits and list only governed
     total += datas(kb(v)).filter((x) => x.startsWith("ak:")).length;
   }
   // governed minus the two that live in Basics (maxPositions, positionSizePct)
-  assert.equal(total, (await import("../settings-schema.js")).GOVERNED_KEYS.length - 2);
+  // + hybridBidAskPct: the one ungoverned knob in the "Hybrid shape" section
+  assert.equal(total, (await import("../settings-schema.js")).GOVERNED_KEYS.length - 2 + 1);
 });
 
 test("profile switch: diff + confirm first; confirm persists, drops overrides, applies live", async () => {

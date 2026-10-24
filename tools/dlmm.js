@@ -58,6 +58,8 @@ const CLOSE_VERIFY_READS = 4;
 const CLOSE_VERIFY_DELAY_MS = 1500;
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
 import { flipCloseTags } from "./bidask-flip.js";
+import { HYBRID, normalizeHybridMix, splitHybridLamports, hybridTrackFields } from "../hybrid-mix.js";
+import { buildHybridStandardTx } from "./hybrid-build.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -465,6 +467,7 @@ const closeInflight = new Map();
 
 async function getPool(poolAddress) {
   const key = poolAddress.toString();
+  if (_poolOverridesForTest.has(key)) return _poolOverridesForTest.get(key); // test seam; empty in production
   if (!poolCache.has(key)) {
     const { DLMM } = await getDLMM();
     const pool = await DLMM.create(getConnection(), new PublicKey(poolAddress));
@@ -572,8 +575,26 @@ export async function deployPosition({
     throw new Error(`Deploy amount ${totalSolAmount} SOL is below the 0.1 SOL minimum. Pass at least 0.1 SOL or omit the amount to use the wallet-scaled default.`);
   }
 
-  if (!["bid_ask", "spot"].includes(activeStrategy)) {
-    throw new Error("Only 'bid_ask' or 'spot' strategies are allowed.");
+  if (!["bid_ask", "spot", HYBRID].includes(activeStrategy)) {
+    throw new Error("Only 'bid_ask', 'spot' or 'hybrid' strategies are allowed.");
+  }
+
+  // Hybrid = ONE single-sided SOL position with a Bid-Ask layer + a Spot layer.
+  // Validate the mix and the shape BEFORE anything is spent or built.
+  let hybridMix = null;
+  if (activeStrategy === HYBRID) {
+    // Hybrid is an owner-defined shape: the LLM may use it only when the owner configured it
+    // (strategy: "hybrid"); owner-initiated Telegram deploys (_manual) may always pick it.
+    if (!_manual && config.strategy.strategy !== HYBRID) {
+      return { success: false, error: "Hybrid deploy refused: the configured shape is '" + config.strategy.strategy + "', and hybrid is an owner-defined shape. Deploy with strategy='" + config.strategy.strategy + "' (or omit strategy)." };
+    }
+    try { hybridMix = normalizeHybridMix(config.strategy.hybridBidAskPct); } catch (e) {
+      return { success: false, error: `Hybrid deploy refused: ${e.message}` };
+    }
+    if ((amount_x ?? 0) > 0 || (sol_split_pct != null && sol_split_pct < 100)) {
+      return { success: false, error: "Hybrid is single-sided SOL only: do not pass amount_x or a sol_split_pct below 100." };
+    }
+    bins_above = 0;
   }
 
   // ─── Hard guard: token-age window (every strategy) ─────────────
@@ -916,6 +937,7 @@ export async function deployPosition({
         amount_x: amount_x || 0,
         amount_y: totalSolAmount,
         wide_range: (activeBinsBelow + activeBinsAbove) > 69,
+        ...(activeStrategy === HYBRID && hybridMix ? { strategy_mix: { bid_ask_pct: hybridMix.bidAskPct, spot_pct: hybridMix.spotPct } } : {}),
       },
       message: "DRY RUN — no transaction sent",
     };
@@ -1163,7 +1185,9 @@ export async function deployPosition({
     spot: StrategyType.Spot,
     curve: StrategyType.Curve,
     bid_ask: StrategyType.BidAsk,
+    hybrid: StrategyType.BidAsk, // leg 1 of a hybrid; leg 2 (Spot) is built separately
   };
+  const isHybrid = activeStrategy === HYBRID && hybridMix != null;
 
   const strategyType = strategyMap[activeStrategy];
   if (strategyType === undefined) {
@@ -1229,6 +1253,18 @@ export async function deployPosition({
 
   const isWideRange = totalBins > 69;
 
+  // Hybrid legs: Bid-Ask gets floor(total × pct), Spot the remainder, so the two
+  // always sum EXACTLY to the deposit. Recomputed if the pre-submit gate shrinks it.
+  const computeHybridLegs = () => (isHybrid ? splitHybridLamports(totalYLamports, hybridMix.bidAskPct) : null);
+  let hybridLegs = computeHybridLegs();
+  const legSol = () => (hybridLegs ? { bid_ask_sol: Number(hybridLegs.bidAsk.toString()) / 1e9, spot_sol: Number(hybridLegs.spot.toString()) / 1e9 } : null);
+  const strategyTrackFields = () => (isHybrid
+    ? { strategy_type: "Hybrid", sol_split_pct: 100, ...hybridTrackFields(hybridMix, { ...legSol() }) }
+    : {
+      strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
+      sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
+    });
+
   log("deploy", `Pool: ${pool_address}`);
   log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
@@ -1282,13 +1318,33 @@ export async function deployPosition({
         log("deploy", `Pre-submit gate: SOL leg shrunk ${finalAmountY} → ${gate.amount} to fit balance after swap fees/rent`);
         finalAmountY = gate.amount;
         totalYLamports = uiToRawBN(finalAmountY, 9);
+        hybridLegs = computeHybridLegs();
       }
       log("deploy", `Pre-submit gate ok (price move ${gate.movePct.toFixed(2)}%, free SOL ${gate.freeSol == null ? "n/a" : gate.freeSol.toFixed(4)})`);
     }
     txMaybeSent = true; // from here a tx may land even if we see an error
     const txHashes = [];
 
-    if (isWideRange) {
+    // Hybrid ≤69 bins: ONE atomic tx (initialize + Bid-Ask add + Spot add). Built
+    // here, before anything is sent. If it can't fit, fall back to the chunked path
+    // (create the empty position, then send the Bid-Ask and Spot layers as separate chunk sets).
+    let hybridStandard = null;
+    let useChunkedPath = isWideRange;
+    if (isHybrid && !isWideRange) {
+      hybridStandard = await buildHybridStandardTx({
+        pool, StrategyType, BN, positionPubKey: newPosition.publicKey, user: wallet.publicKey,
+        minBinId, maxBinId, legs: hybridLegs, slippage: depositSlip.slippagePct,
+      });
+      if (!hybridStandard.tx) {
+        log("deploy_warn", `Hybrid: ${hybridStandard.reason}; using the chunked path (create + per-chunk adds)`);
+        hybridStandard = null;
+        useChunkedPath = true;
+      } else {
+        log("deploy", `Hybrid ${hybridMix.bidAskPct}% Bid-Ask / ${hybridMix.spotPct}% Spot in one tx (${hybridStandard.size} bytes): ${hybridLegs.bidAsk} + ${hybridLegs.spot} lamports`);
+      }
+    }
+
+    if (useChunkedPath) {
       // ── Wide Range Path (>69 bins) ─────────────────────────────────
       // Solana limits inner instruction realloc to 10240 bytes, so we can't create
       // a large position in a single initializePosition ix.
@@ -1320,8 +1376,7 @@ export async function deployPosition({
         base_mint: pool.lbPair.tokenXMint.toBase58(),
         strategy: activeStrategy,
         strategy_profile: config.strategy.activeStrategy || null,
-        strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
-        sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
+        ...strategyTrackFields(),
         bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
         bin_step: resolvedBinStep,
         volatility,
@@ -1341,24 +1396,43 @@ export async function deployPosition({
       // Refresh pool state after the create txs so the strategy/slippage math
       // uses a fresh activeId rather than the stale pre-create snapshot.
       await pool.refetchStates();
+      const layersLanded = []; // hybrid: layers fully confirmed on-chain so far
       try {
+        // Hybrid: the Bid-Ask layer's chunk txs go first, the Spot layer's second (a merged
+        // chunk tx would need ~1.37M CU and ~1.15 KB: measured on mainnet, too close to the
+        // 1.4M / 1232 B ceilings). Each layer is reconciled against the position on-chain
+        // before the next starts, so a failure leaves a known, tracked, bid-ask-only position.
+        const addLayers = isHybrid
+          ? [
+            { name: "bid-ask", y: hybridLegs.bidAsk, type: StrategyType.BidAsk },
+            ...(hybridLegs.spot.isZero() ? [] : [{ name: "spot", y: hybridLegs.spot, type: StrategyType.Spot }]),
+          ]
+          : [{ name: null, y: totalYLamports, type: strategyType }];
+        for (const layer of addLayers) {
+        const layerTag = layer.name ? ` [${layer.name} layer]` : "";
+        // Re-read the active bin before EACH layer is built (the Spot layer must not reuse the
+        // pre-Bid-Ask activeId snapshot: slippage guards are priced off pool.lbPair.activeId).
+        if (layer.name && layersLanded.length > 0) await pool.refetchStates();
         const addTxs = await pool.addLiquidityByStrategyChunkable({
           positionPubKey: newPosition.publicKey,
           user: wallet.publicKey,
           totalXAmount: totalXLamports,
-          totalYAmount: totalYLamports,
-          strategy: { minBinId, maxBinId, strategyType },
+          totalYAmount: layer.y,
+          strategy: { minBinId, maxBinId, strategyType: layer.type },
           slippage: depositSlip.slippagePct,
         });
         const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
         const { chunkBinRange } = await import("@meteora-ag/dlmm");
         const chunkRanges = chunkBinRange(minBinId, maxBinId);
+        // Per-chunk holdings BEFORE this layer: the Spot layer lands on bins the Bid-Ask layer
+        // already funded, so "landed" means "holds more than before", not "holds anything".
+        const before = layer.name ? await readChunkShares(pool, newPosition.publicKey, chunkRanges) : null;
         if (chunkRanges.length !== addTxArray.length) {
           // Unexpected SDK chunking: can't map txs to bins for reconcile, so
           // keep the old one-at-a-time behaviour.
           log("deploy_warn", `SDK returned ${addTxArray.length} add txs for ${chunkRanges.length} bin chunks — sending sequentially`);
           for (let i = 0; i < addTxArray.length; i++) {
-            const txHash = await sendManagedTransaction(addTxArray[i], [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`);
+            const txHash = await sendManagedTransaction(addTxArray[i], [wallet], `deploy add-liquidity${layerTag} ${i + 1}/${addTxArray.length}`);
             txHashes.push(txHash);
             log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
           }
@@ -1371,11 +1445,15 @@ export async function deployPosition({
           // once (each signed once, with its own rebroadcast + confirm): one
           // confirmation window instead of N, and every chunk is priced off
           // the same activeId.
-          const readFunded = () => readChunkFunding(pool, newPosition.publicKey, chunkRanges);
+          const readFunded = () => readChunkFunding(pool, newPosition.publicKey, chunkRanges, before);
+          // Resend only if this chunk is verified still untouched: hybrid compares liquidity
+          // shares for EXACT equality (swaps cannot fake or hide a deposit); plain = bins empty.
+          const resendSafe = async (i) => before
+            ? (await readChunkShareState(pool, newPosition.publicKey, chunkRanges, before))?.[i]?.unchanged === true
+            : (await readFunded())?.[i] === false;
           const results = await Promise.allSettled(addTxArray.map((tx, i) =>
-            sendManagedTransaction(tx, [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`, {
-              // Resend only if this chunk's bins are verified still empty.
-              beforeResend: async () => (await readFunded())?.[i] === false,
+            sendManagedTransaction(tx, [wallet], `deploy add-liquidity${layerTag} ${i + 1}/${addTxArray.length}`, {
+              beforeResend: () => resendSafe(i),
             })));
           // Reconcile against the position on-chain, never against send
           // results alone: a "failed" chunk may have landed.
@@ -1389,8 +1467,10 @@ export async function deployPosition({
           if (rec.failed.length || rec.unknown.length) {
             const why = [...rec.failed, ...rec.unknown].sort((a, b) => a - b)
               .map((i) => `chunk ${i + 1}/${addTxArray.length} (bins ${chunkRanges[i].lowerBinId}..${chunkRanges[i].upperBinId}) ${rec.failed.includes(i) ? "empty on-chain" : "unverified"}: ${results[i].reason?.message || results[i].reason}`);
-            throw new Error(`${rec.failed.length + rec.unknown.length}/${addTxArray.length} add-liquidity chunk(s) did not land — ${why.join("; ")}`);
+            throw new Error(`${rec.failed.length + rec.unknown.length}/${addTxArray.length} add-liquidity chunk(s)${layerTag} did not land — ${why.join("; ")}`);
           }
+        }
+        if (layer.name) layersLanded.push(layer.name);
         }
       } catch (liqErr) {
         // Liquidity add failed partway. Earlier chunks may already have landed
@@ -1457,6 +1537,10 @@ export async function deployPosition({
           ...(partialX != null && { amount_x: partialX }),
           ...(partialUsd != null && { initial_value_usd: partialUsd }),
           partial_deploy: true,
+          ...(isHybrid && {
+            layers_landed: layersLanded, // fully confirmed layers; a failed layer may still hold some chunks (amount_sol is the on-chain total)
+            legs: { bid_ask_sol: layersLanded.includes("bid-ask") ? legSol().bid_ask_sol : null, spot_sol: layersLanded.includes("spot") ? legSol().spot_sol : null, landed_total_sol: partialY },
+          }),
         }, note);
         _positionsCacheAt = 0;
         log("deploy_warn", `Position ${posAddr.slice(0, 8)} is ${status} — kept open for management/close. ${note}`);
@@ -1472,6 +1556,9 @@ export async function deployPosition({
           txs: txHashes,
         };
       }
+    } else if (hybridStandard) {
+      const txHash = await sendManagedTransaction(hybridStandard.tx, [wallet, newPosition], "deploy hybrid standard");
+      txHashes.push(txHash);
     } else {
       // ── Standard Path (<=69 bins) ─────────────────────────────────
       const tx = await pool.initializePositionAndAddLiquidityByStrategy({
@@ -1498,8 +1585,7 @@ export async function deployPosition({
       base_mint: pool.lbPair.tokenXMint.toBase58(),
       strategy: activeStrategy,
       strategy_profile: config.strategy.activeStrategy || null,
-      strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
-      sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
+      ...strategyTrackFields(),
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step: resolvedBinStep,
       volatility,
@@ -1521,6 +1607,7 @@ export async function deployPosition({
       pool: pool_address,
       bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
       strategy: activeStrategy,
+      ...(isHybrid ? { strategy_mix: { bid_ask_pct: hybridMix.bidAskPct, spot_pct: hybridMix.spotPct }, legs: legSol() } : {}),
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
@@ -2745,6 +2832,8 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         pool_name: tracked.pool_name || poolAddress.slice(0, 8),
         strategy: tracked.strategy,
         strategy_type: tracked.strategy_type || null,
+        ...(tracked.strategy_mix && { strategy_mix: tracked.strategy_mix }),
+        ...(tracked.legs && { legs: tracked.legs }),
         sol_split_pct: tracked.sol_split_pct ?? null,
         bin_range: tracked.bin_range,
         bin_step: tracked.bin_step || null,
@@ -2833,16 +2922,57 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
 
 // ─── Helpers ──────────────────────────────────────────────────
 /**
+ * Per-chunk liquidity SHARES (BigInt, sum of positionLiquidity) of a position's bins.
+ * Shares change only on deposit / withdraw. Token amounts (positionX/YAmount) are the
+ * position's pro-rata share of each bin's CURRENT reserves, so a swap through the range
+ * changes them with no deposit, and X and Y raw units are not comparable. Never use
+ * amounts to decide whether a chunk landed.
+ */
+function chunkShares(bins, ranges) {
+  const big = (v) => { try { return BigInt(String(v ?? "0").split(".")[0] || "0"); } catch { return 0n; } };
+  return ranges.map(({ lowerBinId, upperBinId }) =>
+    bins.filter((b) => b.binId >= lowerBinId && b.binId <= upperBinId)
+      .reduce((sum, b) => sum + big(b.positionLiquidity), 0n));
+}
+
+/** Per-chunk liquidity shares read on-chain; throws when unreadable (the layer then fails closed, before anything is sent). */
+async function readChunkShares(pool, positionPubKey, ranges) {
+  const pd = (await pool.getPosition(positionPubKey))?.positionData;
+  if (!pd) throw new Error("could not read the position's bins before the next hybrid layer");
+  return chunkShares(pd.positionBinData || [], ranges);
+}
+
+/**
+ * Hybrid per-chunk state vs the shares held BEFORE the layer, read on-chain.
+ * funded: shares grew (a deposit landed). unchanged: shares identical (safe to resend).
+ * Returns null when the read fails (unknown: neither funded nor resendable).
+ */
+async function readChunkShareState(pool, positionPubKey, ranges, before) {
+  try {
+    const pd = (await pool.getPosition(positionPubKey))?.positionData;
+    if (!pd) return null;
+    return chunkShares(pd.positionBinData || [], ranges).map((v, i) => ({ funded: v > before[i], unchanged: v === before[i] }));
+  } catch (e) {
+    log("deploy_warn", `Could not read chunk shares for ${positionPubKey.toString().slice(0, 8)}: ${e.message}`);
+    return null;
+  }
+}
+
+/**
  * Per-chunk funding of a position, read on-chain in one call: for each
  * { lowerBinId, upperBinId } range, true if any of its bins holds liquidity,
  * false if all are empty. Returns null when the read fails (unknown).
  */
-async function readChunkFunding(pool, positionPubKey, ranges) {
+async function readChunkFunding(pool, positionPubKey, ranges, before = null) {
   try {
     const pd = (await pool.getPosition(positionPubKey))?.positionData;
     if (!pd) return null;
     const bins = pd.positionBinData || [];
     const has = (b) => Number(b.positionXAmount || 0) > 0 || Number(b.positionYAmount || 0) > 0;
+    // `before` (hybrid layers): a chunk counts as funded only if its liquidity SHARES grew since before this layer.
+    if (before) {
+      return chunkShares(bins, ranges).map((v, i) => v > before[i]);
+    }
     return ranges.map(({ lowerBinId, upperBinId }) =>
       bins.some((b) => b.binId >= lowerBinId && b.binId <= upperBinId && has(b)));
   } catch (e) {
@@ -2962,7 +3092,7 @@ export function _setPoolForTest(poolAddress, pool) {
   else { poolCache.set(String(poolAddress), pool); _poolOverridesForTest.set(String(poolAddress), pool); }
 }
 
-export { readChunkFunding as _readChunkFundingForTest };
+export { readChunkFunding as _readChunkFundingForTest, readChunkShareState as _readChunkShareStateForTest };
 
 /**
  * Test seam only: swap in a mock connection / wallet (pass null to restore the

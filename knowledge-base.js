@@ -846,7 +846,9 @@ export function filePositionClose(perf) {
     const outcome = cls === "win" ? "WIN" : cls === "loss" ? "LOSS" : cls === "breakeven" ? "BREAKEVEN" : "UNKNOWN";
     const pnlText = pnlUnknown ? "PnL unknown" : `PnL ${pnl.toFixed(1)}%`;
     const now = new Date().toISOString().slice(0, 16);
-    const strategy = perf.strategy || "unknown";
+    const strategy = perf.strategy === "hybrid" && perf.strategy_mix
+      ? `hybrid (${perf.strategy_mix.bid_ask_pct}% bid_ask / ${perf.strategy_mix.spot_pct}% spot)`
+      : (perf.strategy || "unknown");
     const reason = perf.close_reason || "manual";
     const held = perf.minutes_held ?? "?";
     const vol = perf.volatility ?? "?";

@@ -241,6 +241,7 @@ const stratChoice = await askChoice("Active strategy:", [
   { label: `Classic    — use the configured shape below${e("activeStrategy") && e("activeStrategy") !== "evil_panda" ? " (current)" : ""}`, key: "classic" },
 ]);
 
+let hybridBidAskPct;
 let activeStrategy, strategyShape, evilPandaPriceRangePct, evilPandaMinMcap, evilPandaMinTokenVolume24h;
 if (stratChoice.key === "evil_panda") {
   activeStrategy = "evil_panda";
@@ -253,8 +254,10 @@ if (stratChoice.key === "evil_panda") {
   const shapeChoice = await askChoice("Position shape:", [
     { label: "Spot",    key: "spot" },
     { label: "Bid/Ask", key: "bid_ask" },
+    { label: "Hybrid (Bid/Ask + Spot layers, single-sided SOL)", key: "hybrid" },
   ]);
   strategyShape = shapeChoice.key;
+  if (strategyShape === "hybrid") hybridBidAskPct = await askNum("Hybrid: % of the SOL in the Bid-Ask layer (rest goes to Spot)", e("hybridBidAskPct", 60), { min: 1, max: 100 });
 }
 
 // ─── Exit Rules ─────────────────────────────────────────────────────────────────
@@ -316,6 +319,7 @@ const changes = {
     : {}),
   activeStrategy,
   strategy: strategyShape,
+  ...(strategyShape === "hybrid" ? { hybridBidAskPct } : {}),
   ...(activeStrategy === "evil_panda"
     ? { evilPandaPriceRangePct, evilPandaMinMcap, evilPandaMinTokenVolume24h }
     : {}),
@@ -349,7 +353,7 @@ console.log(`
 
 Preset:        ${presetName}
 Screening:     ${screeningSource}${screeningSource === "gmgn" ? "  (filters in gmgn-config.json)" : screeningSource === "both" ? `  (Meteora timeframe ${timeframe} + gmgn-config.json)` : `  (timeframe ${timeframe})`}
-Strategy:      ${activeStrategy} / ${strategyShape}${activeStrategy === "evil_panda" ? `  (range ${evilPandaPriceRangePct}%)` : ""}
+Strategy:      ${activeStrategy} / ${strategyShape}${strategyShape === "hybrid" ? ` (${hybridBidAskPct}% Bid-Ask / ${100 - hybridBidAskPct}% Spot)` : ""}${activeStrategy === "evil_panda" ? `  (range ${evilPandaPriceRangePct}%)` : ""}
 
   Deploy:      ${deployAmountSol} SOL/position  |  Max: ${maxPositions} positions
   Min balance: ${minSolToOpen} SOL to open  |  gas reserve ${gasReserve} SOL${usdcMode ? `

@@ -135,7 +135,11 @@ export const SCHEMA = [
 
   // ── Strategy ──
   row("activeStrategy", ["strategy", "activeStrategy"], "enum", "evil_panda", { tier: 1, enum: ["classic", "evil_panda"], label: "Entry strategy" }),
-  row("strategy", ["strategy", "strategy"], "enum", "spot", { tier: 1, enum: ["spot", "bid_ask"], label: "Liquidity shape" }),
+  row("strategy", ["strategy", "strategy"], "enum", "spot", { tier: 1, enum: ["spot", "bid_ask", "hybrid"], label: "Liquidity shape" }),
+  // hybrid = ONE position holding a Bid-Ask layer + a Spot layer (single-sided SOL). The Bid-Ask share is the
+  // only knob; the Spot share is DERIVED (100 - bid-ask), so the two can never be misconfigured to a bad sum.
+  row("hybridBidAskPct", ["strategy", "hybridBidAskPct"], "int", 60, { tier: 2, min: 1, max: 100, unit: "%", label: "Hybrid: Bid-Ask share (Spot gets the rest)" }),
+  row("hybridSpotPct", ["strategy", "hybridSpotPct"], "int", 40, { tier: 2, hidden: true, derivedFrom: "hybridBidAskPct", unit: "%", label: "Hybrid: Spot share (derived = 100 - Bid-Ask)" }),
   row("maxRangePct", ["strategy", "maxRangePct"], "int", 80, { min: 1, max: 99, unit: "%" }),
   row("rangeDepthMode", ["strategy", "rangeDepthMode"], "enum", "ohlcv", { enum: ["ohlcv", "volatility"] }),
   row("ohlcvBufferMult", ["strategy", "ohlcvBufferMult"], "float", 1.3, { min: 1, max: 1.8 }),
@@ -293,6 +297,7 @@ export function makeResolver(rawIn = {}) {
   const resolve = (key) => {
     const r = BY_KEY.get(key);
     if (!r) throw new Error(`unknown setting: ${key}`);
+    if (r.derivedFrom) { const base = Number(resolve(r.derivedFrom).value); return { value: Number.isFinite(base) ? Math.max(0, Math.round((100 - base) * 100) / 100) : r.def, source: "derived" }; }
     const v = raw[key];
     // Nullable keys: an explicit null is a real value ("off" / "no limit"), same as the old `nullable()` helper.
     if (r.nullable ? v !== undefined : v != null) return { value: v, source: "user" };
