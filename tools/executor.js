@@ -13,7 +13,8 @@ import { getWalletBalances, swapToken } from "./wallet.js";
 import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded } from "../state.js";
+import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded, getDeployCooldown } from "../state.js";
+import { withWalletLock, priorityForTool } from "../wallet-lock.js";
 import { checkAgentSwap } from "./swap-guard.js";
 import { isManagementBusy, getManagementCloseReason, isDraining, trackInflightOp } from "../session.js";
 import { managementPnlCloseGate } from "../pnl-confirm.js";
@@ -358,7 +359,11 @@ function startCloseBinsSnapshot(positionAddress) {
 // Fund-moving tools: tracked as in-flight so the shutdown drain waits for them.
 const FUND_TOOLS = new Set(["deploy_position", "close_position", "swap_token", "claim_fees"]);
 
-export async function executeTool(name, args, { manual = false } = {}) {
+// `codeExit` is set only by the runner's own code-fired rule closes
+// (management rules 4/5 in index.js): the rule was already decided in code,
+// so the LLM-oriented management PnL gate does not apply. The LLM never
+// reaches this option (agent.js passes name + args only).
+export async function executeTool(name, args, { manual = false, codeExit = false } = {}) {
   // Gate new exposure BEFORE anything runs (the USDC-mode entry swaps first).
   if (name === "deploy_position") {
     if (isDraining()) {
@@ -370,11 +375,19 @@ export async function executeTool(name, args, { manual = false } = {}) {
       return { blocked: true, reason: "state.json is corrupt and saves are disabled, so a new position could not be tracked. Restore state.json first." };
     }
   }
-  if (FUND_TOOLS.has(name)) return trackInflightOp(name, executeToolInner(name, args, { manual }));
-  return executeToolInner(name, args, { manual });
+  // Fund-moving tools run one at a time through the priority wallet lock:
+  // close > claim / swap > deploy (wallet-lock.js).
+  if (FUND_TOOLS.has(name)) {
+    return trackInflightOp(name, withWalletLock(
+      () => executeToolInner(name, args, { manual, codeExit }),
+      priorityForTool(name),
+      name,
+    ));
+  }
+  return executeToolInner(name, args, { manual, codeExit });
 }
 
-async function executeToolInner(name, args, { manual = false } = {}) {
+async function executeToolInner(name, args, { manual = false, codeExit = false } = {}) {
   const startTime = Date.now();
   // `_manual` (skip the token-age window) is only honoured for owner-initiated
   // Telegram deploys, which pass { manual: true }; strip it from anything else
@@ -422,7 +435,7 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   // ─── Pre-execution safety checks ──────────
   let swapGuard = null;
   if (WRITE_TOOLS.has(name)) {
-    const safetyCheck = await runSafetyChecks(name, args, { manual });
+    const safetyCheck = await runSafetyChecks(name, args, { manual, codeExit });
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       return {
@@ -602,6 +615,20 @@ async function checkDeployEligibility(args) {
     }
   }
 
+  // Re-entry cooldown after a stop loss / repeated OOR-timeout closes (state.js).
+  // Owner (Telegram) deploys override it, logged.
+  const cooldown = getDeployCooldown({ pool: args.pool_address, base_mint: args.base_mint });
+  if (cooldown) {
+    const what = cooldown.scope === "pool" ? `pool ${args.pool_name || args.pool_address}` : `token ${args.base_mint}`;
+    if (args._manual) {
+      log("cooldown", `Owner deploy overrides cooldown on ${what} (until ${cooldown.until}: ${cooldown.reason})`);
+    } else {
+      const reason = `Re-entry cooldown: ${what} is blocked until ${cooldown.until} (${cooldown.reason}). Pick a different pool.`;
+      log("cooldown", `deploy_position blocked — ${reason}`);
+      return { pass: false, reason };
+    }
+  }
+
   return { pass: true };
 }
 
@@ -617,6 +644,7 @@ async function confirmManagementPnlClose(args) {
       getPositions: () => getMyPositions(),
       getTracked: getTrackedPosition,
       getOnchain: getOnchainPnl,
+      requiredTicks: Number(config.exits?.confirmTicks ?? 2),
       onHold: (cls, decision) => recordPnlHold(args.position_address, null, `${cls.rule}: ${decision.why}`, { onchainPct: decision.onchainPct, config }),
     });
   } catch (e) {
@@ -629,13 +657,14 @@ async function confirmManagementPnlClose(args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args, { manual = false } = {}) {
+async function runSafetyChecks(name, args, { manual = false, codeExit = false } = {}) {
   switch (name) {
     case "close_position":
       // Management closes on rule 3 (take profit) / rule 6 (emergency stop) and
       // EXIT ALERTS read pnl_pct from the PnL API; confirm those on-chain first.
       // Owner closes (Telegram, REPL) never run inside a management cycle.
-      if (manual || !isManagementBusy()) return { pass: true };
+      // Code-fired rule closes were decided by the runner and are not gated.
+      if (manual || codeExit || !isManagementBusy()) return { pass: true };
       return confirmManagementPnlClose(args);
 
     case "deploy_position": {
