@@ -353,10 +353,25 @@ export async function token2022Blocker(tokenX) {
  * "Transaction simulation failed" on every build before falling back. The CU ix
  * is stripped anyway, so drop just that line instead of spamming bot logs.
  */
-async function quietSdkSimNoise(fn) {
-  const orig = console.error;
-  console.error = (...a) => { if (/Transaction simulation failed/i.test(a.map((x) => String(x?.message ?? x)).join(" "))) return; orig.apply(console, a); };
-  try { return await fn(); } finally { console.error = orig; }
+let sdkNoiseDepth = 0;
+let sdkNoiseOrig = null;
+const SDK_SIM_NOISE_RE = /^Transaction simulation failed:/;
+export async function quietSdkSimNoise(fn) {
+  // N3: console.error is swapped only for the duration of this build (depth-counted
+  // so overlapping builds restore correctly), and ONLY the SDK's exact message
+  // (an Error/string beginning "Transaction simulation failed:") is dropped.
+  // Everything else — including other tasks' logs in the window — passes through.
+  if (sdkNoiseDepth++ === 0) {
+    sdkNoiseOrig = console.error;
+    const orig = sdkNoiseOrig;
+    console.error = (...a) => {
+      const first = a[0];
+      const msg = typeof first === "string" ? first : (first instanceof Error ? first.message : "");
+      if (SDK_SIM_NOISE_RE.test(msg)) return;
+      orig.apply(console, a);
+    };
+  }
+  try { return await fn(); } finally { if (--sdkNoiseDepth === 0) { console.error = sdkNoiseOrig; sdkNoiseOrig = null; } }
 }
 
 const isComputeBudgetIx = (ix) => ix?.programId?.toBase58?.() === "ComputeBudget111111111111111111111111111111";
@@ -390,10 +405,15 @@ export async function buildAtomicFlipIxs({ pool, positionPk, positionData, plan,
   // A bitmap-extension init (or anything else DLMM) pushed into the pre-ixs
   // would otherwise slip past the bin-array guards above.
   const dlmmIxs = all.filter((ix) => ix?.programId?.toBase58?.() === DLMM_PROGRAM_ID);
-  if (dlmmIxs.length > 1) throw new Error(`flip build contains ${dlmmIxs.length} DLMM instructions (expected 1) — refusing`);
+  if (dlmmIxs.length !== 1) throw new Error(`flip build contains ${dlmmIxs.length} DLMM instructions (expected exactly 1) — refusing`);
   const ixs = all.filter((ix) => !isComputeBudgetIx(ix));
   return {
-    ataCreates: ixs.filter((ix) => ix?.programId?.toBase58?.() === ATA_PROGRAM_ID).length,
+    // N2: ATA creates whose rent is NOT refunded in-tx. WSOL ATA creates are
+    // closed by the SDK's post ix (rent refunded), so they are excluded. Each entry
+    // is the ATA address (dedupe key); unknown layouts count conservatively.
+    ataCreates: ixs.filter((ix) => ix?.programId?.toBase58?.() === ATA_PROGRAM_ID && ix.keys?.[3]?.pubkey?.toBase58?.() !== WSOL).length,
+    ataKeys: ixs.filter((ix) => ix?.programId?.toBase58?.() === ATA_PROGRAM_ID && ix.keys?.[3]?.pubkey?.toBase58?.() !== WSOL)
+      .map((ix) => ix.keys?.[1]?.pubkey?.toBase58?.() ?? "unknown"),
     ixs,
     cuIx: all.find(isComputeBudgetIx) || null,
     resp,
@@ -510,6 +530,22 @@ async function flipOne(p, ctx) {
     return { position: p.position, action: "hold", reason };
   }
 
+  // N1: after a live flip the API PnL is untrustworthy (it books the flip's
+  // withdraw+redeposit as flows). If the on-chain read failed this tick
+  // (pnl_source !== "onchain") the divergence check above is blind, so hold.
+  if (!shadow && Number(tracked.bid_ask_flip?.flips) > 0 && p.pnl_source !== "onchain") {
+    const reason = `no on-chain PnL after live flip (pnl_source ${p.pnl_source ?? "unset"}) — no further flips`;
+    log("bidask_flip", `${p.pair ?? "?"} ${String(p.position).slice(0, 8)}: ${reason}`);
+    return { position: p.position, action: "hold", reason };
+  }
+
+  // N6 (known, accepted): peak_pnl_pct recorded BEFORE the first live flip comes
+  // from the API; afterwards trailing measures peak(API era) - on-chain now. The
+  // >2pp mismatch handling in updatePnlAndCheckExits/recordPnlHold bounds this
+  // mixed-source error below any sane trailingDropPct, so the peak is not reset.
+  // L8: RPC cost — in shadow AND live every eligible open bot bid_ask position
+  // costs one refetchStates + getPosition per management tick, plus ~15 RPC calls
+  // (build + simulate) per would-be flip.
   const pool = await getPool(p.pool);
   await pool.refetchStates();
   const { PublicKey } = await import("@solana/web3.js");
@@ -551,13 +587,19 @@ async function flipOne(p, ctx) {
   }
   // M3/M5: the SDK pre-ixs can create the owner's token-X ATA (≈0.002 SOL rent,
   // seen on mainnet sim 38KS…). Count it in the cost floor and make it visible.
-  const ataCreates = built.reduce((n, b) => n + (b.ataCreates || 0), 0);
+  // N2: rent for the one-time token-X ATA is paid once (every pre-built chunk carries
+  // the idempotent create, but only the first lands it), so dedupe by ATA address.
+  // It is not scaled by the 25× multiplier: floor = 25 × tx fees + ATA rent once.
+  // WSOL ATA creates are excluded (rent refunded by the in-tx CloseAccount).
+  const ataSet = new Set(built.flatMap((b) => b.ataKeys || []));
+  const ataCreates = ataSet.size;
   if (ataCreates > 0) {
-    const costSol = estimateFlipCostLamports({ chunks: built.length, maxPriorityFeeLamports: ctx.config?.management?.maxPriorityFeeLamports, ataCreates }) / 1e9;
-    const floorSol = COST_FLOOR_MULT * costSol;
-    log("bidask_flip", `${p.pair ?? "?"} ${String(p.position).slice(0, 8)}: flip creates ${ataCreates} token ATA(s) (~${(ataCreates * ATA_RENT_LAMPORTS / 1e9).toFixed(4)} SOL rent); est. total cost ${costSol.toFixed(4)} SOL`);
+    const feeSol = estimateFlipCostLamports({ chunks: built.length, maxPriorityFeeLamports: ctx.config?.management?.maxPriorityFeeLamports }) / 1e9;
+    const ataSol = (ataCreates * ATA_RENT_LAMPORTS) / 1e9;
+    const floorSol = COST_FLOOR_MULT * feeSol + ataSol;
+    log("bidask_flip", `${p.pair ?? "?"} ${String(p.position).slice(0, 8)}: flip creates ${ataCreates} token ATA(s) (~${ataSol.toFixed(4)} SOL rent, once); est. total cost ${(feeSol + ataSol).toFixed(4)} SOL`);
     if (plan.trancheSol < floorSol) {
-      const reason = `tranche ${plan.trancheSol.toFixed(4)} SOL < ${COST_FLOOR_MULT}× est. cost incl. ATA rent (${floorSol.toFixed(4)})`;
+      const reason = `tranche ${plan.trancheSol.toFixed(4)} SOL < ${COST_FLOOR_MULT}× tx fees + ATA rent (${floorSol.toFixed(4)})`;
       log("bidask_flip", `[${cfg.mode}] ${formatFlipPlan(p.pair, p.position, plan)} — HOLD: ${reason}`);
       return { position: p.position, action: "hold", reason, activeId: plan.activeId, flips: plan.flips, fill: plan.fill };
     }

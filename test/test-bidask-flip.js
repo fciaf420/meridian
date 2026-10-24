@@ -533,6 +533,67 @@ test("L3: more than one DLMM-program instruction in the build is refused", async
   const b = band({ active: -460 });
   const plan = planBidAskFlip(baseInput(b));
   await assert.rejects(buildAtomicFlipIxs({ pool: fakePool({ extraDlmm: 1 }), positionPk: OWNER, positionData: {}, plan, rentPayer: OWNER, sdk }), /2 DLMM instructions/);
+  // N4: zero DLMM instructions (empty build) is refused too
+  const emptyPool = fakePool();
+  const orig = emptyPool.rebalancePosition;
+  emptyPool.rebalancePosition = async (...a) => ({ ...(await orig(...a)), rebalancePositionInstruction: [] });
+  await assert.rejects(buildAtomicFlipIxs({ pool: emptyPool, positionPk: OWNER, positionData: {}, plan, rentPayer: OWNER, sdk }), /0 DLMM instructions/);
+});
+
+test("N3: quietSdkSimNoise drops only the SDK's simulation message; other console.error output passes through and the global is restored", async () => {
+  const seen = [];
+  const real = console.error;
+  console.error = (...a) => seen.push(a.map(String).join(" "));
+  const wrapped = console.error;
+  try {
+    const bf = await import(new URL("../tools/bidask-flip.js", import.meta.url));
+    await bf.quietSdkSimNoise(async () => {
+      console.error(new Error("Transaction simulation failed:\n  • logs"));
+      console.error("Transaction simulation failed:\n  • x");
+      console.error("some other task: Transaction simulation failed in my own code");
+      console.error("unrelated error");
+    });
+    assert.equal(console.error, wrapped, "global restored");
+  } finally { console.error = real; }
+  assert.deepEqual(seen, ["some other task: Transaction simulation failed in my own code", "unrelated error"]);
+});
+
+test("N2: token-X ATA rent counted once (not per chunk, not ×25); WSOL ATA create excluded", async () => {
+  const ATA = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+  const mk = (mint, ata) => new TransactionInstruction({ programId: ATA, data: Buffer.from([1]), keys: [OWNER, ata, OWNER, mint, OWNER, OWNER].map((k) => ({ pubkey: k, isSigner: false, isWritable: false })) });
+  const X = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const W = new PublicKey(WSOL);
+  const plan = planBidAskFlip(baseInput(band({ active: -460 })));
+  const r = await buildAtomicFlipIxs({ pool: fakePool({ extraPre: [mk(X, OWNER), mk(W, X)] }), positionPk: OWNER, positionData: {}, plan, rentPayer: OWNER, sdk });
+  assert.equal(r.ataCreates, 1);
+  // hook: floor = 25 × fees + one ATA rent. Choose a tranche between 25×(fees+ATA) and 25×fees+ATA.
+  // fees = 10_000 + 0 prio ⇒ 25×fees ≈ 0.00025 SOL; ATA once = 0.0021 ⇒ floor ≈ 0.00235 ≪ 0.14 SOL tranche ⇒ flips.
+  const h = hookDeps({ mode: "shadow", tracked: trackedBidAsk(), pool: fakePool({ extraPre: [mk(X, OWNER), mk(W, X)] }), management: { maxPriorityFeeLamports: 0 } });
+  const [r1] = await runBidAskFlips([posRow()], h.deps);
+  assert.equal(r1.action, "flip");
+  assert.ok(h.logs.some((l) => /creates 1 token ATA/.test(l) && /once/.test(l)));
+  // WSOL-only create ⇒ no ATA accounting at all
+  const h2 = hookDeps({ mode: "shadow", tracked: trackedBidAsk(), pool: fakePool({ extraPre: [mk(W, X)] }), management: { maxPriorityFeeLamports: 0 } });
+  await runBidAskFlips([posRow()], h2.deps);
+  assert.ok(!h2.logs.some((l) => /token ATA/.test(l)));
+  // a huge priority fee makes 25×fees + ATA exceed the tranche ⇒ hold with the new message
+  const h3 = hookDeps({ mode: "shadow", tracked: trackedBidAsk(), pool: fakePool({ extraPre: [mk(X, OWNER)] }), management: { maxPriorityFeeLamports: 4_000_000 } });
+  const [r3] = await runBidAskFlips([posRow()], h3.deps);
+  assert.ok(r3.action === "hold" ? /tx fees \+ ATA rent/.test(r3.reason) : r3.trancheSol >= (25 * 4_010_000 + 2_100_000) / 1e9);
+});
+
+test("N1: live-flipped position with pnl_source !== 'onchain' holds (no RPC), even with no pnl_api_pct", async () => {
+  const pool = fakePool();
+  let poolReads = 0;
+  const h = hookDeps({ mode: "live", tracked: trackedBidAsk({ bid_ask_flip: { flips: 1, last_flip_active_bin: -300 } }), pool });
+  h.deps.getPool = async () => { poolReads++; return pool; };
+  for (const src of ["api_after_flip", undefined]) {
+    const [r] = await runBidAskFlips([posRow({ pnl_pct: 3, pnl_source: src })], h.deps);
+    assert.equal(r.action, "hold");
+    assert.match(r.reason, /no on-chain PnL/);
+  }
+  assert.equal(poolReads, 0);
+  assert.equal(h.sends.length, 0);
 });
 
 // ── M4: chunked live sequencing, partial failure, owner mismatch, pre/post ix retention ──

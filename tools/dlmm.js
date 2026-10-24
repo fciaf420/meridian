@@ -2815,7 +2815,7 @@ export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
 // Read-only access for the re-center shadow log (tools/recenter-shadow.js).
 export { getPool as getPoolForRead, initializedBinArrayWindow };
 // Bid-Ask flip live mode (tools/bidask-flip.js) signs its rebalance with the bot wallet.
-export { getWallet as _getWalletForFlip, getWallet as getWalletForFlip };
+export { getWallet as getWalletForFlip };
 export { sendManagedTransaction as sendManagedTransactionForFlip };
 
 /** Test hook: seed the pool cache with a mock DLMM instance. */
