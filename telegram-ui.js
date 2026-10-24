@@ -25,6 +25,7 @@ import {
 import { renderBinStrip, renderBinChart, withTimeout } from "./tools/bin-visual.js";
 import { evaluateTokenAgeWindow, tokenAgeWindow, fmtAgeHours, fmtWindow } from "./tools/token-age.js";
 import { resolveSolPrice, valueDlmmPositions } from "./portfolio-value.js";
+import { createConsole, looksLikeSecret } from "./settings-console.js";
 
 export const MENU_BUTTON_TEXT = "🏠 Menu";
 export const CONFIRM_TTL_MS = 60_000;
@@ -496,7 +497,7 @@ export function renderMainMenu({ header = "" } = {}) {
       [btn("📈 Status", "st"), btn("📊 Positions", "po:0")],
       [btn("🔍 Candidates", "ca:0"), btn("💰 Wallet", "wa")],
       [btn("⚙️ Settings", "se:0"), btn("🎛 Bot controls", "bc")],
-      [btn("⚙️ Trading settings", "ts")],
+      [btn("⚙️ Trading settings", "ts"), btn("🧰 Settings console", "k0")],
     ],
   };
 }
@@ -1106,7 +1107,7 @@ export function renderSettingCard(svc, e, { fmt, dryRun = false, note = null, aw
     lines.push("", dryRun
       ? "🧪 Now <b>DRY RUN</b>: no transactions are sent. Turning it off makes the bot trade with <b>real funds</b>."
       : "🔴 Now <b>LIVE</b>: the bot signs real transactions. Turning dryRun on stops sending them.");
-    if (svc.dryRunInEnv) lines.push("⚠️ .env sets DRY_RUN: the change applies now, but after a restart .env wins over user-config.json.");
+    if (svc.dryRunInEnv) lines.push("⚠️ DRY_RUN=true is set in the environment (.env / npm run dev): it forces dry run on every start. Going LIVE here lasts until the next restart; remove DRY_RUN from .env to make it stick.");
   }
   if (awaitingInput) lines.push("", `✏️ <b>Send the new value</b> as your next message (${Math.round(ttlMs / 1000)}s). /cancel aborts.`);
   if (note) lines.push("", note);
@@ -1121,6 +1122,7 @@ export function renderSettingCard(svc, e, { fmt, dryRun = false, note = null, aw
   }
   if (awaitingInput) keyboard.push([btn("✖ Cancel input", "ax")]);
   keyboard.push([btn(`⬅ ${clipText(e.groupLabel ?? "Group", 30)}`, `ag:${e.group}:0`), btn("🧾 All settings", "as")]);
+  if (e.tier <= 2) keyboard.push([btn("🧰 Settings console", "k0")]);
   return { text: lines.join("\n"), keyboard };
 }
 
@@ -1664,6 +1666,9 @@ export function createTelegramUI(deps) {
     if (Array.isArray(v)) return v.length ? v.join(", ") : "(empty)";
     return String(v);
   };
+  const consoleUI = createConsole({ btn, escapeHtml, clipText });
+  const profileName = () => deps.profiles?.current?.() ?? deps.config?.profile ?? "custom";
+  const consoleView = (extra = {}) => consoleUI.renderConsole(svc(), { dryRun: isDryRun(), profile: profileName(), ...extra });
   const withGroupLabel = (e) => ({ ...e, groupLabel: svc().groups().find((g) => g.id === e.group)?.label });
   const settingCard = (e, extra = {}) => renderSettingCard(svc(), withGroupLabel(e), { fmt: fmtSetting, dryRun: isDryRun(), ttlMs: deps.ttlMs ?? CONFIRM_TTL_MS, ...extra });
 
@@ -1711,7 +1716,7 @@ export function createTelegramUI(deps) {
         "",
         `This ${escapeHtml(reasons.join(" and "))}.`,
         live ? "The bot will sign and send REAL transactions with real funds from the next action on." : null,
-        e.special === "dryRun" && svc().dryRunInEnv ? "⚠️ .env sets DRY_RUN: after a restart .env wins over this setting." : null,
+        e.special === "dryRun" && svc().dryRunInEnv ? "⚠️ DRY_RUN=true is set in the environment: it forces dry run again on the next restart unless you remove it from .env." : null,
         "",
         `Saves to ${e.file === "gmgn" ? "gmgn-config.json" : "user-config.json"}${e.restart ? " (applies after a restart)" : " and applies to the running bot"}. Expires in ${Math.round((deps.ttlMs ?? CONFIRM_TTL_MS) / 1000)}s.`,
       ].filter((l) => l != null).join("\n");
@@ -1786,6 +1791,13 @@ export function createTelegramUI(deps) {
       return show(ctx, settingCard(e, { note: r.note }));
     }
 
+    if (action === "profile_set") {
+      if (!deps.profiles) return edit("Profiles aren't available — nothing was changed.", [[btn("⚙️ Console", "k0")]]);
+      const r = deps.profiles.apply(params.name);
+      logf("telegram", `Profile switched from Telegram: ${params.label} (${r.changed.length} values changed)`);
+      return show(ctx, consoleView({ note: `✅ Profile is now <b>${escapeHtml(r.profile)}</b> (${r.changed.length} value${r.changed.length === 1 ? "" : "s"} changed).` }));
+    }
+
     if (action === "trade_set") {
       const r = applyTrading(params.changes, params);
       return show(ctx, tradingView({ note: r.note }));
@@ -1834,6 +1846,15 @@ export function createTelegramUI(deps) {
     const briefingCmd = /^\/briefing(?:@\w+)?(?:\s+(\S+))?\s*$/i.exec(text);
     if (briefingCmd && deps.latestBriefing && deps.generateBriefing) {
       await briefingCommand(String(briefingCmd[1] || "").toLowerCase());
+      return true;
+    }
+
+    // A private key must never be typed into the chat (secrets are .env-only): refuse it before it
+    // can become a setting value or reach the LLM, and tell the owner to delete the message.
+    if (looksLikeSecret(text)) {
+      state.cfgInput = null;
+      logf("telegram_warn", "Refused a message that looks like a private key (not stored, not forwarded)");
+      await deps.tg.sendHTML("🔐 That looks like a <b>private key</b>. I did not store or use it. Delete that message from this chat now, and never send keys here: the wallet key, RPC URL, bot token and API keys live in <code>.env</code> only. If it was a real key, treat it as exposed and move funds to a new wallet.");
       return true;
     }
 
@@ -2034,9 +2055,41 @@ export function createTelegramUI(deps) {
           const extraRow = [btn("⚙️ Trading settings", "ts")];
           if (deps.setEntryFilter) extraRow.unshift(btn("🛡 Entry filters", "ef"));
           view.keyboard.push(extraRow);
-          if (deps.allSettings) view.keyboard.push([btn("🧾 All settings", "as")]);
+          if (deps.allSettings) view.keyboard.push([btn("🧰 Settings console", "k0"), btn("🧾 All settings", "as")]);
           view.keyboard.push(backRow(`se:${view.page}`));
           await show(ctx, view, opts);
+          return;
+        }
+        case "k0":
+          await answer();
+          await show(ctx, svc() ? consoleView() : { text: "Settings console isn't available here.", keyboard: [[btn("⬅ Menu", "m")]] }, opts);
+          return;
+        case "kp":
+          await answer();
+          await show(ctx, consoleUI.renderProfilePicker(profileName()), opts);
+          return;
+        case "kt":
+          await answer();
+          await show(ctx, arg
+            ? consoleUI.renderTuningSection(svc(), arg, { profile: profileName(), sourceOf: deps.settingSource })
+            : consoleUI.renderTuningIndex(svc(), { profile: profileName(), sourceOf: deps.settingSource }), opts);
+          return;
+        case "kq": {
+          // Owner-only (transport). Never applies on the first tap: diff + nonce confirm.
+          if (!deps.profiles || !deps.profiles.names.includes(arg)) {
+            await answer("Unknown profile.", true);
+            return;
+          }
+          await answer();
+          if (arg === profileName()) {
+            await show(ctx, consoleUI.renderProfilePicker(profileName()), opts);
+            return;
+          }
+          const diff = deps.profiles.preview(arg);
+          const nonce = nonces.put("profile_set", { name: arg, label: `profile ${profileName()} → ${arg}` });
+          logf("telegram", `Profile switch confirm requested: ${profileName()} → ${arg} (${diff.length} values)`);
+          const text = `${consoleUI.renderProfileDiff(arg, diff, profileName())}\n\nApplies to the running bot now and is saved to user-config.json. Expires in ${Math.round((deps.ttlMs ?? CONFIRM_TTL_MS) / 1000)}s.`;
+          await presentConfirm(ctx, { nonce, view: { text, keyboard: [[btn("✅ Switch profile", `y:${nonce}`), btn("✖ Cancel", `n:${nonce}`)]] } }, opts);
           return;
         }
         case "bc":
@@ -2310,8 +2363,10 @@ export function createTelegramUI(deps) {
           await answer(r.entry ? "Cancelled" : "Nothing to cancel");
           if (r.entry?.action === "trade_set") logf("telegram", `Trading settings change cancelled: ${r.entry.params.label}`);
           if (r.entry?.action === "cfg_set") logf("telegram", `Setting change cancelled: ${r.entry.params.label}`);
+          if (r.entry?.action === "profile_set") logf("telegram", `Profile switch cancelled: ${r.entry.params.label}`);
           const back = r.entry?.action === "trade_set" ? [[btn("⚙️ Trading settings", "ts"), btn("⬅ Menu", "m")]]
             : r.entry?.action === "cfg_set" ? [[btn("🧾 All settings", "as"), btn("⬅ Menu", "m")]]
+              : r.entry?.action === "profile_set" ? [[btn("⚙️ Console", "k0"), btn("⬅ Menu", "m")]]
               : [[btn("⬅ Menu", "m")]];
           await show(ctx, { text: "✖ Cancelled. Nothing was done.", keyboard: back });
           return;

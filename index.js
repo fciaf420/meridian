@@ -11,7 +11,8 @@ import { runManagementWithOorFallback, formatOorFallbackReport } from "./oor-fal
 import { getPositionBins } from "./tools/bin-visual.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount, resolveDeploySizing, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, resolveDeploySizing, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV, switchProfile, currentGovernedValues, settingSource } from "./config.js";
+import { createProfileService } from "./settings-console.js";
 import { createAllSettings } from "./all-settings.js";
 import { normalizeEntryFilterValue, isLooseningChange } from "./tools/entry-safety.js";
 import { applyTradingSettings } from "./trading-settings.js";
@@ -1091,6 +1092,19 @@ const tgUI = createTelegramUI({
     dryRunInEnv: DRY_RUN_SET_IN_ENV,
     onScheduleChange: (key, value) => {
       if (!cronStarted) return; // startCronJobs() reads the new value when cycles start
+      if (key === "pnlWatcherIntervalSec") startPnlWatcher(value);
+      else startCronJobs();
+    },
+    log,
+  }),
+  // Settings console: profile picker (diff + confirm) and "✎ overridden" tags.
+  settingSource,
+  profiles: createProfileService({
+    config,
+    switchProfile,
+    currentGovernedValues,
+    onScheduleChange: (key, value) => {
+      if (!cronStarted) return;
       if (key === "pnlWatcherIntervalSec") startPnlWatcher(value);
       else startCronJobs();
     },
