@@ -13,7 +13,7 @@ import { getWalletBalances, swapToken } from "./wallet.js";
 import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded, getDeployCooldown } from "../state.js";
+import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded, getDeployCooldown, getActiveCooldowns } from "../state.js";
 import { withWalletLock, priorityForTool } from "../wallet-lock.js";
 import { checkAgentSwap } from "./swap-guard.js";
 import { isManagementBusy, getManagementCloseReason, isDraining, trackInflightOp } from "../session.js";
@@ -379,7 +379,15 @@ export async function executeTool(name, args, { manual = false, codeExit = false
   // close > claim / swap > deploy (wallet-lock.js).
   if (FUND_TOOLS.has(name)) {
     return trackInflightOp(name, withWalletLock(
-      () => executeToolInner(name, args, { manual, codeExit }),
+      () => {
+        // L4: a deploy that queued behind a long close/claim must not start
+        // once a shutdown drain has begun in the meantime.
+        if (name === "deploy_position" && isDraining()) {
+          log("safety_block", "deploy_position blocked: shutdown drain began while queued for the wallet lock");
+          return { blocked: true, reason: "Bot is shutting down (drain in progress); no new deploys." };
+        }
+        return executeToolInner(name, args, { manual, codeExit });
+      },
       priorityForTool(name),
       name,
     ));
@@ -557,18 +565,22 @@ async function executeToolInner(name, args, { manual = false, codeExit = false }
  * standard safety checks so USDC mode never swaps before confirming the deploy
  * is even allowed.
  */
-async function checkDeployEligibility(args) {
-  // Resolve bin_step — fall back to the pool detail API if the caller didn't pass it.
-  let effectiveBinStep = args.bin_step;
-  if (effectiveBinStep == null && args.pool_address) {
+export async function checkDeployEligibility(args, { getPoolDetailFn = getPoolDetail, getPositionsFn = getMyPositions } = {}) {
+  // Resolve the pool's own facts. bin_step falls back to the pool detail when the
+  // caller omitted it; the BASE MINT is always taken from the pool (H3): the
+  // tool-call `base_mint` is optional LLM input that may be omitted or wrong,
+  // and the mint cooldown / duplicate-token guard must not depend on it.
+  let poolDetail = null;
+  if (args.pool_address) {
     try {
-      const { getPoolDetail } = await import("./screening.js");
-      const poolDetail = await getPoolDetail({ pool_address: args.pool_address });
-      effectiveBinStep = poolDetail?.bin_step ?? null;
+      poolDetail = await getPoolDetailFn({ pool_address: args.pool_address });
     } catch {
-      effectiveBinStep = null;
+      poolDetail = null;
     }
   }
+  const effectiveBinStep = args.bin_step ?? poolDetail?.bin_step ?? null;
+  const poolMint = poolDetail?.base?.mint || null;
+  const mints = [...new Set([poolMint, args.base_mint].filter((m) => typeof m === "string" && m))];
 
   // Reject pools with bin_step out of configured range. Fail closed: if we could
   // not resolve a numeric bin_step (caller omitted it AND the pool detail lookup
@@ -589,7 +601,7 @@ async function checkDeployEligibility(args) {
   }
 
   // Check position count limit + duplicate pool guard
-  const positions = await getMyPositions();
+  const positions = await getPositionsFn();
   if (positions.total_positions >= config.risk.maxPositions) {
     return {
       pass: false,
@@ -604,22 +616,32 @@ async function checkDeployEligibility(args) {
     };
   }
 
-  // Block same base token across different pools
-  if (args.base_mint) {
-    const alreadyHasMint = positions.positions.some((p) => p.base_mint === args.base_mint);
-    if (alreadyHasMint) {
+  // Block same base token across different pools (pool-resolved mint AND the caller's)
+  for (const mint of mints) {
+    if (positions.positions.some((p) => p.base_mint === mint)) {
       return {
         pass: false,
-        reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
+        reason: `Already holding base token ${mint} in another pool. One position per token only.`,
       };
     }
   }
 
   // Re-entry cooldown after a stop loss / repeated OOR-timeout closes (state.js).
   // Owner (Telegram) deploys override it, logged.
-  const cooldown = getDeployCooldown({ pool: args.pool_address, base_mint: args.base_mint });
+  let cooldown = getDeployCooldown({ pool: args.pool_address, base_mint: null });
+  for (const mint of mints) {
+    cooldown = cooldown || getDeployCooldown({ pool: null, base_mint: mint });
+  }
+  if (!cooldown && mints.length === 0) {
+    // Mint unresolvable: fail closed while ANY mint cooldown is active (the
+    // deploy could be a sibling pool of a token we are cooling down on).
+    const anyMint = getActiveCooldowns().find((c) => c.scope === "mint");
+    if (anyMint) cooldown = { scope: "mint-unresolved", key: anyMint.key, until: anyMint.until, reason: `base mint of this pool could not be resolved and token ${anyMint.key} is cooling down: ${anyMint.reason}` };
+  }
   if (cooldown) {
-    const what = cooldown.scope === "pool" ? `pool ${args.pool_name || args.pool_address}` : `token ${args.base_mint}`;
+    const what = cooldown.scope === "pool" ? `pool ${args.pool_name || args.pool_address}`
+      : cooldown.scope === "mint" ? `token ${cooldown.key}`
+      : "this pool (base mint unresolved)";
     if (args._manual) {
       log("cooldown", `Owner deploy overrides cooldown on ${what} (until ${cooldown.until}: ${cooldown.reason})`);
     } else {
@@ -630,6 +652,35 @@ async function checkDeployEligibility(args) {
   }
 
   return { pass: true };
+}
+
+/**
+ * M3: bookkeeping a code-fired PnL close (exit-engine closeForExit) must do
+ * for parity with a close made through executeTool: actions log, USDC settle
+ * (usdcMode), screening-signal capture. The close alert is emitted by
+ * closeForExit itself (pnl_watcher_close), so it is not emitted twice here.
+ */
+export async function finalizeCodeClose(args, result, durationMs = 0) {
+  logAction({
+    tool: "close_position",
+    args,
+    result: summarizeResult(result),
+    duration_ms: durationMs,
+    success: true,
+  });
+  if (usdcModeEnabled()) {
+    try {
+      const settle = await settleToUsdc();
+      result.usdc_settled = settle;
+      log("usdc", `Post-close settle: ${settle.settled ?? 0} swap(s) to USDC${settle.dry_run ? " [DRY RUN]" : ""}`);
+    } catch (e) {
+      log("usdc", `Post-close settle failed: ${e.message}`);
+      result.usdc_settle_error = e.message;
+    }
+  }
+  try {
+    captureToolSignals("close_position", args, result);
+  } catch { /* signal capture is best-effort */ }
 }
 
 /**
