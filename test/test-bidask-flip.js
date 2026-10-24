@@ -5,6 +5,7 @@
  * live modes. No RPC: every chain read is faked. The SDK is the real installed
  * @meteora-ag/dlmm (only its pure helpers are called).
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -13,6 +14,7 @@ import path from "path";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-bidask-flip-"));
 process.chdir(tmp);
+process.env.MERIDIAN_DATA_DIR = tmp; // this file works in its own cwd
 process.env.DRY_RUN = "true";
 
 const BN = (await import("bn.js")).default;

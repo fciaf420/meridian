@@ -1,6 +1,7 @@
 // Telegram menu UI + owner-only transport. Everything is mocked: no Telegram API
 // call, no RPC, no LLM, no transaction. Runs in a temp cwd so state.json and
 // logs/ written by the modules under test never touch the repo.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -15,6 +16,7 @@ delete process.env.TELEGRAM_ALLOWLIST;
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-tg-"));
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 

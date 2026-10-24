@@ -1,4 +1,5 @@
 // Prompt text that depends on the configured strategy and the management close policy.
+import "./_bootstrap.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 

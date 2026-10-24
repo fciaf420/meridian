@@ -3,6 +3,7 @@
  * helper (getOnchainTokenBalance). Everything is mocked: balance reads, price,
  * swap and the RPC connection. No network, no RPC, no transactions.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Keypair, PublicKey } from "@solana/web3.js";

@@ -1,6 +1,7 @@
 // Jupiter Tokens API V2 (tools/jup-tokens.js): normalization, datapi fallback,
 // cache, the token.js call sites, and the Telegram lines (entry-filter toggle,
 // candidate + lookup card). fetch is mocked: no network.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -15,6 +16,7 @@ process.env.JUPITER_API_KEY = "test-key";
 delete process.env.DRY_RUN;
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 

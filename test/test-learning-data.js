@@ -10,6 +10,7 @@
  */
 process.env.DRY_RUN = "true";
 
+import "./_bootstrap.js";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -18,6 +19,7 @@ import path from "path";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-learning-data-"));
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 process.env.MERIDIAN_USER_CONFIG_PATH = path.join(TMP, "user-config.json"); // never the checkout's
 after(() => fs.rmSync(TMP, { recursive: true, force: true }));

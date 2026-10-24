@@ -1,5 +1,6 @@
 // Dashboard: loopback bind, token-gated chat, same-origin WebSocket upgrades.
 process.env.DRY_RUN = "true";
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";

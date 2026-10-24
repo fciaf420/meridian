@@ -15,6 +15,7 @@
  * size-weighted PnL difference clears zero and the minimum effect.
  */
 
+import { rootDataPath } from "./config-paths.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -42,7 +43,7 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // MERIDIAN_AUTORESEARCH_FILE lets tests point at a scratch copy instead of the repo file.
-const AUTORESEARCH_FILE = process.env.MERIDIAN_AUTORESEARCH_FILE || path.join(__dirname, "autoresearch.json");
+const AUTORESEARCH_FILE = process.env.MERIDIAN_AUTORESEARCH_FILE || rootDataPath("autoresearch.json");
 
 // Hard cap on one generator call (HTTP or CLI). Autoresearch never runs on the close
 // path, but a hung call would still hold the single-experiment lock forever.

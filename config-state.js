@@ -4,8 +4,6 @@
 //
 // Path: MERIDIAN_CONFIG_STATE_PATH, else config-state.json beside user-config.json.
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { configStatePath } from "./config-paths.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 

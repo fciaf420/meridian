@@ -1,7 +1,5 @@
 import fs from "fs";
 import { isTruthyDryRun } from "./env-flags.js";
-import path from "path";
-import { fileURLToPath } from "url";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 import { getEffectiveMinSolToOpen, normalizeScreeningSource, worstCaseDeployOverheadSol } from "./runtime-helpers.js";
 import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
@@ -11,7 +9,6 @@ import { userConfigPath, gmgnConfigPath } from "./config-paths.js";
 import { migrateLegacyBookkeeping } from "./config-state.js";
 import { syncWalletLockFromConfig } from "./wallet-lock.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // MERIDIAN_USER_CONFIG_PATH lets tests point every reader/writer at a temp file.
 export const USER_CONFIG_PATH = userConfigPath();
 // MERIDIAN_GMGN_CONFIG_PATH lets tests point the gmgn-config.json reader/writer at a temp file.

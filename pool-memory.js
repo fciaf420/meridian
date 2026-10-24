@@ -5,11 +5,12 @@
  * (via recordPerformance in lessons.js). Agent can query before deploying.
  */
 
+import { dataPath } from "./config-paths.js";
 import fs from "fs";
 import { log } from "./logger.js";
 import { poolAggregates } from "./learning-data.js";
 
-const POOL_MEMORY_FILE = "./pool-memory.json";
+const POOL_MEMORY_FILE = dataPath("pool-memory.json");
 
 function load() {
   if (!fs.existsSync(POOL_MEMORY_FILE)) return {};

@@ -8,6 +8,7 @@
  * No network: fetch is stubbed to fail, so the LP Agent lookup in the sync
  * returns an empty map.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -17,6 +18,7 @@ import path from "path";
 const REPO = process.cwd();
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-reliability-"));
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 process.env.DRY_RUN = "true";
 for (const k of Object.keys(process.env)) if (k.startsWith("LPAGENT")) delete process.env[k];

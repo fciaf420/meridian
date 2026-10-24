@@ -1,6 +1,7 @@
 // Candle-based range depth (tools/ohlcv.js) + its deploy / Telegram wiring.
 // Every source is mocked: no gmgn-cli spawn, no HTTP, no RPC.
 process.env.DRY_RUN = "true";
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";

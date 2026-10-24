@@ -1,4 +1,5 @@
 // Telegram settings console + profile switching + auto-tune opt-in. Temp files and mocks only.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -18,6 +19,7 @@ process.env.WALLET_PRIVATE_KEY = bs58.encode(Keypair.generate().secretKey);
 process.env.RPC_URL = "http://127.0.0.1:9";
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR;
 test.after(() => { process.env.DRY_RUN = "true"; fs.rmSync(TMP, { recursive: true, force: true }); });
 

@@ -1,6 +1,7 @@
 // Deploy-path safety ports from yunus-0x/meridian: instance lock, crash
 // checkpoint, deploy-time threshold re-check, volatility refusal, pre-submit
 // gate, deposit slippage, RPC host masking.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";

@@ -3,6 +3,7 @@
  * network, no RPC. The throwaway wallet is never funded; the transactions it
  * signs only ever reach the mocks.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {

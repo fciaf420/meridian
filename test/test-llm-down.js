@@ -1,6 +1,7 @@
 // LLM-provider outage hardening: Codex error parsing, non-retryable
 // classification, the rule-4 OOR fallback and the deduped outage alert.
 // Unit-only: no CLI is spawned, no RPC, no transactions.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 

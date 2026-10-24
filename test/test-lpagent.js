@@ -2,6 +2,7 @@
  * LPAgent API mapping tests — mocked fetch, no network, no signing.
  * Response fixtures follow the documented examples at https://docs.lpagent.io.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 

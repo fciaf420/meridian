@@ -6,6 +6,8 @@ import cron from "node-cron";
 import readline from "readline";
 import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./agent.js";
 import { log, enableLogPathFile } from "./logger.js";
+import "./boot-guard.js";
+import { logDir, dataPath, dataDirOverride } from "./config-paths.js";
 import { getMyPositions, isCloseInflight, getInflightCloses, positionAccountExists } from "./tools/dlmm.js";
 import { acquireInstanceLock, releaseInstanceLock } from "./instance-lock.js";
 import { reconcileAttempts, getUnresolvedAttempts, clearAttempt, isAttemptInFlight, setCorruptionHandler } from "./deploy-checkpoint.js";
@@ -98,16 +100,16 @@ installCrashHandlers({
 // MERIDIAN_SKIP_INSTANCE_LOCK=1 bypasses the lock (tests / deliberate overrides,
 // and sandboxes/containers where kill(pid, 0) returns EPERM for every pid and `ps`
 // is unavailable: the lock then fails closed on any stale pidfile).
-const PID_FILE = path.join("logs", "bot.pid");
+const PID_FILE = path.join(logDir(), "bot.pid");
 try {
-  fs.mkdirSync("logs", { recursive: true });
+  fs.mkdirSync(logDir(), { recursive: true });
   if (process.env.MERIDIAN_SKIP_INSTANCE_LOCK === "1") {
     fs.writeFileSync(PID_FILE, `${process.pid}\n`);
     log("startup_warn", "Instance lock bypassed (MERIDIAN_SKIP_INSTANCE_LOCK=1)");
   } else {
     acquireInstanceLock(PID_FILE, { log: (m) => log("startup_warn", m) });
   }
-  enableLogPathFile(path.join("logs", "bot.logpath"));
+  enableLogPathFile(path.join(logDir(), "bot.logpath"));
 } catch (e) {
   if (e.code === "INSTANCE_LOCKED") {
     log("startup_error", e.message);
@@ -191,9 +193,9 @@ deduplicateLessons();
 
 // Auto-migrate existing JSON data to knowledge base on first run
 if (config.knowledgeBase?.enabled) {
-  const kbDir = config.knowledgeBase.dir || "./knowledge";
+  const kbDir = path.resolve(dataDirOverride() || ".", config.knowledgeBase.dir || "./knowledge");
   if (!fs.existsSync(path.join(kbDir, "INDEX.md"))) {
-    const hasData = fs.existsSync("./lessons.json") || fs.existsSync("./pool-memory.json");
+    const hasData = fs.existsSync(dataPath("lessons.json")) || fs.existsSync(dataPath("pool-memory.json"));
     if (hasData) {
       log("kb", "Knowledge base not found — running initial migration...");
       migrateFromJson().then(r => {
@@ -813,7 +815,7 @@ function startCronJobsInner() {
       // Inject recent auto-closes from PnL watcher so LLM knows what happened
       let autoCloseInfo = "";
       try {
-        const stateRaw = (await import("fs")).readFileSync("./state.json", "utf8");
+        const stateRaw = (await import("fs")).readFileSync(dataPath("state.json"), "utf8");
         const stateData = JSON.parse(stateRaw);
         const recent = (stateData.recentAutoCloses || []).filter(
           ac => Date.now() - new Date(ac.ts).getTime() < 60 * 60 * 1000 // last hour
@@ -1469,7 +1471,7 @@ async function handleTelegramCommand(rawText, ctx = {}) {
         return;
       }
       const fsMod = await import("fs");
-      const lessonsData = JSON.parse(fsMod.default.readFileSync("./lessons.json", "utf8"));
+      const lessonsData = JSON.parse(fsMod.default.readFileSync(dataPath("lessons.json"), "utf8"));
       const result = evolveThresholds(lessonsData.performance, config);
       if (!result || Object.keys(result.changes).length === 0) {
         await tgSend("No threshold changes needed — current settings already match performance data.");
@@ -1803,7 +1805,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
           return;
         }
         const fs = await import("fs");
-        const lessonsData = JSON.parse(fs.default.readFileSync("./lessons.json", "utf8"));
+        const lessonsData = JSON.parse(fs.default.readFileSync(dataPath("lessons.json"), "utf8"));
         const result = evolveThresholds(lessonsData.performance, config);
         if (!result || Object.keys(result.changes).length === 0) {
           console.log("\nNo threshold changes needed — current settings already match performance data.\n");

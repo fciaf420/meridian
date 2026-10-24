@@ -6,6 +6,7 @@
  * agent avoids repeating mistakes and doubles down on what works.
  */
 
+import { dataPath } from "./config-paths.js";
 import fs from "fs";
 import { log } from "./logger.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
@@ -22,7 +23,7 @@ import {
   recordPnlPct,
 } from "./learning-data.js";
 
-const LESSONS_FILE = "./lessons.json";
+const LESSONS_FILE = dataPath("lessons.json");
 const MIN_EVOLVE_POSITIONS = 5;   // don't evolve until we have real data
 // Every evolveThresholds rule needs at least this many of the closes it is
 // based on (the wins or losses it looks at; a rule comparing winners with

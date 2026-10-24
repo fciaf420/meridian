@@ -5,6 +5,7 @@
  * weighted calls and holders/traders only for finalists, and the risk/security
  * fields are LOG-ONLY. gmgn-cli is never spawned: exec/sleep/now are injected.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -19,6 +20,7 @@ process.env.MERIDIAN_GMGN_CONFIG_PATH = path.join(TMP, "gmgn-config.json");
 process.env.DRY_RUN = "true";
 const REPO = process.cwd();
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 test.after(() => { process.chdir(REPO); fs.rmSync(TMP, { recursive: true, force: true }); });
 
 const policy = await import("../tools/gmgn-policy.js");

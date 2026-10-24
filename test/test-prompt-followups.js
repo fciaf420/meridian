@@ -1,5 +1,6 @@
 // Prompt-audit follow-ups: F3 (management goal uses the preloaded positions),
 // F4 (GENERAL deploy size computed in code), F6 (one sol_split_pct rule).
+import "./_bootstrap.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";

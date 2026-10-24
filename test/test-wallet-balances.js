@@ -2,6 +2,7 @@
  * getWalletBalances / getSolPrice without the Helius Wallet API: stub RPC
  * connections and a mocked fetch (Jupiter Price v3 + Tokens v2). No network.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@solana/web3.js";

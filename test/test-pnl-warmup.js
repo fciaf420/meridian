@@ -4,6 +4,7 @@
  * state.js reads/writes ./state.json relative to the cwd, so this test chdirs
  * into a temp dir BEFORE importing it — it must never touch the live state file.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -12,6 +13,7 @@ import path from "path";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-pnl-warmup-"));
 process.chdir(tmp);
+process.env.MERIDIAN_DATA_DIR = tmp; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 process.env.DRY_RUN = "true";
 

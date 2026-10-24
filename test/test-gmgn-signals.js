@@ -4,6 +4,7 @@
  * fetch-failure fallback. gmgn-cli is never spawned: every fetch uses an
  * injected spawn mock. Weights and config live in a temp dir.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -17,7 +18,8 @@ process.env.MERIDIAN_USER_CONFIG_PATH = path.join(TMP, "user-config.json");
 process.env.MERIDIAN_GMGN_CONFIG_PATH = path.join(TMP, "gmgn-config.json");
 process.env.DRY_RUN = "true";
 const REPO = process.cwd();
-process.chdir(TMP); // signal-weights.json / lessons.json / logs are cwd-relative
+process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd // signal-weights.json / lessons.json / logs are cwd-relative
 test.after(() => { process.chdir(REPO); fs.rmSync(TMP, { recursive: true, force: true }); });
 
 const sig = await import("../tools/gmgn-signals.js");

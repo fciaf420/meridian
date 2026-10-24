@@ -1,5 +1,6 @@
 // deploy_position caps range depth at strategy.maxRangePct (default 80%).
 process.env.DRY_RUN = "true";
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 
