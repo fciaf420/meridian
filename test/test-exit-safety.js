@@ -494,11 +494,14 @@ test("M1: a stale holder alerts; a hung holder is released after the hard timeou
   const alerts = [];
   lockMod.setWalletLockOptions({ warnMs: 20, hardMs: 80, onAlert: (a) => alerts.push(a) });
   try {
-    const hung = withWalletLock(() => new Promise(() => {}), 10, "hung close");
-    const next = withWalletLock(async () => "ran", 5, "next op");
+    let settle;
+    const hung = withWalletLock(() => new Promise((r) => { settle = r; }), 10, "hung close");
+    const next = withWalletLock(async () => "ran", 10, "next close"); // N1: only closes are admitted
     await assert.rejects(hung, /wallet lock timeout/);
     assert.equal(await next, "ran");
-    assert.deepEqual(alerts.map((a) => a.kind), ["stale", "abandoned"]);
+    assert.deepEqual([...new Set(alerts.map((a) => a.kind))].sort(), ["abandoned", "stale", "tainted"]);
+    settle(); // let the abandoned op settle so the lock is no longer tainted
+    await new Promise((r) => setTimeout(r, 10));
   } finally {
     lockMod.setWalletLockOptions({ warnMs: 300_000, hardMs: 900_000, onAlert: null });
   }
@@ -615,4 +618,146 @@ test("L1: cooldown kinds come from structured close-reason prefixes only, not fr
 test("L2: the watcher takes a fresh timestamp per position", () => {
   const w = fs.readFileSync(new URL("../pnl-watcher.js", import.meta.url), "utf8");
   assert.match(w, /const now = nowFn\(\); \/\/ L2/);
+});
+
+// ═══ Opus 5.5 review fixes ═══
+const walletLockMod = await import(new URL("../wallet-lock.js", import.meta.url));
+const nodeCron = (await import("node-cron")).default;
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test("C1: a setInterval created inside a locked op can take the lock after the op returns", async () => {
+  let handle;
+  const fired = new Promise((resolve) => {
+    withWalletLock(async () => {
+      handle = setInterval(() => {
+        withWalletLock(async () => "ok", 10, "timer close").then(resolve, resolve);
+      }, 15);
+    }, 0, "deploy_position");
+  });
+  const r = await fired;
+  clearInterval(handle);
+  assert.equal(r, "ok", String(r?.message || r));
+});
+
+test("C1: a node-cron job created inside a locked op can take the lock after the op returns", async () => {
+  let task;
+  const fired = new Promise((resolve) => {
+    withWalletLock(async () => {
+      task = nodeCron.schedule("* * * * * *", () => {
+        withWalletLock(async () => "ok", 10, "cron close").then(resolve, resolve);
+      });
+    }, 0, "deploy_position");
+  });
+  const r = await Promise.race([fired, sleepMs(3000).then(() => "timeout")]);
+  task.stop();
+  assert.equal(r, "ok", String(r?.message || r));
+});
+
+test("C1: re-entry from a genuinely running holder still throws", async () => {
+  await assert.rejects(withWalletLock(async () => withWalletLock(async () => 1, 10, "inner"), 0, "outer"), /re-entered/);
+});
+
+test("C1: outsideWalletLock runs timers in a clean context", async () => {
+  let handle;
+  const fired = new Promise((resolve) => {
+    withWalletLock(async () => {
+      walletLockMod.outsideWalletLock(() => {
+        handle = setInterval(() => withWalletLock(async () => "ok", 10, "t").then(resolve, resolve), 10);
+      });
+      // while the holder is still running, a timer from outside the context queues instead of throwing
+      await sleepMs(40);
+    }, 0, "deploy_position");
+  });
+  const r = await fired;
+  clearInterval(handle);
+  assert.equal(r, "ok");
+});
+
+test("C1: a deploy whose update_config restarts cron does not block later closes", async () => {
+  // Same shape as executor.js: update_config → outsideWalletLock(restarter) inside the locked deploy.
+  let handle;
+  const restarter = () => { handle = setInterval(() => {}, 1000); handle.unref?.(); };
+  let closeResult;
+  const closeFromTimer = new Promise((resolve) => {
+    withWalletLock(async () => {
+      walletLockMod.outsideWalletLock(() => {
+        clearInterval(handle);
+        handle = setInterval(() => withWalletLock(async () => "closed", 10, "close").then(resolve, resolve), 10);
+        handle.unref?.();
+      });
+      void restarter;
+    }, 0, "deploy_position");
+  });
+  closeResult = await closeFromTimer;
+  clearInterval(handle);
+  assert.equal(closeResult, "closed");
+});
+
+test("N1: after the hard release only closes are admitted until the abandoned op settles", async () => {
+  walletLockMod.setWalletLockOptions({ warnMs: 0, hardMs: 40, onAlert: (a) => alerts.push(a) });
+  const alerts = [];
+  let release;
+  const hung = new Promise((r) => { release = r; });
+  const deploy = withWalletLock(() => hung, 0, "deploy_position");
+  await assert.rejects(deploy, /wallet lock timeout/);
+  assert.equal(walletLockMod.isWalletLockTainted(), true);
+  assert.ok(alerts.some((a) => a.kind === "tainted"), "tainted alert raised");
+  await assert.rejects(withWalletLock(async () => 1, 0, "deploy_position"), /tainted/);
+  await assert.rejects(withWalletLock(async () => 1, 5, "claim_fees"), /tainted/);
+  assert.equal(await withWalletLock(async () => "closed", 10, "close"), "closed");
+  release();
+  await sleepMs(10);
+  assert.equal(walletLockMod.isWalletLockTainted(), false);
+  assert.equal(await withWalletLock(async () => "deployed", 0, "deploy_position"), "deployed");
+  walletLockMod.setWalletLockOptions({ warnMs: 5 * 60_000, hardMs: 15 * 60_000, onAlert: null });
+});
+
+test("N2: pool detail fetch is bounded and fails closed", async () => {
+  const exec = await import(new URL("../tools/executor.js", import.meta.url));
+  const t0 = Date.now();
+  const hang = await exec.checkDeployEligibility({ pool_address: POOL, bin_step: 100 }, { getPoolDetailFn: () => new Promise(() => {}), getPositionsFn: async () => ({ total_positions: 0, positions: [] }) });
+  assert.equal(hang.pass, false);
+  assert.match(hang.reason, /fail closed/);
+  assert.ok(Date.now() - t0 < exec.POOL_DETAIL_TIMEOUT_MS + 2000);
+  const thrown = await exec.checkDeployEligibility({ pool_address: POOL, bin_step: 100 }, { getPoolDetailFn: async () => { throw new Error("boom"); }, getPositionsFn: async () => ({ total_positions: 0, positions: [] }) });
+  assert.equal(thrown.pass, false);
+}, { timeout: 20000 });
+
+test("N3: forced on-chain read is stamped per source; a management read does not delay the watcher's", async () => {
+  const now = Date.now();
+  const tracked = { last_onchain_by: { management: new Date(now - 30_000).toISOString() }, last_onchain_at: new Date(now - 30_000).toISOString() };
+  const mg = { stopLossPct: -15, emergencyPriceDropPct: -50, takeProfitFeePct: 7 };
+  assert.equal(engine.needsOnchain(-5, tracked, mg, { now, intervalMs: 60_000, source: "management" }), false);
+  assert.equal(engine.needsOnchain(-5, tracked, mg, { now, intervalMs: 60_000, source: "watcher" }), true, "watcher has its own stamp");
+  const p = open();
+  state.markOnchainRead(p, now, "watcher");
+  const t = state.getTrackedPosition(p);
+  assert.ok(t.last_onchain_by.watcher);
+  assert.equal(t.last_onchain_by.management, undefined);
+});
+
+test("N4: API-only SL fallback waits 120s when every tick is at/below the emergency level, 300s otherwise", () => {
+  const cfg = { ...config, exits: { ...config.exits, stopLossUnverifiedMaxWaitSec: 300, stopLossEmergencyMaxWaitSec: 120, confirmMinSpacingSec: 0, confirmTicks: 2 } };
+  const run = (emergency) => {
+    const p = open();
+    const t0 = Date.now();
+    for (let i = 0; i < 3; i++) state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", reason: "x", config: cfg, now: t0 + i * 1000, emergency });
+    return state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", reason: "x", config: cfg, now: t0 + 130_000, emergency });
+  };
+  assert.equal(run(true).fireOnApi, true, "emergency: fires after >120s");
+  assert.equal(run(false).fireOnApi, false, "normal: still waiting at 130s");
+  // a mixed streak (one non-emergency tick) uses the normal wait
+  const p = open();
+  const t0 = Date.now();
+  const cfg2 = cfg;
+  state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config: cfg2, now: t0, emergency: false });
+  state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config: cfg2, now: t0 + 1000, emergency: true });
+  state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config: cfg2, now: t0 + 2000, emergency: true });
+  assert.equal(state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config: cfg2, now: t0 + 130_000, emergency: true }).fireOnApi, false);
+});
+
+test("L3: pnlExitsWarning flags positions without state or without a recorded deposit", () => {
+  assert.match(engine.pnlExitsWarning({}, null), /OFF/);
+  assert.match(engine.pnlExitsWarning({}, { amount_sol: 0 }), /degraded/);
+  assert.equal(engine.pnlExitsWarning({}, { amount_sol: 5 }), null);
 });

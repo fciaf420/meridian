@@ -473,12 +473,12 @@ export function getActiveCooldowns(nowMs = Date.now()) {
 //          | "refute" (on-chain contradicts) | "clear" (no signal this tick)
 // Returns { fire, fireOnApi, count, seen, kind, waitedMs }.
 
-export function registerExitTick(position_address, { kind = null, outcome = "clear", suspicious = false, reason = null, config = liveConfig, now = Date.now() } = {}) {
+export function registerExitTick(position_address, { kind = null, outcome = "clear", suspicious = false, reason = null, config = liveConfig, now = Date.now(), emergency = false } = {}) {
   const none = { fire: false, fireOnApi: false, count: 0, seen: 0, kind, waitedMs: 0 };
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return none;
-  const { confirmTicks, minSpacingMs, stopLossUnverifiedMaxWaitMs } = exitSettings(config);
+  const { confirmTicks, minSpacingMs, stopLossUnverifiedMaxWaitMs, stopLossEmergencyMaxWaitMs } = exitSettings(config);
 
   if (!kind || outcome === "clear" || outcome === "refute") {
     if (pos.exit_streak) {
@@ -497,6 +497,7 @@ export function registerExitTick(position_address, { kind = null, outcome = "cle
   if (spaced && !suspicious) {
     if (outcome === "confirm") st.confirms += 1;
     st.seen += 1;
+    if (!emergency) st.non_emergency_seen = (st.non_emergency_seen || 0) + 1; // N4
     st.last_counted_at = new Date(now).toISOString();
   }
   st.last_outcome = suspicious ? "suspicious" : outcome;
@@ -508,7 +509,7 @@ export function registerExitTick(position_address, { kind = null, outcome = "cle
   // confirmTicks) on top of the wait, so a short RPC outage plus a wrong priced
   // API reading cannot close a healthy position on two looks.
   const fireOnApi = !fire && kind === "stop_loss" && outcome === "unverified" && !suspicious
-    && st.seen >= Math.max(confirmTicks, 3) && waitedMs >= stopLossUnverifiedMaxWaitMs;
+    && st.seen >= Math.max(confirmTicks, 3) && waitedMs >= ((st.non_emergency_seen || 0) === 0 ? Math.min(stopLossEmergencyMaxWaitMs, stopLossUnverifiedMaxWaitMs) : stopLossUnverifiedMaxWaitMs);
   const result = { fire, fireOnApi, count: st.confirms, seen: st.seen, kind, waitedMs };
   // H2 (Fable audit): the streak is NOT deleted when it fires. A failed close
   // (blockhash expiry, oversize tx, RPC error) must retry on the very next tick
@@ -521,11 +522,16 @@ export function registerExitTick(position_address, { kind = null, outcome = "cle
 }
 
 /** H1: stamp the time of the last successful on-chain PnL read for a position. */
-export function markOnchainRead(position_address, now = Date.now()) {
+export function markOnchainRead(position_address, now = Date.now(), source = null) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return;
   pos.last_onchain_at = new Date(now).toISOString();
+  if (source) {
+    // N3: per-source stamps so the watcher's forced read isn't skipped because
+    // the management cycle read recently (and vice versa).
+    pos.last_onchain_by = { ...(pos.last_onchain_by || {}), [source]: pos.last_onchain_at };
+  }
   save(state);
 }
 
@@ -637,6 +643,8 @@ function exitSettings(config) {
     // No `exits` block (hand-built test configs): no spacing.
     minSpacingMs: Math.max(0, Number(e.confirmMinSpacingSec ?? 0) * 1000) || 0,
     stopLossUnverifiedMaxWaitMs: Math.max(0, Number(e.stopLossUnverifiedMaxWaitSec ?? 300) * 1000),
+    // N4: every counted tick at/below the emergency level → shorter API-only wait.
+    stopLossEmergencyMaxWaitMs: Math.max(0, Number(e.stopLossEmergencyMaxWaitSec ?? 120) * 1000),
   };
 }
 

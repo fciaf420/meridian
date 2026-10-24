@@ -14,7 +14,7 @@ import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js"
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded, getDeployCooldown, getActiveCooldowns } from "../state.js";
-import { withWalletLock, priorityForTool } from "../wallet-lock.js";
+import { withWalletLock, priorityForTool, outsideWalletLock } from "../wallet-lock.js";
 import { checkAgentSwap } from "./swap-guard.js";
 import { isManagementBusy, getManagementCloseReason, isDraining, trackInflightOp } from "../session.js";
 import { managementPnlCloseGate } from "../pnl-confirm.js";
@@ -210,7 +210,8 @@ const toolMap = {
     // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null || applied.pnlWatcherIntervalSec != null;
     if (intervalChanged && _cronRestarter) {
-      _cronRestarter();
+      // C1: timers created here would inherit this lock's ALS context forever.
+      outsideWalletLock(() => _cronRestarter());
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
     }
 
@@ -565,6 +566,8 @@ async function executeToolInner(name, args, { manual = false, codeExit = false }
  * standard safety checks so USDC mode never swaps before confirming the deploy
  * is even allowed.
  */
+export const POOL_DETAIL_TIMEOUT_MS = 8_000;
+
 export async function checkDeployEligibility(args, { getPoolDetailFn = getPoolDetail, getPositionsFn = getMyPositions } = {}) {
   // Resolve the pool's own facts. bin_step falls back to the pool detail when the
   // caller omitted it; the BASE MINT is always taken from the pool (H3): the
@@ -572,10 +575,25 @@ export async function checkDeployEligibility(args, { getPoolDetailFn = getPoolDe
   // and the mint cooldown / duplicate-token guard must not depend on it.
   let poolDetail = null;
   if (args.pool_address) {
+    // N2: bounded (this runs under the wallet lock — a hung fetch would block exits).
+    let timedOut = false;
     try {
-      poolDetail = await getPoolDetailFn({ pool_address: args.pool_address });
+      poolDetail = await new Promise((resolve, reject) => {
+        const t = setTimeout(() => { timedOut = true; resolve(null); }, POOL_DETAIL_TIMEOUT_MS);
+        t.unref?.();
+        Promise.resolve().then(() => getPoolDetailFn({ pool_address: args.pool_address }))
+          .then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+      });
     } catch {
       poolDetail = null;
+    }
+    // Fail closed: without the pool's own facts the base mint (cooldown / duplicate-token
+    // guards) cannot be verified, so refuse the deploy.
+    if (!poolDetail || timedOut) {
+      return {
+        pass: false,
+        reason: `Could not fetch pool detail for ${args.pool_address}${timedOut ? ` within ${POOL_DETAIL_TIMEOUT_MS / 1000}s` : ""}; cannot verify its base mint against cooldowns / duplicate-token limits. Refusing deploy (fail closed) — retry later.`,
+      };
     }
   }
   const effectiveBinStep = args.bin_step ?? poolDetail?.bin_step ?? null;

@@ -17,11 +17,12 @@ import { normalizeEntryFilterValue, isLooseningChange } from "./tools/entry-safe
 import { applyTradingSettings } from "./trading-settings.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
 import { registerCronRestarter, executeTool, finalizeCodeClose } from "./tools/executor.js";
-import { setWalletLockOptions } from "./wallet-lock.js";
+import { setWalletLockOptions, outsideWalletLock } from "./wallet-lock.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, editHTML, answerCallback, setMyCommands, isEnabled as telegramEnabled } from "./telegram.js";
 import { createTelegramUI, BOT_COMMANDS, readRecentErrors } from "./telegram-ui.js";
 import { lookupToken, parseMint } from "./tools/token-lookup.js";
 import { isScreeningPaused, setScreeningPaused } from "./state.js";
+import { pnlExitsWarning } from "./exit-engine.js";
 import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing, recordBriefing, latestBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
@@ -568,6 +569,11 @@ ${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
 }
 
 function startCronJobs() {
+  // C1: never create cron/watcher timers inside a wallet-lock ALS context.
+  return outsideWalletLock(startCronJobsInner);
+}
+
+function startCronJobsInner() {
   stopCronJobs(); // stop any running tasks before (re)starting
   if (isDraining()) return; // shutting down: never (re)start cycles
 
@@ -723,7 +729,7 @@ function startCronJobs() {
             update: updatePnlAndCheckExits,
             register: registerExitTick,
             recordHold: recordPnlHold,
-            readOnchain: getOnchainPnl,
+            readOnchain: (pos) => withTimeout(getOnchainPnl(pos), 20_000),
             markOnchain: markOnchainRead,
           },
           closeDeps: {
@@ -1230,6 +1236,8 @@ async function handleTelegramCommand(rawText, ctx = {}) {
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
         const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
         lines.push(`• ${p.pair}  ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
+        const exitWarn = pnlExitsWarning(p, getTrackedPosition(p.position));
+        if (exitWarn) lines.push(`   ⚠ ${exitWarn}`);
       }
       await tgSend(lines.join("\n"));
     });
@@ -1408,6 +1416,8 @@ if (runtimeMode.interactive) {
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
         const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
         console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
+        const exitWarn = pnlExitsWarning(p, getTrackedPosition(p.position));
+        if (exitWarn) console.log(`    ! ${exitWarn}`);
       }
       console.log();
     }

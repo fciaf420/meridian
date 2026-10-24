@@ -30,6 +30,17 @@ import { emit as realEmit } from "./notifier.js";
 const finite = (v) => v != null && Number.isFinite(Number(v));
 
 /**
+ * L3: is the PnL exit path (stop loss / TP / trailing) degraded or off for this
+ * position? Returns a short warning string, or null when fully active.
+ */
+export function pnlExitsWarning(p, tracked) {
+  if (!tracked) return "PnL exits OFF (no state record)";
+  if (tracked.closed) return null;
+  if (!(Number(tracked.amount_sol) > 0)) return "PnL exits degraded (adopted: API-only stop, no on-chain/TP/trailing)";
+  return null;
+}
+
+/**
  * A tick is suspicious only when it cannot be priced (yunus-0x/meridian@9f94792,
  * 196c1a2): PnL missing / not a number, or the position value is missing,
  * non-finite or ≤ 0 (a price outage collapses value to 0, which reads as
@@ -55,9 +66,10 @@ const ONCHAIN_READ_SLACK_MS = 5_000;
  * so a stale API reading that sits harmlessly above the stop cannot hide a
  * crash the chain already shows. opts: { now, intervalMs }.
  */
-export function needsOnchain(apiPct, tracked, mgmt, { now = Date.now(), intervalMs = 60_000 } = {}) {
+export function needsOnchain(apiPct, tracked, mgmt, { now = Date.now(), intervalMs = 60_000, source = null } = {}) {
   if (intervalMs > 0) {
-    const last = tracked?.last_onchain_at ? Date.parse(tracked.last_onchain_at) : NaN;
+    const stamp = (source && tracked?.last_onchain_by?.[source]) || (source ? null : tracked?.last_onchain_at);
+    const last = stamp ? Date.parse(stamp) : NaN;
     if (!Number.isFinite(last) || now - last >= intervalMs - ONCHAIN_READ_SLACK_MS) return true;
   }
   const peak = tracked?.peak_pnl_pct || 0;
@@ -148,7 +160,7 @@ export async function evaluatePnlExit(p, deps) {
   const onchainOnce = async () => {
     if (onchain === undefined) {
       try { onchain = await readOnchain(p); } catch { onchain = null; }
-      if (onchain != null) { try { markOnchain?.(p.position, now); } catch { /* best-effort */ } }
+      if (onchain != null && finite(onchainPctForUnit(onchain, unit))) { try { markOnchain?.(p.position, now, source); } catch { /* best-effort */ } }
     }
     return onchain;
   };
@@ -191,7 +203,7 @@ export async function evaluatePnlExit(p, deps) {
   // ─── Priced tick ───
   const apiPct = Number(p.pnl_pct);
   const readEverySec = Number(config.exits?.onchainReadIntervalSec ?? 60);
-  if (needsOnchain(apiPct, tracked, mgmt, { now, intervalMs: Number.isFinite(readEverySec) ? readEverySec * 1000 : 60_000 })) await onchainOnce();
+  if (needsOnchain(apiPct, tracked, mgmt, { now, intervalMs: Number.isFinite(readEverySec) ? readEverySec * 1000 : 60_000, source })) await onchainOnce();
   const ocPct = onchainPctForUnit(onchain, unit);
   if (finite(ocPct)) recordPnlBias(apiPct, ocPct, log);
   const exitAction = update(p.position, apiPct, config, { onchainPct: ocPct, strict: true, now });
@@ -248,7 +260,8 @@ export async function evaluatePnlExit(p, deps) {
   }
   const outcome = decision.close ? "confirm" : decision.unverified ? "unverified" : "refute";
   if (!decision.close) recordHold(p.position, reason, decision.why, { onchainPct: decision.onchainPct, config });
-  const tick = register(p.position, { kind, outcome, reason, config, now });
+  const emergencyTick = finite(apiPct) && mgmt.emergencyPriceDropPct != null && apiPct <= mgmt.emergencyPriceDropPct;
+  const tick = register(p.position, { kind, outcome, reason, config, now, emergency: emergencyTick });
   const close = tick.fire || tick.fireOnApi;
   if (!close) {
     const need = Number(config.exits?.confirmTicks ?? 2);

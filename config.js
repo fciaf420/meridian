@@ -255,6 +255,8 @@ export const config = {
     // signal has persisted this long (and on >= confirmTicks priced ticks).
     // Default 300s (M5): with a 60s watcher that is 5 priced observations.
     stopLossUnverifiedMaxWaitSec: u.stopLossUnverifiedMaxWaitSec ?? 300,
+    // N4: API-only fallback wait when every priced tick is at/below the emergency level.
+    stopLossEmergencyMaxWaitSec: u.stopLossEmergencyMaxWaitSec ?? 120,
     // H1: force an on-chain PnL read for every tracked position at least this
     // often, even when the API reading looks harmless, so a stale API cannot
     // hide a crash the chain already shows.

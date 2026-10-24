@@ -20,6 +20,7 @@ import { evaluatePnlExit, closeForExit } from "./exit-engine.js";
 import { emit } from "./notifier.js";
 import { getPositionBins, withTimeout } from "./tools/bin-visual.js";
 import { isDraining } from "./session.js";
+import { outsideWalletLock } from "./wallet-lock.js";
 import { finalizeCodeClose } from "./tools/executor.js";
 
 let _intervalHandle = null;
@@ -158,8 +159,11 @@ export function startPnlWatcher(intervalSec = 30) {
   const intervalMs = intervalSec * 1000;
   log("pnl_watcher", `Starting PnL watcher (every ${intervalSec}s)`);
 
-  runPnlWatcher();
-  _intervalHandle = setInterval(runPnlWatcher, intervalMs);
+  // C1: timers must not inherit a wallet-lock ALS context from the caller.
+  outsideWalletLock(() => {
+    runPnlWatcher();
+    _intervalHandle = setInterval(runPnlWatcher, intervalMs);
+  });
 }
 
 export function stopPnlWatcher() {
