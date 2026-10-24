@@ -608,8 +608,9 @@ test("M5: the API-only stop-loss fallback needs >= 3 priced observations as well
   state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config, now: t0 });
   assert.equal(state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config, now: t0 + 500_000 }).fireOnApi, false, "only 2 observations");
   assert.equal(state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config, now: t0 + 510_000 }).fireOnApi, true);
-  const cfg = fs.readFileSync(new URL("../config.js", import.meta.url), "utf8");
-  assert.match(cfg, /stopLossUnverifiedMaxWaitSec: u\.stopLossUnverifiedMaxWaitSec \?\? 300/);
+  // integrate: #131 moved this default into settings-schema.js
+  const schema = fs.readFileSync(new URL("../settings-schema.js", import.meta.url), "utf8");
+  assert.match(schema, /row\("stopLossUnverifiedMaxWaitSec", \["exits", "stopLossUnverifiedMaxWaitSec"\], "int", 300/);
 });
 
 test("L1: cooldown kinds come from structured close-reason prefixes only, not free text", () => {

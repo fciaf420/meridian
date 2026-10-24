@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Live funds — read first
 
-Meridian signs real Solana transactions. `npm start` (`node index.js`) trades live whenever `DRY_RUN` isn't `"true"`, and both `user-config.json` and `user-config.example.json` ship with `"dryRun": false`. Use `npm run dev` (`DRY_RUN=true`) for anything exploratory. Ask before running a command that could run live: `npm start`, `node index.js` without `DRY_RUN=true`, or scripts that call deploy, close or swap tools. A PreToolUse hook in `.claude/settings.json` enforces this for the entry point.
+Meridian signs real Solana transactions. `npm start` (`node index.js`) trades live whenever `DRY_RUN` isn't `"true"`, and `user-config.json` may have `"dryRun": false` (`user-config.example.json` ships `true`). `DRY_RUN=true` in the environment still forces dry run over a live `user-config.json` (the only env value that beats it, because it can only make the bot safer). Use `npm run dev` (`DRY_RUN=true`) for anything exploratory. Ask before running a command that could run live: `npm start`, `node index.js` without `DRY_RUN=true`, or scripts that call deploy, close or swap tools. A PreToolUse hook in `.claude/settings.json` enforces this for the entry point.
 
 `DRY_RUN` is checked as the string `=== "true"` in several places (tools/dlmm.js, tools/wallet.js, tools/usdc-mode.js). Any new fund-moving code path needs the same guard.
 
@@ -23,7 +23,7 @@ Swaps go through Jupiter Swap API v2 (`/swap/v2/order` + `/execute`, auto slippa
 
 ## Config and state
 
-- Resolution order: `.env`, then `user-config.json` (backfills env with `||=`, config.js:20-28), then code defaults. `gmgn-config.json` takes precedence for the GMGN key. All three are gitignored; `.env.example` and `user-config.example.json` are the documented templates.
+- Resolution order: secrets come from `.env` (old user-config copies still work with a deprecation warning); every other setting is `user-config.json` > profile preset > schema default (`settings-schema.js`, read by `config.js`). Old env names (`DRY_RUN=false`, `USDC_MODE`, `LLM_*`, `WEB_PORT`) are only a fallback when user-config has no value. All config files are gitignored; `.env.example` and `user-config.example.json` are the documented templates. New settings: add one row to `settings-schema.js`.
 - The app rewrites `user-config.json` at runtime (threshold evolution, lessons, autoresearch, Telegram chat ID), so expect it to change underneath you.
 - Runtime state is JSON in the repo root (state.json, lessons.json, pool-memory.json, and others) and is gitignored. One tracked file is also rewritten at runtime: `autoresearch.json`. Leave its runtime changes out of commits unless asked.
 - Memory layers: `pool-memory.json` (history by pool address), `lessons.json` (plus `add_pool_note`) and the knowledge base in `knowledge/`. The nuggets layer was removed, so don't reintroduce free-form model-written memory into the system prompt.

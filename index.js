@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { isDryRun } from "./env-flags.js";
 import fs from "fs";
 import path from "path";
 import cron from "node-cron";
@@ -15,7 +16,8 @@ import { runManagementWithOorFallback, formatOorFallbackReport } from "./oor-fal
 import { getPositionBins } from "./tools/bin-visual.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount, resolveDeploySizing, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, resolveDeploySizing, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV, switchProfile, currentGovernedValues, settingSource } from "./config.js";
+import { createProfileService } from "./settings-console.js";
 import { createAllSettings } from "./all-settings.js";
 import { normalizeEntryFilterValue, isLooseningChange } from "./tools/entry-safety.js";
 import { applyTradingSettings } from "./trading-settings.js";
@@ -67,7 +69,7 @@ import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buil
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
 log("startup", "DLMM LP Agent starting...");
-log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
+log("startup", `Mode: ${isDryRun() ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${config.llm.managementModel} (provider: ${process.env.LLM_PROVIDER || "openrouter"})`);
 
 // Crash handlers first, so a throw anywhere below is logged, alerted and exits 1
@@ -888,7 +890,7 @@ function startCronJobsInner() {
           isCloseInflight,
           management: config.management,
           log,
-          dryRun: process.env.DRY_RUN === "true",
+          dryRun: isDryRun(),
         },
       });
       fallbackSummary = mgmtRun.fallbackSummary;
@@ -1238,6 +1240,19 @@ const tgUI = createTelegramUI({
     },
     log,
   }),
+  // Settings console: profile picker (diff + confirm) and "✎ overridden" tags.
+  settingSource,
+  profiles: createProfileService({
+    config,
+    switchProfile,
+    currentGovernedValues,
+    onScheduleChange: (key, value) => {
+      if (!cronStarted) return;
+      if (key === "pnlWatcherIntervalSec") startPnlWatcher(value);
+      else startCronJobs();
+    },
+    log,
+  }),
   applyTradingSettings: (changes) => applyTradingSettings(changes, {
     config,
     persistUserConfig,
@@ -1313,7 +1328,7 @@ function startTelegram() {
   // Liveness: a restart (crash loop, launchd, manual) is visible in the chat.
   if (!startupAnnounced) {
     startupAnnounced = true;
-    sendMessage(`🟢 Meridian started — ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}, pid ${process.pid}, strategy ${config.strategy.activeStrategy ?? config.strategy.strategy}, RPC ${formatRpcHosts()}`)
+    sendMessage(`🟢 Meridian started — ${isDryRun() ? "DRY RUN" : "LIVE"}, pid ${process.pid}, strategy ${config.strategy.activeStrategy ?? config.strategy.strategy}, RPC ${formatRpcHosts()}`)
       .catch(() => {});
   }
 }

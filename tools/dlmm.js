@@ -1,3 +1,4 @@
+import { isDryRun } from "../env-flags.js";
 import {
   Connection,
   ComputeBudgetProgram,
@@ -903,7 +904,7 @@ export async function deployPosition({
     };
   }
 
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     const dryRunResult = {
       dry_run: true,
       would_deploy: {
@@ -2267,7 +2268,7 @@ export async function searchPools({ query, limit = 10 }) {
 // ─── Claim Fees ────────────────────────────────────────────────
 export async function claimFees({ position_address }) {
   position_address = normalizeMint(position_address);
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
 
@@ -2360,7 +2361,7 @@ export function getInflightCloses() {
 // closes such as the OOR fallback); the LLM-facing tool schema does not expose it.
 export async function closePosition({ position_address, _pnlOverride = null, _close_reason = null }) {
   position_address = normalizeMint(position_address);
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }
 

@@ -165,71 +165,73 @@ Before a real run, verify:
 - the first screening and management cycles complete without errors
 - Telegram is registered if you enabled it
 
-## How Config Is Resolved
+## Settings: three tiers, one profile
 
-Meridian uses both `.env` and `user-config.json`.
+Meridian has a lot of knobs, but you only need to look at a few.
 
-Resolution order:
+| Tier | What | Where |
+| --- | --- | --- |
+| 0. Secrets | `WALLET_PRIVATE_KEY`, `RPC_URL`, `TELEGRAM_BOT_TOKEN` (required); LLM key and `GMGN_API_KEY` (optional) | `.env` only. Never shown or accepted in Telegram. |
+| 1. Basics | dry run, profile, max positions, position size, max SOL per position, screening source, strategy + shape, LLM provider | Telegram: **Menu → Settings console** (or `user-config.json`) |
+| 2. Tuning | ~25 knobs a **profile** sets for you: exits, screening thresholds, entry filters, sizing floor, cadence | Console → Tuning |
+| 3. Advanced | everything else (GMGN filters, per-role models, Darwin/autoresearch constants, USDC mode, ...) | Console → Advanced (the All-settings editor), or `user-config.json` |
 
-1. `.env` is loaded first.
-2. `user-config.json` backfills key env values only when the env var is missing.
-3. Runtime config is built from `user-config.json`, then env fallbacks, then code defaults.
+The list of settings, with type, range, unit, tier, restart-required and profile-governed flags, is one table: [`settings-schema.js`](settings-schema.js). `config.js`, the Telegram console and the All-settings editor are all generated from it.
 
-In practice:
+### Profiles
 
-- `rpcUrl` can populate `RPC_URL`
-- `walletKey` can populate `WALLET_PRIVATE_KEY`
-- `llmProvider` can populate `LLM_PROVIDER`
-- `llmModel` can populate `LLM_MODEL`
-- `dryRun` can populate `DRY_RUN`
+`"profile"` in `user-config.json` (or the console's Profile picker) is one of:
 
-Per-role model precedence:
+- `balanced`: the values this bot has been running live.
+- `conservative`: tighter exits, stricter screening, fewer and smaller positions. **Untested starting point.**
+- `degen`: wider exits, looser screening, more positions. **Untested starting point.**
+- `custom`: no preset; `user-config.json` is the whole truth. **A config from before profiles has no `profile` key and loads as `custom` with an identical effective config.**
 
-1. `managementModel` / `screeningModel` / `generalModel`
-2. `LLM_MODEL`
-3. provider default
+Resolution for every setting: **`user-config.json` value > profile preset > schema default.** Setting a Tuning knob yourself under a profile is an override (shown with ✎ in the console) and survives restarts. Switching profile shows a diff and asks for confirmation; it drops your Tuning overrides so the preset takes effect. Switching to `custom` pins every Tuning knob to its current value (no behavior change).
 
-So `LLM_MODEL` is only a global fallback. The main live settings are the per-role model fields in `user-config.json`.
+### Precedence rules
+
+- Secrets: `.env` wins. A `walletKey` / `rpcUrl` / `gmgnApiKey` left in `user-config.json` / `gmgn-config.json` still works for one more release and logs a deprecation warning.
+- Everything else: `user-config.json` wins over a stale `.env` value. The old env names `DRY_RUN`, `USDC_MODE`, `LLM_PROVIDER`, `LLM_MODEL`, `WEB_PORT` are only a fallback when `user-config.json` has no value, and log a deprecation warning (and a loud "ignored" warning when they disagree).
+- Per-role models: `managementModel` / `screeningModel` / `generalModel`, then `llmModel`, then the provider default.
+
+### Auto-tuning is opt-in
+
+`autoTune` (default `false`) controls whether `lessons.js` may rewrite thresholds in `user-config.json` after closes. Off, it still runs the analysis but only **logs** (`evolve_proposed`) and records the latest proposal in `config-state.json`. Explicit owner commands (`/evolve`, dashboard) still apply immediately. Bookkeeping counters (`_lastEvolved` etc.) live in `config-state.json`, not in `user-config.json`.
 
 ## Core Files
 
-- `.env`: secrets and optional overrides
-- `user-config.json`: primary runtime settings
+- `.env`: secrets and endpoints only
+- `user-config.json`: runtime settings (hand/Telegram-edited; the bot no longer writes counters here)
+- `settings-schema.js`: the settings table (types, ranges, tiers, profiles)
+- `config-state.json`: bot-written bookkeeping (gitignored)
 - `user-config.example.json`: reference config shape
 - `autoresearch.json`: prompt experiment state
 - `lessons.json`: performance-derived lessons
 
 ## Environment Variables
 
-Typical `.env`:
+Typical `.env` (see `.env.example`):
 
 ```env
-LLM_PROVIDER=claude
-RPC_URL=https://...helius-rpc.com
 WALLET_PRIVATE_KEY=your_base58_key
-HELIUS_API_KEY=your_helius_key
-OPENROUTER_API_KEY=sk-or-...
-DEEPSEEK_API_KEY=sk-...
-MINIMAX_API_KEY=...
-LPAGENT_API_KEY=your_lpagent_key
-LPAGENT_RPM=5
+RPC_URL=https://...helius-rpc.com
 TELEGRAM_BOT_TOKEN=123456:ABC...
-TELEGRAM_CHAT_ID=
-TELEGRAM_ALLOWLIST=
-DRY_RUN=true
+# plus, only if you use them:
+# OPENROUTER_API_KEY / DEEPSEEK_API_KEY / MINIMAX_API_KEY, GMGN_API_KEY, HELIUS_API_KEY, JUPITER_API_KEY, LPAGENT_API_KEY
 ```
 
 Notes:
 
 - `LPAGENT_API_KEY` accepts a comma-separated list, but use a single key. LPAgent's [Terms of Service §7](https://docs.lpagent.io/terms-of-service.md) prohibits creating multiple accounts to circumvent restrictions, so rotating keys from several accounts to get around the rate limit risks termination. If you need more throughput, upgrade the plan (Basic 5, Premium 10, Enterprise 20 requests/min) and set `LPAGENT_RPM` to match. The two-sided spot deploy gate needs a Premium or Enterprise key (`/pools/{id}/top-lpers`); without one, two-sided spot stays blocked.
-- `LLM_PROVIDER` can be `claude`, `codex`, `openrouter`, `deepseek`, or `minimax`
+- `llmProvider` (user-config.json) can be `claude`, `codex`, `openrouter`, `deepseek`, or `minimax`
 - `OPENROUTER_API_KEY` is only needed when provider is `openrouter`
 - `DEEPSEEK_API_KEY` is only needed when provider is `deepseek`
 - `MINIMAX_API_KEY` is only needed when provider is `minimax`
 - `claude` and `codex` providers use OAuth login, no API key needed
 - `TELEGRAM_CHAT_ID` should be your own chat id. If it (and `telegramChatId` in user-config) is empty, the first private chat to message the bot is registered once, with a loud warning in the log
 - `TELEGRAM_ALLOWLIST` (optional) is a comma-separated list of Telegram user ids allowed to act inside the owner chat; needed when the owner chat is a group
-- `DRY_RUN=true` is the safest default until you validate behavior
+- `dryRun` lives in `user-config.json` (flip it from the Telegram console); keep it `true` until you validate behavior
 
 ## Runtime Modes
 
@@ -365,8 +367,6 @@ Everything in `user-config.json` is optional, but these are the main knobs.
 
 | Field | Purpose |
 | --- | --- |
-| `rpcUrl` | Solana RPC URL |
-| `walletKey` | Solana wallet private key |
 | `dryRun` | Simulate or trade live |
 | `llmProvider` | `claude`, `codex`, `openrouter`, `deepseek`, or `minimax` |
 | `managementModel` | manager model |
@@ -405,10 +405,7 @@ Everything in `user-config.json` is optional, but these are the main knobs.
 | `gasReserve` | reserve left for gas |
 | `positionSizePct` | dynamic sizing fraction |
 | `positionSizeBase` | `total` (default) or `wallet`: what `positionSizePct` is a fraction of (see Deploy sizing below) |
-| `minClaimAmount` | minimum amount worth claiming |
-| `outOfRangeBinsToClose` | OOR threshold in bins |
 | `outOfRangeWaitMinutes` | OOR hold time before action |
-| `minVolumeToRebalance` | minimum volume to justify rebalance logic |
 | `emergencyPriceDropPct` | emergency-drop cutoff |
 | `stopLossPct` | stop-loss threshold |
 | `takeProfitFeePct` | take-profit threshold |
@@ -438,7 +435,6 @@ On the `total` basis, if any open position's value is unknown or the positions/p
 | --- | --- |
 | `managementIntervalMin` | management cycle cadence |
 | `screeningIntervalMin` | screening cycle cadence |
-| `healthCheckIntervalMin` | health-check cadence |
 | `pnlWatcherIntervalSec` | watcher cadence |
 | `maxSteps` | max ReAct steps per agent turn |
 
@@ -498,7 +494,7 @@ The earlier Nuggets memory layer was removed. If an older install still has `dat
 
 ### Threshold Evolution
 
-Meridian can evolve screening thresholds from real performance and lesson history. These changes persist back into `user-config.json`.
+Meridian can evolve screening thresholds from real performance and lesson history. **This is opt-in: set `autoTune: true`.** When off (the default) the same analysis runs but only logs proposed changes (`evolve_proposed`); nothing in `user-config.json` moves. Applied changes persist back into `user-config.json`.
 
 - A close is a win above +1% PnL and a loss below −1%. Anything in between is break-even and doesn't count toward wins or losses. The same classifier (`learning-data.js`) drives lessons, pool-memory win rates and signal weights.
 - Every evolution rule needs at least `MIN_RULE_SAMPLES` (5) of the closes (or, for lesson-based rules, lessons) it relies on before it moves a setting. A rule that compares winners with losers needs 5 on each side it uses.

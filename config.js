@@ -1,10 +1,13 @@
 import fs from "fs";
+import { isTruthyDryRun } from "./env-flags.js";
 import path from "path";
 import { fileURLToPath } from "url";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 import { getEffectiveMinSolToOpen, normalizeScreeningSource, worstCaseDeployOverheadSol } from "./runtime-helpers.js";
 import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 import { computePortfolioSol } from "./portfolio-value.js";
+import { BY_KEY, GOVERNED_KEYS, makeResolver, normalizeProfile, PROFILE_NAMES } from "./settings-schema.js";
+import { migrateLegacyBookkeeping } from "./config-state.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // MERIDIAN_USER_CONFIG_PATH lets tests point every reader/writer at a temp file.
@@ -18,18 +21,81 @@ function readJsonIfExists(filePath) {
     : {};
 }
 
+// `_last*` bookkeeping moved to config-state.json; this is a no-op once migrated.
+migrateLegacyBookkeeping(USER_CONFIG_PATH);
+
 const u = readJsonIfExists(USER_CONFIG_PATH);
 const gmgnUserConfig = readJsonIfExists(GMGN_CONFIG_PATH);
 
-// Apply wallet/RPC from user-config if not already in env
-if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
-if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
-if (u.llmProvider) process.env.LLM_PROVIDER     ||= u.llmProvider;
-if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
-// True when DRY_RUN came from the environment (.env), which wins over user-config dryRun at startup.
-export const DRY_RUN_SET_IN_ENV = process.env.DRY_RUN !== undefined;
-if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
-if (u.usdcMode !== undefined) process.env.USDC_MODE ||= String(u.usdcMode);
+/** Deprecation / precedence warnings collected at boot (also printed once). Shown by `npm run settings`. */
+export const CONFIG_WARNINGS = [];
+function warn(msg) {
+  CONFIG_WARNINGS.push(msg);
+  console.warn(`[config] ${msg}`);
+}
+
+// ─── Precedence ───────────────────────────────────────────────────
+//  * Secrets (WALLET_PRIVATE_KEY, RPC_URL, GMGN_API_KEY): .env wins; the old
+//    user-config.json copies still work for one release, with a warning.
+//  * Everything else: user-config.json (= what Telegram edits) wins over a stale
+//    .env value. The old env names (DRY_RUN, USDC_MODE, LLM_PROVIDER, LLM_MODEL,
+//    WEB_PORT) are only a fallback when user-config.json has no value, with a warning.
+//    Downstream code reads process.env.DRY_RUN etc., so the RESOLVED value is
+//    written back to process.env (overwriting the stale one).
+if (u.rpcUrl) {
+  if (!process.env.RPC_URL) warn("rpcUrl in user-config.json is deprecated; put RPC_URL in .env (secrets belong in .env only).");
+  process.env.RPC_URL ||= u.rpcUrl;
+}
+if (u.walletKey) {
+  if (!process.env.WALLET_PRIVATE_KEY) warn("walletKey in user-config.json is deprecated; put WALLET_PRIVATE_KEY in .env.");
+  process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
+}
+if (!process.env.GMGN_API_KEY && (gmgnUserConfig.apiKey || u.gmgnApiKey)) {
+  warn("GMGN api key in gmgn-config.json / user-config.json is deprecated; put GMGN_API_KEY in .env.");
+}
+// True when DRY_RUN=true is in the environment (`npm run dev`, a .env line, a service unit). That is the ONE
+// env value that still beats user-config.json, because it can only make the bot safer: it forces dry run for
+// this process. DRY_RUN=false in the environment never overrides a dry-run user-config.
+export const DRY_RUN_SET_IN_ENV = isTruthyDryRun(process.env.DRY_RUN);
+
+const ENV_FALLBACKS = [
+  ["dryRun", "DRY_RUN", (v) => isTruthyDryRun(v)],
+  ["usdcMode", "USDC_MODE", (v) => String(v) === "true"],
+  ["llmProvider", "LLM_PROVIDER", (v) => v],
+  ["llmModel", "LLM_MODEL", (v) => v],
+  ["webPort", "WEB_PORT", (v) => parseInt(v, 10)],
+];
+for (const [key, envName, parse] of ENV_FALLBACKS) {
+  const envVal = process.env[envName];
+  if (key === "dryRun" && DRY_RUN_SET_IN_ENV) {
+    if (u.dryRun === false) warn("DRY_RUN=true in the environment forces DRY RUN for this run; user-config.json dryRun=false is NOT used while it is set. Unset DRY_RUN (or remove it from .env) to go live.");
+    else if (u.dryRun === undefined) warn("DRY_RUN in .env is deprecated (used as a fallback for one more release). Set dryRun in user-config.json or Telegram instead.");
+    u.dryRun = true;
+    process.env.DRY_RUN = "true";
+    continue;
+  }
+  if (u[key] !== undefined && u[key] !== null) {
+    if (envVal !== undefined && String(envVal) !== String(u[key])) {
+      warn(`${envName}=${envVal} in .env is ignored: user-config.json ${key}=${u[key]} wins. Remove ${envName} from .env.`);
+    }
+    process.env[envName] = String(u[key]);
+  } else if (envVal !== undefined && envVal !== "") {
+    warn(`${envName} in .env is deprecated (used as a fallback for one more release). Set ${key} in user-config.json or Telegram instead.`);
+    u[key] = parse(envVal);
+    if (key === "dryRun") process.env.DRY_RUN = u.dryRun ? "true" : "false"; // normalize: downstream readers see exactly true/false
+  }
+}
+if (u.profile !== undefined && !PROFILE_NAMES.includes(String(u.profile).toLowerCase())) {
+  warn(`unknown profile "${u.profile}" in user-config.json; treating it as "custom".`);
+}
+
+const R = makeResolver(u);
+const S = (key) => R.get(key);
+/** Where an effective value came from: "user" | "profile" | "default". */
+export const settingSource = (key) => {
+  try { return makeResolver(readJsonIfExists(USER_CONFIG_PATH)).source(key); } catch { return R.source(key); }
+};
+
 if (gmgnUserConfig.apiKey || u.gmgnApiKey) {
   process.env.GMGN_API_KEY ||= gmgnUserConfig.apiKey || u.gmgnApiKey;
 }
@@ -55,20 +121,22 @@ function gmgnArray(key, legacyKey, fallback) {
 
 const DEFAULT_MODEL = getDefaultModelForProvider(getLlmProvider());
 
-// Numeric keys where an explicit null disables the guard (so `??` can't be used).
-const nullable = (key, fallback) => (u[key] !== undefined ? u[key] : fallback);
-
+// Every plain setting below is read through the schema (settings-schema.js):
+// user-config.json value > active profile preset > schema default.
 export const config = {
+  // Active profile: "conservative" | "balanced" | "degen" | "custom" (custom = user-config.json only).
+  profile: R.profile,
+
   // ─── Risk Limits ─────────────────────────
   risk: {
-    maxPositions:    u.maxPositions    ?? 3,
-    maxDeployAmount: u.maxDeployAmount ?? 50,
+    maxPositions:    S("maxPositions"),
+    maxDeployAmount: S("maxDeployAmount"),
     // Refuse a swap whose quoted price impact is above this (%): agent swap_token,
     // deploy auto-swap, USDC entry (wallet.js swapToken).
-    maxSwapPriceImpactPct: u.maxSwapPriceImpactPct ?? 5,
+    maxSwapPriceImpactPct: S("maxSwapPriceImpactPct"),
     // Looser cap for post-close swap-backs (close-swap.js, sync-close, USDC settle):
     // leaving the withdrawn bag is worse than the slippage. Owner-only (not in update_config).
-    maxCloseSwapPriceImpactPct: u.maxCloseSwapPriceImpactPct ?? 25,
+    maxCloseSwapPriceImpactPct: S("maxCloseSwapPriceImpactPct"),
   },
 
   // ─── Deploy-path safety (ported from yunus-0x/meridian) ─────────
@@ -76,55 +144,57 @@ export const config = {
   safety: {
     // Re-check TVL / volume / fee-ratio / volatility / token thresholds against a
     // fresh Pool Discovery read at deploy time (fails closed if unreadable).
-    recheckScreeningAtDeploy: u.recheckScreeningAtDeploy ?? true,
+    recheckScreeningAtDeploy: S("recheckScreeningAtDeploy"),
     // Refuse a deploy when the pool's volatility is unknown (null/NaN). 0 is valid
     // (every trade stayed inside one bin).
-    requireKnownVolatility: u.requireKnownVolatility ?? true,
+    requireKnownVolatility: S("requireKnownVolatility"),
     // Max price move (%) between the start of a deploy and the first tx send.
     // DROP-ONLY for SOL-only deposits (a rise leaves the bins below the active
     // bin, harmless); symmetric when a token X leg is deposited (two-sided).
-    maxEntryPriceMovePct: u.maxEntryPriceMovePct ?? 5,
+    maxEntryPriceMovePct: S("maxEntryPriceMovePct"),
     // Max price DROP (%) between the price shown at screening and the fresh pool
     // price at deploy time (the minutes-long screening -> LLM -> deploy gap).
     // Rises are logged, never refused. 0 disables. Skipped when screening.source
     // is "gmgn" (different price source) or no Pool Discovery screening price exists.
-    maxScreenToDeployDropPct: u.maxScreenToDeployDropPct ?? 12,
+    maxScreenToDeployDropPct: S("maxScreenToDeployDropPct"),
     // Deposit slippage (%) handed to the DLMM SDK. The SDK converts it to an
     // allowed active-bin drift: ceil(pct / (binStep/100)) bins. Was a hard-coded
     // 10%. See deploy-guards.js depositSlippage().
-    depositSlippagePct: u.depositSlippagePct ?? 5,
+    depositSlippagePct: S("depositSlippagePct"),
   },
 
   // ─── Pool Screening Thresholds ───────────
   screening: {
-    source:            normalizeScreeningSource(u.screeningSource), // "meteora" | "gmgn" | "both"; invalid → "meteora"
-    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
-    minTvl:            u.minTvl            ?? 10_000,
-    maxTvl:            u.maxTvl            ?? 150_000,
-    minVolume:         u.minVolume         ?? 500,
-    minOrganic:        u.minOrganic        ?? 60,
-    minHolders:        u.minHolders        ?? 500,
-    minMcap:           u.minMcap           ?? 150_000,
-    maxMcap:           u.maxMcap           ?? 10_000_000,
-    minBinStep:        u.minBinStep        ?? 80,
-    maxBinStep:        u.maxBinStep        ?? 125,
-    maxVolatility:     u.maxVolatility     ?? 8,
-    maxPriceChangePct: u.maxPriceChangePct ?? 300,
-    timeframe:         u.timeframe         ?? "5m",
-    category:          u.category          ?? "trending",
-    feeDataDownRatio:  u.feeDataDownRatio  ?? 0.8,   // share of candidates with a FAILED fee fetch that raises fee_data_down (once per outage)
-    minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
-    athTopThresholdPct: u.athTopThresholdPct ?? 90,
-    minTokenAgeHours:  u.minTokenAgeHours  ?? null, // null = no minimum (token age from GMGN creation_timestamp)
-    maxTokenAgeHours:  u.maxTokenAgeHours  ?? null, // null = no maximum
-    gmgnSignalsEnabled: u.gmgnSignalsEnabled ?? true, // GMGN market-signal feed (buy pressure / spikes) on candidates; informational
+    source:            normalizeScreeningSource(S("screeningSource")), // "meteora" | "gmgn" | "both"; invalid → "meteora"
+    minFeeActiveTvlRatio: S("minFeeActiveTvlRatio"),
+    minTvl:            S("minTvl"),
+    maxTvl:            S("maxTvl"),
+    minVolume:         S("minVolume"),
+    minOrganic:        S("minOrganic"),
+    minHolders:        S("minHolders"),
+    minMcap:           S("minMcap"),
+    maxMcap:           S("maxMcap"),
+    minBinStep:        S("minBinStep"),
+    maxBinStep:        S("maxBinStep"),
+    maxVolatility:     S("maxVolatility"),
+    maxPriceChangePct: S("maxPriceChangePct"),
+    timeframe:         S("timeframe"),
+    category:          S("category"),
+    feeDataDownRatio:  S("feeDataDownRatio"),   // share of candidates with a FAILED fee fetch that raises fee_data_down (once per outage)
+    minTokenFeesSol:   S("minTokenFeesSol"),  // global fees paid (priority+jito tips). below = bundled/scam
+    athTopThresholdPct: S("athTopThresholdPct"),
+    minTokenAgeHours:  S("minTokenAgeHours"), // null = no minimum (token age from GMGN creation_timestamp)
+    maxTokenAgeHours:  S("maxTokenAgeHours"), // null = no maximum
+    gmgnSignalsEnabled: S("gmgnSignalsEnabled"), // GMGN market-signal feed (buy pressure / spikes) on candidates; informational
   },
 
   // ─── GMGN Screening (opt-in via screening.source = "gmgn" or "both") ─
   // Sourced from gmgn-config.json (preferred), then legacy user-config.json
   // keys (gmgn*), then defaults. See gmgn-config.example.json for the schema.
+  // (Advanced tier: not profile-governed. The three keys nothing read — requireKol,
+  // minKolCount, minSmartDegenCount — were removed.)
   gmgn: {
-    apiKey: nonEmptyString(gmgnUserConfig.apiKey, u.gmgnApiKey, process.env.GMGN_API_KEY),
+    apiKey: nonEmptyString(process.env.GMGN_API_KEY, gmgnUserConfig.apiKey, u.gmgnApiKey),
     // Stage-1 (trending rank) controls
     interval:    gmgnValue("interval",    "gmgnInterval",    "5m"),
     orderBy:     gmgnValue("orderBy",     "gmgnOrderBy",     "volume"),
@@ -150,8 +220,6 @@ export const config = {
     maxFreshWalletRate:  gmgnValue("maxFreshWalletRate",  "gmgnMaxFreshWalletRate",  0.2),
     maxRatTraderRate:    gmgnValue("maxRatTraderRate",    "gmgnMaxRatTraderRate",    0.2),
     athFilterPct:        gmgnValue("athFilterPct",        "gmgnAthFilterPct",        null),
-    // Optional Stage-1/2 gates (read from trending row where available)
-    // (minSmartDegenCount / requireKol / minKolCount were removed: nothing ever read them.)
     maxRugRatio:         gmgnValue("maxRugRatio",         "gmgnMaxRugRatio",         0.3),
     maxSniperCount:      gmgnValue("maxSniperCount",      "gmgnMaxSniperCount",      20),
     // Reliability (tools/gmgn-policy.js): pacing plan, holders/traders finalist cap, and
@@ -192,27 +260,24 @@ export const config = {
 
   // ─── Position Management ────────────────
   management: {
-    minClaimAmount:        u.minClaimAmount        ?? 5,
-    outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 5,
-    outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
-    minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
-    emergencyPriceDropPct: u.emergencyPriceDropPct ?? -50,
-    stopLossPct:           u.stopLossPct ?? -20,
-    takeProfitFeePct:      u.takeProfitFeePct ?? 5,
-    trailingTakeProfit:    u.trailingTakeProfit ?? true,
-    trailingTriggerPct:    u.trailingTriggerPct ?? 3,
-    trailingDropPct:       u.trailingDropPct ?? 1.5,
+    outOfRangeWaitMinutes: S("outOfRangeWaitMinutes"),
+    emergencyPriceDropPct: S("emergencyPriceDropPct"),
+    stopLossPct:           S("stopLossPct"),
+    takeProfitFeePct:      S("takeProfitFeePct"),
+    trailingTakeProfit:    S("trailingTakeProfit"),
+    trailingTriggerPct:    S("trailingTriggerPct"),
+    trailingDropPct:       S("trailingDropPct"),
     minSolToOpen:          getEffectiveMinSolToOpen({
-      minSolToOpen: u.minSolToOpen ?? 0.55,
-      deployAmountSol: u.deployAmountSol ?? 0.5,
-      gasReserve: u.gasReserve ?? 0.2,
+      minSolToOpen: S("minSolToOpen"),
+      deployAmountSol: S("deployAmountSol"),
+      gasReserve: S("gasReserve"),
     }),
-    deployAmountSol:       u.deployAmountSol ?? 0.5,
-    gasReserve:            u.gasReserve        ?? 0.2,   // always keep this much SOL for gas
-    positionSizePct:       u.positionSizePct   ?? 0.35,  // % of deployable capital per position
-    positionSizeBase:      u.positionSizeBase  ?? "total", // "total" (wallet SOL + open DLMM positions) or "wallet" (free SOL only)
-    pnlUnit:               u.pnlUnit           ?? "sol", // "sol" or "usd" — how PnL is displayed
-    priorityFeeLevel:      u.priorityFeeLevel  ?? "Medium",
+    deployAmountSol:       S("deployAmountSol"),
+    gasReserve:            S("gasReserve"),   // always keep this much SOL for gas
+    positionSizePct:       S("positionSizePct"),  // % of deployable capital per position
+    positionSizeBase:      S("positionSizeBase"), // "total" (wallet SOL + open DLMM positions) or "wallet" (free SOL only)
+    pnlUnit:               S("pnlUnit"), // "sol" or "usd" — how PnL is displayed
+    priorityFeeLevel:      S("priorityFeeLevel"),
   },
 
   // ─── Entry-safety filters ───────────────
@@ -220,39 +285,39 @@ export const config = {
   // deployPosition. The user loosens them (Telegram "🛡 Entry filters" or this
   // file); the LLM's update_config may only tighten them.
   entryFilters: {
-    blockTransferFeeAbovePct: nullable("blockTransferFeeAbovePct", 1.0), // Token-2022 transfer fee %, null = off
-    blockTransferHook:        u.blockTransferHook        ?? true,
-    blockPermanentDelegate:   u.blockPermanentDelegate   ?? true,
-    blockFreezeAuthority:     u.blockFreezeAuthority     ?? true, // also default-account-state frozen
-    blockMintAuthority:       u.blockMintAuthority       ?? false,
-    blockPausable:            u.blockPausable            ?? true,
-    blockNonTransferable:     u.blockNonTransferable     ?? true,
+    blockTransferFeeAbovePct: S("blockTransferFeeAbovePct"), // Token-2022 transfer fee %, null = off
+    blockTransferHook:        S("blockTransferHook"),
+    blockPermanentDelegate:   S("blockPermanentDelegate"),
+    blockFreezeAuthority:     S("blockFreezeAuthority"), // also default-account-state frozen
+    blockMintAuthority:       S("blockMintAuthority"),
+    blockPausable:            S("blockPausable"),
+    blockNonTransferable:     S("blockNonTransferable"),
     // Only enter pools whose CollectFeeMode pays LP fees in SOL (OnlyY, SOL = token Y).
-    solFeePoolsOnly:          u.solFeePoolsOnly          ?? false,
+    solFeePoolsOnly:          S("solFeePoolsOnly"),
     // Don't open bid_ask when price is > N% above the on-chain oracle TWAP; null = off.
-    twapSpikeMaxPct:          nullable("twapSpikeMaxPct", 15),
-    twapWindowMinutes:        u.twapWindowMinutes        ?? 60,
+    twapSpikeMaxPct:          S("twapSpikeMaxPct"),
+    twapWindowMinutes:        S("twapWindowMinutes"),
     // Jupiter Tokens API scam flag (audit.isSus present, or banned); lookup failure = allow.
-    blockJupiterSuspicious:   u.blockJupiterSuspicious   ?? false, // off by default; the owner turns it on in Telegram
+    blockJupiterSuspicious:   S("blockJupiterSuspicious"), // off by default; the owner turns it on in Telegram
   },
 
   // ─── Strategy Mapping ───────────────────
   strategy: {
-    activeStrategy: u.activeStrategy ?? "evil_panda",
-    maxRangePct: u.maxRangePct ?? 80, // deepest downside range any deploy may use (%), enforced in deploy_position
+    activeStrategy: S("activeStrategy"),
+    maxRangePct: S("maxRangePct"), // deepest downside range any deploy may use (%), enforced in deploy_position
     // Range depth from candles (tools/ohlcv.js): "ohlcv" sizes price_range_pct from
     // max drawdown × ohlcvBufferMult + ATR slack and deploy_position widens to it;
     // "volatility" = the prompt's volatility table only.
-    rangeDepthMode: u.rangeDepthMode ?? "ohlcv",
-    ohlcvBufferMult: u.ohlcvBufferMult ?? 1.3,
-    solanaTrackerDailyCap: u.solanaTrackerDailyCap ?? 60, // SolanaTracker fallback calls per UTC day (free-plan credits)
-    ohlcvTiers: u.ohlcvTiers ?? null, // token-age → candle timeframe tiers; null = DEFAULT_OHLCV_TIERS in tools/ohlcv.js
-    strategy:   u.strategy   ?? "spot",
-    binsBelow:  u.binsBelow  ?? 69,  // activeBin - 69 to activeBin = 70 bins total (program max)
+    rangeDepthMode: S("rangeDepthMode"),
+    ohlcvBufferMult: S("ohlcvBufferMult"),
+    solanaTrackerDailyCap: S("solanaTrackerDailyCap"), // SolanaTracker fallback calls per UTC day (free-plan credits)
+    ohlcvTiers: S("ohlcvTiers"), // token-age → candle timeframe tiers; null = DEFAULT_OHLCV_TIERS in tools/ohlcv.js
+    strategy:   S("strategy"),
+    binsBelow:  S("binsBelow"),  // activeBin - 69 to activeBin = 70 bins total (program max)
     evilPanda: {
-      minTokenVolume24h: u.evilPandaMinTokenVolume24h ?? 750_000,
-      minMcap: u.evilPandaMinMcap ?? 200_000,
-      priceRangePct: u.evilPandaPriceRangePct ?? 80,
+      minTokenVolume24h: S("evilPandaMinTokenVolume24h"),
+      minMcap: S("evilPandaMinMcap"),
+      priceRangePct: S("evilPandaPriceRangePct"),
     },
   },
 
@@ -262,20 +327,20 @@ export const config = {
   // it settles all recovered tokens + surplus SOL back to USDC, keeping only
   // a small native-SOL buffer for gas. Pools are still SOL-quoted; USDC is
   // just the home/accounting currency.
+  // (usdcMode precedence: user-config.json wins over a stale USDC_MODE env var — see ENV_FALLBACKS above.)
   usdc: {
-    enabled:         u.usdcMode ?? (process.env.USDC_MODE === "true"),
-    deployAmountUsd: u.deployAmountUsd ?? 50,    // USD deployed per position
-    maxDeployUsd:    u.maxDeployUsd    ?? 500,   // hard per-position USD cap
-    minUsdcToOpen:   u.minUsdcToOpen   ?? (u.deployAmountUsd ?? 50), // min USDC to start screening
-    gasReserveSol:   u.gasReserveSol   ?? 0.2,   // native SOL kept for gas (hard floor — enforced in swapToken + settle; matches upstream)
+    enabled:         S("usdcMode"),
+    deployAmountUsd: S("deployAmountUsd"),    // USD deployed per position
+    maxDeployUsd:    S("maxDeployUsd"),   // hard per-position USD cap
+    minUsdcToOpen:   S("minUsdcToOpen") ?? S("deployAmountUsd"), // min USDC to start screening
+    gasReserveSol:   S("gasReserveSol"),   // native SOL kept for gas (hard floor — enforced in swapToken + settle; matches upstream)
   },
 
   // ─── Scheduling ─────────────────────────
   schedule: {
-    managementIntervalMin: u.managementIntervalMin ?? 10,
-    screeningIntervalMin:  u.screeningIntervalMin  ?? 30,
-    healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
-    pnlWatcherIntervalSec: u.pnlWatcherIntervalSec ?? 30,
+    managementIntervalMin: S("managementIntervalMin"),
+    screeningIntervalMin:  S("screeningIntervalMin"),
+    pnlWatcherIntervalSec: S("pnlWatcherIntervalSec"),
   },
 
   // ─── Exit safety (fix/exits-in-code) ────
@@ -283,93 +348,100 @@ export const config = {
   exits: {
     // Consecutive confirming ticks before a PnL exit (stop loss, emergency,
     // trailing, take profit) closes, and before a new trailing peak counts.
-    confirmTicks:              u.exitConfirmTicks ?? 2,
-    peakConfirmTicks:          u.peakConfirmTicks ?? u.exitConfirmTicks ?? 2,
+    confirmTicks:              S("exitConfirmTicks"),
+    peakConfirmTicks:          S("peakConfirmTicks") ?? S("exitConfirmTicks"),
     // Two ticks closer together than this count once (the management cycle and
     // the watcher can tick seconds apart on the same ~20s-cached on-chain read).
-    confirmMinSpacingSec:      u.exitConfirmMinSpacingSec ?? 20,
+    confirmMinSpacingSec:      S("exitConfirmMinSpacingSec"),
     // Stop loss whose on-chain read keeps failing: exit on the API value once the
     // signal has persisted this long (and on >= confirmTicks priced ticks).
     // Default 300s (M5): with a 60s watcher that is 5 priced observations.
-    stopLossUnverifiedMaxWaitSec: u.stopLossUnverifiedMaxWaitSec ?? 300,
+    stopLossUnverifiedMaxWaitSec: S("stopLossUnverifiedMaxWaitSec"),
     // N4: API-only fallback wait when every priced tick is at/below the emergency level.
-    stopLossEmergencyMaxWaitSec: u.stopLossEmergencyMaxWaitSec ?? 120,
+    stopLossEmergencyMaxWaitSec: S("stopLossEmergencyMaxWaitSec"),
     // H1: force an on-chain PnL read for every tracked position at least this
     // often, even when the API reading looks harmless, so a stale API cannot
     // hide a crash the chain already shows.
-    onchainReadIntervalSec:    u.onchainReadIntervalSec ?? 60,
+    onchainReadIntervalSec:    S("onchainReadIntervalSec"),
     // M4: API-vs-on-chain disagreement (points) above which a trailing / take
     // profit exit is held (stop loss is exempt). Measured via pnl_bias logs.
-    pnlMismatchPts:            u.pnlMismatchPts ?? 2,
+    pnlMismatchPts:            S("pnlMismatchPts"),
     // Alert after this many consecutive ticks a trailing exit was held only
     // because the two sources disagree (trailing is effectively disabled).
-    trailingMismatchAlertTicks: u.trailingMismatchAlertTicks ?? 3,
+    trailingMismatchAlertTicks: S("trailingMismatchAlertTicks"),
     // M1: wallet-lock stale-holder alert / hard release (seconds; 0 disables hard release).
-    walletLockWarnSec:         u.walletLockWarnSec ?? 300,
-    walletLockTimeoutSec:      u.walletLockTimeoutSec ?? 900,
+    walletLockWarnSec:         S("walletLockWarnSec"),
+    walletLockTimeoutSec:      S("walletLockTimeoutSec"),
     // M1: bound on a single on-chain / positions read inside the watcher.
-    readTimeoutSec:            u.exitReadTimeoutSec ?? 20,
+    readTimeoutSec:            S("exitReadTimeoutSec"),
     // Re-entry cooldowns (pool + base mint), checked at deploy time.
-    stopLossCooldownMinutes:   u.stopLossCooldownMinutes ?? 240,
-    oorCooldownTriggerCount:   u.oorCooldownTriggerCount ?? 3,
-    oorCooldownMinutes:        u.oorCooldownMinutes ?? 360,
+    stopLossCooldownMinutes:   S("stopLossCooldownMinutes"),
+    oorCooldownTriggerCount:   S("oorCooldownTriggerCount"),
+    oorCooldownMinutes:        S("oorCooldownMinutes"),
   },
 
   // ─── LLM Settings ──────────────────────
   llm: {
-    temperature: u.temperature ?? 0.373,
-    maxTokens:   u.maxTokens   ?? 4096,
-    deepseekFallbackModel: u.deepseekFallbackModel ?? "deepseek-flash", // DeepSeek V4.1 Flash; used when the primary provider fails
-    maxSteps: u.maxSteps ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,
-    managementFallbackModel: u.managementFallbackModel ?? null,
-    screeningFallbackModel:  u.screeningFallbackModel  ?? null,
-    generalFallbackModel:    u.generalFallbackModel    ?? null,
+    temperature: S("temperature"),
+    maxTokens:   S("maxTokens"),
+    deepseekFallbackModel: S("deepseekFallbackModel"), // DeepSeek V4.1 Flash; used when the primary provider fails
+    maxSteps: S("maxSteps"),
+    managementModel: S("managementModel") ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,
+    screeningModel:  S("screeningModel")  ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,
+    generalModel:    S("generalModel")    ?? process.env.LLM_MODEL ?? DEFAULT_MODEL,
+    managementFallbackModel: S("managementFallbackModel"),
+    screeningFallbackModel:  S("screeningFallbackModel"),
+    generalFallbackModel:    S("generalFallbackModel"),
     // Codex agent-loop reasoning effort for every role (low|medium|high|xhigh).
     // null keeps the per-role default: MANAGER high, others medium.
-    reasoningEffort: u.llmReasoningEffort ?? null,
+    reasoningEffort: S("llmReasoningEffort"),
   },
 
   // ─── Web UI ───────────────────────────
   web: {
-    port: parseInt(u.webPort || process.env.WEB_PORT || "3737", 10),
+    port: parseInt(S("webPort"), 10),
+  },
+
+  // ─── Learning ──────────────────────────
+  // autoTune: lessons.js may rewrite thresholds from closed-trade history. OFF by
+  // default; when off it only logs what it would have changed.
+  learning: {
+    autoTune: S("autoTune"),
   },
 
   // ─── Darwinian Signal Weighting ─────────
   darwin: {
-    enabled: u.darwinianWeights ?? false,
-    windowDays: u.darwinianWindowDays ?? 60,
-    boostFactor: u.darwinianBoostFactor ?? 1.05,
-    decayFactor: u.darwinianDecayFactor ?? 0.95,
-    weightFloor: u.darwinianWeightFloor ?? 0.3,
-    weightCeiling: u.darwinianWeightCeiling ?? 2.5,
-    minSamples: u.darwinianMinSamples ?? 10,
-    perSignalMinSamples: u.darwinianPerSignalMinSamples ?? 12,
-    minAbsLiftToAdjust: u.darwinianMinAbsLiftToAdjust ?? 0.05,
-    strongLiftThreshold: u.darwinianStrongLiftThreshold ?? 0.2,
-    calibrationMinSamples: u.darwinianCalibrationMinSamples ?? 20,
-    meanReversionRate: u.darwinianMeanReversionRate ?? 0.02,
+    enabled: S("darwinianWeights"),
+    windowDays: S("darwinianWindowDays"),
+    boostFactor: S("darwinianBoostFactor"),
+    decayFactor: S("darwinianDecayFactor"),
+    weightFloor: S("darwinianWeightFloor"),
+    weightCeiling: S("darwinianWeightCeiling"),
+    minSamples: S("darwinianMinSamples"),
+    perSignalMinSamples: S("darwinianPerSignalMinSamples"),
+    minAbsLiftToAdjust: S("darwinianMinAbsLiftToAdjust"),
+    strongLiftThreshold: S("darwinianStrongLiftThreshold"),
+    calibrationMinSamples: S("darwinianCalibrationMinSamples"),
+    meanReversionRate: S("darwinianMeanReversionRate"),
   },
 
   // ─── Autoresearch (prompt A/B experiments, after karpathy/autoresearch) ─────
   autoresearch: {
-    enabled: u.autoresearch ?? false,
+    enabled: S("autoresearch"),
     // Concurrent A/B verdict: control vs candidate arms, size-weighted mean PnL,
     // seeded bootstrap 95% CI. Keep only if CI lower bound > 0 AND effect >= minEffectPct.
-    minClosesPerArm: u.autoresearchMinClosesPerArm ?? 100,
-    minEffectPct: u.autoresearchMinEffectPct ?? 1.5,          // percentage points of mean PnL
-    maxExperimentDays: u.autoresearchMaxExperimentDays ?? 14, // cap: inconclusive, candidate discarded
-    autoKeep: u.autoresearchAutoKeep ?? false,                // false = a passing candidate becomes a pending proposal
-    minAttributedLosses: u.autoresearchMinAttributedLosses ?? 3,
-    cooldownCloses: u.autoresearchCooldownCloses ?? 5,
-    llmModel: u.autoresearchModel ?? DEFAULT_MODEL,
-    reasoningEffort: u.autoresearchReasoningEffort ?? "medium",
-    maxDiffPct: u.autoresearchMaxDiffPct ?? 30, // reject candidates that change more than this % of lines
+    minClosesPerArm: S("autoresearchMinClosesPerArm"),
+    minEffectPct: S("autoresearchMinEffectPct"),          // percentage points of mean PnL
+    maxExperimentDays: S("autoresearchMaxExperimentDays"), // cap: inconclusive, candidate discarded
+    autoKeep: S("autoresearchAutoKeep"),                // false = a passing candidate becomes a pending proposal
+    minAttributedLosses: S("autoresearchMinAttributedLosses"),
+    cooldownCloses: S("autoresearchCooldownCloses"),
+    llmModel: S("autoresearchModel") ?? DEFAULT_MODEL,
+    reasoningEffort: S("autoresearchReasoningEffort"),
+    maxDiffPct: S("autoresearchMaxDiffPct"), // reject candidates that change more than this % of lines
   },
 
-  // ─── Knowledge Base ─────────────��──────
+  // ─── Knowledge Base ─────────────────────
   knowledgeBase: {
     enabled:                   u.knowledgeBase?.enabled ?? true,
     dir:                       u.knowledgeBase?.dir ?? "./knowledge",
@@ -517,7 +589,6 @@ export const LOCKED_KEYS = new Set(["walletKey", "rpcUrl", "llmModel"]);
 // Keys that atlas_autotune may NOT change (cadence / owner-level)
 const ATLAS_DISALLOWED = new Set([
   "managementIntervalMin",
-  "healthCheckIntervalMin",
   "pnlWatcherIntervalSec",
 ]);
 
@@ -526,12 +597,11 @@ export const INTEGER_KEYS = new Set([
   "minTvl", "maxTvl", "minVolume", "minOrganic", "minHolders",
   "minMcap", "maxMcap", "minBinStep", "maxBinStep", "maxVolatility",
   "maxPriceChangePct", "minTokenFeesSol", "athTopThresholdPct",
-  "maxTop10Pct", "maxBundlersPct",
-  "outOfRangeBinsToClose", "outOfRangeWaitMinutes",
+  "outOfRangeWaitMinutes",
   "emergencyPriceDropPct", "stopLossPct", "takeProfitFeePct",
   "maxPositions", "maxDeployAmount",
   "managementIntervalMin", "screeningIntervalMin",
-  "healthCheckIntervalMin", "pnlWatcherIntervalSec",
+  "pnlWatcherIntervalSec",
   "maxTokens", "maxSteps", "solanaTrackerDailyCap",
 ]);
 
@@ -638,41 +708,49 @@ export function applyConfigChanges({ changes = {}, source = "manual", reason = "
   };
 }
 
+// Keys reloadScreeningThresholds() re-applies from the file (and from the active
+// profile). Everything governed by a profile is included except the schedule
+// (cron intervals only change through switchProfile / the schedule hooks).
+const RELOAD_KEYS = [
+  "screeningSource", "minFeeActiveTvlRatio", "minOrganic", "minHolders", "minMcap", "maxMcap", "minTvl", "maxTvl",
+  "minVolume", "minBinStep", "maxBinStep", "maxVolatility", "maxPriceChangePct", "timeframe", "category",
+  "athTopThresholdPct", "minTokenAgeHours", "maxTokenAgeHours", "stopLossPct", "takeProfitFeePct",
+  "outOfRangeWaitMinutes", "trailingTriggerPct", "trailingDropPct", "ohlcvBufferMult",
+  ...GOVERNED_KEYS.filter((k) => !/IntervalMin$|IntervalSec$/.test(k)),
+];
+
+function setConfigPath(pathArr, value) {
+  let o = config;
+  for (const k of pathArr.slice(0, -1)) o = o[k];
+  o[pathArr.at(-1)] = pathArr.join(".") === "screening.source" ? normalizeScreeningSource(value) : value;
+}
+
+/** Recompute the derived minSolToOpen from the live deploy floor / gas reserve. */
+function refreshMinSolToOpen(resolver) {
+  config.management.minSolToOpen = getEffectiveMinSolToOpen({
+    minSolToOpen: resolver.get("minSolToOpen"),
+    deployAmountSol: config.management.deployAmountSol,
+    gasReserve: config.management.gasReserve,
+  });
+}
+
 /**
- * Reload user-config.json and apply updated screening thresholds to the
- * in-memory config object. Called after threshold evolution so the next
- * agent cycle uses the evolved values without a restart.
+ * Reload user-config.json and apply updated thresholds to the in-memory config
+ * object (user value, else the active profile's preset; schema defaults are not
+ * re-applied so a value set in memory is never clobbered). Called after a profile
+ * switch or threshold change so the next agent cycle sees it without a restart.
  */
 export function reloadScreeningThresholds() {
   try {
     const fresh = readJsonIfExists(USER_CONFIG_PATH);
-    const s = config.screening;
-    if (fresh.screeningSource != null) s.source = normalizeScreeningSource(fresh.screeningSource);
-    if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
-    if (fresh.minOrganic     != null) s.minOrganic     = fresh.minOrganic;
-    if (fresh.minHolders     != null) s.minHolders     = fresh.minHolders;
-    if (fresh.minMcap        != null) s.minMcap        = fresh.minMcap;
-    if (fresh.maxMcap        != null) s.maxMcap        = fresh.maxMcap;
-    if (fresh.minTvl         != null) s.minTvl         = fresh.minTvl;
-    if (fresh.maxTvl         != null) s.maxTvl         = fresh.maxTvl;
-    if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
-    if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
-    if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
-    if (fresh.maxVolatility  != null) s.maxVolatility  = fresh.maxVolatility;
-    if (fresh.maxPriceChangePct != null) s.maxPriceChangePct = fresh.maxPriceChangePct;
-    if (fresh.timeframe      != null) s.timeframe      = fresh.timeframe;
-    if (fresh.category       != null) s.category       = fresh.category;
-    if (fresh.athTopThresholdPct != null) s.athTopThresholdPct = fresh.athTopThresholdPct;
-    if (fresh.minTokenAgeHours !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
-    if (fresh.maxTokenAgeHours !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
-    // Also reload management thresholds that evolution may have changed
-    const m = config.management;
-    if (fresh.stopLossPct           != null) m.stopLossPct           = fresh.stopLossPct;
-    if (fresh.takeProfitFeePct      != null) m.takeProfitFeePct      = fresh.takeProfitFeePct;
-    if (fresh.outOfRangeWaitMinutes != null) m.outOfRangeWaitMinutes = fresh.outOfRangeWaitMinutes;
-    if (fresh.trailingTriggerPct    != null) m.trailingTriggerPct    = fresh.trailingTriggerPct; // evolved by lessons.js
-    if (fresh.trailingDropPct       != null) m.trailingDropPct       = fresh.trailingDropPct;    // evolved by lessons.js
-    if (fresh.ohlcvBufferMult       != null) config.strategy.ohlcvBufferMult = fresh.ohlcvBufferMult; // evolved by lessons.js
+    const res = makeResolver(fresh);
+    config.profile = res.profile;
+    for (const key of RELOAD_KEYS) {
+      const row = BY_KEY.get(key);
+      if (!row?.path || res.source(key) === "default") continue;
+      setConfigPath(row.path, res.get(key));
+    }
+    refreshMinSolToOpen(res);
   } catch { /* ignore */ }
   // Refresh GMGN screening keys from gmgn-config.json (mirrors the gmgn block above)
   try {
@@ -681,7 +759,7 @@ export function reloadScreeningThresholds() {
     for (const [key, value] of Object.entries(freshGmgn)) {
       if (key in g && key !== "apiKey") g[key] = value;
     }
-    if (freshGmgn.apiKey) g.apiKey = freshGmgn.apiKey;
+    if (freshGmgn.apiKey && !process.env.GMGN_API_KEY) g.apiKey = freshGmgn.apiKey;
   } catch { /* ignore */ }
 }
 
@@ -689,4 +767,51 @@ export function reloadScreeningThresholds() {
 // say so once instead of letting it flip into a live hard reject. Opt in with indicatorRules.enforceAlreadyAtBottom.
 if ((gmgnUserConfig.indicatorRules || {}).rejectAlreadyAtBottom === true && (gmgnUserConfig.indicatorRules || {}).enforceAlreadyAtBottom !== true) {
   console.warn("[config] gmgn indicatorRules.rejectAlreadyAtBottom=true is log-only (it never fired before either). Set indicatorRules.enforceAlreadyAtBottom=true to actually reject.");
+}
+
+/** Effective value of every profile-governed key, as currently in memory. */
+export function currentGovernedValues() {
+  const out = {};
+  for (const key of GOVERNED_KEYS) {
+    const row = BY_KEY.get(key);
+    out[key] = row.path.reduce((o, k) => o?.[k], config);
+  }
+  return out;
+}
+
+/**
+ * Switch profile and persist it.
+ *  - conservative | balanced | degen: write `profile` and DROP the user's explicit
+ *    values for every governed key, so the preset takes effect (the caller shows the
+ *    diff and asks for confirmation first).
+ *  - custom: write `profile: "custom"` and PIN every governed key to its current
+ *    effective value, so leaving a profile never changes behavior.
+ * Returns { profile, changed: [{key, from, to}], scheduleChanged: [keys] }.
+ */
+export function switchProfile(name) {
+  const target = normalizeProfile(name);
+  const before = currentGovernedValues();
+  const file = readJsonIfExists(USER_CONFIG_PATH);
+  const next = { ...file, profile: target };
+  if (target === "custom") {
+    for (const [k, v] of Object.entries(before)) next[k] = v;
+  } else {
+    for (const k of GOVERNED_KEYS) delete next[k];
+  }
+  writeJsonAtomicSync(USER_CONFIG_PATH, next);
+  const res = makeResolver(next);
+  config.profile = res.profile;
+  const changed = [];
+  const scheduleChanged = [];
+  for (const key of GOVERNED_KEYS) {
+    const row = BY_KEY.get(key);
+    const to = res.get(key);
+    if (JSON.stringify(before[key]) !== JSON.stringify(to)) {
+      changed.push({ key, from: before[key], to });
+      if (row.path[0] === "schedule") scheduleChanged.push(key);
+    }
+    setConfigPath(row.path, to);
+  }
+  refreshMinSolToOpen(res);
+  return { profile: target, changed, scheduleChanged };
 }
