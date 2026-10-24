@@ -162,6 +162,7 @@ WHEN TO USE WHICH:
 - When unsure → for autonomous runs use the active strategy from your instructions.
 
 HARD RULES:
+- screen_price (optional): pass the candidate price field exactly as get_top_candidates showed it. The executor refuses the deploy if the fresh pool price has moved more than the configured limit since screening (the executor also records this itself, so omitting it is safe).
 - Bin Step: Screening filters apply (config minBinStep/maxBinStep). If user specifies a pool, deploy regardless of bin step.
 
 RANGE: Pass price_range_pct, the % price move the range covers from the active bin (80 = liquidity reaching down to 80% below the current price on a SOL-only position). The tool converts it to a bin count from the pool's bin_step, so the same % means the same coverage on any bin step; how wide to go is set by the range rules in your instructions. Positions wider than 69 bins are deployed over several transactions automatically; positions under 20 bins in total are rejected. Pass bins_below / bins_above only when you need an exact bin count.
@@ -213,6 +214,8 @@ This sends a real on-chain transaction unless the runner is in DRY_RUN mode.`,
           base_mint: { type: "string", description: "Base token mint address — used to prevent duplicate token exposure across pools" },
           bin_step: { type: "number", description: "Pool bin step (from discover_pools)" },
           volatility: { type: "number", description: "Pool volatility at deploy time" },
+          screen_price: { type: "number", description: "Candidate price (pool_price) exactly as shown by get_top_candidates; deploy is refused if the fresh price drifted past the configured limit" },
+          screen_active_bin: { type: "number", description: "Active bin id seen at screening, if known; deploy is refused (before any swap) if the pool's active bin moved past the price-move limit since" },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
           initial_value_usd: { type: "number", description: "Estimated USD value being deployed" },

@@ -94,9 +94,20 @@ test("rpc hosts: only hostnames, never keys in path/query/userinfo", () => {
 });
 
 // ─── volatility ───────────────────────────────────────────────────
-test("volatility: unknown / non-positive refuses", () => {
-  for (const v of [undefined, null, "", NaN, "abc", 0, -1]) assert.equal(g.checkVolatilityKnown(v).pass, false, String(v));
+test("volatility: unknown / garbage refuses; ZERO is valid (one-bin trading); negative is broken data", () => {
+  for (const v of [undefined, null, "", NaN, "abc", -1]) assert.equal(g.checkVolatilityKnown(v).pass, false, String(v));
+  assert.deepEqual(g.checkVolatilityKnown(0), { pass: true, volatility: 0 });
+  assert.deepEqual(g.checkVolatilityKnown("0"), { pass: true, volatility: 0 });
   assert.deepEqual(g.checkVolatilityKnown("2.5"), { pass: true, volatility: 2.5 });
+});
+
+test("pickVolatility: fresh positive beats stale 0; 0 stands when nothing positive; unknown stays unknown", () => {
+  assert.equal(g.pickVolatility(0, 3), 3);
+  assert.equal(g.pickVolatility(2, 0), 2);
+  assert.equal(g.pickVolatility(0, 0), 0);
+  assert.equal(g.pickVolatility(0, null), 0);
+  assert.equal(g.pickVolatility(undefined, 0), 0);
+  assert.equal(g.checkVolatilityKnown(g.pickVolatility(undefined, undefined)).pass, false);
 });
 
 // ─── screening thresholds at deploy ───────────────────────────────
@@ -146,7 +157,8 @@ test("thresholds: null/0 bounds mean no limit", () => {
 test("fetchPoolForRecheck: builds a pool_address filter, returns the first row / null, throws on HTTP error", async () => {
   let url;
   const mk = (body, ok = true) => async (u) => { url = u; return { ok, status: ok ? 200 : 503, statusText: "x", json: async () => body }; };
-  assert.deepEqual(await g.fetchPoolForRecheck("POOLX", "5m", mk({ data: [{ tvl: 1 }] })), { tvl: 1 });
+  assert.deepEqual(await g.fetchPoolForRecheck("POOLX", "5m", mk({ data: [{ pool_address: "POOLX", tvl: 1 }] })), { pool_address: "POOLX", tvl: 1 });
+  assert.equal(await g.fetchPoolForRecheck("POOLX", "5m", mk({ data: [{ pool_address: "OTHER", tvl: 1 }] })), null, "echo-check: a different pool_address is treated as not found");
   assert.match(url, /filter_by=pool_address%3DPOOLX/);
   assert.match(url, /timeframe=5m/);
   assert.equal(await g.fetchPoolForRecheck("POOLX", "5m", mk({ data: [] })), null);
@@ -182,9 +194,14 @@ test("executor guard: unknown volatility refuses; falls back to the fresh pool's
     assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P" })).pass, true, "fresh pool volatility is used");
     ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), volatility: 0 }));
     await withConfig({ safety: { recheckScreeningAtDeploy: false } }, async () => {
+      assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: null })).pass, true, "fresh pool volatility 0 is valid (one-bin trading)");
+      assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: 0 })).pass, true);
+      ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), volatility: 4 }));
+      assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: 0 })).pass, true, "stale screener 0 rescued by fresh positive");
+      ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), volatility: null }));
       const r = await ex.checkDeploySafetyGuards({ pool_address: "P", volatility: null });
       assert.equal(r.pass, false);
-      assert.match(r.reason, /Volatility is/);
+      assert.match(r.reason, /Volatility is unknown/);
       config.safety.requireKnownVolatility = false;
       assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "P" })).pass, true);
     });
@@ -323,4 +340,78 @@ test("checkpoint: resolved history is pruned to a bounded size", () => {
   const db = JSON.parse(fs.readFileSync(process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE, "utf8"));
   const resolved = Object.values(db.attempts).filter((x) => !["submitting", "uncertain"].includes(x.status));
   assert.ok(resolved.length <= 50);
+});
+
+// ─── screening -> deploy drift (finding 5) ────────────────────────
+test("screen drift: pure check; skipped when a side is missing", () => {
+  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 1.04, maxMovePct: 5 }).pass, true);
+  const bad = g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 0.9, maxMovePct: 5 });
+  assert.equal(bad.pass, false); assert.match(bad.reason, /-10\.0%/);
+  assert.deepEqual(g.checkScreenPriceDrift({ screenPrice: null, freshPrice: 1, maxMovePct: 5 }), { pass: true, checked: false });
+  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 50, maxMovePct: 0 }).pass, true, "0 disables");
+});
+
+test("executor guard: screening price (LLM arg or code snapshot) vs fresh pool price", async () => {
+  g.resetRefusalStats(); g.clearScreenedPrices();
+  await withConfig({}, async () => {
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), pool_price: 1.5 }));
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.5 })).pass, true);
+    const r = await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.0 });
+    assert.equal(r.pass, false); assert.match(r.reason, /price drift/);
+    // The code-recorded snapshot wins over a (possibly dodging) model-supplied value.
+    g.noteScreenedPrice("PD", 1.0);
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.5 })).pass, false);
+    g.clearScreenedPrices();
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD" })).pass, true, "no screening price -> documented fallback: not checked");
+    await withConfig({ safety: { maxScreenToDeployMovePct: 0 } }, async () => {
+      assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.0 })).pass, true);
+    });
+  });
+  assert.equal(g.getRefusalStats().screen_drift, 2);
+});
+
+test("refusal counters: tallied by kind and exposed with the last reason", () => {
+  g.resetRefusalStats();
+  g.recordRefusal("recheck", "tvl"); g.recordRefusal("pre_submit", "moved"); g.recordRefusal("bogus", "x");
+  const st = g.getRefusalStats();
+  assert.equal(st.total, 3); assert.equal(st.recheck, 1); assert.equal(st.other, 1); assert.equal(st.last.kind, "other");
+  g.resetRefusalStats();
+});
+
+// ─── post-swap gate (finding 2) ───────────────────────────────────
+test("pre-submit gate after an auto-swap: own swap impact excluded; balance leg shrinks instead of refusing", async () => {
+  // load-time bin 100, pool moved to 110 BECAUSE of our swap; anchor is the post-swap refetch (110).
+  const ok = await g.preSubmitGate(gateArgs({ loadBinId: null, anchorBinId: 110, getActiveId: () => 110 }));
+  assert.equal(ok.pass, true);
+  // Same inputs with the stale load bin would have refused (the bug).
+  assert.equal((await g.preSubmitGate(gateArgs({ loadBinId: 100, anchorBinId: 110, getActiveId: () => 110 }))).pass, false);
+  // Balance short: refuses normally, shrinks with allowShrink.
+  const tight = gateArgs({ readFreeSol: async () => 1.25, amount: 1 });
+  assert.equal((await g.preSubmitGate(tight)).pass, false);
+  const fit = await g.preSubmitGate({ ...tight, allowShrink: true });
+  assert.equal(fit.pass, true); assert.equal(fit.shrunk, true); assert.ok(fit.amount < 1 && fit.amount >= 0.1);
+  // Too little even after shrinking: still a refusal (caller must swap back).
+  assert.equal((await g.preSubmitGate({ ...tight, readFreeSol: async () => 0.3, allowShrink: true })).pass, false);
+});
+
+test("swapBackAfterRefusal: sells the swapped token to SOL; reports failures without throwing", async () => {
+  const calls = [];
+  const ok = await g.swapBackAfterRefusal({ swapFn: async (a) => { calls.push(a); return { success: true }; }, baseMint: "MINTX", amount: 12.5, solMint: "SOL" });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(calls[0], { input_mint: "MINTX", output_mint: "SOL", amount: 12.5 });
+  assert.equal((await g.swapBackAfterRefusal({ swapFn: async () => ({ success: false, error: "no route" }), baseMint: "MINTX", amount: 1, solMint: "SOL" })).ok, false);
+  assert.equal((await g.swapBackAfterRefusal({ swapFn: async () => { throw new Error("boom"); }, baseMint: "MINTX", amount: 1, solMint: "SOL" })).ok, false);
+  assert.equal((await g.swapBackAfterRefusal({ swapFn: async () => { throw new Error("unused"); }, baseMint: "MINTX", amount: 0, solMint: "SOL" })).ok, false);
+});
+
+test("deploy source: every refusal after the auto-swap unwinds it; gate skips the load bin post-swap", () => {
+  const src = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  const swapAt = src.indexOf("autoSwapped = { baseMint");
+  const afterSwap = src.slice(swapAt);
+  assert.ok(swapAt > 0);
+  assert.ok(/loadBinId: autoSwapped \? null : activeIdAtLoad/.test(src));
+  assert.ok(/allowShrink: !!autoSwapped/.test(src));
+  const refusals = afterSwap.match(/return \{ success: false,[^\n]*\n?/g).filter((l) => /bin arrays|Pre-submit recheck failed|crash checkpoint/.test(l));
+  assert.ok(refusals.length >= 4);
+  for (const l of refusals) assert.ok(/unwindAutoSwap\(\)/.test(l), l.slice(0, 80));
 });

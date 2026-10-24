@@ -9,7 +9,7 @@ import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
-import { preSubmitGate, depositSlippage } from "../deploy-guards.js";
+import { preSubmitGate, depositSlippage, checkEntryPriceMove, swapBackAfterRefusal, recordRefusal } from "../deploy-guards.js";
 import { beginAttempt, markAttempt } from "../deploy-checkpoint.js";
 import { emit } from "../notifier.js";
 import {
@@ -526,6 +526,8 @@ export async function deployPosition({
   base_mint,
   bin_step,
   volatility,
+  screen_price, // eslint-disable-line no-unused-vars -- consumed by the executor's drift guard
+  screen_active_bin,
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
@@ -936,6 +938,33 @@ export async function deployPosition({
   const pool = _poolOverridesForTest.get(String(pool_address))
     ?? await DLMM.create(getConnection(), new PublicKey(pool_address));
   const activeIdAtLoad = pool.lbPair.activeId;
+  // Screening -> deploy gap, bin form: runs BEFORE any swap, so a refusal here
+  // strands nothing. (The price form lives in the executor's safety checks.)
+  if (screen_active_bin != null && Number.isFinite(Number(screen_active_bin))) {
+    const m = checkEntryPriceMove({
+      binStep: bin_step ?? pool.lbPair?.binStep, fromBinId: Number(screen_active_bin), toBinId: activeIdAtLoad,
+      maxMovePct: config.safety?.maxScreenToDeployMovePct ?? 5,
+    });
+    if (!m.pass && m.movePct != null) {
+      recordRefusal("screen_drift", m.reason);
+      log("deploy", `Refusing deploy into ${pool_address}: ${m.reason} (screening bin)`);
+      return { success: false, blocked_by: "screen_drift", error: `Screening→deploy drift: ${m.reason}` };
+    }
+  }
+  // Set once the two-sided auto-swap has bought the token; any refusal after that
+  // point sells it back (see unwindAutoSwap) so a refusal never strands a bag.
+  let autoSwapped = null;
+  const unwindAutoSwap = async () => {
+    if (!autoSwapped) return "";
+    const { baseMint, amount } = autoSwapped;
+    autoSwapped = null;
+    const r = await swapBackAfterRefusal({
+      swapFn: swapToken, baseMint, amount, solMint: WSOL_MINT,
+      log: (m) => log("deploy", m),
+    });
+    if (!r.ok) log("deploy_warn", `Auto-swap unwind: ${r.note}`);
+    return ` Auto-swap unwind: ${r.note}.`;
+  };
   // Deploys fund the Y side with SOL (both SOL and USDC mode swap to SOL first),
   // so a pool whose token Y isn't wrapped SOL would be funded with the wrong token.
   const tokenYMint = pool.lbPair?.tokenYMint?.toBase58?.() ?? String(pool.lbPair?.tokenYMint ?? "");
@@ -1016,6 +1045,7 @@ export async function deployPosition({
         } catch { /* use swap output as fallback */ }
 
         // Apply 2% buffer so SDK simulation doesn't fail on rounding
+        autoSwapped = { baseMint, amount: swapReceived > 0 ? Math.min(swapReceived, actualBalance) : actualBalance };
         amount_x = actualBalance * 0.98;
         amount_y = totalSolAmount - tokenSolAmount;
         hasBaseToken = true;
@@ -1077,7 +1107,7 @@ export async function deployPosition({
     if (w.missing.length > 0) {
       if (w.min == null) {
         log("deploy", `Refusing deploy into ${pool_address}: range needs uninitialized bin arrays ${w.missing.join(",")} (rent is non-refundable)`);
-        return { success: false, error: `Range needs new bin arrays (${w.missing.length} × ~0.0714 SOL non-refundable rent) and no initialized window exists around the active bin. Not deployed.` };
+        return { success: false, error: `Range needs new bin arrays (${w.missing.length} × ~0.0714 SOL non-refundable rent) and no initialized window exists around the active bin. Not deployed.${await unwindAutoSwap()}` };
       }
       const newBelow = Math.max(0, activeBin.binId - w.min);
       const newAbove = Math.max(0, w.max - activeBin.binId);
@@ -1086,7 +1116,7 @@ export async function deployPosition({
       const newRangePct = stepPct > 0 ? (1 - Math.pow(1 + stepPct, -Math.max(newBelow, newAbove))) * 100 : 0;
       if (newTotal < MIN_BINS || (stepPct > 0 && newRangePct < MIN_RANGE_PCT)) {
         log("deploy", `Refusing deploy into ${pool_address}: only ${newTotal} bins (${newRangePct.toFixed(1)}%) are in initialized bin arrays; minimum is ${MIN_BINS} bins / ${MIN_RANGE_PCT}%`);
-        return { success: false, error: `Only ${newTotal} bins (${newRangePct.toFixed(1)}% range) fall in already-initialized bin arrays — below the ${MIN_BINS}-bin / ${MIN_RANGE_PCT}% minimum. Not deployed (won't pay non-refundable bin-array rent).` };
+        return { success: false, error: `Only ${newTotal} bins (${newRangePct.toFixed(1)}% range) fall in already-initialized bin arrays — below the ${MIN_BINS}-bin / ${MIN_RANGE_PCT}% minimum. Not deployed (won't pay non-refundable bin-array rent).${await unwindAutoSwap()}` };
       }
       log("deploy", `Trimmed range to initialized bin arrays: ${minBinId}..${maxBinId} → ${w.min}..${w.max} (${totalBins} → ${newTotal} bins, ~${newRangePct.toFixed(1)}%); avoided ${w.missing.length} new bin array(s)`);
       minBinId = w.min;
@@ -1110,7 +1140,7 @@ export async function deployPosition({
 
   // Calculate amounts
   // If amount_y is not provided but amount_sol is, use amount_sol (for backward compatibility)
-  const finalAmountY = amount_y ?? amount_sol ?? 0;
+  let finalAmountY = amount_y ?? amount_sol ?? 0;
   // USD value at deploy, for PnL history. The screener passes it; manual Telegram
   // deploys don't, which left it 0 and made the close fall back to the final
   // value (PnL 0%). Estimate it from the SOL committed (before any auto-swap).
@@ -1204,7 +1234,7 @@ export async function deployPosition({
       });
     } catch (e) {
       log("deploy_error", `Could not write deploy checkpoint: ${e.message}`);
-      return { success: false, error: `Deploy refused: could not persist the crash checkpoint (${e.message}).` };
+      return { success: false, error: `Deploy refused: could not persist the crash checkpoint (${e.message}).${await unwindAutoSwap()}` };
     }
     {
       const gate = await preSubmitGate({
@@ -1212,17 +1242,27 @@ export async function deployPosition({
         getActiveId: () => pool.lbPair.activeId,
         readFreeSol: async () => (await getConnection().getBalance(wallet.publicKey, "confirmed")) / 1e9,
         binStep: resolvedBinStep ?? pool.lbPair?.binStep,
-        loadBinId: activeIdAtLoad,
+        // After an auto-swap the load-time bin predates the bot's OWN swap impact,
+        // so anchor only on the post-swap refetch (activeBin) and skip the load bin.
+        loadBinId: autoSwapped ? null : activeIdAtLoad,
         anchorBinId: activeBin.binId,
         maxMovePct: config.safety?.maxEntryPriceMovePct ?? 5,
         reserve: Number(config.management.gasReserve ?? 0.2),
         amount: finalAmountY,
         totalBins,
+        // With a swapped token in hand, fit the SOL leg to the balance instead of refusing.
+        allowShrink: !!autoSwapped,
       });
       if (!gate.pass) {
         markAttempt(attemptId, "aborted", { error: gate.reason });
+        recordRefusal("pre_submit", gate.reason);
         log("deploy", `Pre-submit gate refused deploy into ${pool_address}: ${gate.reason}`);
-        return { success: false, blocked_by: "pre_submit", error: `Pre-submit recheck failed: ${gate.reason}` };
+        return { success: false, blocked_by: "pre_submit", error: `Pre-submit recheck failed: ${gate.reason}.${await unwindAutoSwap()}` };
+      }
+      if (gate.shrunk && gate.amount > 0 && gate.amount < finalAmountY) {
+        log("deploy", `Pre-submit gate: SOL leg shrunk ${finalAmountY} → ${gate.amount} to fit balance after swap fees/rent`);
+        finalAmountY = gate.amount;
+        totalYLamports = uiToRawBN(finalAmountY, 9);
       }
       log("deploy", `Pre-submit gate ok (price move ${gate.movePct.toFixed(2)}%, free SOL ${gate.freeSol == null ? "n/a" : gate.freeSol.toFixed(4)})`);
     }

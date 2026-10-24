@@ -140,6 +140,12 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     pools.filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
   );
 
+  // Remember what price each candidate was shown at (deploy-time drift guard).
+  if (config.screening.source !== "gmgn") {
+    const { noteScreenedPrice } = await import("../deploy-guards.js");
+    for (const p of eligible) noteScreenedPrice(p.pool, p.price);
+  }
+
   return {
     candidates: eligible.slice(0, limit).map(normalizeCandidateForUi),
     total_eligible: eligible.length,

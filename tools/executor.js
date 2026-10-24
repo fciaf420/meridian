@@ -30,7 +30,7 @@ import { execSync, spawn } from "child_process";
 import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } from "../runtime-helpers.js";
 
 import { log, logAction } from "../logger.js";
-import { checkVolatilityKnown, evaluatePoolThresholds, fetchPoolForRecheck } from "../deploy-guards.js";
+import { checkVolatilityKnown, pickVolatility, evaluatePoolThresholds, fetchPoolForRecheck, checkScreenPriceDrift, getScreenedPrice, recordRefusal } from "../deploy-guards.js";
 import { findBlockingAttempt } from "../deploy-checkpoint.js";
 import { getPositionBins, withTimeout } from "./bin-visual.js";
 import { emit } from "../notifier.js";
@@ -400,6 +400,7 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   if (name === "deploy_position" && usdcModeEnabled()) {
     const elig = await checkDeployEligibility(args);
     if (!elig.pass) {
+      recordRefusal("eligibility", elig.reason);
       log("safety_block", `deploy_position blocked (usdc preflight): ${elig.reason}`);
       return { blocked: true, reason: elig.reason };
     }
@@ -424,7 +425,7 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   // ─── Pre-execution safety checks ──────────
   let swapGuard = null;
   if (WRITE_TOOLS.has(name)) {
-    const safetyCheck = await runSafetyChecks(name, args, { manual });
+    const safetyCheck = await runSafetyChecks(name, args, { manual, eligibilityChecked: usdcModeEnabled() });
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       return {
@@ -555,7 +556,9 @@ export async function checkDeploySafetyGuards(args) {
   if (args._manual) return { pass: true };
   const wantRecheck = sf.recheckScreeningAtDeploy !== false;
   const wantVol = sf.requireKnownVolatility !== false;
-  if (!wantRecheck && !wantVol) return { pass: true };
+  const maxDrift = Number(sf.maxScreenToDeployMovePct ?? 5);
+  const wantDrift = maxDrift > 0 && config.screening.source !== "gmgn";
+  if (!wantRecheck && !wantVol && !wantDrift) return { pass: true };
 
   let pool = null;
   let fetchError = null;
@@ -569,16 +572,29 @@ export async function checkDeploySafetyGuards(args) {
   // pool filters were never applied, so there is nothing to "re-check" against.
   if (wantRecheck && config.screening.source !== "gmgn") {
     if (fetchError) {
+      recordRefusal("recheck", fetchError.message);
       return { pass: false, reason: `Could not verify pool screening thresholds before deploy: ${fetchError.message}` };
     }
     const r = evaluatePoolThresholds(pool, config.screening);
-    if (!r.pass) return { pass: false, reason: `Deploy-time screening re-check failed: ${r.reason}` };
+    if (!r.pass) { recordRefusal("recheck", r.reason); return { pass: false, reason: `Deploy-time screening re-check failed: ${r.reason}` }; }
     for (const n of r.notes || []) log("deploy", `Screening re-check: ${n}`);
   }
 
   if (wantVol) {
-    const v = checkVolatilityKnown(args.volatility ?? pool?.volatility);
-    if (!v.pass) return { pass: false, reason: v.reason };
+    // A fresh positive reading beats a stale screener 0; 0 itself is valid.
+    const v = checkVolatilityKnown(pickVolatility(args.volatility, pool?.volatility));
+    if (!v.pass) { recordRefusal("volatility", v.reason); return { pass: false, reason: v.reason }; }
+  }
+
+  // Screening -> deploy gap: compare the price the candidate was shown at with
+  // the fresh pool price. Code-recorded screening price first (the model cannot
+  // dodge it by omitting the arg), then the model-supplied screen_price. When
+  // neither exists, or the fresh read failed, this check is skipped with a log.
+  if (wantDrift) {
+    const screenPrice = getScreenedPrice(args.pool_address) ?? args.screen_price;
+    const d = checkScreenPriceDrift({ screenPrice, freshPrice: pool?.pool_price, maxMovePct: maxDrift });
+    if (!d.checked) log("deploy", "Screening->deploy price drift not checked (no screening price or no fresh price available)");
+    else if (!d.pass) { recordRefusal("screen_drift", d.reason); return { pass: false, reason: `Screening→deploy price drift: ${d.reason}` }; }
   }
   return { pass: true };
 }
@@ -689,7 +705,7 @@ async function confirmManagementPnlClose(args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args, { manual = false } = {}) {
+async function runSafetyChecks(name, args, { manual = false, eligibilityChecked = false } = {}) {
   switch (name) {
     case "close_position":
       // Management closes on rule 3 (take profit) / rule 6 (emergency stop) and
@@ -699,8 +715,12 @@ async function runSafetyChecks(name, args, { manual = false } = {}) {
       return confirmManagementPnlClose(args);
 
     case "deploy_position": {
-      const elig = await checkDeployEligibility(args);
-      if (!elig.pass) return elig;
+      // USDC mode already ran this (amount-independent) check in its preflight,
+      // before swapping; don't pay for a second Pool Discovery fetch.
+      if (!eligibilityChecked) {
+        const elig = await checkDeployEligibility(args);
+        if (!elig.pass) { recordRefusal("eligibility", elig.reason); return elig; }
+      }
 
       const usdc = usdcModeEnabled();
 

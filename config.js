@@ -77,10 +77,16 @@ export const config = {
     // Re-check TVL / volume / fee-ratio / volatility / token thresholds against a
     // fresh Pool Discovery read at deploy time (fails closed if unreadable).
     recheckScreeningAtDeploy: u.recheckScreeningAtDeploy ?? true,
-    // Refuse a deploy when the pool's volatility is unknown or <= 0.
+    // Refuse a deploy when the pool's volatility is unknown (null/NaN). 0 is valid
+    // (every trade stayed inside one bin).
     requireKnownVolatility: u.requireKnownVolatility ?? true,
     // Max price move (%) between the start of a deploy and the first tx send.
     maxEntryPriceMovePct: u.maxEntryPriceMovePct ?? 5,
+    // Max price move (%) between the price shown at screening and the fresh pool
+    // price at deploy time (the minutes-long screening -> LLM -> deploy gap).
+    // 0 disables. Skipped when screening.source is "gmgn" (different price source)
+    // or no screening price is available.
+    maxScreenToDeployMovePct: u.maxScreenToDeployMovePct ?? 5,
     // Deposit slippage (%) handed to the DLMM SDK. The SDK converts it to an
     // allowed active-bin drift: ceil(pct / (binStep/100)) bins. Was a hard-coded
     // 10%. See deploy-guards.js depositSlippage().

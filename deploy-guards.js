@@ -21,16 +21,79 @@ const num = (v) => {
 // ─── Volatility must be known ─────────────────────────────────────
 
 /**
- * Unknown (missing / NaN) or non-positive volatility means the range cannot be
- * sized against real price movement, so never deploy blind.
+ * Unknown (missing / NaN / non-numeric) or negative volatility means the data is
+ * broken, so never deploy blind. ZERO IS VALID: Pool Discovery reports
+ * volatility 0 whenever every trade in the window stayed inside one bin, which
+ * is routine for wide-bin-step pools at the 5m timeframe (audit finding 1).
+ * This repo does not size bins from volatility, so 0 is not a sizing hazard.
  * @returns {{pass:true, volatility:number}|{pass:false, reason:string}}
  */
 export function checkVolatilityKnown(volatility) {
   const v = num(volatility);
-  if (v == null || v <= 0) {
+  if (v == null || v < 0) {
     return { pass: false, reason: `Volatility is ${volatility == null || volatility === "" ? "unknown" : `invalid (${volatility})`}; refusing to deploy a range that cannot be sized against real volatility.` };
   }
   return { pass: true, volatility: v };
+}
+
+/**
+ * Pick the volatility to validate: a fresh positive reading wins over a stale
+ * zero (the screener's 0 may predate the fresh one). Order: caller value if
+ * positive, else fresh pool value if positive, else whichever is known (0 is a
+ * legitimate "no bin crossings"), else the caller value (unknown -> refused).
+ */
+export function pickVolatility(fromArgs, fromFreshPool) {
+  const a = num(fromArgs), p = num(fromFreshPool);
+  if (a != null && a > 0) return a;
+  if (p != null && p > 0) return p;
+  if (a != null) return a;
+  if (p != null) return p;
+  return fromArgs ?? fromFreshPool;
+}
+
+// ─── Refusal counters (visible in Status) ─────────────────────────
+const refusals = { recheck: 0, volatility: 0, screen_drift: 0, eligibility: 0, pre_submit: 0, other: 0 };
+let lastRefusal = null;
+/** Count a deploy refusal by kind; remembers the most recent reason. */
+export function recordRefusal(kind, reason = "") {
+  const k = Object.hasOwn(refusals, kind) ? kind : "other";
+  refusals[k]++;
+  lastRefusal = { kind: k, reason: String(reason).slice(0, 200), at: Date.now() };
+}
+export function getRefusalStats() { return { ...refusals, total: Object.values(refusals).reduce((a, b) => a + b, 0), last: lastRefusal }; }
+export function resetRefusalStats() { for (const k of Object.keys(refusals)) refusals[k] = 0; lastRefusal = null; }
+
+// ─── Screening -> deploy price drift ──────────────────────────────
+// getTopCandidates() records the price it showed for each candidate here, so the
+// screening -> LLM -> deploy gap is guarded in code even if the model omits
+// screen_price from deploy_position.
+const screened = new Map();
+const SCREEN_SNAPSHOT_TTL_MS = 60 * 60_000;
+export function noteScreenedPrice(pool, price, now = Date.now()) {
+  const p = num(price);
+  if (!pool || p == null || p <= 0) return;
+  screened.set(String(pool), { price: p, at: now });
+  if (screened.size > 500) for (const [k, v] of screened) if (now - v.at > SCREEN_SNAPSHOT_TTL_MS) screened.delete(k);
+}
+export function getScreenedPrice(pool, now = Date.now(), ttlMs = SCREEN_SNAPSHOT_TTL_MS) {
+  const v = screened.get(String(pool));
+  return v && now - v.at <= ttlMs ? v.price : null;
+}
+export function clearScreenedPrices() { screened.clear(); }
+
+/**
+ * Compare the price seen at screening with the fresh pool price. Both numbers
+ * come from the same Pool Discovery `pool_price` field. Returns pass with
+ * checked:false when either side is missing (callers log + fall back).
+ */
+export function checkScreenPriceDrift({ screenPrice, freshPrice, maxMovePct }) {
+  const a = num(screenPrice), b = num(freshPrice), max = num(maxMovePct);
+  if (a == null || a <= 0 || b == null || b <= 0) return { pass: true, checked: false };
+  const movePct = ((b - a) / a) * 100;
+  if (max != null && max > 0 && Math.abs(movePct) > max) {
+    return { pass: false, checked: true, movePct, reason: `price moved ${movePct.toFixed(1)}% between screening (${a}) and deploy (${b}); limit is ${max}%` };
+  }
+  return { pass: true, checked: true, movePct };
 }
 
 // ─── Screening thresholds, re-checked at deploy ───────────────────
@@ -45,7 +108,10 @@ export async function fetchPoolForRecheck(poolAddress, timeframe = "5m", fetchIm
   const res = await fetchImpl(url);
   if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
-  return (data?.data || [])[0] ?? null;
+  const row = (data?.data || [])[0] ?? null;
+  // Echo-check: the filter must have matched the pool we asked about.
+  if (row && String(row.pool_address) !== String(poolAddress)) return null;
+  return row;
 }
 
 /**
@@ -196,6 +262,7 @@ export async function preSubmitGate({
   refetch, getActiveId, readFreeSol,
   binStep, loadBinId, anchorBinId, maxMovePct,
   reserve, amount, totalBins,
+  allowShrink = false, minAmount = 0.1,
 }) {
   try { await refetch(); } catch (e) { return { pass: false, reason: `fresh pool read failed (${e.message})` }; }
   const nowBin = getActiveId();
@@ -213,9 +280,36 @@ export async function preSubmitGate({
     try { freeSol = await readFreeSol(); } catch (e) { return { pass: false, reason: `balance read unavailable (${e.message})` }; }
     if (!Number.isFinite(freeSol)) return { pass: false, reason: "balance read unavailable" };
     const fit = fitDeployAmount({ freeSol, reserve, amount, totalBins });
+    if (fit.shrunk && allowShrink && fit.amount >= minAmount) {
+      // Shrink-to-fit instead of refusing (used after an auto-swap, where a
+      // refusal would strand the swapped token): deploy a smaller SOL leg.
+      return { pass: true, movePct: worst, freeSol, shrunk: true, amount: fit.amount };
+    }
     if (fit.shrunk) {
       return { pass: false, reason: `insufficient spendable SOL: ${freeSol.toFixed(4)} free cannot cover ${amount} SOL + ~${fit.overhead.toFixed(4)} rent/fees and the ${reserve} SOL reserve` };
     }
   }
-  return { pass: true, movePct: worst, freeSol };
+  return { pass: true, movePct: worst, freeSol, shrunk: false, amount: num(amount) };
+}
+
+// ─── Undo an auto-swap when the deploy is refused afterwards ──────
+
+/**
+ * Sell the token bought by the two-sided auto-swap back to SOL, so a refusal
+ * after the swap never leaves the wallet holding a memecoin with no position.
+ * Never throws. `swapFn` is swapToken-compatible.
+ * @returns {Promise<{ok:boolean, note:string}>}
+ */
+export async function swapBackAfterRefusal({ swapFn, baseMint, amount, solMint, log = () => {} }) {
+  if (!(Number(amount) > 0)) return { ok: false, note: "no swapped token amount recorded; nothing to swap back" };
+  try {
+    const r = await swapFn({ input_mint: baseMint, output_mint: solMint, amount });
+    if (r?.success || r?.dry_run) {
+      log(`Swapped ${amount} ${String(baseMint).slice(0, 8)}... back to SOL after refusal`);
+      return { ok: true, note: "swapped back to SOL" };
+    }
+    return { ok: false, note: `swap-back failed (${r?.error ?? "unknown"}); token ${baseMint} remains in the wallet` };
+  } catch (e) {
+    return { ok: false, note: `swap-back errored (${e.message}); token ${baseMint} remains in the wallet` };
+  }
 }
