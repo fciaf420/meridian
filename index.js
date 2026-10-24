@@ -59,7 +59,10 @@ import {
 import { startServer } from "./server.js";
 import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
-import { getScreeningThresholdSummary, getStartupMode, screeningCronGate } from "./runtime-helpers.js";
+import {
+  getScreeningThresholdSummary, getStartupMode, screeningCronGate,
+  classifyGlobalFeesUnknown, globalFeesHardSkipReason, evaluateFeeDataOutage,
+} from "./runtime-helpers.js";
 import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal, formatRunnerPrecheck } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
@@ -455,6 +458,7 @@ async function screeningCycleBody() {
         const smartWalletCount = swResult?.in_pool?.length || 0;
         c._smartWalletCount = smartWalletCount;
         c._globalFeesSol = holdResult?.global_fees_sol ?? null;
+        c._feesUnknownReason = classifyGlobalFeesUnknown({ holdersSettled: holders, holdResult });
         c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
 
         let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
@@ -522,9 +526,11 @@ async function screeningCycleBody() {
       );
       // Hard skips are threshold checks on pre-loaded data: drop failing candidates in
       // code so the model only judges the survivors (narrative, momentum, pick-or-skip).
-      // Unknown values (null) never cause a skip here; the model still sees them.
+      // Unknown global_fees_sol fails CLOSED (skip); other unknown values (e.g. top10 null) do not skip
+      // here and the model still sees them. A fee-fetch outage hitting most candidates raises one alert below.
       const hardSkipReason = (c) => {
-        if (c._globalFeesSol != null && c._globalFeesSol < config.screening.minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${config.screening.minTokenFeesSol}`;
+        const feeReason = globalFeesHardSkipReason(c, config.screening.minTokenFeesSol);
+        if (feeReason) return feeReason;
         if (Number.isFinite(c._top10Pct) && c._top10Pct > 60) return `top10 ${c._top10Pct}% > 60%`;
         if (config.strategy.activeStrategy === "evil_panda" && c._evilPandaPass === false) return "Evil Panda entry FAIL";
         return null;
@@ -536,6 +542,10 @@ async function screeningCycleBody() {
         else survivors.push(c);
       }
       if (hardSkipped.length > 0) log("cron", `Screening hard-skipped in code: ${hardSkipped.join("; ")}`);
+      const feeOutage = evaluateFeeDataOutage(rankedCandidates, { ratio: config.screening.feeDataDownRatio });
+      if (feeOutage.notify) {
+        emit("fee_data_down", { reason: `global_fees fetch failed for ${feeOutage.failed}/${feeOutage.total} candidate(s) (Meteora datapi holders / Jupiter fee data); those are skipped (fail closed) until it recovers.` });
+      }
       const validBlocks = survivors
         .map((c) => blockMap.get(c.pool))
         .filter(Boolean);
@@ -618,7 +628,7 @@ SCREENING CYCLE — DEPLOY ONLY${signalWeightsBlock}${kbScreenContext}${candidat
 ${strategyBlock}
 ${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and GMGN signal data.
 Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
-HARD SKIP rules still apply (code has already dropped candidates whose known global_fees_sol or top_10 value fails the first two):
+HARD SKIP rules still apply (code has already dropped candidates whose global_fees_sol is below the minimum or UNKNOWN (fail closed), or whose known top_10 value fails the second):
 - global_fees_sol < ${config.screening.minTokenFeesSol} SOL → skip (bundled/scam)
 - top_10_real_holders_pct > 60% OR bundlers > 30% → skip
 - No smart wallets or GMGN confirmation + empty/hype narrative → skip

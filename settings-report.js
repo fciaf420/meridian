@@ -175,7 +175,6 @@ export function buildSettingsReport({ color = false } = {}) {
     row("token age", `${config.gmgn.minTokenAgeHours}–${config.gmgn.maxTokenAgeHours} h`, "min/maxTokenAgeHours");
     row("min holders", config.gmgn.minHolders, "minHolders");
     row("min volume", `$${Number(config.gmgn.minVolume).toLocaleString()}`, "minVolume");
-    row("require KOL", config.gmgn.requireKol, "requireKol");
     row("max sniper count", config.gmgn.maxSniperCount, "maxSniperCount");
     row("indicator filter", config.gmgn.indicatorFilter ? "on (Evil Panda gates)" : "off", "indicatorFilter");
   }

@@ -16,6 +16,8 @@ const emitter = new EventEmitter();
 //   swap_unwind_failed — deploy refused after the auto-swap and the swap back to SOL failed (token stranded)
 //   briefing         — morning briefing HTML
 //   status           — busy state changes
+//   gmgn_outage      — GMGN transport outage (once per outage; tools/gmgn-outage.js)
+//   fee_data_down    — most (>= screening.feeDataDownRatio, default 80%) screening candidates have a failed global_fees fetch (once per outage)
 //   llm_unavailable  — LLM provider + fallback both failed (deduped in llm-health.js)
 
 export function emit(event, data) {

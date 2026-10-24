@@ -2420,6 +2420,17 @@ export function createTelegramUI(deps) {
       `Deploy was refused after the SOL→token swap and the swap back to SOL failed. The token is still in the wallet: <code>${escapeHtml(shortAddr(d.mint))}</code> (~${escapeHtml(d.amount)}).`,
       escapeHtml(String(d.note ?? "").slice(0, 300)),
     ].join("\n"), [[btn("💰 Wallet", "wa!")]]),
+    // Emitted once per GMGN outage by tools/gmgn-outage.js (gmgn-cli missing/broken, bad key, or a
+    // cycle of all-unknown lookups); the limiter is a second guard.
+    gmgn_outage: (d) => alert("gmgn_outage", "gmgn", 60 * 60_000, [
+      "📡 <b>GMGN outage</b>",
+      escapeHtml(String(d.reason ?? "GMGN data unavailable").slice(0, 400)),
+    ].join("\n"), [[btn("🧯 Recent errors", "er!")]]),
+    // Most screening candidates were hard-skipped because fee data could not be fetched.
+    fee_data_down: (d) => alert("fee_data_down", "fees", 60 * 60_000, [
+      "💸 <b>Fee data unavailable — most candidates skipped</b>",
+      escapeHtml(String(d.reason ?? "").slice(0, 400)),
+    ].join("\n"), [[btn("🧯 Recent errors", "er!")]]),
     cycle_error: (d) => alert("cycle_error", `${d.cycle}:${String(d.error).slice(0, 60)}`, 15 * 60_000,
       `❌ <b>${escapeHtml(d.cycle)} cycle failed</b>\n${escapeHtml(String(d.error ?? "").slice(0, 500))}`,
       [[btn("🧯 Recent errors", "er!")]]),
