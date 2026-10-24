@@ -138,7 +138,8 @@ STRATEGIES:
   (a) SOL-only spot: Only provide amount_y (SOL), no amount_x. Bins go BELOW active bin only (bins_below = range, bins_above = 0). Same direction as bid_ask but spot distribution instead of bid_ask curve.
   (b) Token-only spot: Only provide amount_x (base token), no amount_y. Bins go ABOVE active bin only (bins_below = 0, bins_above = range). You are selling the token as price rises.
   (c) Two-sided spot: Just provide total SOL as amount_y + sol_split_pct. Token is auto-swapped. The executor swaps the token portion via Jupiter and deploys with both sides. sol_split_pct is the % kept as SOL (100 = pure SOL). Unless the user gives a split, use 85-90.
-Only 'bid_ask' and 'spot' are accepted; any other strategy is rejected.
+- 'hybrid': ONE single-sided SOL position (bins_above = 0) holding a Bid-Ask layer AND a Spot layer over the same range. The Bid-Ask/Spot split is set by the owner (config hybridBidAskPct), not by you. Same direction and risk profile as bid_ask with a flatter, fee-earning base; never pass amount_x or sol_split_pct with it.
+Only 'bid_ask', 'spot' and 'hybrid' are accepted; any other strategy is rejected.
 
 SPOT BIN DIRECTION:
 - SOL (quote token / Y) fills bins BELOW the active bin (active_bin minus N)
@@ -191,8 +192,8 @@ This sends a real on-chain transaction unless the runner is in DRY_RUN mode.`,
           },
           strategy: {
             type: "string",
-            enum: ["bid_ask", "spot"],
-            description: "DLMM strategy. 'bid_ask' = single-sided SOL only. 'spot' = uniform distribution; with sol_split_pct auto-swaps token portion via Jupiter for two-sided. If user specifies, use exactly what they said. Otherwise use the active strategy's lp_strategy field. Default: bid_ask."
+            enum: ["bid_ask", "spot", "hybrid"],
+            description: "DLMM strategy. 'hybrid' = single-sided SOL, Bid-Ask + Spot layers in one position (split from config). 'bid_ask' = single-sided SOL only. 'spot' = uniform distribution; with sol_split_pct auto-swaps token portion via Jupiter for two-sided. If user specifies, use exactly what they said. Otherwise use the active strategy's lp_strategy field. Default: bid_ask."
           },
           bins_above: {
             type: "number",

@@ -96,6 +96,8 @@ export function trackPosition({
   pool_name,
   strategy,
   strategy_type = null,
+  strategy_mix = null,       // hybrid only: { bid_ask_pct, spot_pct }
+  legs = null,               // hybrid only: SOL per leg { bid_ask_sol, spot_sol }
   sol_split_pct = null,
   bin_range = {},
   amount_sol,
@@ -127,6 +129,8 @@ export function trackPosition({
     base_mint: base_mint || null,
     strategy,
     strategy_type,
+    ...(strategy_mix && { strategy_mix }),
+    ...(legs && { legs }),
     sol_split_pct,
     bin_range,
     amount_sol,
@@ -1003,6 +1007,7 @@ async function syncOpenPositionsOnce(active_addresses) {
           pool_name: pos.pool_name || closedData.pair || "unknown",
           strategy: pos.strategy || closedData.strategy,
           strategy_type: pos.strategy_type || null,
+          strategy_mix: pos.strategy_mix || null,
           sol_split_pct: pos.sol_split_pct ?? null,
           bin_range: pos.bin_range || { min: closedData.lower_bin, max: closedData.upper_bin },
           bin_step: pos.bin_step || closedData.bin_step,

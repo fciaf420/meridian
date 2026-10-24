@@ -100,7 +100,7 @@ function save(data) {
  * @param {string} perf.position       - Position address
  * @param {string} perf.pool           - Pool address
  * @param {string} perf.pool_name      - Pool name (e.g. "Mustard-SOL")
- * @param {string} perf.strategy       - "spot" | "curve" | "bid_ask"
+ * @param {string} perf.strategy       - "spot" | "curve" | "bid_ask" | "hybrid" (hybrid also carries perf.strategy_mix {bid_ask_pct, spot_pct})
  * @param {number} [perf.sol_split_pct]  - SOL split % (100=single-sided, <100=two-sided spot)
  * @param {number} perf.bin_range      - Bin range used
  * @param {number} perf.bin_step       - Pool bin step
@@ -196,6 +196,7 @@ export async function recordPerformance(perf) {
         minutes_held: perf.minutes_held,
         close_reason: perf.close_reason,
         strategy: perf.strategy,
+        ...(perf.strategy_mix && { strategy_mix: perf.strategy_mix }),
         sol_split_pct: perf.sol_split_pct ?? null,
         volatility: perf.volatility,
         price_range_pct: deployRangePct,
@@ -301,7 +302,7 @@ function derivLesson(perf) {
 
   if (outcome === "good" || outcome === "bad") {
     if (perf.range_efficiency < 30 && outcome === "bad") {
-      const isSingleSidedBelow = perf.strategy === "bid_ask" || (perf.strategy === "spot" && !isTwoSided);
+      const isSingleSidedBelow = perf.strategy === "bid_ask" || perf.strategy === "hybrid" || (perf.strategy === "spot" && !isTwoSided);
       const dirHint = oorDir === "downside"
         ? " Price dropped below range (downside OOR) — SOL converted to token, realized loss. Wider range may help catch deeper dips."
         : oorDir === "upside" && isSingleSidedBelow

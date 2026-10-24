@@ -426,7 +426,7 @@ export async function computeTwapDeviation({ oracle, activeId = null, binStep, n
  */
 export function evaluateTwapGuard(twap, { maxPct = 15, strategy = "bid_ask" } = {}) {
   if (maxPct == null) return { pass: true, note: "TWAP spike guard off" };
-  if (strategy !== "bid_ask") return { pass: true, note: `TWAP spike guard applies to bid_ask only (strategy ${strategy})` };
+  if (strategy !== "bid_ask" && strategy !== "hybrid") return { pass: true, note: `TWAP spike guard applies to bid_ask / hybrid only (strategy ${strategy})` };
   if (!twap?.known) return { pass: true, unknown: true, note: `TWAP unknown (${twap?.note ?? "no data"}) — allowed` };
   if (twap.devPct > Number(maxPct)) {
     return {
@@ -800,7 +800,7 @@ export async function runDeployEntryChecks({
 
   // TWAP spike guard (bid_ask only; unknown TWAP allows with a note).
   let twap = null;
-  if (filters.twapSpikeMaxPct != null && strategy === "bid_ask") {
+  if (filters.twapSpikeMaxPct != null && (strategy === "bid_ask" || strategy === "hybrid")) {
     twap = await readTwap(pool, { windowMinutes: filters.twapWindowMinutes ?? 60, nowSec });
   }
   const tg = evaluateTwapGuard(twap, { maxPct: filters.twapSpikeMaxPct, strategy });

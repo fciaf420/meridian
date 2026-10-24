@@ -425,7 +425,8 @@ WHY EVIL PANDA IS DEFAULT:
    2. Pool has smart_wallets_present = true (institutional conviction)
    3. Price trend is STABILIZING or RANGING (not mid-pump, not fading)
    4. Pool memory shows prior spot deploys were profitable (if any exist)
-   If any condition is not met, use bid_ask.
+   If any condition is not met, use bid_ask.${config.strategy.strategy === "hybrid" ? `
+   CONFIGURED SHAPE = HYBRID: the owner runs ONE single-sided SOL position holding a Bid-Ask layer (${config.strategy.hybridBidAskPct}%) plus a Spot layer (${config.strategy.hybridSpotPct}%). Pass strategy="hybrid" (bins_above=0, no amount_x, no sol_split_pct) instead of bid_ask; the split is applied by the executor, do not choose it.` : ""}
 
    When using two-sided spot:
    - sol_split_pct MUST be 85-90% (mostly SOL, minimal token exposure)

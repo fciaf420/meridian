@@ -386,12 +386,13 @@ export function autoRange(c, strategy) {
 /** Range presets offered by the Telegram picker (besides Auto). */
 export const RANGE_PRESETS = [25, 50, 80];
 
-export const STRATEGY_LABELS = { bid_ask: "Bid-Ask", spot: "Spot" };
+export const STRATEGY_LABELS = { bid_ask: "Bid-Ask", spot: "Spot", hybrid: "Hybrid" };
 
 /** The strategy the bot would use on its own (the picker marks it as default). */
 export function defaultPickerStrategy(config, usdcMode = false) {
   if (usdcMode) return "bid_ask";
-  return config.strategy?.strategy === "bid_ask" ? "bid_ask" : "spot";
+  const s = config.strategy?.strategy;
+  return s === "bid_ask" || s === "hybrid" ? s : "spot";
 }
 
 /**
@@ -409,7 +410,7 @@ export function buildDeployPlan(candidate, { wallet, config, computeDeployAmount
   let strategy;
   if (evil) strategy = "spot";
   else if (chosen != null) {
-    if (chosen !== "bid_ask" && chosen !== "spot") return { error: `Unknown strategy ${chosen}.` };
+    if (chosen !== "bid_ask" && chosen !== "spot" && chosen !== "hybrid") return { error: `Unknown strategy ${chosen}.` };
     if (usdcMode && chosen !== "bid_ask") return { error: "USDC mode only supports Bid-Ask." };
     strategy = chosen;
   } else strategy = defaultPickerStrategy(config, usdcMode); // executor forces bid_ask in USDC mode
@@ -1190,7 +1191,7 @@ export function renderDeployConfirm(c, plan, nonce, { dryRun = false, source = "
 // db:<id> (back to strategy), dx:<id> (cancel). <id> is a short server-side
 // step id; the candidate and the choices live in the step store, never in the data.
 
-export function renderStrategyStep(c, stepId, { defaultStrategy } = {}) {
+export function renderStrategyStep(c, stepId, { defaultStrategy, hybridBidAskPct = null } = {}) {
   const mark = (s) => (s === defaultStrategy ? " ✓" : "");
   return {
     text: [
@@ -1200,10 +1201,11 @@ export function renderStrategyStep(c, stepId, { defaultStrategy } = {}) {
       "Both are single-sided SOL (liquidity below the price, no token needed):",
       "• <b>Bid-Ask</b>: more SOL further below the price; buys dips.",
       "• <b>Spot</b>: SOL spread evenly across the range.",
+      `• <b>Hybrid</b>: ONE position, a Bid-Ask layer${hybridBidAskPct != null ? ` (${hybridBidAskPct}% of the SOL)` : ""} plus a Spot layer.`,
       `✓ = your configured default (${STRATEGY_LABELS[defaultStrategy]}).`,
     ].join("\n"),
     keyboard: [
-      [btn(`Bid-Ask${mark("bid_ask")}`, `ds:${stepId}:b`), btn(`Spot${mark("spot")}`, `ds:${stepId}:s`)],
+      [btn(`Bid-Ask${mark("bid_ask")}`, `ds:${stepId}:b`), btn(`Spot${mark("spot")}`, `ds:${stepId}:s`), btn(`Hybrid${mark("hybrid")}`, `ds:${stepId}:h`)],
       [btn("✖ Cancel", `dx:${stepId}`)],
     ],
   };
@@ -1449,7 +1451,7 @@ export function createTelegramUI(deps) {
     const id = steps.put("pick", { candidate, usdcMode, strategy: usdcMode ? "bid_ask" : null, origin, warnings });
     const view = usdcMode
       ? renderRangeStep(candidate, id, "bid_ask", { usdcMode: true })
-      : renderStrategyStep(candidate, id, { defaultStrategy: defaultPickerStrategy(deps.config) });
+      : renderStrategyStep(candidate, id, { defaultStrategy: defaultPickerStrategy(deps.config), hybridBidAskPct: deps.config.strategy?.hybridBidAskPct });
     const msg = await show(ctx, view, opts);
     steps.bind(id, msg?.message_id ?? null, ctx?.chatId ?? msg?.chat?.id ?? null);
     return msg;
@@ -1502,12 +1504,12 @@ export function createTelegramUI(deps) {
         return;
       }
       p.strategy = null;
-      await show(ctx, renderStrategyStep(c, id, { defaultStrategy: defaultPickerStrategy(deps.config) }));
+      await show(ctx, renderStrategyStep(c, id, { defaultStrategy: defaultPickerStrategy(deps.config), hybridBidAskPct: deps.config.strategy?.hybridBidAskPct }));
       return;
     }
 
     if (head === "ds") {
-      const strategy = choice === "b" ? "bid_ask" : choice === "s" ? "spot" : null;
+      const strategy = choice === "b" ? "bid_ask" : choice === "s" ? "spot" : choice === "h" ? "hybrid" : null;
       if (!strategy || (p.usdcMode && strategy !== "bid_ask")) {
         await answer("That strategy isn't available here.", true);
         return;

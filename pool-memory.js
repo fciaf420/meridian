@@ -66,6 +66,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
     minutes_held: deployData.minutes_held ?? null,
     close_reason: deployData.close_reason || null,
     strategy: deployData.strategy || null,
+    ...(deployData.strategy_mix && { strategy_mix: deployData.strategy_mix }),
     sol_split_pct: deployData.sol_split_pct ?? null,
     volatility_at_deploy: deployData.volatility ?? null,
     price_range_pct: deployData.price_range_pct ?? null,

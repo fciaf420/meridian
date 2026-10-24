@@ -637,7 +637,7 @@ export function attributeLosses(recent) {
       // problem, so bid_ask and SOL-only spot go to the screener.
       const strat = (p.strategy || "").toLowerCase();
       const twoSided = p.sol_split_pct != null && p.sol_split_pct < 100;
-      if (strat.includes("bid_ask") || (strat === "spot" && !twoSided)) {
+      if (strat.includes("bid_ask") || strat === "hybrid" || (strat === "spot" && !twoSided)) {
         sectionLosses.screener_criteria.push(p);
       } else {
         sectionLosses.range_selection.push(p);
