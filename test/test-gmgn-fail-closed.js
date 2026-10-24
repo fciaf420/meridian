@@ -39,7 +39,7 @@ const goodStat = () => ({
   top_10_holder_rate: 0.3, dev_team_hold_rate: 0.01, bot_degen_rate: 0.1, fresh_wallet_rate: 0.1,
   top_bundler_trader_percentage: 0.1, top_rat_trader_percentage: 0.05, creator_hold_rate: 0.01,
   top70_sniper_hold_rate: 0.05, top_entrapment_trader_percentage: 0.02, private_vault_hold_rate: 0.0,
-  creator_created_count: 3, bot_degen_count: 5,
+  creator_created_count: 3, bot_degen_count: 5, holder_count: 2000,
 });
 const goodInfo = (extra = {}) => ({
   holder_count: 2000, total_fee: 100, trade_fee: 10, ath_price: 0.002, creation_timestamp: NOW_S - 24 * 3600,
@@ -53,7 +53,7 @@ const holderRows = (snipers = 0) => [
 ];
 
 function makeDeps(over = {}) {
-  const calls = { pools: [], info: [], security: [], price: [], call: [] };
+  const calls = { pools: [], info: [], security: [], price: [], call: [], holders: [] };
   const deps = {
     cfg: config,
     call: async (args) => {
@@ -63,6 +63,7 @@ function makeDeps(over = {}) {
       if (args[1] === "traders") return { status: GMGN_STATUS.OK, data: { list: [] } };
       return { status: GMGN_STATUS.ERROR, data: null };
     },
+    fetchHolders: async (mint) => { calls.holders.push(mint); return deps.call(["token", "holders", "--address", mint]); },
     fetchPools: async (mint) => { calls.pools.push(mint); return over.pools ? over.pools(mint) : [{ address: `pool-${mint}`, name: `${mint}-SOL`, tvl: 50_000, token_x: { address: mint, symbol: "X" }, token_y: { address: "So11111111111111111111111111111111111111112" }, pool_config: { bin_step: 100 } }]; },
     fetchInfo: async (mint) => { calls.info.push(mint); return over.info ? over.info(mint) : { status: GMGN_STATUS.OK, info: goodInfo() }; },
     fetchSecurity: async (mint) => { calls.security.push(mint); return over.security ? over.security(mint) : { status: GMGN_STATUS.OK, security: { renounced_mint: true, renounced_freeze_account: true, burn_status: "", buy_tax: 0, sell_tax: 0, lock_summary: { is_locked: false } } }; },
@@ -73,19 +74,39 @@ function makeDeps(over = {}) {
 }
 const reasonFor = (res, stage) => res.filtered_examples.filter((f) => f.stage === stage);
 
+/* Real gmgn-cli rate-limit strings (src/client/OpenApiClient.ts buildOpenApiErrorMessage). */
+const REAL_BANNED = (n) => `[gmgn-cli] GET /v1/token/info failed: HTTP 429 code=429 error=RATE_LIMIT_BANNED message=rate limited. Rate limit resets at 2026-10-24 11:02:16 GMT-04:00 (~${n}s remaining). Stop sending requests before then; repeated requests can extend the ban by 5s up to 5 minutes.`;
+const REAL_BANNED_MAX = (n) => `[gmgn-cli] GET /v1/token/info failed: HTTP 429 code=429 error=RATE_LIMIT_BANNED_MAX message=banned. The ban has reached the 5-minute maximum. Stop ALL requests until 2026-10-24 11:02:16 GMT-04:00 (~${n}s remaining); every request sent before then resets the ban to 5 minutes.`;
+
 /* ------------------------------ policy ------------------------------ */
 test("command weights, pacing, ban reset parsing and escalation", () => {
   assert.equal(policy.commandWeight(["token", "holders", "--chain", "sol"]), 5);
   assert.equal(policy.commandWeight(["token", "traders"]), 5);
   assert.equal(policy.commandWeight(["token", "info"]), 1);
-  assert.equal(policy.commandWeight(["market", "kline"]), 1);
+  assert.equal(policy.commandWeight(["market", "kline"]), 2);
+  assert.equal(policy.commandWeight(["market", "trending"]), 3);
+  assert.equal(policy.commandWeight(["market", "trenches"]), 2);
+  assert.equal(policy.commandWeight(["market", "signal"]), 1);
+  assert.equal(policy.commandWeight(["token", "security"]), 1);
+  assert.equal(policy.commandWeight(["track", "smartmoney"]), 1);
+  assert.equal(policy.commandWeight(["track", "kol"]), 1);
+  assert.equal(policy.paceGapMs(2, 5), 400);
   assert.equal(policy.paceGapMs(5, 5), 1000);
   assert.equal(policy.paceGapMs(1, 5), 200);
   assert.equal(policy.paceGapMs(5, 50), 100);
   const now = 1_790_000_000_000;
   assert.equal(policy.parseResetAtMs('{"code":429,"error":"RATE_LIMIT_BANNED","reset_at":1790000120}', now), 1_790_000_120_000);
   assert.equal(policy.parseResetAtMs("x-ratelimit-reset: 1790000090", now), 1_790_000_090_000);
+  // REAL gmgn-cli text (OpenApiClient.buildOpenApiErrorMessage): relative "(~Ns remaining)", no raw epoch.
+  assert.equal(policy.parseResetAtMs(REAL_BANNED(287), now), now + 287_000);
   assert.equal(policy.parseResetAtMs("no reset here", now), null);
+  assert.equal(policy.parseResetAtMs(REAL_BANNED(99_999), now), null, "absurd remaining ignored");
+  assert.equal(policy.cooldownUntilMs({ errorText: REAL_BANNED(287), strikes: 1, now }), now + 288_000);
+  assert.equal(policy.cooldownUntilMs({ errorText: REAL_BANNED_MAX(299), strikes: 1, now }), now + 300_000);
+  // ban class with NO parseable reset => full 300s (not the 30s soft-limit first strike)
+  assert.equal(policy.cooldownUntilMs({ errorText: "HTTP 429 error=RATE_LIMIT_BANNED", strikes: 1, now }), now + 300_000);
+  assert.equal(policy.cooldownUntilMs({ errorText: "HTTP 429 error=RATE_LIMIT_BANNED_MAX", strikes: 1, now }), now + 300_000);
+  assert.equal(policy.cooldownUntilMs({ errorText: "HTTP 429 error=RATE_LIMIT_EXCEEDED", strikes: 1, now }), now + 30_000, "soft limit keeps the ladder");
   assert.equal(policy.parseResetAtMs('reset_at":1700000000', now), null, "stale reset ignored");
   assert.equal(policy.cooldownUntilMs({ errorText: '{"reset_at":1790000120}', strikes: 1, now }), 1_790_000_121_000);
   assert.equal(policy.cooldownUntilMs({ errorText: "429", strikes: 1, now }), now + 30_000);
@@ -101,6 +122,23 @@ test("stat population test and unknown-aware readers", () => {
   assert.equal(policy.isStatUnpopulated({}), true);
   assert.equal(policy.isStatUnpopulated(Object.fromEntries(policy.STAT_RISK_FIELDS.map((k) => [k, 0]))), true);
   assert.equal(policy.isStatUnpopulated(goodStat()), false);
+  assert.equal(policy.STAT_RISK_FIELDS.length, 10, "doc test 2 uses ten fields");
+  assert.ok(policy.STAT_RISK_FIELDS.includes("creator_created_count") && policy.STAT_RISK_FIELDS.includes("top_10_holder_rate"));
+  assert.ok(!policy.STAT_RISK_FIELDS.includes("dev_team_hold_rate"));
+  // only creator_created_count / top_10_holder_rate non-zero => populated per the doc (old 9-field list said no)
+  assert.equal(policy.isStatUnpopulated({ creator_created_count: 4 }), false);
+  assert.equal(policy.isStatUnpopulated({ top_10_holder_rate: 0.3 }), false);
+  // dev_team_hold_rate alone is not in the doc's list
+  assert.equal(policy.isStatUnpopulated({ dev_team_hold_rate: 0.1 }), true);
+  // test 1 (CAKE shape): stat.holder_count 0 while info.holder_count > 0 => unpopulated even with other fields set
+  assert.equal(policy.isStatUnpopulated({ ...goodStat(), holder_count: 0 }, { holder_count: 381430 }), true);
+  assert.equal(policy.isStatUnpopulated((({ holder_count, ...rest }) => rest)(goodStat()), { holder_count: 381430 }), true, "absent stat.holder_count counts as 0");
+  assert.equal(policy.isStatUnpopulated({ ...goodStat(), holder_count: 100 }, { holder_count: 100 }), false);
+  // WETH-on-base shape: stat.holder_count mirrors info but all ten are zero => test 2 catches it
+  const zeros = Object.fromEntries(policy.STAT_RISK_FIELDS.map((k) => [k, 0]));
+  assert.equal(policy.isStatUnpopulated({ ...zeros, holder_count: 4818570 }, { holder_count: 4818570 }), true);
+  // USDC-on-sol shape: eight zeros but top70_sniper_hold_rate > 0 and holder counts agree => populated
+  assert.equal(policy.isStatUnpopulated({ ...zeros, top70_sniper_hold_rate: "0.0000086741", holder_count: 9000000 }, { holder_count: 9000000 }), false);
   assert.equal(policy.numOrNull(undefined), null);
   assert.equal(policy.numOrNull(""), null);
   assert.equal(policy.numOrNull("0.2"), 0.2);
@@ -125,8 +163,7 @@ test("rate limit is a distinct result, honors reset_at, blocks spawns, never cac
   let mode = "limit";
   const { execs, clock } = useExec((args) => {
     if (mode === "limit") {
-      const reset = Math.floor(clock.c.now / 1000) + 90;
-      return { error: new Error("exit 1"), stderr: `{"code":429,"error":"RATE_LIMIT_BANNED","reset_at":${reset}}` };
+      return { error: new Error("exit 1"), stderr: REAL_BANNED(90) };
     }
     return { stdout: JSON.stringify({ holder_count: 5, price: { price: 1 } }) };
   });
@@ -304,7 +341,10 @@ test("stage 4 fails closed with no candles / no price; rate-limited is deferred;
   assert.equal(r.signal.bbPosition, "below");
   assert.equal(r.signal.alreadyAtBottom, true);
   assert.equal(r.passed, true, "default stays non-gating");
-  const hard = T.checkBounceSetup(bottom, { ...config.gmgn, indicatorRules: { ...config.gmgn.indicatorRules, rejectAlreadyAtBottom: true } });
+  // explicit legacy true keeps its old effective behavior (it never fired): still log-only
+  const legacy = T.checkBounceSetup(bottom, { ...config.gmgn, indicatorRules: { ...config.gmgn.indicatorRules, rejectAlreadyAtBottom: true } });
+  assert.equal(legacy.passed, true, "legacy rejectAlreadyAtBottom=true stays non-gating");
+  const hard = T.checkBounceSetup(bottom, { ...config.gmgn, indicatorRules: { ...config.gmgn.indicatorRules, enforceAlreadyAtBottom: true } });
   assert.equal(hard.passed, false);
 });
 
@@ -444,7 +484,7 @@ test("Meteora-source candidates run the GMGN safety gates (fail closed), already
     },
   });
   const pre = { ...mPool(9), gmgn: true, gmgn_gated: true };
-  const res = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3), mPool(4), pre], { limit: 10, deps: { ...deps, force: true } });
+  const res = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3), mPool(4), pre], { limit: 10, deps: { ...deps, force: true, mode: "hard" } });
   const keptNames = res.kept.map((p) => p.name).sort();
   assert.deepEqual(keptNames, ["M1-SOL", "M9-SOL"]);
   const kinds = Object.fromEntries(res.dropped.map((d) => [d.symbol, d.kind]));
@@ -457,12 +497,12 @@ test("Meteora-source candidates run the GMGN safety gates (fail closed), already
 
 test("Meteora-source gate: holders unavailable fails closed; rate limit defers the rest; skipped without a GMGN key", async () => {
   const unavailable = makeDeps({ holders: () => ({ status: GMGN_STATUS.ERROR, data: null }) });
-  const r1 = await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { ...unavailable.deps, force: true } });
+  const r1 = await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { ...unavailable.deps, force: true, mode: "hard" } });
   assert.equal(r1.kept.length, 0);
   assert.equal(r1.dropped[0].kind, "unknown");
 
   const limited = makeDeps({ info: async (m) => (m === "Mint2" ? { status: GMGN_STATUS.RATE_LIMITED, info: null } : { status: GMGN_STATUS.OK, info: goodInfo() }) });
-  const r2 = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3)], { deps: { ...limited.deps, force: true } });
+  const r2 = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3)], { deps: { ...limited.deps, force: true, mode: "hard" } });
   assert.equal(r2.rate_limited, true);
   assert.deepEqual(r2.dropped.map((d) => d.kind).sort(), ["deferred", "deferred", "deferred"].sort(), "limited candidate and everything after it are deferred; Mint1 deferred too because phase B stopped");
   assert.equal(r2.kept.length, 0, "a rate limit never passes a candidate");
@@ -482,13 +522,206 @@ test("dead KOL/smart-degen config removed; new reliability settings present with
   for (const k of ["requireKol", "minKolCount", "minSmartDegenCount"]) assert.ok(!(k in config.gmgn), `${k} removed`);
   assert.equal(config.gmgn.plan, "free");
   assert.equal(config.gmgn.finalistLimit, 5);
-  assert.equal(config.gmgn.gateMeteoraSource, true);
+  assert.equal(config.gmgn.gateMeteoraSource, "shadow", "Meteora-source gate defaults to shadow");
   assert.equal(config.gmgn.indicatorRules.rejectAlreadyAtBottom, false);
+  assert.equal(config.gmgn.indicatorRules.enforceAlreadyAtBottom, false);
   const example = JSON.parse(fs.readFileSync(path.join(REPO, "gmgn-config.example.json"), "utf8"));
   assert.ok(!("requireKol" in example) && !("minKolCount" in example) && !("minSmartDegenCount" in example));
 });
 
-test("global_fees_sol gate in index.js is fail-closed", () => {
+/* ====================== Fable 5.1 audit fixes ====================== */
+const notifier = await import("../notifier.js");
+const outageMod = await import("../tools/gmgn-outage.js");
+const helpers = await import("../runtime-helpers.js");
+
+test("H1: the real gmgn-cli 429 text drives the cooldown (reset-aware, ban class defaults to 300s)", async () => {
+  const { clock } = useExec(() => ({ error: new Error("exit 1"), stderr: REAL_BANNED(287) }));
+  const r = await gmgn.spawnGmgnResult(["token", "info", "--address", "a"]);
+  assert.equal(r.status, GMGN_STATUS.RATE_LIMITED);
+  assert.ok(r.retryAfterMs >= 287_000 && r.retryAfterMs <= 289_000, `expected ~288s, got ${r.retryAfterMs}`);
+  assert.equal(gmgn.getGmgnRateLimitState().strikes, 1);
+  void clock;
+  // BANNED_MAX with no parseable reset => 300s, never the 30s first-strike floor
+  useExec(() => ({ error: new Error("x"), stderr: "HTTP 429 code=429 error=RATE_LIMIT_BANNED_MAX message=banned" }));
+  const r2 = await gmgn.spawnGmgnResult(["token", "info", "--address", "a"]);
+  assert.equal(r2.retryAfterMs, 300_000);
+  // soft limit keeps the 30s ladder
+  useExec(() => ({ error: new Error("x"), stderr: "HTTP 429 code=429 error=RATE_LIMIT_EXCEEDED" }));
+  assert.equal((await gmgn.spawnGmgnResult(["token", "info", "--address", "a"])).retryAfterMs, 30_000);
+});
+
+test("H2: kline (2) and trending (3) are paced by weight, including the index.js enrichment path (fetchGmgnPriceInfo)", async () => {
+  const { clock } = useExec((args) => (args[0] === "market" ? { stdout: JSON.stringify({ list: [{ time: 1, open: 1, close: 1, high: 1, low: 1, volume: 1 }] }) } : { stdout: JSON.stringify({ holder_count: 5, price: { price: 1 } }) }));
+  await gmgn.spawnGmgnResult(["market", "kline", "--address", "a"]);
+  await gmgn.spawnGmgnResult(["token", "info", "--address", "a"]);   // waits out the kline cost: 2/5 s = 400ms
+  await gmgn.spawnGmgnResult(["market", "trending", "--chain", "sol"]);
+  await gmgn.spawnGmgnResult(["token", "info", "--address", "b"]);   // waits out trending: 3/5 s = 600ms
+  assert.deepEqual(clock.c.sleeps.filter((x) => x >= 400), [400, 600]);
+  // the enrichment path calls fetchGmgnPriceInfo -> spawnGmgnResult(["market","kline"...]): same pacer
+  const { execs, clock: c2 } = useExec((args) => (args[1] === "kline" ? { stdout: JSON.stringify({ list: [{ time: 1, open: 1, close: 1, high: 1, low: 1, volume: 1 }] }) } : { stdout: JSON.stringify({ holder_count: 5, price: { price: 1 } }) }));
+  await Promise.all([gmgn.fetchGmgnPriceInfoResult("M1"), gmgn.fetchGmgnPriceInfoResult("M1")]);
+  assert.equal(execs.filter((a) => a[1] === "kline").length, 1, "in-flight kline dedupe: one spawn for concurrent callers");
+  assert.ok(c2.c.sleeps.includes(200) || c2.c.sleeps.includes(400), "kline spacing applied before the next call");
+});
+
+test("F5: holders cached 60s on OK only, deduped in flight, never cached when rate limited", async () => {
+  let mode = "ok";
+  const { execs, clock } = useExec(() => (mode === "limit" ? { error: new Error("x"), stderr: REAL_BANNED(30) } : { stdout: JSON.stringify({ list: holderRows(0) }) }));
+  const [a, b] = await Promise.all([gmgn.fetchGmgnHoldersResult("H1", 100), gmgn.fetchGmgnHoldersResult("H1", 100)]);
+  assert.equal(a.status, GMGN_STATUS.OK); assert.equal(b.status, GMGN_STATUS.OK);
+  assert.equal(execs.length, 1, "concurrent callers share one weight-5 spawn");
+  await gmgn.fetchGmgnHoldersResult("H1", 100);
+  assert.equal(execs.length, 1, "second call inside the TTL is a cache hit");
+  clock.c.now += 61_000;
+  mode = "limit";
+  const lim = await gmgn.fetchGmgnHoldersResult("H1", 100);
+  assert.equal(lim.status, GMGN_STATUS.RATE_LIMITED);
+  assert.equal(execs.length, 2, "expired entry re-fetched");
+  clock.c.now += 40_000;
+  mode = "ok";
+  const again = await gmgn.fetchGmgnHoldersResult("H1", 100);
+  assert.equal(again.status, GMGN_STATUS.OK, "the rate-limit was not cached");
+  assert.equal(execs.length, 3);
+});
+
+test("F10/F3: missing gmgn-cli and a bad API key are flagged as transport state (one-shot, not per call)", async () => {
+  useExec(() => ({ error: Object.assign(new Error("spawn gmgn-cli ENOENT"), { code: "ENOENT" }) }));
+  assert.equal((await gmgn.spawnGmgnResult(["token", "info"])).status, GMGN_STATUS.ERROR);
+  assert.equal(gmgn.getGmgnTransportState().binaryMissing, true);
+  useExec(() => ({ error: new Error("exit 1"), stderr: "[gmgn-cli] GET /v1/token/info failed: HTTP 401 code=401 error=UNAUTHORIZED message=invalid api key" }));
+  assert.equal((await gmgn.spawnGmgnResult(["token", "info"])).status, GMGN_STATUS.ERROR);
+  assert.equal(gmgn.getGmgnTransportState().authFailed, true);
+  assert.equal(gmgn.getGmgnRateLimitState().limited, false, "401 is not a rate limit");
+  assert.ok(policy.looksUnauthorized("HTTP 401 code=401"));
+  assert.ok(!policy.looksUnauthorized("failed to open /tmp/x14010y"));
+});
+
+test("F7/F8: top10 falls back to dev.top_10_holder_rate before declaring unknown", () => {
+  const g = config.gmgn;
+  const noStatTop10 = goodInfo({ stat: { ...goodStat(), top_10_holder_rate: 0 }, dev: { top_10_holder_rate: 0.25 } });
+  const r = T.analyzeTokenInfo(noStatTop10, g);
+  assert.ok(!r.unknown.includes("top_10_holder_rate"), "dev block supplies the value");
+  assert.equal(r.top10HolderPct, 25);
+  const none = T.analyzeTokenInfo(goodInfo({ stat: { ...goodStat(), top_10_holder_rate: 0 } }), g);
+  assert.ok(none.unknown.includes("top_10_holder_rate"));
+  // info.holder_count > 0 with stat.holder_count absent => unpopulated (doc test 1)
+  const cake = T.analyzeTokenInfo(goodInfo({ stat: (({ holder_count, ...rest }) => rest)(goodStat()) }), g);
+  assert.equal(cake.statUnpopulated, true);
+});
+
+test("F9: holders gate is unknown (not a 0/0 pass) for all-DEX lists and for rows without amount_percentage", () => {
+  const allDex = T.analyzeHoldersAndTraders([{ address: "p1", addr_type: 2, amount_percentage: 0.4, tags: [] }, { address: "b", addr_type: 1, amount_percentage: 0.3, tags: [] }], []);
+  assert.equal(allDex.passed, false);
+  assert.equal(allDex.noRealHolders, true);
+  const noPct = T.analyzeHoldersAndTraders(Array.from({ length: 10 }, (_, i) => ({ address: `h${i}`, addr_type: 0, tags: [] })), []);
+  assert.equal(noPct.supplyShareKnown, false);
+  assert.equal(noPct.sniperSupplyShare, null, "unknown, not 0");
+  assert.equal(noPct.passed, true, "the GMGN-pipeline path still applies the row-rate check");
+  assert.equal(T.analyzeHoldersAndTraders(holderRows(0), []).supplyShareKnown, true);
+});
+
+test("H3: shadow mode (default) keeps every candidate and records gmgn_gate_would_drop + reasons", async () => {
+  const { deps } = makeDeps({
+    info: async (mint) => {
+      if (mint === "Mint2") return { status: GMGN_STATUS.OK, info: goodInfo({ stat: {} }) };
+      if (mint === "Mint4") return { status: GMGN_STATUS.OK, info: goodInfo({ stat: { ...goodStat(), top_bundler_trader_percentage: 0.9 } }) };
+      return { status: GMGN_STATUS.OK, info: goodInfo() };
+    },
+  });
+  const res = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(4)], { limit: 10, deps: { ...deps, force: true } });
+  assert.equal(res.mode, "shadow");
+  assert.equal(res.kept.length, 3, "nothing is dropped in shadow mode");
+  assert.equal(res.dropped.length, 0);
+  assert.equal(res.would_drop.length, 2);
+  const by = Object.fromEntries(res.kept.map((p) => [p.name, p]));
+  assert.equal(by["M1-SOL"].gmgn_gate_would_drop, false);
+  assert.equal(by["M2-SOL"].gmgn_gate_would_drop, true);
+  assert.equal(by["M2-SOL"].gmgn_gate_would_drop_kind, "unknown");
+  assert.match(by["M2-SOL"].gmgn_gate_would_drop_reasons.join(), /stat block unpopulated/);
+  assert.match(by["M4-SOL"].gmgn_gate_would_drop_reasons.join(), /bundler/);
+  const snap = screening.getCandidateSignalSnapshot(by["M2-SOL"]);
+  assert.equal(snap.gmgn_risk_log_only.gmgn_gate_would_drop, true, "recorded in the signal snapshot");
+  // explicit hard still drops
+  const hard = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2)], { deps: { ...deps, force: true, mode: "hard" } });
+  assert.equal(hard.kept.length, 1);
+  assert.equal(policy.meteoraGateMode({ gmgn: { gateMeteoraSource: true } }), "hard");
+  assert.equal(policy.meteoraGateMode({ gmgn: { gateMeteoraSource: false } }), "off");
+  assert.equal(policy.meteoraGateMode({ gmgn: {} }), "shadow");
+});
+
+test("H3: the Meteora path uses its own thresholds; total_fee is log-only there", async () => {
+  // GMGN-pipeline defaults (maxTop10 0.5, minHolders 1000, minTotalFee 30) would reject this token.
+  const info = goodInfo({ holder_count: 300, total_fee: undefined, stat: { ...goodStat(), top_10_holder_rate: 0.55, holder_count: 300 } });
+  assert.equal(T.analyzeTokenInfo(info, config.gmgn).passed, false, "trending-pipeline thresholds reject it");
+  const { deps } = makeDeps({ info: async () => ({ status: GMGN_STATUS.OK, info }) });
+  const res = await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { ...deps, force: true, mode: "hard" } });
+  assert.equal(res.kept.length, 1, "Meteora-path thresholds accept it");
+  assert.deepEqual(Object.keys(policy.METEORA_GATE_DEFAULTS).sort(), ["maxBotDegenRate", "maxBundlerRate", "maxDevTeamHoldRate", "maxFreshWalletRate", "maxRatTraderRate", "maxTop10HolderRate", "minHolders", "minTotalFeeSol"]);
+  const merged = policy.meteoraGateThresholds({ gmgn: { maxTop10HolderRate: 0.1, meteoraGate: { maxTop10HolderRate: 0.4 } } });
+  assert.equal(merged.maxTop10HolderRate, 0.4, "user meteoraGate override wins over defaults and pipeline values");
+});
+
+test("H3: Meteora-path holders gate fails closed on all-DEX rows and missing amount_percentage", async () => {
+  const allDex = makeDeps({ holders: () => ({ status: GMGN_STATUS.OK, data: { list: [{ address: "p", addr_type: 2, amount_percentage: 0.5, tags: [] }] } }) });
+  const r1 = await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { ...allDex.deps, force: true, mode: "hard" } });
+  assert.equal(r1.kept.length, 0);
+  assert.equal(r1.dropped[0].kind, "unknown");
+  const noPct = makeDeps({ holders: () => ({ status: GMGN_STATUS.OK, data: { list: Array.from({ length: 5 }, (_, i) => ({ address: `h${i}`, addr_type: 0, tags: [] })) } }) });
+  const r2 = await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { ...noPct.deps, force: true, mode: "hard" } });
+  assert.equal(r2.kept.length, 0);
+  assert.match(r2.dropped[0].reason, /amount_percentage missing/);
+});
+
+test("H3: cycle-wide GMGN outage notifies once per outage, re-arms after recovery; rate limit is not an outage", async () => {
+  gmgn._setGmgnDepsForTest(null); // clear transport flags left by earlier tests
+  outageMod._resetGmgnOutageForTest();
+  const events = [];
+  const h = (d) => events.push(d);
+  notifier.on("gmgn_outage", h);
+  try {
+    const dead = makeDeps({ info: async () => ({ status: GMGN_STATUS.ERROR, info: null }) });
+    const run = (mode) => screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3)], { deps: { ...dead.deps, force: true, mode } });
+    const r1 = await run("hard");
+    assert.equal(r1.outage, true);
+    assert.equal(r1.kept.length, 0, "hard mode still fails closed");
+    await run("hard"); await run("shadow");
+    assert.equal(events.length, 1, "once per outage, not per cycle/candidate");
+    const shadowRes = await run("shadow");
+    assert.equal(shadowRes.kept.length, 3, "shadow mode keeps candidates during an outage");
+    // fewer than N candidates is not enough evidence
+    outageMod._resetGmgnOutageForTest();
+    const small = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2)], { deps: { ...dead.deps, force: true, mode: "hard" } });
+    assert.equal(small.outage, false);
+    // a healthy cycle clears the outage and re-arms the notification
+    outageMod._resetGmgnOutageForTest();
+    await run("hard");
+    assert.equal(outageMod.gmgnOutageState().active, true);
+    const ok = makeDeps();
+    await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { ...ok.deps, force: true, mode: "hard" } });
+    assert.equal(outageMod.gmgnOutageState().active, false);
+    await run("hard");
+    assert.equal(events.length, 3, "re-armed: second outage notifies again (initial, after reset, after recovery)");
+    // rate limited => never an outage
+    outageMod._resetGmgnOutageForTest();
+    const lim = makeDeps({ info: async () => ({ status: GMGN_STATUS.RATE_LIMITED, info: null }) });
+    const rl = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3)], { deps: { ...lim.deps, force: true, mode: "hard" } });
+    assert.equal(rl.outage, false);
+  } finally { notifier.off("gmgn_outage", h); outageMod._resetGmgnOutageForTest(); }
+});
+
+test("F4/F11: fee-unknown classification, pure hard-skip reason, and all-fetch-failed detection", () => {
+  assert.equal(helpers.classifyGlobalFeesUnknown({ holdersSettled: { status: "rejected" }, holdResult: null }), "fetch_failed");
+  assert.equal(helpers.classifyGlobalFeesUnknown({ holdersSettled: { status: "fulfilled" }, holdResult: { global_fees_sol: null } }), "not_indexed");
+  assert.equal(helpers.classifyGlobalFeesUnknown({ holdersSettled: { status: "fulfilled" }, holdResult: { global_fees_sol: 12 } }), null);
+  assert.match(helpers.globalFeesHardSkipReason({ _globalFeesSol: null, _feesUnknownReason: "fetch_failed" }, 30), /unknown \(fetch_failed\) \(fail closed\)/);
+  assert.match(helpers.globalFeesHardSkipReason({ _globalFeesSol: 5 }, 30), /5 SOL < 30/);
+  assert.equal(helpers.globalFeesHardSkipReason({ _globalFeesSol: 0 }, 0), null, "a real 0 is known, never coerced to unknown");
+  assert.equal(helpers.globalFeesHardSkipReason({ _globalFeesSol: 50 }, 30), null);
+  assert.equal(helpers.allSkippedForFeeFetchFailure([{ _globalFeesSol: null, _feesUnknownReason: "fetch_failed" }, { _globalFeesSol: null, _feesUnknownReason: "fetch_failed" }]), true);
+  assert.equal(helpers.allSkippedForFeeFetchFailure([{ _globalFeesSol: null, _feesUnknownReason: "fetch_failed" }, { _globalFeesSol: null, _feesUnknownReason: "not_indexed" }]), false);
+  assert.equal(helpers.allSkippedForFeeFetchFailure([]), false);
   const src = fs.readFileSync(path.join(REPO, "index.js"), "utf8");
-  assert.match(src, /c\._globalFeesSol == null\) return "global_fees unknown \(fail closed\)"/);
+  assert.ok(!/Unknown values \(null\) never cause a skip here/.test(src), "stale comment removed");
+  assert.match(src, /globalFeesHardSkipReason\(c, config\.screening\.minTokenFeesSol\)/);
+  assert.match(src, /emit\("fee_data_down"/);
 });
