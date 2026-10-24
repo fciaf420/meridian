@@ -797,6 +797,6 @@ async function flipOne(p, ctx) {
 /** Fields to add to the close/performance record for flipped positions. */
 export function flipCloseTags(tracked) {
   const f = tracked?.bid_ask_flip;
-  if (!f?.flips) return {};
-  return { flipped: true, flip_count: f.flips, flip_fill_pct: f.first_flip_fill_pct ?? f.last_flip_fill_pct ?? null };
+  if (!f?.flips && !f?.pending) return {};
+  return { flipped: true, flip_count: f.flips ?? 0, flip_fill_pct: f.first_flip_fill_pct ?? f.last_flip_fill_pct ?? null };
 }

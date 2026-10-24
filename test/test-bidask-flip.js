@@ -898,15 +898,51 @@ test("D6: an abandoned run that lands after tracked state advanced does not over
   assert.deepEqual(tracked.bid_ask_flip.txs, ["sigNewer"]);
 });
 
-test("D7: a successful auto-swap is recorded for unwinding before the decimals read", async () => {
+test("D7: a successful auto-swap is recorded raw for unwinding before the decimals read", async () => {
   const g = await import("../deploy-guards.js");
-  const rec = g.provisionalAutoSwap("MINTX", "2500000000");
+  const rec = g.provisionalAutoSwap("MINTX", "2500000");
   assert.equal(rec.baseMint, "MINTX");
-  assert.equal(rec.amount, 2.5);
-  assert.equal(g.provisionalAutoSwap("M", undefined).amount, 0);
+  assert.equal(rec.rawAmount, "2500000");
+  assert.equal(rec.amount, null, "no decimals guess stored");
+  assert.equal(g.provisionalAutoSwap("M", undefined).rawAmount, "0");
   const src = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
   const iRec = src.indexOf("autoSwapped = provisionalAutoSwap(");
-  const iDec = src.indexOf("getParsedAccountInfo(new PublicKey(baseMint))");
+  const iDec = src.indexOf("getParsedAccountInfo(new PublicKey(baseMint))", iRec);
   assert.ok(iRec > 0 && iDec > iRec, "swap recorded before any further RPC");
   assert.match(src, /catch \(swapErr\)[\s\S]{0,400}unwindAutoSwap\(\)/, "fallback sells the swapped token back");
+  assert.match(src, /could not read decimals/, "normal path fails closed instead of defaulting to 9");
+  assert.ok(!/decimals \?\? 9;/.test(src.slice(iRec, iRec + 1500)), "no 9-decimals fallback on the auto-swap path");
+});
+
+test("D7: provisional unwind reads decimals fresh (6-decimals raw 2500000 -> 2.5)", async () => {
+  const g = await import("../deploy-guards.js");
+  const r = await g.resolveProvisionalAmount({ rawAmount: "2500000", readDecimals: async () => 6, readBalance: async () => 100 });
+  assert.deepEqual(r, { ok: true, amount: 2.5 });
+  const calls = [];
+  const sw = await g.swapBackAfterRefusal({ swapFn: async (a) => { calls.push(a.amount); return { success: true }; }, baseMint: "M", amount: r.amount, solMint: "SOL" });
+  assert.equal(sw.ok, true);
+  assert.deepEqual(calls, [2.5]);
+});
+
+test("D7: decimals read failure or no data -> no swap, caller alerts", async () => {
+  const g = await import("../deploy-guards.js");
+  for (const readDecimals of [async () => { throw new Error("rpc down"); }, async () => undefined]) {
+    const r = await g.resolveProvisionalAmount({ rawAmount: "2500000", readDecimals, readBalance: async () => 100 });
+    assert.equal(r.ok, false);
+    assert.match(r.note, /decimals unreadable/);
+  }
+  const src = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  assert.match(src, /if \(!r\.ok\) \{\s*emit\("swap_unwind_failed", \{[^}]*rawAmount: rec\.rawAmount/, "alert carries raw amount + mint");
+});
+
+test("D7: provisional unwind amount is capped at the fresh wallet balance", async () => {
+  const g = await import("../deploy-guards.js");
+  const r = await g.resolveProvisionalAmount({ rawAmount: "2500000", readDecimals: async () => 6, readBalance: async () => 1.2 });
+  assert.deepEqual(r, { ok: true, amount: 1.2 });
+  const r2 = await g.resolveProvisionalAmount({ rawAmount: "2500000", readDecimals: async () => 6, readBalance: async () => { throw new Error("x"); } });
+  assert.deepEqual(r2, { ok: true, amount: 2.5 }, "balance read failure keeps raw-derived amount");
+});
+
+test("flipCloseTags also tags when a flip is pending", () => {
+  assert.deepEqual(flipCloseTags({ bid_ask_flip: { pending: { sigs: ["a"] } } }), { flipped: true, flip_count: 0, flip_fill_pct: null });
 });

@@ -10,7 +10,7 @@ import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
-import { preSubmitGate, depositSlippage, swapBackAfterRefusal, recordRefusal, provisionalAutoSwap } from "../deploy-guards.js";
+import { preSubmitGate, depositSlippage, swapBackAfterRefusal, recordRefusal, provisionalAutoSwap, resolveProvisionalAmount } from "../deploy-guards.js";
 import { beginAttempt, markAttempt, trackInFlightAttempt, releaseInFlightAttempt } from "../deploy-checkpoint.js";
 import { emit } from "../notifier.js";
 import {
@@ -946,8 +946,24 @@ export async function deployPosition({
   let autoSwapped = null;
   const unwindAutoSwap = async () => {
     if (!autoSwapped) return "";
-    const { baseMint, amount } = autoSwapped;
+    const rec = autoSwapped;
     autoSwapped = null;
+    const { baseMint } = rec;
+    let amount = rec.amount;
+    if (rec.provisional) {
+      const pairName = pool_name || String(pool_address).slice(0, 8);
+      const r = await resolveProvisionalAmount({
+        rawAmount: rec.rawAmount,
+        readDecimals: async () => (await getConnection().getParsedAccountInfo(new PublicKey(baseMint))).value?.data?.parsed?.info?.decimals,
+        readBalance: async () => (await getWalletBalances({ fresh: true })).tokens?.find(t => t.mint === baseMint)?.balance,
+      });
+      if (!r.ok) {
+        emit("swap_unwind_failed", { pair: pairName, pool: pool_address, mint: baseMint, rawAmount: rec.rawAmount, note: r.note });
+        log("deploy_warn", `Auto-swap unwind: ${r.note}; token ${baseMint} remains in the wallet`);
+        return ` Auto-swap unwind: ${r.note}; token ${baseMint} remains in the wallet.`;
+      }
+      amount = r.amount;
+    }
     const r = await swapBackAfterRefusal({
       swapFn: swapToken, baseMint, amount, solMint: WSOL_MINT,
       log: (m) => log("deploy", m),
@@ -1022,7 +1038,9 @@ export async function deployPosition({
         // swapResult.amount_out which can differ from what's actually available
         // due to fees, rounding, or existing token dust in the wallet.
         const mintInfo = await getConnection().getParsedAccountInfo(new PublicKey(baseMint));
-        const decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+        const decimals = mintInfo.value?.data?.parsed?.info?.decimals;
+        // Fail closed: never guess 9. The provisional record is still set, so the catch unwinds it with a fresh read.
+        if (!Number.isInteger(decimals)) throw new Error(`could not read decimals for ${baseMint}`);
         const swapReceived = Number(swapResult.amount_out) / Math.pow(10, decimals);
 
         // Query actual on-chain balance to use for deploy

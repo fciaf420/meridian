@@ -339,10 +339,30 @@ async function swapBackInner({ swapFn, baseMint, amount, solMint, log }) {
 
 /**
  * D7: record an auto-swap for unwinding the moment the swap succeeds, before any
- * further RPC (decimals / balance reads) that could throw. `amount` is a provisional
- * UI-unit figure (9-decimals default, same as the later fallback) refined afterwards.
+ * further RPC that could throw. Stores the RAW output amount; decimals are never
+ * guessed here (see resolveProvisionalAmount, which reads them fresh at unwind time).
  */
-export function provisionalAutoSwap(baseMint, amountOutRaw, decimals = 9) {
+export function provisionalAutoSwap(baseMint, amountOutRaw) {
   const n = Number(amountOutRaw);
-  return { baseMint, amount: Number.isFinite(n) && n > 0 ? n / Math.pow(10, decimals) : 0, provisional: true };
+  return { baseMint, rawAmount: Number.isFinite(n) && n > 0 ? String(amountOutRaw) : "0", amount: null, provisional: true };
+}
+
+/**
+ * Turn a provisional record into a UI-unit sell amount. Fails closed when decimals
+ * can't be read (a mis-sized sell must never be reported as success). The result is
+ * capped at the fresh wallet balance when that read succeeds.
+ * @returns {Promise<{ok:true, amount:number}|{ok:false, note:string}>}
+ */
+export async function resolveProvisionalAmount({ rawAmount, readDecimals, readBalance }) {
+  let decimals;
+  try { decimals = await readDecimals(); } catch { decimals = null; }
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 30) return { ok: false, note: "decimals unreadable" };
+  let amount = Number(rawAmount) / Math.pow(10, decimals);
+  if (!(amount > 0)) return { ok: false, note: "no swapped token amount recorded; nothing to swap back" };
+  try {
+    const bal = Number(await readBalance());
+    if (Number.isFinite(bal) && bal >= 0) amount = Math.min(amount, bal);
+  } catch { /* keep the raw-derived amount */ }
+  if (!(amount > 0)) return { ok: false, note: "wallet balance of swapped token is zero; nothing to swap back" };
+  return { ok: true, amount };
 }
