@@ -85,7 +85,10 @@ test("registerExitTick: fires after N confirming ticks of the same kind; keyed b
   assert.equal(t1.fire, false);
   const t2 = state.registerExitTick(p, { kind: "stop_loss", outcome: "confirm", reason: "STOP_LOSS: PnL -17.4%", config });
   assert.equal(t2.fire, true, "different PnL in the reason text must not reset the streak");
-  assert.equal(state.getExitStreak(p), null, "streak cleared once fired");
+  assert.equal(state.getExitStreak(p).confirms, 2, "H2: streak kept after firing so a failed close retries on the next tick");
+  assert.equal(state.registerExitTick(p, { kind: "stop_loss", outcome: "confirm", reason: "STOP_LOSS: PnL -17.9%", config }).fire, true, "keeps firing");
+  state.recordClose(p, "STOP_LOSS: closed");
+  assert.equal(state.getExitStreak(p), null, "recordClose clears the streak");
 });
 
 test("registerExitTick: refute / clear reset; unverified and suspicious freeze", () => {
@@ -240,7 +243,8 @@ test("wallet lock: a throwing operation rejects its caller and does not wedge th
 
 test("executeTool routes fund-moving tools through the priority wallet lock", () => {
   const src = fs.readFileSync(new URL("../tools/executor.js", import.meta.url), "utf8");
-  assert.match(src, /withWalletLock\(\s*\(\) => executeToolInner\(name, args, \{ manual, codeExit \}\),\s*priorityForTool\(name\)/);
+  assert.match(src, /withWalletLock\(\s*\(\) => \{[\s\S]*?return executeToolInner\(name, args, \{ manual, codeExit \}\);\s*\},\s*priorityForTool\(name\)/);
+  assert.match(src, /name === "deploy_position" && isDraining\(\)/, "L4: drain re-checked inside the lock");
   assert.match(src, /if \(manual \|\| codeExit \|\| !isManagementBusy\(\)\) return \{ pass: true \};/);
 });
 
@@ -293,7 +297,8 @@ test("cooldown: 3 consecutive OOR-timeout closes in one pool trigger it; an inte
 
 test("deploy eligibility checks the cooldown and lets owner deploys override it (logged)", () => {
   const src = fs.readFileSync(new URL("../tools/executor.js", import.meta.url), "utf8");
-  assert.match(src, /getDeployCooldown\(\{ pool: args\.pool_address, base_mint: args\.base_mint \}\)/);
+  assert.match(src, /getDeployCooldown\(\{ pool: args\.pool_address, base_mint: null \}\)/);
+  assert.match(src, /getDeployCooldown\(\{ pool: null, base_mint: mint \}\)/);
   assert.match(src, /if \(args\._manual\) \{\s*log\("cooldown"/);
   assert.match(src, /log\("cooldown", `deploy_position blocked/);
 });
@@ -399,4 +404,215 @@ test("index.js management cycle executes rules in code and no longer feeds stop-
   const src = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
   assert.match(src, /await runManagementCodeRules\(precheckedPositions,/);
   assert.doesNotMatch(src, /const exitAction = updatePnlAndCheckExits\(p\.position, p\.pnl_pct, config\);/);
+});
+
+
+// ═══════════════ Fable 5.1 audit fixes (PR #132) ═══════════════
+const pnlWatcher = await import(new URL("../pnl-watcher.js", import.meta.url));
+const executor = await import(new URL("../tools/executor.js", import.meta.url));
+const lockMod = await import(new URL("../wallet-lock.js", import.meta.url));
+
+test("H1: stale API (-10) hides an on-chain -40 with NO prior streak → forced on-chain read still exits in 2 ticks", async () => {
+  engine._resetBiasForTest();
+  const p = open();
+  const cfg = { ...config, exits: { ...config.exits, onchainReadIntervalSec: 60 } };
+  let reads = 0;
+  const deps = (now) => ({ ...engineDeps(() => { reads++; return oc(-40); }, now), config: cfg, markOnchain: state.markOnchainRead });
+  const t0 = Date.now();
+  const r1 = await engine.evaluatePnlExit(apiPos(p, -10), deps(t0));
+  assert.equal(r1.action, "hold", "tick 1: on-chain read forced (never read before) → streak starts");
+  assert.equal(reads, 1);
+  const r2 = await engine.evaluatePnlExit(apiPos(p, -10), deps(t0 + 60_000));
+  assert.equal(r2.action, "close", "tick 2 confirms");
+  assert.match(r2.reason, /^STOP_LOSS/);
+});
+
+test("H1: the forced read is periodic, not every tick (API harmless + fresh read → no on-chain call)", async () => {
+  const p = open();
+  const cfg = { ...config, exits: { ...config.exits, onchainReadIntervalSec: 60 } };
+  let reads = 0;
+  const deps = (now) => ({ ...engineDeps(() => { reads++; return oc(-1); }, now), config: cfg, markOnchain: state.markOnchainRead });
+  const t0 = Date.now();
+  await engine.evaluatePnlExit(apiPos(p, -1), deps(t0));
+  assert.equal(reads, 1);
+  await engine.evaluatePnlExit(apiPos(p, -1), deps(t0 + 20_000));
+  assert.equal(reads, 1, "within the interval");
+  await engine.evaluatePnlExit(apiPos(p, -1), deps(t0 + 60_000));
+  assert.equal(reads, 2, "interval elapsed");
+  assert.equal(engine.needsOnchain(-1, { last_onchain_at: new Date(t0).toISOString() }, config.management, { now: t0 + 1_000, intervalMs: 0 }), false, "0 disables the forced read");
+});
+
+test("H2: a failed close retries on the very next tick without re-confirming; success clears the streak", async () => {
+  const p = open();
+  const t0 = Date.now();
+  assert.equal((await engine.evaluatePnlExit(apiPos(p, -20), engineDeps(oc(-20), t0))).action, "hold");
+  const res = await engine.evaluatePnlExit(apiPos(p, -20), engineDeps(oc(-20), t0 + 1_000));
+  assert.equal(res.action, "close");
+  let attempts = 0;
+  const closeDeps = {
+    closePosition: async (args) => { attempts++; if (attempts === 1) return { success: false, error: "blockhash expired" }; state.recordClose(args.position_address, args._close_reason); return { success: true }; },
+    getTracked: state.getTrackedPosition, isCloseInflight: () => false, recordAutoClose: state.recordAutoClose, emit: () => {}, log: quiet,
+  };
+  const c1 = await engine.closeForExit(apiPos(p, -20), res, closeDeps);
+  assert.equal(c1.closed, false);
+  const res2 = await engine.evaluatePnlExit(apiPos(p, -20), engineDeps(oc(-20), t0 + 2_000));
+  assert.equal(res2.action, "close", "H2: fires again immediately — no extra confirming ticks");
+  const c2 = await engine.closeForExit(apiPos(p, -20), res2, closeDeps);
+  assert.equal(c2.closed, true);
+  assert.equal(state.getExitStreak(p), null);
+});
+
+test("H3: deploy omitting base_mint is still blocked by a mint cooldown (mint resolved from the pool)", async () => {
+  const mint = "MintCoolDown1111111111111111111111111111111";
+  const sibling = "SiblingPool11111111111111111111111111111111";
+  const p = open({ pool: POOL, base_mint: mint });
+  state.recordClose(p, "STOP_LOSS: PnL -16% hit stop loss (-15%)");
+  const binStep = config.screening.minBinStep;
+  const deps = (detail) => ({ getPoolDetailFn: async () => detail, getPositionsFn: async () => ({ total_positions: 0, positions: [] }) });
+  const blocked = await executor.checkDeployEligibility({ pool_address: sibling, pool_name: "SIB" }, deps({ bin_step: binStep, base: { mint } }));
+  assert.equal(blocked.pass, false, "base_mint omitted by the model, pool says it is the cooled-down token");
+  assert.match(blocked.reason, /Re-entry cooldown: token MintCoolDown/);
+  const wrong = await executor.checkDeployEligibility({ pool_address: sibling, base_mint: "SomethingElse" }, deps({ bin_step: binStep, base: { mint } }));
+  assert.equal(wrong.pass, false, "a wrong model-supplied base_mint does not bypass it");
+  const unresolved = await executor.checkDeployEligibility({ pool_address: sibling, bin_step: binStep }, { getPoolDetailFn: async () => { throw new Error("api down"); }, getPositionsFn: async () => ({ total_positions: 0, positions: [] }) });
+  assert.equal(unresolved.pass, false, "mint unresolvable while a mint cooldown is active → fail closed");
+  const owner = await executor.checkDeployEligibility({ pool_address: sibling, _manual: true }, deps({ bin_step: binStep, base: { mint } }));
+  assert.equal(owner.pass, true, "owner override still works");
+  const other = await executor.checkDeployEligibility({ pool_address: sibling }, deps({ bin_step: binStep, base: { mint: "OtherToken1111111111111111111111111111111111" } }));
+  assert.equal(other.pass, true);
+});
+
+test("M1: re-entering the wallet lock throws instead of deadlocking", async () => {
+  await assert.rejects(
+    () => withWalletLock(async () => withWalletLock(async () => 1, 10, "inner"), 10, "outer"),
+    /re-entered/,
+  );
+  assert.equal(await withWalletLock(async () => "still works", 0), "still works");
+});
+
+test("M1: a stale holder alerts; a hung holder is released after the hard timeout and the queue moves on", async () => {
+  const alerts = [];
+  lockMod.setWalletLockOptions({ warnMs: 20, hardMs: 80, onAlert: (a) => alerts.push(a) });
+  try {
+    const hung = withWalletLock(() => new Promise(() => {}), 10, "hung close");
+    const next = withWalletLock(async () => "ran", 5, "next op");
+    await assert.rejects(hung, /wallet lock timeout/);
+    assert.equal(await next, "ran");
+    assert.deepEqual(alerts.map((a) => a.kind), ["stale", "abandoned"]);
+  } finally {
+    lockMod.setWalletLockOptions({ warnMs: 300_000, hardMs: 900_000, onAlert: null });
+  }
+});
+
+test("M2: a close queued behind a held wallet lock does not starve other positions of their ticks", async () => {
+  const a = open();
+  const b = open();
+  state.registerExitTick(a, { kind: "stop_loss", outcome: "confirm", reason: "STOP_LOSS: seed", config }); // A is one tick from firing
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const held = withWalletLock(() => gate, 0, "long deploy");
+  const closes = [];
+  pnlWatcher._setPnlWatcherDepsForTest({
+    getMyPositions: async () => ({ positions: [apiPos(a, -30), apiPos(b, -30)] }),
+    getOnchainPnl: async () => oc(-30),
+    closePosition: async (args) => { closes.push(args.position_address); state.recordClose(args.position_address, args._close_reason); return { success: true, txs: [] }; },
+    getPositionBins: async () => null, emit: () => {}, isCloseInflight: () => false, postClose: async () => {},
+  });
+  const tick = pnlWatcher.runPnlWatcher();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(state.getExitStreak(b)?.confirms, 1, "B was evaluated while A's close is still waiting for the lock");
+  assert.equal(closes.length, 0);
+  release();
+  await held;
+  await tick;
+  assert.deepEqual(closes, [a]);
+  pnlWatcher._setPnlWatcherDepsForTest(null);
+});
+
+test("M3: closeForExit runs the postClose parity hook (actions log / USDC settle / signal capture) after a successful close, and its failure does not fail the close", async () => {
+  const p = open();
+  const res = { reason: "STOP_LOSS: x", onchainPct: null, onchain: null };
+  const calls = [];
+  const base = { closePosition: async (args) => { state.recordClose(args.position_address, args._close_reason); return { success: true }; }, getTracked: state.getTrackedPosition, isCloseInflight: () => false, recordAutoClose: state.recordAutoClose, emit: () => {}, log: quiet };
+  const r = await engine.closeForExit(apiPos(p, -20), res, { ...base, postClose: async (args, result) => { calls.push(args.position_address); } });
+  assert.equal(r.closed, true);
+  assert.deepEqual(calls, [p]);
+  const q = open();
+  const r2 = await engine.closeForExit(apiPos(q, -20), res, { ...base, postClose: async () => { throw new Error("settle blew up"); } });
+  assert.equal(r2.closed, true);
+  const w = fs.readFileSync(new URL("../pnl-watcher.js", import.meta.url), "utf8");
+  const ix = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  assert.match(w, /postClose: dep\("postClose", finalizeCodeClose\)/);
+  assert.match(ix, /postClose: finalizeCodeClose/);
+  assert.equal(typeof executor.finalizeCodeClose, "function");
+});
+
+test("M3: management rule 3 close passes through the same postClose hook", async () => {
+  const p = open();
+  const h = mgmtHarness({ onchain: oc(8) });
+  const seen = [];
+  h.deps.closeDeps.postClose = async (args) => { seen.push(args._close_reason); };
+  await runManagementCodeRules([apiPos(p, 8)], h.deps);
+  const out = await runManagementCodeRules([apiPos(p, 8)], h.deps);
+  assert.equal(out.closed.length, 1);
+  assert.equal(seen.length, 1);
+  assert.match(seen[0], /rule 3/);
+});
+
+test("L5: a throwing close does not abort the management cycle for later positions", async () => {
+  const a = open();
+  const b = open({ ageMin: 60 });
+  const h = mgmtHarness({ onchain: oc(8) });
+  h.deps.closeDeps.closePosition = async (args) => { if (args.position_address === a) throw new Error("rpc exploded"); state.recordClose(args.position_address, args._close_reason); return { success: true }; };
+  await runManagementCodeRules([apiPos(a, 8), apiPos(b, 8)], h.deps);
+  const out = await runManagementCodeRules([apiPos(a, 8), apiPos(b, 8)], h.deps);
+  assert.equal(out.failed.length, 1);
+  assert.equal(out.closed.length, 1, "B still closed");
+});
+
+test("M4: mismatch tolerance is configurable; API-vs-on-chain bias is measured; a trailing exit held only by mismatch alerts", async () => {
+  engine._resetBiasForTest();
+  const base = { kind: "trailing", apiPct: 7, onchainPct: 4.5, peakPct: 10, dropPct: 4 };
+  assert.equal(decidePnlExit(base).close, false, "default 2pt: 2.5pt disagreement holds");
+  assert.equal(decidePnlExit({ ...base, mismatchPts: 3 }).close, true, "3pt tolerance closes");
+  for (let i = 0; i < 20; i++) engine.recordPnlBias(5, 5 + (i % 4), quiet);
+  const s = engine.getPnlBiasStats();
+  assert.equal(s.n, 20);
+  assert.ok(s.max >= 3 && s.median >= 1);
+
+  const p = open();
+  state.updatePnlAndCheckExits(p, 10, config, { onchainPct: 10, strict: true });
+  state.updatePnlAndCheckExits(p, 10, config, { onchainPct: 10, strict: true });
+  assert.equal(state.getTrackedPosition(p).trailing_active, true);
+  const events = [];
+  const deps = { ...engineDeps(oc(3.0)), config: { ...config, exits: { ...config.exits, trailingMismatchAlertTicks: 3 } }, emit: (ev, d) => events.push([ev, d]) };
+  for (let i = 0; i < 3; i++) {
+    const r = await engine.evaluatePnlExit(apiPos(p, 6.0), deps);
+    assert.equal(r.action === "close", false);
+  }
+  assert.equal(events.filter(([e]) => e === "ops_alert").length, 1, "alert after 3 consecutive mismatch-held ticks, not silent");
+  assert.match(events[0][1].text, /trailing take profit is being HELD/);
+});
+
+test("M5: the API-only stop-loss fallback needs >= 3 priced observations as well as the wait", () => {
+  const p = open();
+  const t0 = Date.now();
+  state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config, now: t0 });
+  assert.equal(state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config, now: t0 + 500_000 }).fireOnApi, false, "only 2 observations");
+  assert.equal(state.registerExitTick(p, { kind: "stop_loss", outcome: "unverified", config, now: t0 + 510_000 }).fireOnApi, true);
+  const cfg = fs.readFileSync(new URL("../config.js", import.meta.url), "utf8");
+  assert.match(cfg, /stopLossUnverifiedMaxWaitSec: u\.stopLossUnverifiedMaxWaitSec \?\? 300/);
+});
+
+test("L1: cooldown kinds come from structured close-reason prefixes only, not free text", () => {
+  assert.equal(state.cooldownKindForReason("rule 1: instruction met — close when stop loss hits"), null);
+  assert.equal(state.cooldownKindForReason("agent decision: avoiding a stop loss, emergency stop soon"), null);
+  assert.equal(state.cooldownKindForReason("something about OOR timeout"), null);
+  assert.equal(state.cooldownKindForReason("STOP_LOSS: PnL -16%"), "stop_loss");
+  assert.equal(state.cooldownKindForReason("rule 4: OOR timeout (31m ≥ 30m)"), "oor");
+});
+
+test("L2: the watcher takes a fresh timestamp per position", () => {
+  const w = fs.readFileSync(new URL("../pnl-watcher.js", import.meta.url), "utf8");
+  assert.match(w, /const now = nowFn\(\); \/\/ L2/);
 });
