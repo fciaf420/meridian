@@ -25,17 +25,59 @@ export const PLAN_RATE_PER_SEC = Object.freeze({ free: 5, plus: 20, pro: 50 });
 export const GMGN_FIX_DEFAULTS = Object.freeze({
   plan: "free",            // conservative: pace for the smallest bucket
   finalistLimit: 5,        // holders/traders (weight 5 each) only for this many tokens
-  gateMeteoraSource: true, // run the GMGN safety gates on Meteora-source candidates (needs a GMGN key)
+  // Meteora-source GMGN gating mode: "shadow" (default: evaluate + record gmgn_gate_would_drop,
+  // never drop), "hard" (drop), or "off". Booleans map true -> "hard", false -> "off".
+  gateMeteoraSource: "shadow",
+  outageMinCandidates: 3,  // all-unknown (transport-failed) candidates in one cycle that count as an outage
 });
+
+/**
+ * Separate, looser thresholds for the Meteora-source gate. The GMGN trending pipeline's
+ * thresholds (selected for a different candidate population) must NOT be reused here.
+ * Override any key via gmgn-config.json `meteoraGate`. `null` disables that gate; a null
+ * minTotalFeeSol/minHolders makes the field log-only.
+ */
+export const METEORA_GATE_DEFAULTS = Object.freeze({
+  minHolders: 200,
+  minTotalFeeSol: null, // total_fee is not a documented `token info` field: log-only (index.js global_fees gate covers fees)
+  maxTop10HolderRate: 0.6,
+  maxDevTeamHoldRate: 0.05,
+  maxBotDegenRate: 0.6,
+  maxFreshWalletRate: 0.5,
+  maxRatTraderRate: 0.3,
+  maxBundlerRate: 0.6,
+});
+
+/** Merge: GMGN-pipeline cfg < METEORA_GATE_DEFAULTS < user `gmgn.meteoraGate` overrides. */
+export function meteoraGateThresholds(cfg) {
+  return { ...(cfg?.gmgn || {}), ...METEORA_GATE_DEFAULTS, ...(cfg?.gmgn?.meteoraGate || {}) };
+}
+
+/** Normalize gateMeteoraSource to "off" | "shadow" | "hard". */
+export function meteoraGateMode(cfg) {
+  const v = gmgnSetting(cfg, "gateMeteoraSource");
+  if (v === true || v === "hard") return "hard";
+  if (v === false || v === "off") return "off";
+  return "shadow";
+}
 
 export function gmgnSetting(cfg, key) {
   return cfg?.gmgn?.[key] ?? GMGN_FIX_DEFAULTS[key];
 }
 
-/** GMGN route weight: `token holders` / `token traders` cost 5, everything else 1. */
+/**
+ * GMGN route weights from the skill docs (gmgn-token/market/track/portfolio SKILL.md).
+ * Anything not listed costs 1 (token info/security/pool, market signal/search, track kol/smartmoney).
+ */
+const COMMAND_WEIGHTS = Object.freeze({
+  token: { holders: 5, traders: 5, info: 1, security: 1, pool: 1 },
+  market: { kline: 2, trending: 3, trenches: 2, "hot-searches": 3, signal: 1, search: 1 },
+  track: { "follow-tokens": 3, "follow-token-groups": 1, "follow-wallet": 10, kol: 1, smartmoney: 1 },
+  portfolio: { holdings: 2, info: 2, activity: 3, stats: 3, profits: 3, "token-balance": 2, "created-tokens": 2 },
+});
+
 export function commandWeight(args = []) {
-  if (args[0] === "token" && (args[1] === "holders" || args[1] === "traders")) return 5;
-  return 1;
+  return COMMAND_WEIGHTS[args[0]]?.[args[1]] ?? 1;
 }
 
 /** Minimum spacing (ms) to leave after a request of `weight` on a plan of `ratePerSec`. */
@@ -59,16 +101,36 @@ export function looksForbidden(text) {
   return /PLAN_UPGRADE_REQUIRED/i.test(String(text));
 }
 
+/** Ban-class errors: a request sent inside the window re-extends it, so never probe early. */
+export function looksBanned(text) {
+  if (!text) return false;
+  return /RATE_LIMIT_BANNED|ERROR_RATE_LIMIT_BLOCKED/i.test(String(text));
+}
+
+/** 401 / bad API key (distinct from rate limit and plan-upgrade). */
+export function looksUnauthorized(text) {
+  if (!text) return false;
+  return /HTTP 401\b|UNAUTHORI[SZ]ED|INVALID[_ ]API[_ ]KEY|API key.*(invalid|missing)/i.test(String(text));
+}
+
 /**
- * Pull the ban-lift instant (epoch ms) out of GMGN error text:
- *   {"code":429,"error":"RATE_LIMIT_BANNED","reset_at":1775184222}   (unix seconds)
- *   X-RateLimit-Reset: 1775184222
+ * Pull the ban-lift instant (epoch ms) out of GMGN error text. The real gmgn-cli
+ * (OpenApiClient.buildOpenApiErrorMessage) prints:
+ *   "... Rate limit resets at 2026-10-24 11:02:16 GMT-04:00 (~287s remaining). Stop sending ..."
+ *   "... Stop ALL requests until 2026-10-24 11:02:16 GMT-04:00 (~287s remaining); ..."
+ * It never prints a raw epoch, but a raw JSON `reset_at` / X-RateLimit-Reset is still accepted.
  * Returns null when absent / implausible.
  */
 export function parseResetAtMs(text, now = Date.now()) {
   if (!text) return null;
-  const m = String(text).match(/reset_at["']?\s*[:=]\s*["']?(\d{9,13})/i)
-    || String(text).match(/x-ratelimit-reset["']?\s*[:=]\s*["']?(\d{9,13})/i);
+  const t = String(text);
+  const rem = t.match(/\(~\s*(\d+)\s*s remaining\)/i);
+  if (rem) {
+    const v = now + Number(rem[1]) * 1000;
+    return v > now + 10 * 60_000 ? null : v;
+  }
+  const m = t.match(/reset_at["']?\s*[:=]\s*["']?(\d{9,13})/i)
+    || t.match(/x-ratelimit-reset["']?\s*[:=]\s*["']?(\d{9,13})/i);
   if (!m) return null;
   let v = Number(m[1]);
   if (!Number.isFinite(v)) return null;
@@ -77,6 +139,8 @@ export function parseResetAtMs(text, now = Date.now()) {
   if (v < now - 60_000 || v > now + 10 * 60_000) return null;
   return v;
 }
+
+export const BAN_CEILING_MS = 300_000;
 
 /** Escalating cooldown: 30s, 60s, 120s, 240s, then the 5-minute ban ceiling. */
 export function escalatingCooldownMs(strikes) {
@@ -91,8 +155,11 @@ export function escalatingCooldownMs(strikes) {
  */
 export function cooldownUntilMs({ errorText, strikes, now = Date.now() }) {
   const reset = parseResetAtMs(errorText, now);
-  const floor = now + escalatingCooldownMs(strikes);
-  if (reset != null) return Math.max(reset + 1000, now + 5000, strikes > 1 ? floor : 0);
+  // Ban-class without a parseable reset: assume the full 5-minute ban (probing earlier extends it).
+  const floor = looksBanned(errorText) && reset == null
+    ? now + BAN_CEILING_MS
+    : now + escalatingCooldownMs(strikes);
+  if (reset != null) return Math.max(reset + 1000, now + 5000, strikes > 1 ? now + escalatingCooldownMs(strikes) : 0);
   return floor;
 }
 
@@ -105,10 +172,12 @@ export function numOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-/** `stat.*` fields that are all 0/absent when GMGN has not computed the block yet. */
+/**
+ * The ten `stat.*` fields of gmgn-contract-dd Step 1B test 2: all 0/absent => unpopulated.
+ * (dev_team_hold_rate is deliberately NOT in this list; the doc's list is the authority.)
+ */
 export const STAT_RISK_FIELDS = Object.freeze([
   "creator_hold_rate",
-  "dev_team_hold_rate",
   "top_bundler_trader_percentage",
   "top70_sniper_hold_rate",
   "top_rat_trader_percentage",
@@ -116,6 +185,8 @@ export const STAT_RISK_FIELDS = Object.freeze([
   "bot_degen_rate",
   "fresh_wallet_rate",
   "private_vault_hold_rate",
+  "creator_created_count",
+  "top_10_holder_rate",
 ]);
 
 /**
@@ -123,8 +194,11 @@ export const STAT_RISK_FIELDS = Object.freeze([
  * GMGN often returns the block unpopulated for fresh tokens; reading those zeros
  * as "clean" is exactly the bug this fix removes.
  */
-export function isStatUnpopulated(stat) {
+export function isStatUnpopulated(stat, info) {
   if (!stat || typeof stat !== "object") return true;
+  // Test 1 (contract-dd 1B): stat.holder_count 0/absent while info.holder_count > 0.
+  if (numOrNull(info?.holder_count) > 0 && !(numOrNull(stat.holder_count) > 0)) return true;
+  // Test 2: all ten chain-analysis fields 0/absent.
   return STAT_RISK_FIELDS.every((k) => !(numOrNull(stat[k]) > 0));
 }
 

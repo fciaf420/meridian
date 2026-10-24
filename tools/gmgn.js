@@ -32,7 +32,7 @@ import { log } from "../logger.js";
 import { buildCliEnv } from "../child-env.js";
 import { config } from "../config.js";
 import {
-  GMGN_STATUS, commandWeight, paceGapMs, ratePerSecForPlan, looksRateLimited, looksForbidden,
+  GMGN_STATUS, commandWeight, paceGapMs, ratePerSecForPlan, looksRateLimited, looksForbidden, looksUnauthorized,
   cooldownUntilMs, numOrNull, gmgnSetting,
 } from "./gmgn-policy.js";
 
@@ -97,6 +97,16 @@ let _nextAllowedAt = 0;
 let _rateLimitedUntil = 0;
 let _rateLimitStrikes = 0;
 let _forbiddenLogged = false;
+// Transport health (read by the Meteora-source outage detector).
+let _binaryMissing = false;   // gmgn-cli ENOENT
+let _authFailed = false;      // 401 / bad API key (cleared by the next OK response)
+let _authLogged = false;
+let _binaryLogged = false;
+
+/** Transport health: missing binary / rejected API key. */
+export function getGmgnTransportState() {
+  return { binaryMissing: _binaryMissing, authFailed: _authFailed };
+}
 
 const _deps = {
   exec: (...a) => execFile(...a),
@@ -116,7 +126,8 @@ export function _setGmgnDepsForTest(d) {
   _rateLimitedUntil = 0;
   _rateLimitStrikes = 0;
   _forbiddenLogged = false;
-  for (const m of [_tokenInfoCache, _tokenInfoInflight, _priceCache, _signalCache]) m.clear();
+  _binaryMissing = false; _authFailed = false; _authLogged = false; _binaryLogged = false;
+  for (const m of [_tokenInfoCache, _tokenInfoInflight, _priceCache, _signalCache, _holdersCache, _holdersInflight, _klineInflight]) m.clear();
   _trackSnapshot = null;
   _trackSnapshotExpiresAt = 0;
   _trackSnapshotInflight = null;
@@ -206,6 +217,20 @@ export function spawnGmgnResult(args) {
                 resolve({ status: GMGN_STATUS.FORBIDDEN, data: null });
                 return;
               }
+              if (error.code === "ENOENT") {
+                _binaryMissing = true;
+                if (!_binaryLogged) log("gmgn", "gmgn-cli not found on PATH (ENOENT): every GMGN call will fail until it is installed");
+                _binaryLogged = true;
+                resolve({ status: GMGN_STATUS.ERROR, data: null, transport: "binary_missing" });
+                return;
+              }
+              if (looksUnauthorized(blob)) {
+                _authFailed = true;
+                if (!_authLogged) log("gmgn", "GMGN auth failed (401): check GMGN_API_KEY / gmgn-config.json apiKey (further 401s are not logged)");
+                _authLogged = true;
+                resolve({ status: GMGN_STATUS.ERROR, data: null, transport: "auth_failed" });
+                return;
+              }
               if (error.killed) log("gmgn", `Timeout: ${args.join(" ")}`);
               else log("gmgn", `Spawn error (${args.join(" ")}): ${(stderr || error.message || "").trim().slice(0, 200)}`);
               resolve({ status: GMGN_STATUS.ERROR, data: null });
@@ -221,6 +246,8 @@ export function spawnGmgnResult(args) {
             try {
               const data = JSON.parse(out);
               _rateLimitStrikes = 0; // a good response clears the escalation
+              _binaryMissing = false;
+              _authFailed = false;
               resolve({ status: GMGN_STATUS.OK, data });
             } catch (e) {
               log("gmgn", `Parse error (${args.join(" ")}): ${e.message}`);
@@ -462,13 +489,47 @@ export async function fetchGmgnSecurityResult(mint) {
   return { status: GMGN_STATUS.OK, security };
 }
 
+/**
+ * `token holders` (weight 5) for one mint, status-tagged, cached 60s on OK results only
+ * (never rate_limited/error) with in-flight dedupe, so repeated getTopCandidates() calls
+ * (cycle, dashboard, deploy path, LLM tool) never re-spend the weight-5 call within the TTL.
+ * Returns { status, data, retryAfterMs? } (same shape as spawnGmgnResult).
+ */
+const HOLDERS_TTL = 60_000;
+const _holdersCache = new Map();
+const _holdersInflight = new Map();
+export async function fetchGmgnHoldersResult(mint, limit = 100) {
+  if (!mint) return { status: GMGN_STATUS.ERROR, data: null };
+  const key = `${mint}:${limit}`;
+  const cached = readCache(_holdersCache, key);
+  if (cached) return { status: GMGN_STATUS.OK, data: cached };
+  if (_holdersInflight.has(key)) return _holdersInflight.get(key);
+  const p = (async () => {
+    const res = await spawnGmgnResult([
+      "token", "holders", "--chain", CHAIN, "--address", mint,
+      "--limit", String(limit), "--order-by", "amount_percentage", "--direction", "desc",
+    ]);
+    if (res.status === GMGN_STATUS.OK && res.data != null) writeCache(_holdersCache, key, res.data, HOLDERS_TTL);
+    return res;
+  })().finally(() => _holdersInflight.delete(key));
+  _holdersInflight.set(key, p);
+  return p;
+}
+
 /* ============================== PRICE / CANDLES ============================== */
 
 /**
  * Fetch 5m klines for the candle summary + min price.
  * Returns candles sorted oldest -> newest, or null.
  */
-async function fetchKlinesResult(mint) {
+const _klineInflight = new Map();
+function fetchKlinesResult(mint) {
+  if (_klineInflight.has(mint)) return _klineInflight.get(mint);
+  const p = fetchKlinesUncached(mint).finally(() => _klineInflight.delete(mint));
+  _klineInflight.set(mint, p);
+  return p;
+}
+async function fetchKlinesUncached(mint) {
   const now = Math.floor(Date.now() / 1000);
   const from = now - KLINE_WINDOW_SECONDS;
   const res = await spawnGmgnResult([
