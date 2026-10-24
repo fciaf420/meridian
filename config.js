@@ -71,6 +71,30 @@ export const config = {
     maxCloseSwapPriceImpactPct: u.maxCloseSwapPriceImpactPct ?? 25,
   },
 
+  // ─── Deploy-path safety (ported from yunus-0x/meridian) ─────────
+  // Pure guards: they only ever REFUSE a deploy, never change what is sent.
+  safety: {
+    // Re-check TVL / volume / fee-ratio / volatility / token thresholds against a
+    // fresh Pool Discovery read at deploy time (fails closed if unreadable).
+    recheckScreeningAtDeploy: u.recheckScreeningAtDeploy ?? true,
+    // Refuse a deploy when the pool's volatility is unknown (null/NaN). 0 is valid
+    // (every trade stayed inside one bin).
+    requireKnownVolatility: u.requireKnownVolatility ?? true,
+    // Max price move (%) between the start of a deploy and the first tx send.
+    // DROP-ONLY for SOL-only deposits (a rise leaves the bins below the active
+    // bin, harmless); symmetric when a token X leg is deposited (two-sided).
+    maxEntryPriceMovePct: u.maxEntryPriceMovePct ?? 5,
+    // Max price DROP (%) between the price shown at screening and the fresh pool
+    // price at deploy time (the minutes-long screening -> LLM -> deploy gap).
+    // Rises are logged, never refused. 0 disables. Skipped when screening.source
+    // is "gmgn" (different price source) or no Pool Discovery screening price exists.
+    maxScreenToDeployDropPct: u.maxScreenToDeployDropPct ?? 12,
+    // Deposit slippage (%) handed to the DLMM SDK. The SDK converts it to an
+    // allowed active-bin drift: ceil(pct / (binStep/100)) bins. Was a hard-coded
+    // 10%. See deploy-guards.js depositSlippage().
+    depositSlippagePct: u.depositSlippagePct ?? 5,
+  },
+
   // ─── Pool Screening Thresholds ───────────
   screening: {
     source:            normalizeScreeningSource(u.screeningSource), // "meteora" | "gmgn" | "both"; invalid → "meteora"

@@ -5,7 +5,11 @@ import cron from "node-cron";
 import readline from "readline";
 import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./agent.js";
 import { log, enableLogPathFile } from "./logger.js";
-import { getMyPositions, isCloseInflight, getInflightCloses } from "./tools/dlmm.js";
+import { getMyPositions, isCloseInflight, getInflightCloses, positionAccountExists } from "./tools/dlmm.js";
+import { acquireInstanceLock, releaseInstanceLock } from "./instance-lock.js";
+import { reconcileAttempts, getUnresolvedAttempts, clearAttempt, isAttemptInFlight, setCorruptionHandler } from "./deploy-checkpoint.js";
+import { getRefusalStats } from "./deploy-guards.js";
+import { activeRpcHosts, formatRpcHosts } from "./rpc-hosts.js";
 import { llmHealth, isLlmUnavailableError } from "./llm-health.js";
 import { runManagementWithOorFallback, formatOorFallbackReport } from "./oor-fallback.js";
 import { getPositionBins } from "./tools/bin-visual.js";
@@ -65,13 +69,98 @@ installCrashHandlers({
 });
 
 // Let operators find this process and its log without guessing (ops/README.md).
+// logs/bot.pid doubles as the single-instance lock: a second bot on the same
+// wallet would double-deploy and double-close, so refuse to start while the
+// first is alive. A stale pidfile (crash, reboot, recycled pid) is reclaimed.
+// MERIDIAN_SKIP_INSTANCE_LOCK=1 bypasses the lock (tests / deliberate overrides,
+// and sandboxes/containers where kill(pid, 0) returns EPERM for every pid and `ps`
+// is unavailable: the lock then fails closed on any stale pidfile).
 const PID_FILE = path.join("logs", "bot.pid");
 try {
   fs.mkdirSync("logs", { recursive: true });
-  fs.writeFileSync(PID_FILE, `${process.pid}\n`);
+  if (process.env.MERIDIAN_SKIP_INSTANCE_LOCK === "1") {
+    fs.writeFileSync(PID_FILE, `${process.pid}\n`);
+    log("startup_warn", "Instance lock bypassed (MERIDIAN_SKIP_INSTANCE_LOCK=1)");
+  } else {
+    acquireInstanceLock(PID_FILE, { log: (m) => log("startup_warn", m) });
+  }
   enableLogPathFile(path.join("logs", "bot.logpath"));
 } catch (e) {
+  if (e.code === "INSTANCE_LOCKED") {
+    log("startup_error", e.message);
+    console.error(e.message);
+    process.exit(1);
+  }
   log("startup_warn", `Could not write logs/bot.pid / logs/bot.logpath: ${e.message}`);
+}
+log("startup", `RPC hosts: ${formatRpcHosts()}`);
+
+// A corrupt deploy-attempts.json is moved aside and the checkpoint restarts
+// empty (deploy-checkpoint.js); tell the owner, because anything in-flight that
+// was recorded there is no longer tracked.
+setCorruptionHandler(({ backup, error }) => {
+  if (telegramEnabled()) sendMessage(`⚠️ deploy-attempts.json was corrupt (${error}). Moved to ${path.basename(backup)}; starting with an empty checkpoint. Check your wallet for any position opened by an interrupted deploy.`).catch(() => {});
+});
+
+// Reconcile unresolved deploy attempts ("submitting" after a crash, or "uncertain"
+// after an RPC blip) against the chain: at boot, then on every management tick
+// while any remain, and on demand via /reconcile. Until an attempt resolves,
+// re-entry into its pool/token stays blocked (findBlockingAttempt).
+const reconcileNotified = new Set(); // unverified attempts already announced (no per-tick spam)
+let reconcileInFlight = false;
+// Periodic ticks leave attempts younger than this alone (a deploy may still be running).
+const PERIODIC_RECONCILE_MIN_AGE_MS = 10 * 60_000;
+async function reconcileDeployAttemptsNow({ source = "periodic", announceAll = false } = {}) {
+  if (reconcileInFlight) return [];
+  reconcileInFlight = true;
+  try {
+    return await reconcileAttempts({
+      positionExists: positionAccountExists,
+      minAgeMs: source === "periodic" ? PERIODIC_RECONCILE_MIN_AGE_MS : 0,
+      notify: async (results) => {
+        const fresh = results.filter(({ attempt, outcome }) => announceAll || outcome !== "unverified" || !reconcileNotified.has(attempt.id));
+        for (const { attempt, outcome } of results) if (outcome === "unverified") reconcileNotified.add(attempt.id);
+        if (!fresh.length) return;
+        const lines = fresh.map(({ attempt, outcome }) =>
+          `${outcome === "landed" ? "⚠️ position EXISTS" : outcome === "absent" ? "no position created" : "❓ unverified (still blocking; /reconcile to retry)"}: pool ${String(attempt.pool).slice(0, 8)} pos ${String(attempt.position).slice(0, 8)} id ${attempt.id}`);
+        if (telegramEnabled()) await sendMessage(`Deploy attempt reconcile (${source}):\n${lines.join("\n")}`);
+      },
+    });
+  } finally {
+    reconcileInFlight = false;
+  }
+}
+function unresolvedDeployCount() {
+  try { return getUnresolvedAttempts().length; } catch { return 0; }
+}
+reconcileDeployAttemptsNow({ source: "boot" }).catch((e) => log("startup_warn", `Deploy-attempt reconcile failed: ${e.message}`));
+
+/**
+ * /reconcile            re-check every unresolved attempt against the chain now
+ * /reconcile clear <id|all> force   operator override after checking the chain
+ *                                   yourself (Solscan); marks them cleared_manual
+ */
+async function handleReconcileCommand(rawArgs = "") {
+  const parts = String(rawArgs).trim().split(/\s+/).filter(Boolean);
+  if (parts[0] === "clear") {
+    const target = parts[1];
+    const open = getUnresolvedAttempts();
+    if (!target) return `Usage: /reconcile clear <id|all> force\nUnresolved: ${open.map((a) => a.id).join(", ") || "none"}`;
+    if (parts[2] !== "force") {
+      return `This marks the attempt resolved WITHOUT trusting the bot's own chain read. First confirm on an explorer that the position account does not exist (or is already managed), then repeat:\n/reconcile clear ${target} force`;
+    }
+    const ids = target === "all" ? open.map((a) => a.id) : [target];
+    const busy = ids.filter((id) => isAttemptInFlight(id));
+    const cleared = ids.filter((id) => !isAttemptInFlight(id) && clearAttempt(id, "cleared by operator via /reconcile"));
+    const busyNote = busy.length ? `\nRefused (deploy in flight in this process, even with force): ${busy.join(", ")}` : "";
+    return (cleared.length ? `Cleared ${cleared.length} attempt(s): ${cleared.join(", ")}` : "No matching unresolved attempt.") + busyNote;
+  }
+  const results = await reconcileDeployAttemptsNow({ source: "manual", announceAll: false });
+  const remaining = getUnresolvedAttempts();
+  const summary = results.length
+    ? results.map(({ attempt, outcome }) => `${outcome}: pool ${String(attempt.pool).slice(0, 8)} id ${attempt.id}`).join("\n")
+    : "No unresolved deploy attempts.";
+  return `${summary}${remaining.length ? `\nStill blocking: ${remaining.map((a) => `${a.id} (${a.status})`).join(", ")}` : ""}`;
 }
 
 // One-time lesson dedup on startup
@@ -568,6 +657,11 @@ function startCronJobs() {
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
     if (isDraining()) return;
+    // Retry unresolved deploy attempts (one getAccountInfo each) every tick, before
+    // any early return below, so an RPC blip does not block a pool until restart.
+    if (unresolvedDeployCount() > 0) {
+      reconcileDeployAttemptsNow({ source: "periodic" }).catch((e) => log("cron_warn", `Deploy-attempt reconcile failed: ${e.message}`));
+    }
     if (isBusy()) {
       timers.managementLastRun = Date.now();
       log("cron", "Management deferred — position action in progress");
@@ -907,13 +1001,22 @@ const shutdownController = createShutdownController({
   onDrained: async () => {
     const positions = await getMyPositions().catch(() => null);
     log("shutdown", `Open positions at shutdown: ${positions?.total_positions ?? "unknown"}`);
+    // Liveness: tell the owner the bot is going down (bounded, never blocks exit).
+    if (telegramEnabled()) {
+      await Promise.race([
+        sendMessage(`🛑 Meridian stopped (${lastShutdownSignal}) — open positions: ${positions?.total_positions ?? "unknown"}`),
+        new Promise((r) => setTimeout(r, 3000)),
+      ]).catch(() => {});
+    }
     try {
-      if (fs.readFileSync(PID_FILE, "utf8").trim() === String(process.pid)) fs.unlinkSync(PID_FILE);
+      releaseInstanceLock(PID_FILE); // only removes the file if it still names this pid
     } catch { /* already gone */ }
   },
 });
 
+let lastShutdownSignal = "signal";
 function shutdown(signal, opts) {
+  if (!shutdownController.isShuttingDown()) lastShutdownSignal = signal;
   return shutdownController.handleSignal(signal, opts);
 }
 
@@ -1004,6 +1107,7 @@ const TELEGRAM_HELP = [
   "/learn [pool] — study top LPers (all top pools, or one address)",
   "/evolve — evolve thresholds from performance",
   "/autoresearch [list|show|revert|restore|approve|reject …] — prompt overrides (operator only)",
+  "/reconcile — re-check unresolved deploy attempts on-chain (/reconcile clear <id|all> force after checking an explorer)",
   "/stop — shut the agent down",
   "/help — this list",
   "",
@@ -1147,6 +1251,9 @@ const tgUI = createTelegramUI({
     screeningBusy: isScreeningBusy(),
     cronStarted,
     usdcMode: usdcModeEnabled(),
+    rpcHosts: formatRpcHosts(activeRpcHosts()), // hostnames only, never keys
+    unresolvedDeploys: unresolvedDeployCount(),
+    deployRefusals: getRefusalStats(), // since boot
   }),
   buildSettingsReport: () => buildSettingsReportSync(),
   handleAutoresearchCommand: (args) => handleAutoresearchCommand(args),
@@ -1160,10 +1267,17 @@ const telegramHandlers = {
   onCallback: (data, ctx) => tgUI.handleCallback(data, ctx),
 };
 
+let startupAnnounced = false;
 function startTelegram() {
   if (!telegramEnabled()) return;
   setMyCommands(BOT_COMMANDS).catch(() => {}); // best-effort
   startPolling(telegramHandlers);
+  // Liveness: a restart (crash loop, launchd, manual) is visible in the chat.
+  if (!startupAnnounced) {
+    startupAnnounced = true;
+    sendMessage(`🟢 Meridian started — ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}, pid ${process.pid}, strategy ${config.strategy.activeStrategy ?? config.strategy.strategy}, RPC ${formatRpcHosts()}`)
+      .catch(() => {});
+  }
 }
 
 async function handleTelegramCommand(rawText, ctx = {}) {
@@ -1179,6 +1293,11 @@ async function handleTelegramCommand(rawText, ctx = {}) {
 
   // ── Menu, /candidates, number-reply deploy and "auto" (all confirm first) ──
   if (await tgUI.handleMessage(text, ctx)) return;
+
+  // ── Unresolved deploy attempts ──
+  if (text === "/reconcile" || text.startsWith("/reconcile ")) {
+    return runRemote(async () => tgSend(await handleReconcileCommand(text.slice("/reconcile".length))));
+  }
 
   // ── Shutdown ──
   if (text === "/stop") {
@@ -1419,6 +1538,7 @@ Commands:
   /thresholds    Show current screening thresholds + performance stats
   /evolve        Manually trigger threshold evolution from performance data
   /autoresearch  Prompt overrides: list | show | revert | restore <section>
+  /reconcile     Re-check unresolved deploy attempts (/reconcile clear <id|all> force)
   /stop          Shut down
 `);
 
@@ -1472,6 +1592,11 @@ Commands:
     }
 
     // ── Slash commands ───────────────────────
+    if (input === "/reconcile" || input.startsWith("/reconcile ")) {
+      console.log(`\n${await handleReconcileCommand(input.slice("/reconcile".length))}\n`);
+      rl.prompt();
+      return;
+    }
     if (input === "/stop") { await shutdown("user command", { force: false }); return; }
 
     if (input === "/status") {

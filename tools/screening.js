@@ -140,6 +140,23 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     pools.filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
   );
 
+  // Remember what price each candidate was shown at (deploy-time drift guard).
+  // ONLY Pool Discovery `pool_price` (SOL per token) is recorded: that is the unit
+  // the deploy-time check compares against. GMGN rows carry a USD token price, so
+  // they are skipped (logged), including GMGN-only rows in "both" mode.
+  if (config.screening.source !== "gmgn") {
+    const { noteScreenedPrice, noteUncomparableScreenPrice } = await import("../deploy-guards.js");
+    for (const p of eligible) {
+      const fromPoolDiscovery = !Array.isArray(p.sources) || p.sources.includes("meteora");
+      if (!fromPoolDiscovery) {
+        noteUncomparableScreenPrice(p.pool);
+        log("screening", `Screen price not recorded for ${p.pool}: GMGN-only candidate (USD price, not comparable to pool_price)`);
+        continue;
+      }
+      noteScreenedPrice(p.pool, p.price);
+    }
+  }
+
   return {
     candidates: eligible.slice(0, limit).map(normalizeCandidateForUi),
     total_eligible: eligible.length,

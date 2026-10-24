@@ -13,6 +13,7 @@ const emitter = new EventEmitter();
 //   close            — position closed
 //   out_of_range     — position out of range
 //   deploy_partial   — wide-range deploy failed partway; position kept open
+//   swap_unwind_failed — deploy refused after the auto-swap and the swap back to SOL failed (token stranded)
 //   briefing         — morning briefing HTML
 //   status           — busy state changes
 //   llm_unavailable  — LLM provider + fallback both failed (deduped in llm-health.js)

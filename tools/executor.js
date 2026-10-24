@@ -30,6 +30,8 @@ import { execSync, spawn } from "child_process";
 import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } from "../runtime-helpers.js";
 
 import { log, logAction } from "../logger.js";
+import { checkVolatilityKnown, pickVolatility, evaluatePoolThresholds, fetchPoolForRecheck, checkScreenPriceDrift, getScreenedPrice, isScreenPriceUncomparable, recordRefusal } from "../deploy-guards.js";
+import { findBlockingAttempt } from "../deploy-checkpoint.js";
 import { getPositionBins, withTimeout } from "./bin-visual.js";
 import { emit } from "../notifier.js";
 import { kbRead, kbWrite, kbSearch, kbList, kbDelete, kbMigrate, kbGetStats, kbRebuildIndexes } from "./knowledge-base-tools.js";
@@ -398,6 +400,7 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   if (name === "deploy_position" && usdcModeEnabled()) {
     const elig = await checkDeployEligibility(args);
     if (!elig.pass) {
+      recordRefusal("eligibility", elig.reason);
       log("safety_block", `deploy_position blocked (usdc preflight): ${elig.reason}`);
       return { blocked: true, reason: elig.reason };
     }
@@ -422,7 +425,7 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   // ─── Pre-execution safety checks ──────────
   let swapGuard = null;
   if (WRITE_TOOLS.has(name)) {
-    const safetyCheck = await runSafetyChecks(name, args, { manual });
+    const safetyCheck = await runSafetyChecks(name, args, { manual, eligibilityChecked: usdcModeEnabled() });
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       return {
@@ -538,13 +541,76 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   }
 }
 
+// Injectable for tests: (poolAddress, timeframe) -> raw Pool Discovery record | null.
+let _fetchPoolForRecheck = fetchPoolForRecheck;
+export function __setDeployRecheckFetch(fn) { _fetchPoolForRecheck = fn || fetchPoolForRecheck; }
+
+/**
+ * Deploy-time guards from upstream yunus-0x/meridian:
+ *  - 3427771: screening thresholds re-enforced against fresh pool data, so a stale
+ *    or model-chosen candidate cannot slip past the filters between screening and deploy
+ *  - exit-rules.js computeBinsBelow: never deploy when volatility is unknown
+ */
+export async function checkDeploySafetyGuards(args) {
+  const sf = config.safety || {};
+  if (args._manual) return { pass: true };
+  const wantRecheck = sf.recheckScreeningAtDeploy !== false;
+  const wantVol = sf.requireKnownVolatility !== false;
+  const maxDrop = Number(sf.maxScreenToDeployDropPct ?? 12);
+  const wantDrift = maxDrop > 0 && config.screening.source !== "gmgn";
+  if (!wantRecheck && !wantVol && !wantDrift) return { pass: true };
+
+  let pool = null;
+  let fetchError = null;
+  try {
+    pool = await _fetchPoolForRecheck(args.pool_address, config.screening.timeframe || "5m");
+  } catch (e) {
+    fetchError = e;
+  }
+
+  // The thresholds come from Meteora's screener. With screening.source "gmgn" those
+  // pool filters were never applied, so there is nothing to "re-check" against.
+  if (wantRecheck && config.screening.source !== "gmgn") {
+    if (fetchError) {
+      recordRefusal("recheck", fetchError.message);
+      return { pass: false, reason: `Could not verify pool screening thresholds before deploy: ${fetchError.message}` };
+    }
+    const r = evaluatePoolThresholds(pool, config.screening);
+    if (!r.pass) { recordRefusal("recheck", r.reason); return { pass: false, reason: `Deploy-time screening re-check failed: ${r.reason}` }; }
+    for (const n of r.notes || []) log("deploy", `Screening re-check: ${n}`);
+  }
+
+  if (wantVol) {
+    // A fresh positive reading beats a stale screener 0; 0 itself is valid.
+    const v = checkVolatilityKnown(pickVolatility(args.volatility, pool?.volatility));
+    if (!v.pass) { recordRefusal("volatility", v.reason); return { pass: false, reason: v.reason }; }
+  }
+
+  // Screening -> deploy gap: compare the price the candidate was shown at with
+  // the fresh pool price. Code-recorded screening price first (the model cannot
+  // dodge it by omitting the arg), then the model-supplied screen_price. When
+  // neither exists, or the fresh read failed, this check is skipped with a log.
+  if (wantDrift) {
+    if (isScreenPriceUncomparable(args.pool_address)) {
+      log("deploy", "Screening->deploy price drift not checked (candidate came from GMGN with a USD price; units differ from pool_price)");
+      return { pass: true };
+    }
+    const screenPrice = getScreenedPrice(args.pool_address) ?? args.screen_price;
+    const d = checkScreenPriceDrift({ screenPrice, freshPrice: pool?.pool_price, maxDropPct: maxDrop });
+    if (!d.checked) log("deploy", "Screening->deploy price drift not checked (no screening price or no fresh price available)");
+    else if (d.pass && d.rose) log("deploy", `Price rose ${d.movePct.toFixed(1)}% since screening (not refused: rises are harmless for SOL-only deposits)`);
+    else if (!d.pass) { recordRefusal("screen_drift", d.reason); return { pass: false, reason: `Screening→deploy price drift: ${d.reason}` }; }
+  }
+  return { pass: true };
+}
+
 /**
  * Amount-independent deploy eligibility checks (bin step, position count,
  * duplicate pool/token). Shared between the USDC-mode entry preflight and the
  * standard safety checks so USDC mode never swaps before confirming the deploy
  * is even allowed.
  */
-async function checkDeployEligibility(args) {
+export async function checkDeployEligibility(args) {
   // Resolve bin_step — fall back to the pool detail API if the caller didn't pass it.
   let effectiveBinStep = args.bin_step;
   if (effectiveBinStep == null && args.pool_address) {
@@ -574,6 +640,21 @@ async function checkDeployEligibility(args) {
       reason: `bin_step ${effectiveBinStep} is outside the allowed range of [${minStep}-${maxStep}].`,
     };
   }
+
+  // An interrupted deploy (crash checkpoint still `submitting`/`uncertain`) must
+  // be reconciled against the chain before this pool/token is entered again.
+  const blocking = findBlockingAttempt({ pool: args.pool_address, mint: args.base_mint });
+  if (blocking) {
+    return {
+      pass: false,
+      reason: `A previous deploy into this pool/token (attempt ${blocking.id}, status ${blocking.status}) was interrupted and not yet reconciled on-chain. Check the position, then retry after the next restart reconciles it.`,
+    };
+  }
+
+  // Deploy-time re-check of screening thresholds + known volatility. The owner's
+  // manual Telegram deploys (args._manual) are exempt, like the token-age window.
+  const safetyGate = await checkDeploySafetyGuards(args);
+  if (!safetyGate.pass) return safetyGate;
 
   // Check position count limit + duplicate pool guard
   const positions = await getMyPositions();
@@ -629,7 +710,7 @@ async function confirmManagementPnlClose(args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args, { manual = false } = {}) {
+async function runSafetyChecks(name, args, { manual = false, eligibilityChecked = false } = {}) {
   switch (name) {
     case "close_position":
       // Management closes on rule 3 (take profit) / rule 6 (emergency stop) and
@@ -639,8 +720,12 @@ async function runSafetyChecks(name, args, { manual = false } = {}) {
       return confirmManagementPnlClose(args);
 
     case "deploy_position": {
-      const elig = await checkDeployEligibility(args);
-      if (!elig.pass) return elig;
+      // USDC mode already ran this (amount-independent) check in its preflight,
+      // before swapping; don't pay for a second Pool Discovery fetch.
+      if (!eligibilityChecked) {
+        const elig = await checkDeployEligibility(args);
+        if (!elig.pass) { recordRefusal("eligibility", elig.reason); return elig; }
+      }
 
       const usdc = usdcModeEnabled();
 

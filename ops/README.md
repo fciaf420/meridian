@@ -18,7 +18,7 @@ You don't create these. The bot writes them at startup:
 
 | File | Contents |
 |---|---|
-| `logs/bot.pid` | The bot's PID. It's removed on a graceful exit and left behind after a crash, so check it with `kill -0`. |
+| `logs/bot.pid` | The bot's PID. It's removed on a graceful exit and left behind after a crash, so check it with `kill -0`. It is also the single-instance lock: a second `node index.js` refuses to start while the pid is alive AND its command line runs this checkout's `index.js`. `kill -0` returning EPERM means the process exists under another user (counted as alive). In sandboxes/containers where the pid probe is unreliable (EPERM for every pid, no `ps`), a stale pidfile fails closed; set `MERIDIAN_SKIP_INSTANCE_LOCK=1` there. |
 | `logs/bot.logpath` | The absolute path of the current `logs/agent-YYYY-MM-DD.log`. It's rewritten when the log rotates at UTC midnight. |
 
 ## Install
