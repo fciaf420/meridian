@@ -37,6 +37,8 @@ Object.assign(config.management, {
   pnlWarmupMaxAbsPct: 25,
   pnlUnit: "sol",
 });
+// Tick confirmation: 2 ticks, no spacing (ticks run back to back here).
+Object.assign(config.exits, { confirmTicks: 2, peakConfirmTicks: 2, confirmMinSpacingSec: 0, stopLossUnverifiedMaxWaitSec: 120 });
 
 const POOL = "Pool111111111111111111111111111111111111111";
 let n = 0;
@@ -56,7 +58,7 @@ function open({ ageMin = 5, amountSol = 6.16, extra = {} } = {}) {
 }
 
 // ─── Watcher harness ───
-function harness({ positions, onchain }) {
+function harness({ positions, onchain, now = null }) {
   const closes = [];
   const emitted = [];
   _setPnlWatcherDepsForTest({
@@ -68,6 +70,8 @@ function harness({ positions, onchain }) {
     closePosition: async (args) => { closes.push(args); return { success: true, txs: ["sig"] }; },
     getPositionBins: async () => null,
     emit: (ev, data) => emitted.push({ ev, data }),
+    isCloseInflight: () => false,
+    ...(now && { now }),
   });
   return { closes, emitted };
 }
@@ -156,8 +160,9 @@ test("decidePnlExit thresholds and fallbacks", () => {
   assert.equal(decidePnlExit({ kind: "stop_loss", apiPct: -15.5, onchainPct: -14.2, threshold: -15 }).close, true);
   assert.equal(decidePnlExit({ kind: "stop_loss", apiPct: -15.5, onchainPct: -13.5, threshold: -15 }).close, false);
   assert.equal(decidePnlExit({ kind: "stop_loss", apiPct: -16, onchainPct: -25, threshold: -15 }).close, true);
-  // read failed: SL exits on API, TP / trailing hold
-  assert.equal(decidePnlExit({ kind: "stop_loss", apiPct: -16, onchainPct: null, threshold: -15 }).close, true);
+  // read failed: every kind holds as "unverified" (the engine's bounded wait decides SL)
+  assert.equal(decidePnlExit({ kind: "stop_loss", apiPct: -16, onchainPct: null, threshold: -15 }).close, false);
+  assert.equal(decidePnlExit({ kind: "stop_loss", apiPct: -16, onchainPct: null, threshold: -15 }).unverified, true);
   assert.equal(decidePnlExit({ kind: "take_profit", apiPct: 8, onchainPct: null, threshold: 7 }).close, false);
   assert.equal(decidePnlExit({ kind: "trailing", apiPct: 2, onchainPct: null, peakPct: 8, dropPct: 4 }).close, false);
   // trailing: on-chain ≤ (peak − drop) + 1
@@ -181,6 +186,8 @@ test("watcher: a real TP closes and records the on-chain PnL", async () => {
   const pos = open({ ageMin: 30 });
   const { closes, emitted } = harness({ positions: [apiPos(pos, 7.5, { oor_direction: "upside" })], onchain: oc(7.2) });
   await runPnlWatcher();
+  assert.equal(closes.length, 0, "first confirming tick only");
+  await runPnlWatcher();
   assert.equal(closes.length, 1);
   assert.equal(closes[0]._pnlOverride.pnl_pct, 7.2);
   assert.equal(closes[0]._pnlOverride.pnl_source, "onchain");
@@ -188,13 +195,20 @@ test("watcher: a real TP closes and records the on-chain PnL", async () => {
   assert.equal(emitted[0].data.pnlPct, 7.2);
 });
 
-test("watcher: stop loss with a failed on-chain read still exits (on the API value)", async () => {
+test("watcher: stop loss with a failed on-chain read holds, then exits on the API value after the bounded wait", async () => {
   const pos = open({ ageMin: 30 });
-  const { closes } = harness({ positions: [apiPos(pos, -16)], onchain: null });
+  let now = Date.now();
+  const { closes } = harness({ positions: [apiPos(pos, -16)], onchain: null, now: () => now });
   await runPnlWatcher();
-  assert.equal(closes.length, 1);
+  assert.equal(closes.length, 0, "unverified: needs confirmation");
+  now += 60_000;
+  await runPnlWatcher();
+  assert.equal(closes.length, 0, "still inside stopLossUnverifiedMaxWaitSec");
+  now += 61_000;
+  await runPnlWatcher();
+  assert.equal(closes.length, 1, "a real crash still exits once the wait is over");
   assert.equal(closes[0]._pnlOverride.pnl_pct, -16);
-  assert.match(closes[0]._close_reason, /^STOP_LOSS/);
+  assert.match(closes[0]._close_reason, /^STOP_LOSS.*exited on the API value/);
 });
 
 test("watcher: TP with a failed on-chain read holds, and closes on a later tick once confirmed", async () => {
@@ -204,6 +218,8 @@ test("watcher: TP with a failed on-chain read holds, and closes on a later tick 
   await runPnlWatcher();
   assert.equal(closes.length, 0);
   read = oc(7.8);
+  await runPnlWatcher();
+  assert.equal(closes.length, 0, "1/2 confirming ticks");
   await runPnlWatcher();
   assert.equal(closes.length, 1);
 });
@@ -224,8 +240,11 @@ test("watcher: trailing uses the on-chain value", async () => {
   const b = open({ ageMin: 60 });
   harness({ positions: [apiPos(b, 6.5)], onchain: oc(6.4) });
   await runPnlWatcher();
+  await runPnlWatcher(); // peak confirmed on the 2nd tick
   assert.equal(getTrackedPosition(b).trailing_active, true);
   h = harness({ positions: [apiPos(b, 2.4)], onchain: oc(2.3) });
+  await runPnlWatcher();
+  assert.equal(h.closes.length, 0, "1/2 confirming ticks");
   await runPnlWatcher();
   assert.equal(h.closes.length, 1);
   assert.match(h.closes[0]._close_reason, /^TRAILING_TP/);
@@ -234,6 +253,7 @@ test("watcher: trailing uses the on-chain value", async () => {
   // 3) API says it dropped, the chain says it didn't: hold.
   const c = open({ ageMin: 60 });
   harness({ positions: [apiPos(c, 6.5)], onchain: oc(6.4) });
+  await runPnlWatcher();
   await runPnlWatcher();
   h = harness({ positions: [apiPos(c, 2.0)], onchain: oc(6.1) });
   await runPnlWatcher();
@@ -250,6 +270,7 @@ test("watcher: FIXED_TP respects the warm-up guard (+33% at age 3m is not closed
 test("updatePnlAndCheckExits without an on-chain value behaves as before", () => {
   const pos = open({ ageMin: 60 });
   assert.equal(updatePnlAndCheckExits(pos, 6, config), null);
+  assert.equal(updatePnlAndCheckExits(pos, 6, config), null); // 2-tick peak confirmation
   assert.equal(getTrackedPosition(pos).peak_pnl_pct, 6);
   assert.match(updatePnlAndCheckExits(pos, 1.5, config) ?? "", /^TRAILING_TP/);
 });
@@ -271,7 +292,7 @@ test("management gate: rule 3 on a false API TP is held; rule 4 and non-PnL clos
   assert.equal((await gate(apiPos(pos, 7.39, { minutes_out_of_range: 31 }), oc(0.01))).pass, true, "rule 4 is not gated");
   assert.equal((await gate(apiPos(pos, 2), oc(0.01))).pass, true, "judgment close, not a PnL rule");
   assert.equal((await gate(apiPos(pos, 7.5), oc(7.1))).pass, true, "real TP");
-  assert.equal((await gate(apiPos(pos, -55), null)).pass, true, "rule 6 with a failed read exits");
+  assert.equal((await gate(apiPos(pos, -55), null)).pass, false, "rule 6 with a failed read holds (the runner's bounded wait closes it)");
   assert.equal((await gate(apiPos(pos, 7.5), null)).pass, false, "rule 3 with a failed read holds");
 });
 

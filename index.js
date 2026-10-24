@@ -20,16 +20,22 @@ import { createAllSettings } from "./all-settings.js";
 import { normalizeEntryFilterValue, isLooseningChange } from "./tools/entry-safety.js";
 import { applyTradingSettings } from "./trading-settings.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
-import { registerCronRestarter, executeTool } from "./tools/executor.js";
+import { registerCronRestarter, executeTool, finalizeCodeClose } from "./tools/executor.js";
+import { setWalletLockOptions, outsideWalletLock } from "./wallet-lock.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, editHTML, answerCallback, setMyCommands, isEnabled as telegramEnabled } from "./telegram.js";
 import { createTelegramUI, BOT_COMMANDS, readRecentErrors } from "./telegram-ui.js";
 import { lookupToken, parseMint } from "./tools/token-lookup.js";
 import { isScreeningPaused, setScreeningPaused } from "./state.js";
+import { pnlExitsWarning } from "./exit-engine.js";
 import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing, recordBriefing, latestBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
+import { updatePnlAndCheckExits, getTrackedPosition, registerExitTick, recordPnlHold, recordAutoClose, markOnchainRead } from "./state.js";
+import { runManagementCodeRules, formatCodeRuleResults } from "./management-rules.js";
+import { getOnchainPnl } from "./tools/onchain-pnl.js";
+import { closePosition } from "./tools/dlmm.js";
+import { withTimeout } from "./tools/bin-visual.js";
 import { emit, on } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
@@ -652,6 +658,11 @@ ${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
 }
 
 function startCronJobs() {
+  // C1: never create cron/watcher timers inside a wallet-lock ALS context.
+  return outsideWalletLock(startCronJobsInner);
+}
+
+function startCronJobsInner() {
   stopCronJobs(); // stop any running tasks before (re)starting
   if (isDraining()) return; // shutting down: never (re)start cycles
 
@@ -717,14 +728,9 @@ function startCronJobs() {
             import("./tools/recenter-shadow.js").then((m) => m.logRecenterShadow(p)).catch(() => {});
           }
 
-          // Trailing TP / stop loss check
-          if (p.pnl_pct != null) {
-            const exitAction = updatePnlAndCheckExits(p.position, p.pnl_pct, config);
-            if (exitAction) {
-              exits.push(`⚠ ${p.pair}: ${exitAction}`);
-              log("exit_check", `${p.pair}: ${exitAction}`);
-            }
-          }
+          // Stop loss / trailing / TP are no longer evaluated here as LLM
+          // "exit alerts": the code rules below run the shared exit engine
+          // (exit-engine.js) and close in code.
 
           // Study hold time context — compare your age to top LPers
           if (p.study_avg_hold_hours != null) {
@@ -800,43 +806,52 @@ function startCronJobs() {
         if (kbHints) kbContext = `\n\n${kbHints}`;
       } catch { /* best-effort */ }
 
-      // Hard-close rules 2-6 are threshold checks on data already in hand. Evaluate them
-      // here and start a model session only when a position carries a free-text
-      // instruction, a rule fired, a rule could not be evaluated, or there are exit
-      // alerts. All-HOLD cycles skip the LLM call. This only gates the LLM: nothing is
-      // closed in code here, and the PnL watcher's own exits are unaffected.
-      if (precheckedPositions?.length && !exitAlerts) {
-        const m = config.management;
-        const ruleHits = [];
-        const closeReasons = []; // [position, label] for the close history (tools/executor.js withCloseReason)
-        for (const p of precheckedPositions) {
-          if (getTrackedPosition(p.position)?.instruction) { ruleHits.push(`${p.pair}: instruction`); closeReasons.push([p.position, "rule 1: instruction met"]); }
-          else if (p.pnl_pct == null) ruleHits.push(`${p.pair}: pnl unknown`);
-          // A PnL the warm-up guard (state.js) is holding as a likely spike is not a
-          // take-profit signal; the PnL watcher re-checks it on its next tick.
-          else if (p.pnl_pct >= m.takeProfitFeePct && getTrackedPosition(p.position)?._pnl_pending_extreme) { /* warm-up spike: hold */ }
-          else if (p.pnl_pct >= m.takeProfitFeePct) { ruleHits.push(`${p.pair}: rule 3`); closeReasons.push([p.position, `rule 3: take profit (${p.pnl_pct}% ≥ ${m.takeProfitFeePct}%)`]); }
-          else if ((p.minutes_out_of_range ?? 0) >= m.outOfRangeWaitMinutes) { ruleHits.push(`${p.pair}: rule 4`); closeReasons.push([p.position, `rule 4: OOR timeout${p.oor_direction ? ` (OOR ${p.oor_direction})` : ""}`]); }
-          else if (p.pnl_pct <= m.emergencyPriceDropPct) { ruleHits.push(`${p.pair}: rule 6`); closeReasons.push([p.position, `rule 6: emergency stop (${p.pnl_pct}%)`]); }
-          else if (!p.pool) ruleHits.push(`${p.pair}: pool unknown`);
-          else {
-            const d = await getPoolDetail({ pool_address: p.pool, timeframe: config.screening.timeframe || "5m" }).catch(() => null);
-            if (!d || !Number.isFinite(d.fee_active_tvl_ratio) || !Number.isFinite(d.volume)) ruleHits.push(`${p.pair}: rule 5 unverified`);
-            else if (d.fee_active_tvl_ratio < config.screening.minFeeActiveTvlRatio && d.volume < config.screening.minVolume) {
-              ruleHits.push(`${p.pair}: rule 5`);
-              closeReasons.push([p.position, "rule 5: yield dead"]);
-            }
-          }
-        }
-        setManagementCloseReasons(closeReasons);
-        if (ruleHits.length === 0) {
-          log("cron", `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD (LLM skipped)`);
-          mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD.`;
+      // Hard-close rules 3-6 are decided AND executed in code (management-rules.js):
+      // PnL rules through the shared exit engine (on-chain confirmation + N
+      // consecutive ticks, same streak as the PnL watcher), rule 4 / rule 5 by
+      // threshold. The LLM runs only for free-text position instructions
+      // (rules 1/2) and strategy exit alerts, and cannot veto a code close:
+      // those have already happened before the model is asked anything.
+      if (precheckedPositions?.length) {
+        const codeRules = await runManagementCodeRules(precheckedPositions, {
+          config,
+          getTracked: getTrackedPosition,
+          getPoolDetail,
+          executeTool,
+          log,
+          engineDeps: {
+            update: updatePnlAndCheckExits,
+            register: registerExitTick,
+            recordHold: recordPnlHold,
+            readOnchain: (pos) => withTimeout(getOnchainPnl(pos), 20_000),
+            markOnchain: markOnchainRead,
+          },
+          closeDeps: {
+            closePosition,
+            getTracked: getTrackedPosition,
+            isCloseInflight,
+            recordAutoClose,
+            emit,
+            getPositionBins,
+            withTimeout,
+            postClose: finalizeCodeClose,
+          },
+        });
+        const ruleHits = codeRules.llmNeeded;
+        // Rule-1 closes by the model are labelled as such (tools/executor.js withCloseReason).
+        setManagementCloseReasons(precheckedPositions
+          .filter((p) => getTrackedPosition(p.position)?.instruction)
+          .map((p) => [p.position, "rule 1: instruction met"]));
+        if (codeRules.closed.length || codeRules.failed.length) mgmtRuleFired = true;
+        const codeSummary = codeRules.lines.length ? `\n${codeRules.lines.join("\n")}` : "";
+        if (ruleHits.length === 0 && !exitAlerts) {
+          log("cron", `Management: ${precheckedPositions.length} position(s) checked in code — ${codeRules.closed.length} closed, ${codeRules.held.length} held for confirmation (LLM skipped)`);
+          mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code — ${codeRules.closed.length} closed in code${codeRules.failed.length ? `, ${codeRules.failed.length} close(s) failed` : ""}${codeRules.closed.length || codeRules.failed.length ? "" : ", no close rule triggered — HOLD"}.${codeSummary}`;
           return; // finally{} still releases the lock and emits the report
         }
-        log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
+        log("cron", `Management: LLM needed — ${[...ruleHits, ...(exitAlerts ? ["strategy exit alert"] : [])].join(", ")}`);
         memoryHints += formatRunnerPrecheck(ruleHits);
-        mgmtRuleFired = ruleHits.some((h) => /: rule [3-6]$/.test(h));
+        memoryHints += formatCodeRuleResults(codeRules);
       }
 
       if (exitAlerts) mgmtRuleFired = true;
@@ -969,6 +984,19 @@ function startCronJobs() {
   _cronTasks = [mgmtTask, screenTask, briefingTask, briefingWatchdog, kbHealthTask];
 
   // Start lightweight PnL watcher (sub-minute interval, no LLM)
+  // M1: stale / hung wallet-lock holder → Telegram alert, hard release after the timeout.
+  setWalletLockOptions({
+    warnMs: (config.exits?.walletLockWarnSec ?? 300) * 1000,
+    hardMs: (config.exits?.walletLockTimeoutSec ?? 900) * 1000,
+    onAlert: ({ kind, label, heldMs, queued }) => {
+      const secs = Math.round(heldMs / 1000);
+      const text = kind === "abandoned"
+        ? `Wallet lock RELEASED after ${secs}s: "${label}" never finished (hung RPC?). It may still land on chain. ${queued} operation(s) were queued.`
+        : `Wallet lock held ${secs}s by "${label}" (${queued} queued). Closes cannot run until it finishes; check RPC health.`;
+      log("wallet_lock", text);
+      emit("ops_alert", { key: `lock:${kind}`, title: kind === "abandoned" ? "Wallet lock released after timeout" : "Wallet lock held too long", text });
+    },
+  });
   startPnlWatcher(config.schedule.pnlWatcherIntervalSec);
 
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m, pnl watcher every ${config.schedule.pnlWatcherIntervalSec}s`);
@@ -1327,6 +1355,8 @@ async function handleTelegramCommand(rawText, ctx = {}) {
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
         const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
         lines.push(`• ${p.pair}  ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
+        const exitWarn = pnlExitsWarning(p, getTrackedPosition(p.position));
+        if (exitWarn) lines.push(`   ⚠ ${exitWarn}`);
       }
       await tgSend(lines.join("\n"));
     });
@@ -1505,6 +1535,8 @@ if (runtimeMode.interactive) {
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
         const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
         console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
+        const exitWarn = pnlExitsWarning(p, getTrackedPosition(p.position));
+        if (exitWarn) console.log(`    ! ${exitWarn}`);
       }
       console.log();
     }

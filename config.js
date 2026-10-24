@@ -265,6 +265,43 @@ export const config = {
     pnlWatcherIntervalSec: u.pnlWatcherIntervalSec ?? 30,
   },
 
+  // ─── Exit safety (fix/exits-in-code) ────
+  // Read-only from user-config.json; not exposed to update_config / auto-tune.
+  exits: {
+    // Consecutive confirming ticks before a PnL exit (stop loss, emergency,
+    // trailing, take profit) closes, and before a new trailing peak counts.
+    confirmTicks:              u.exitConfirmTicks ?? 2,
+    peakConfirmTicks:          u.peakConfirmTicks ?? u.exitConfirmTicks ?? 2,
+    // Two ticks closer together than this count once (the management cycle and
+    // the watcher can tick seconds apart on the same ~20s-cached on-chain read).
+    confirmMinSpacingSec:      u.exitConfirmMinSpacingSec ?? 20,
+    // Stop loss whose on-chain read keeps failing: exit on the API value once the
+    // signal has persisted this long (and on >= confirmTicks priced ticks).
+    // Default 300s (M5): with a 60s watcher that is 5 priced observations.
+    stopLossUnverifiedMaxWaitSec: u.stopLossUnverifiedMaxWaitSec ?? 300,
+    // N4: API-only fallback wait when every priced tick is at/below the emergency level.
+    stopLossEmergencyMaxWaitSec: u.stopLossEmergencyMaxWaitSec ?? 120,
+    // H1: force an on-chain PnL read for every tracked position at least this
+    // often, even when the API reading looks harmless, so a stale API cannot
+    // hide a crash the chain already shows.
+    onchainReadIntervalSec:    u.onchainReadIntervalSec ?? 60,
+    // M4: API-vs-on-chain disagreement (points) above which a trailing / take
+    // profit exit is held (stop loss is exempt). Measured via pnl_bias logs.
+    pnlMismatchPts:            u.pnlMismatchPts ?? 2,
+    // Alert after this many consecutive ticks a trailing exit was held only
+    // because the two sources disagree (trailing is effectively disabled).
+    trailingMismatchAlertTicks: u.trailingMismatchAlertTicks ?? 3,
+    // M1: wallet-lock stale-holder alert / hard release (seconds; 0 disables hard release).
+    walletLockWarnSec:         u.walletLockWarnSec ?? 300,
+    walletLockTimeoutSec:      u.walletLockTimeoutSec ?? 900,
+    // M1: bound on a single on-chain / positions read inside the watcher.
+    readTimeoutSec:            u.exitReadTimeoutSec ?? 20,
+    // Re-entry cooldowns (pool + base mint), checked at deploy time.
+    stopLossCooldownMinutes:   u.stopLossCooldownMinutes ?? 240,
+    oorCooldownTriggerCount:   u.oorCooldownTriggerCount ?? 3,
+    oorCooldownMinutes:        u.oorCooldownMinutes ?? 360,
+  },
+
   // ─── LLM Settings ──────────────────────
   llm: {
     temperature: u.temperature ?? 0.373,

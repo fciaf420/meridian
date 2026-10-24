@@ -303,7 +303,7 @@ test("telegram: /token lookup's age check says a manual deploy is allowed", () =
 
 test("executeTool honours _manual only for owner-initiated deploys", async () => {
   const src = fs.readFileSync(new URL("../tools/executor.js", import.meta.url), "utf8");
-  assert.match(src, /export async function executeTool\(name, args, \{ manual = false \} = \{\}\)/);
+  assert.match(src, /export async function executeTool\(name, args, \{ manual = false(, codeExit = false)? \} = \{\}\)/);
   assert.match(src, /args = manual \? \{ \.\.\.rest, _manual: true \} : rest;/);
   const ui = fs.readFileSync(new URL("../telegram-ui.js", import.meta.url), "utf8");
   assert.match(ui, /executeTool\("deploy_position", \{ \.\.\.params\.args \}, \{ manual: true \}\)/);

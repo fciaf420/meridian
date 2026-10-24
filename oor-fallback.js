@@ -1,10 +1,13 @@
 // oor-fallback.js — close out-of-range positions (hard close rule 4) in code
 // when the management LLM is unavailable.
 //
-// Only rule 4 (minutes_out_of_range >= outOfRangeWaitMinutes) is handled here:
-// it is a pure threshold with no judgement, and a position left open past it
-// keeps bleeding while the LLM is down. Every other management rule stays with
-// the LLM (see the PR description / index.js management prompt).
+// Since fix/exits-in-code, rules 3-6 are closed in code every management cycle
+// BEFORE the LLM runs (management-rules.js), so this fallback is a second net:
+// it only matters if the LLM (now invoked just for position instructions and
+// strategy exit alerts) throws after a position crossed the OOR wait. It
+// re-reads positions first, so it normally finds nothing left to close.
+// Rule 4 is a pure threshold with no judgement; isRule4Position is shared with
+// management-rules.js so both apply the same definition.
 //
 // Dependencies are injected so the logic is unit-testable without RPC, wallet
 // or LLM access.

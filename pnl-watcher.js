@@ -5,21 +5,23 @@
  * stop-loss / trailing TP / fixed TP thresholds, and auto-closes without any
  * LLM call.
  *
- * Every PnL exit is confirmed against on-chain PnL first (pnl-confirm.js):
- * the PnL APIs misreport fresh positions (e/acc-SOL closed on a +7.4%
- * FIXED_TP while flat on-chain). Take profit / trailing hold when on-chain
- * doesn't confirm or can't be read; stop loss still exits when it can't be read.
+ * Decisions come from exit-engine.js (shared with the management cycle):
+ * on-chain confirmation (pnl-confirm.js), N consecutive confirming ticks
+ * (config.exits.confirmTicks), suspicious-tick handling, and a bounded
+ * API-value fallback for a stop loss whose on-chain read keeps failing.
  */
 
 import { log } from "./logger.js";
 import { config } from "./config.js";
-import { updatePnlAndCheckExits, getTrackedPosition, recordPnlHold, recordAutoClose } from "./state.js";
-import { getMyPositions, closePosition } from "./tools/dlmm.js";
-import { getOnchainPnl, onchainPctForUnit } from "./tools/onchain-pnl.js";
-import { confirmPnlExit, exitKindFromReason } from "./pnl-confirm.js";
+import { updatePnlAndCheckExits, getTrackedPosition, recordPnlHold, recordAutoClose, registerExitTick, markOnchainRead } from "./state.js";
+import { getMyPositions, closePosition, isCloseInflight } from "./tools/dlmm.js";
+import { getOnchainPnl } from "./tools/onchain-pnl.js";
+import { evaluatePnlExit, closeForExit } from "./exit-engine.js";
 import { emit } from "./notifier.js";
 import { getPositionBins, withTimeout } from "./tools/bin-visual.js";
-import { isBusy, isManagementBusy, isScreeningBusy, isDraining } from "./session.js";
+import { isDraining } from "./session.js";
+import { outsideWalletLock } from "./wallet-lock.js";
+import { finalizeCodeClose } from "./tools/executor.js";
 
 let _intervalHandle = null;
 // Per-tick inflight guard: prevents overlapping setInterval ticks from
@@ -60,37 +62,6 @@ export function maybePingHealthcheck() {
 }
 export function _resetHealthcheckForTest() { _ticksSincePing = 0; }
 
-/**
- * Would this API reading move the trailing peak or trip an exit? Only then is
- * the on-chain read (≈3 RPC calls, cached 20s) worth doing this tick.
- */
-function needsOnchain(apiPct, tracked, mgmt) {
-  const peak = tracked?.peak_pnl_pct || 0;
-  if (apiPct > peak) return true;
-  if (mgmt.takeProfitFeePct && apiPct >= mgmt.takeProfitFeePct) return true;
-  if (mgmt.stopLossPct && apiPct <= mgmt.stopLossPct) return true;
-  const drop = Number(mgmt.trailingDropPct);
-  if (mgmt.trailingTakeProfit && tracked?.trailing_active && Number.isFinite(drop) && drop > 0 && peak - apiPct >= drop) return true;
-  return false;
-}
-
-/** SOL-PnL-based override for the close record (pnl_usd at the entry SOL price). */
-function onchainOverride(p, tracked, onchain, pct) {
-  const initialUsd = Number(tracked?.initial_value_usd) || 0;
-  const pnlUsd = initialUsd > 0
-    ? Math.round(initialUsd * pct) / 100
-    : (Number(p.sol_price) > 0 ? Math.round(onchain.pnlSol * Number(p.sol_price) * 100) / 100 : p.pnl_usd);
-  return {
-    pnl_usd: pnlUsd,
-    pnl_pct: pct,
-    total_value_usd: initialUsd > 0 ? Math.round((initialUsd + pnlUsd) * 100) / 100 : p.total_value_usd,
-    collected_fees_usd: p.collected_fees_usd,
-    unclaimed_fees_usd: p.unclaimed_fees_usd,
-    pnl_source: "onchain",
-    pnl_sol: onchain?.pnlSol ?? null,
-  };
-}
-
 export async function runPnlWatcher() {
   // Inflight guard: if a previous tick is still running, skip this one so
   // overlapping ticks can't process stale data or race position closes.
@@ -100,131 +71,74 @@ export async function runPnlWatcher() {
   _tickRunning = true;
   maybePingHealthcheck();
   try {
-    // Skip while other agent flows are already active.
-    if (dep("isBusy", isBusy)() || dep("isManagementBusy", isManagementBusy)() || dep("isScreeningBusy", isScreeningBusy)()) return;
-
+    // The watcher no longer skips while a management / screening cycle or an
+    // owner action is running: exits used to wait out a whole screening cycle
+    // (LLM + deploy). Closes now serialize through the wallet lock at close
+    // priority, and closeForExit skips a position already closed / closing.
     const getPositions = dep("getMyPositions", getMyPositions);
-    const cached = await getPositions();
+    // M1: a hung positions read must not wedge the tick (and with it _tickRunning).
+    const readMs = Math.max(1, Number(config.exits?.readTimeoutSec ?? 20)) * 1000;
+    const bounded = (p) => dep("withTimeout", withTimeout)(p, readMs);
+    const cached = await bounded(getPositions());
     if (!cached?.positions?.length) return;
 
-    const result = await getPositions({ force: true });
+    const result = await bounded(getPositions({ force: true }));
     const positions = result?.positions || [];
     if (positions.length === 0) return;
 
-    const mgmt = config.management;
-    for (const p of positions) {
-      if (p.pnl_pct == null) continue;
+    const nowFn = dep("now", () => Date.now());
+    const readOnchain = (pos) => bounded(dep("getOnchainPnl", getOnchainPnl)(pos));
 
+    // M2: two passes. Evaluate EVERY position first (reads + confirming ticks,
+    // no wallet lock needed), then execute the decided closes. A close that is
+    // queued behind a long-running deploy therefore never starves the other
+    // positions of their confirming ticks.
+    const decided = [];
+    for (const p of positions) {
       const tracked = getTrackedPosition(p.position);
+      const now = nowFn(); // L2: fresh per position, not once per (possibly long) tick
       if (tracked?.deployed_at) {
-        const ageMs = Date.now() - new Date(tracked.deployed_at).getTime();
+        const ageMs = now - new Date(tracked.deployed_at).getTime();
         if (ageMs < 120_000) continue;
       }
 
       try {
-        const label = p.pair || p.position.slice(0, 8);
-        const readOnchain = dep("getOnchainPnl", getOnchainPnl);
-        // One on-chain read per position per tick at most (and cached 20s).
-        let onchain;
-        const onchainOnce = async () => {
-          if (onchain === undefined) onchain = await readOnchain(p).catch(() => null);
-          return onchain;
-        };
-        if (needsOnchain(p.pnl_pct, tracked, mgmt)) await onchainOnce();
-
-        const exitAction = updatePnlAndCheckExits(p.position, p.pnl_pct, config, { onchainPct: onchainPctForUnit(onchain, mgmt.pnlUnit) });
-        // updatePnlAndCheckExits leaves a pending marker when it held this reading
-        // as a warm-up spike. Fixed TP must respect that too (it didn't: a +33%
-        // spike at age 2m closed through FIXED_TP while the guard was "waiting").
-        const warmupHeld = !exitAction && !!getTrackedPosition(p.position)?._pnl_pending_extreme;
-        const fixedTpHit =
-          !exitAction &&
-          !warmupHeld &&
-          mgmt.takeProfitFeePct &&
-          p.pnl_pct >= mgmt.takeProfitFeePct;
-
-        const reason = exitAction || (fixedTpHit
-          ? `FIXED_TP: PnL ${p.pnl_pct.toFixed(1)}% >= take profit (${mgmt.takeProfitFeePct}%)`
-          : null);
-
-        if (!reason) continue;
-
-        // ─── Confirm on-chain before closing ───
-        const kind = exitKindFromReason(reason);
-        const trackedNow = getTrackedPosition(p.position);
-        const decision = await confirmPnlExit({
-          position: p,
-          kind,
-          apiPct: p.pnl_pct,
-          threshold: kind === "stop_loss" ? mgmt.stopLossPct : mgmt.takeProfitFeePct,
-          peakPct: trackedNow?.peak_pnl_pct,
-          dropPct: mgmt.trailingDropPct,
-          label,
-          unit: mgmt.pnlUnit,
-          getOnchain: onchainOnce,
+        const res = await evaluatePnlExit(p, {
+          config,
+          getTracked: getTrackedPosition,
+          update: updatePnlAndCheckExits,
+          register: registerExitTick,
+          recordHold: recordPnlHold,
+          readOnchain,
+          markOnchain: markOnchainRead,
+          now,
+          source: "watcher",
         });
-        if (!decision.close) {
-          log("pnl_watcher", `EXIT HELD for ${label}: ${reason} — ${decision.why}`);
-          recordPnlHold(p.position, reason, decision.why, { onchainPct: decision.onchainPct, config });
-          continue;
-        }
-
-        log("pnl_watcher", `EXIT TRIGGERED for ${label}: ${reason} (on-chain ${decision.onchainPct != null ? `${decision.onchainPct}%` : "unavailable"})`);
-
-        const override = decision.onchainPct != null
-          ? onchainOverride(p, trackedNow, decision.onchain, decision.onchainPct)
-          : {
-            pnl_usd: p.pnl_usd,
-            pnl_pct: p.pnl_pct,
-            total_value_usd: p.total_value_usd,
-            collected_fees_usd: p.collected_fees_usd,
-            unclaimed_fees_usd: p.unclaimed_fees_usd,
-          };
-
-        // Read-only bin snapshot for the alert, started alongside the close; never fails it.
-        const preCloseBins = dep("getPositionBins", getPositionBins)(p).catch(() => null);
-        const closeResult = await dep("closePosition", closePosition)({
-          position_address: p.position,
-          _pnlOverride: override,
-          _close_reason: `${reason}${p.oor_direction ? ` (OOR ${p.oor_direction})` : ""}`,
-        });
-
-        if (!closeResult?.success) {
-          log("pnl_watcher_error", `Failed to close ${p.position.slice(0, 8)}: ${closeResult?.error || "unknown error"}`);
-          continue;
-        }
-
-        log("pnl_watcher", `Closed ${label} | PnL: ${override.pnl_pct}% ($${override.pnl_usd})${decision.onchain ? ` on-chain (API said ${p.pnl_pct}%)` : ""}`);
-
-        try {
-          recordAutoClose({
-            position: p.position,
-            pair: p.pair,
-            reason,
-            pnl_pct: override.pnl_pct,
-            ...(decision.onchain && { api_pnl_pct: p.pnl_pct }),
-            ts: new Date().toISOString(),
-          });
-        } catch (stateErr) {
-          log("pnl_watcher_error", `Failed to record auto-close in state: ${stateErr.message}`);
-        }
-
-        dep("emit", emit)("pnl_watcher_close", {
-          pair: p.pair,
-          position: p.position,
-          pool: p.pool,
-          txs: closeResult.txs ?? null,
-          pnlPct: override.pnl_pct,
-          pnlSol: decision.onchain ? decision.onchain.pnlSol : p.pnl_sol,
-          pnlUsd: override.pnl_usd,
-          autoClose: true,
-          reason,
-          bins: await withTimeout(preCloseBins, 1_500),
-        });
+        if (res.action === "close") decided.push({ p, res });
       } catch (posErr) {
-        log("pnl_watcher_error", `Error processing position ${p.position.slice(0, 8)}: ${posErr.message}`);
+        log("pnl_watcher_error", `Error processing position ${String(p.position).slice(0, 8)}: ${posErr.message}`);
       }
     }
+
+    // Closes serialize on the wallet lock (close priority); run them together so
+    // one slow close does not delay the others' lock requests.
+    await Promise.allSettled(decided.map(async ({ p, res }) => {
+      try {
+        await closeForExit(p, res, {
+          closePosition: dep("closePosition", closePosition),
+          getTracked: getTrackedPosition,
+          isCloseInflight: dep("isCloseInflight", isCloseInflight),
+          recordAutoClose,
+          emit: dep("emit", emit),
+          getPositionBins: dep("getPositionBins", getPositionBins),
+          withTimeout,
+          postClose: dep("postClose", finalizeCodeClose),
+          source: "watcher",
+        });
+      } catch (posErr) {
+        log("pnl_watcher_error", `Error closing position ${String(p.position).slice(0, 8)}: ${posErr.message}`);
+      }
+    }));
   } catch (err) {
     log("pnl_watcher_error", `Tick failed: ${err.message}`);
   } finally {
@@ -245,8 +159,11 @@ export function startPnlWatcher(intervalSec = 30) {
   const intervalMs = intervalSec * 1000;
   log("pnl_watcher", `Starting PnL watcher (every ${intervalSec}s)`);
 
-  runPnlWatcher();
-  _intervalHandle = setInterval(runPnlWatcher, intervalMs);
+  // C1: timers must not inherit a wallet-lock ALS context from the caller.
+  outsideWalletLock(() => {
+    runPnlWatcher();
+    _intervalHandle = setInterval(runPnlWatcher, intervalMs);
+  });
 }
 
 export function stopPnlWatcher() {
