@@ -167,11 +167,14 @@ test("fetchPoolForRecheck: builds a pool_address filter, returns the first row /
 });
 
 // ─── executor integration of the two guards ───────────────────────
+// Screening thresholds the executor guards depend on, pinned explicitly so these
+// tests never inherit a developer's real user-config.json. Same values as S above.
 function withConfig(patch, fn) {
-  const before = { safety: { ...config.safety }, source: config.screening.source };
+  const before = { safety: { ...config.safety }, screening: { ...config.screening } };
+  Object.assign(config.screening, S, patch.screening || {});
   Object.assign(config.safety, patch.safety || {});
   if (patch.source) config.screening.source = patch.source;
-  return Promise.resolve(fn()).finally(() => { config.safety = before.safety; config.screening.source = before.source; ex.__setDeployRecheckFetch(null); });
+  return Promise.resolve(fn()).finally(() => { config.safety = before.safety; config.screening = before.screening; ex.__setDeployRecheckFetch(null); });
 }
 
 test("executor guard: passes a healthy pool; refuses a threshold breach; fails closed when the fetch fails", async () => {

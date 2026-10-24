@@ -7,14 +7,15 @@ import { getEffectiveMinSolToOpen, normalizeScreeningSource, worstCaseDeployOver
 import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 import { computePortfolioSol } from "./portfolio-value.js";
 import { BY_KEY, GOVERNED_KEYS, makeResolver, normalizeProfile, PROFILE_NAMES } from "./settings-schema.js";
+import { userConfigPath, gmgnConfigPath } from "./config-paths.js";
 import { migrateLegacyBookkeeping } from "./config-state.js";
 import { syncWalletLockFromConfig } from "./wallet-lock.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // MERIDIAN_USER_CONFIG_PATH lets tests point every reader/writer at a temp file.
-export const USER_CONFIG_PATH = process.env.MERIDIAN_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
+export const USER_CONFIG_PATH = userConfigPath();
 // MERIDIAN_GMGN_CONFIG_PATH lets tests point the gmgn-config.json reader/writer at a temp file.
-export const GMGN_CONFIG_PATH = process.env.MERIDIAN_GMGN_CONFIG_PATH || path.join(__dirname, "gmgn-config.json");
+export const GMGN_CONFIG_PATH = gmgnConfigPath();
 
 function readJsonIfExists(filePath) {
   return fs.existsSync(filePath)

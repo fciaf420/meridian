@@ -6,13 +6,11 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { configStatePath } from "./config-paths.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 
 export function statePath() {
-  if (process.env.MERIDIAN_CONFIG_STATE_PATH) return process.env.MERIDIAN_CONFIG_STATE_PATH;
-  const userPath = process.env.MERIDIAN_USER_CONFIG_PATH;
-  const dir = userPath ? path.dirname(userPath) : path.dirname(fileURLToPath(import.meta.url));
-  return path.join(dir, "config-state.json");
+  return configStatePath();
 }
 
 export function readConfigState() {
