@@ -61,3 +61,6 @@ config-state.json
 # One-time pre-migration backups (may hold walletKey/rpcUrl)
 *.pre-profiles.bak
 user-config.json.pre-profiles.bak
+
+# local scratch output (sim scripts)
+tmp/
