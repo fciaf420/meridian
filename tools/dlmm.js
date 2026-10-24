@@ -58,6 +58,8 @@ const CLOSE_VERIFY_READS = 4;
 const CLOSE_VERIFY_DELAY_MS = 1500;
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
 import { flipCloseTags } from "./bidask-flip.js";
+import { HYBRID, normalizeHybridMix, splitHybridLamports, hybridTrackFields } from "../hybrid-mix.js";
+import { buildHybridStandardTx, buildHybridChunkTxs } from "./hybrid-build.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -572,8 +574,21 @@ export async function deployPosition({
     throw new Error(`Deploy amount ${totalSolAmount} SOL is below the 0.1 SOL minimum. Pass at least 0.1 SOL or omit the amount to use the wallet-scaled default.`);
   }
 
-  if (!["bid_ask", "spot"].includes(activeStrategy)) {
-    throw new Error("Only 'bid_ask' or 'spot' strategies are allowed.");
+  if (!["bid_ask", "spot", HYBRID].includes(activeStrategy)) {
+    throw new Error("Only 'bid_ask', 'spot' or 'hybrid' strategies are allowed.");
+  }
+
+  // Hybrid = ONE single-sided SOL position with a Bid-Ask layer + a Spot layer.
+  // Validate the mix and the shape BEFORE anything is spent or built.
+  let hybridMix = null;
+  if (activeStrategy === HYBRID) {
+    try { hybridMix = normalizeHybridMix(config.strategy.hybridBidAskPct); } catch (e) {
+      return { success: false, error: `Hybrid deploy refused: ${e.message}` };
+    }
+    if ((amount_x ?? 0) > 0 || (sol_split_pct != null && sol_split_pct < 100)) {
+      return { success: false, error: "Hybrid is single-sided SOL only: do not pass amount_x or a sol_split_pct below 100." };
+    }
+    bins_above = 0;
   }
 
   // ─── Hard guard: token-age window (every strategy) ─────────────
@@ -916,6 +931,7 @@ export async function deployPosition({
         amount_x: amount_x || 0,
         amount_y: totalSolAmount,
         wide_range: (activeBinsBelow + activeBinsAbove) > 69,
+        ...(activeStrategy === HYBRID && hybridMix ? { strategy_mix: { bid_ask_pct: hybridMix.bidAskPct, spot_pct: hybridMix.spotPct } } : {}),
       },
       message: "DRY RUN — no transaction sent",
     };
@@ -1163,7 +1179,9 @@ export async function deployPosition({
     spot: StrategyType.Spot,
     curve: StrategyType.Curve,
     bid_ask: StrategyType.BidAsk,
+    hybrid: StrategyType.BidAsk, // leg 1 of a hybrid; leg 2 (Spot) is built separately
   };
+  const isHybrid = activeStrategy === HYBRID && hybridMix != null;
 
   const strategyType = strategyMap[activeStrategy];
   if (strategyType === undefined) {
@@ -1229,6 +1247,18 @@ export async function deployPosition({
 
   const isWideRange = totalBins > 69;
 
+  // Hybrid legs: Bid-Ask gets floor(total × pct), Spot the remainder, so the two
+  // always sum EXACTLY to the deposit. Recomputed if the pre-submit gate shrinks it.
+  const computeHybridLegs = () => (isHybrid ? splitHybridLamports(totalYLamports, hybridMix.bidAskPct) : null);
+  let hybridLegs = computeHybridLegs();
+  const legSol = () => (hybridLegs ? { bid_ask_sol: Number(hybridLegs.bidAsk.toString()) / 1e9, spot_sol: Number(hybridLegs.spot.toString()) / 1e9 } : null);
+  const strategyTrackFields = () => (isHybrid
+    ? { strategy_type: "Hybrid", sol_split_pct: 100, ...hybridTrackFields(hybridMix, { ...legSol() }) }
+    : {
+      strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
+      sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
+    });
+
   log("deploy", `Pool: ${pool_address}`);
   log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
@@ -1282,13 +1312,33 @@ export async function deployPosition({
         log("deploy", `Pre-submit gate: SOL leg shrunk ${finalAmountY} → ${gate.amount} to fit balance after swap fees/rent`);
         finalAmountY = gate.amount;
         totalYLamports = uiToRawBN(finalAmountY, 9);
+        hybridLegs = computeHybridLegs();
       }
       log("deploy", `Pre-submit gate ok (price move ${gate.movePct.toFixed(2)}%, free SOL ${gate.freeSol == null ? "n/a" : gate.freeSol.toFixed(4)})`);
     }
     txMaybeSent = true; // from here a tx may land even if we see an error
     const txHashes = [];
 
-    if (isWideRange) {
+    // Hybrid ≤69 bins: ONE atomic tx (initialize + Bid-Ask add + Spot add). Built
+    // here, before anything is sent. If it can't fit, fall back to the chunked path
+    // (create empty position, then per-chunk txs that each carry both legs).
+    let hybridStandard = null;
+    let useChunkedPath = isWideRange;
+    if (isHybrid && !isWideRange) {
+      hybridStandard = await buildHybridStandardTx({
+        pool, StrategyType, BN, positionPubKey: newPosition.publicKey, user: wallet.publicKey,
+        minBinId, maxBinId, legs: hybridLegs, slippage: depositSlip.slippagePct,
+      });
+      if (!hybridStandard.tx) {
+        log("deploy_warn", `Hybrid: ${hybridStandard.reason}; using the chunked path (create + per-chunk adds)`);
+        hybridStandard = null;
+        useChunkedPath = true;
+      } else {
+        log("deploy", `Hybrid ${hybridMix.bidAskPct}% Bid-Ask / ${hybridMix.spotPct}% Spot in one tx (${hybridStandard.size} bytes): ${hybridLegs.bidAsk} + ${hybridLegs.spot} lamports`);
+      }
+    }
+
+    if (useChunkedPath) {
       // ── Wide Range Path (>69 bins) ─────────────────────────────────
       // Solana limits inner instruction realloc to 10240 bytes, so we can't create
       // a large position in a single initializePosition ix.
@@ -1320,8 +1370,7 @@ export async function deployPosition({
         base_mint: pool.lbPair.tokenXMint.toBase58(),
         strategy: activeStrategy,
         strategy_profile: config.strategy.activeStrategy || null,
-        strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
-        sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
+        ...strategyTrackFields(),
         bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
         bin_step: resolvedBinStep,
         volatility,
@@ -1342,14 +1391,20 @@ export async function deployPosition({
       // uses a fresh activeId rather than the stale pre-create snapshot.
       await pool.refetchStates();
       try {
-        const addTxs = await pool.addLiquidityByStrategyChunkable({
-          positionPubKey: newPosition.publicKey,
-          user: wallet.publicKey,
-          totalXAmount: totalXLamports,
-          totalYAmount: totalYLamports,
-          strategy: { minBinId, maxBinId, strategyType },
-          slippage: depositSlip.slippagePct,
-        });
+        const addTxs = isHybrid
+          // one tx per chunk, each carrying BOTH legs (all-or-nothing per chunk)
+          ? await buildHybridChunkTxs({
+            pool, StrategyType, BN, positionPubKey: newPosition.publicKey, user: wallet.publicKey,
+            minBinId, maxBinId, legs: hybridLegs, slippage: depositSlip.slippagePct,
+          })
+          : await pool.addLiquidityByStrategyChunkable({
+            positionPubKey: newPosition.publicKey,
+            user: wallet.publicKey,
+            totalXAmount: totalXLamports,
+            totalYAmount: totalYLamports,
+            strategy: { minBinId, maxBinId, strategyType },
+            slippage: depositSlip.slippagePct,
+          });
         const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
         const { chunkBinRange } = await import("@meteora-ag/dlmm");
         const chunkRanges = chunkBinRange(minBinId, maxBinId);
@@ -1472,6 +1527,9 @@ export async function deployPosition({
           txs: txHashes,
         };
       }
+    } else if (hybridStandard) {
+      const txHash = await sendManagedTransaction(hybridStandard.tx, [wallet, newPosition], "deploy hybrid standard");
+      txHashes.push(txHash);
     } else {
       // ── Standard Path (<=69 bins) ─────────────────────────────────
       const tx = await pool.initializePositionAndAddLiquidityByStrategy({
@@ -1498,8 +1556,7 @@ export async function deployPosition({
       base_mint: pool.lbPair.tokenXMint.toBase58(),
       strategy: activeStrategy,
       strategy_profile: config.strategy.activeStrategy || null,
-      strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
-      sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
+      ...strategyTrackFields(),
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step: resolvedBinStep,
       volatility,
@@ -1521,6 +1578,7 @@ export async function deployPosition({
       pool: pool_address,
       bin_range: { min: minBinId, max: maxBinId, active: activeBin.binId },
       strategy: activeStrategy,
+      ...(isHybrid ? { strategy_mix: { bid_ask_pct: hybridMix.bidAskPct, spot_pct: hybridMix.spotPct }, legs: legSol() } : {}),
       wide_range: isWideRange,
       amount_x: finalAmountX,
       amount_y: finalAmountY,
