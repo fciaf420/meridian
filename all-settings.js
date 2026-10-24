@@ -43,7 +43,7 @@ const SECTION_GROUP = {
 
 /** Keys with a fixed set of valid values. `null` in a list means "unset / default". */
 export const ENUMS = {
-  strategy: ["spot", "bid_ask"],
+  strategy: ["spot", "bid_ask", "hybrid"],
   screeningSource: ["meteora", "gmgn", "both"],
   llmProvider: ["codex", "claude", "deepseek", "minimax", "openrouter"],
   priorityFeeLevel: ["Min", "Low", "Medium", "High", "VeryHigh", "UnsafeMax"],
@@ -66,6 +66,7 @@ export const RESTART_KEYS = new Set(["llmProvider", "webPort"]);
 const BOUNDS = {
   managementIntervalMin: [1, 1440], screeningIntervalMin: [1, 1440],
   positionSizePct: [0.01, 1], gasReserve: [0, 5], gasReserveSol: [0, 5],
+  hybridBidAskPct: [1, 100],
   deployAmountUsd: [1, 100_000], maxDeployUsd: [1, 100_000], minUsdcToOpen: [0, 1_000_000],
   maxDeployAmount: [0.1, Infinity], maxSwapPriceImpactPct: [0.1, 50], maxCloseSwapPriceImpactPct: [0.1, 90],temperature: [0, 2], maxTokens: [256, 200_000], maxSteps: [1, 100],
   emergencyPriceDropPct: [-100, -1], webPort: [1, 65_535], twapWindowMinutes: [5, 1440],

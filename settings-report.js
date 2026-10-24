@@ -140,6 +140,7 @@ export function buildSettingsReport({ color = false } = {}) {
   h("Strategy  " + C.dim("(user-config.json)"));
   row("active strategy", config.strategy.activeStrategy, "activeStrategy");
   row("shape", config.strategy.strategy, "strategy");
+  if (config.strategy.strategy === "hybrid") row("hybrid mix", `${config.strategy.hybridBidAskPct}% Bid-Ask / ${config.strategy.hybridSpotPct}% Spot  (one position, single-sided SOL)`, "hybridBidAskPct (Spot share is derived = 100 - Bid-Ask)");
   if (config.strategy.activeStrategy === "evil_panda") {
     row("evil panda range %", `${config.strategy.evilPanda.priceRangePct}%`, "evilPandaPriceRangePct");
     row("evil panda min mcap", `$${config.strategy.evilPanda.minMcap.toLocaleString()}`, "evilPandaMinMcap");
@@ -166,7 +167,7 @@ export function buildSettingsReport({ color = false } = {}) {
   row("non-transferable", onOff(ef.blockNonTransferable), "blockNonTransferable");
   row("SOL-fee pools only", ef.solFeePoolsOnly ? C.green("on") : "off", "solFeePoolsOnly (CollectFeeMode OnlyY)");
   row("Jupiter scam flag", onOff(ef.blockJupiterSuspicious), "blockJupiterSuspicious (audit.isSus / banned)");
-  row("TWAP spike (bid_ask)", ef.twapSpikeMaxPct == null ? C.yellow("off") : `> +${ef.twapSpikeMaxPct}% vs ${ef.twapWindowMinutes}-min TWAP → block`, "twapSpikeMaxPct / twapWindowMinutes");
+  row("TWAP spike (bid_ask/hybrid)", ef.twapSpikeMaxPct == null ? C.yellow("off") : `> +${ef.twapSpikeMaxPct}% vs ${ef.twapWindowMinutes}-min TWAP → block`, "twapSpikeMaxPct / twapWindowMinutes");
 
   // ── screening (active source(s) only) ──
   if (srcSource === "both") {

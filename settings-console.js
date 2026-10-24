@@ -24,6 +24,8 @@ export const TUNING_SECTIONS = [
   { id: "ent", label: "Entry filters", pick: (r) => r.path?.[0] === "entryFilters" },
   { id: "siz", label: "Sizing", pick: (r) => ["deployAmountSol", "gasReserve"].includes(r.key) },
   { id: "cad", label: "Cadence", pick: (r) => r.path?.[0] === "schedule" },
+  // Not profile-governed (no preset changes it), but it is a tuning knob: the Bid-Ask share of the "hybrid" shape.
+  { id: "shp", label: "Hybrid shape", ungoverned: true, pick: (r) => r.key === "hybridBidAskPct" },
 ];
 
 const fmt = (v) => (v === null || v === undefined ? "off" : typeof v === "boolean" ? (v ? "on" : "off") : Array.isArray(v) ? v.join(", ") : String(v));
@@ -151,7 +153,7 @@ export function createConsole({ btn, escapeHtml, clipText }) {
   }
 
   function sectionEntries(svc, sec) {
-    return svc.entries.filter((e) => e.governed && !BASIC_KEYS.includes(e.key) && sec.pick(BY_KEY.get(e.key) ?? { key: e.key, path: e.path }));
+    return svc.entries.filter((e) => (e.governed || sec.ungoverned) && !BASIC_KEYS.includes(e.key) && sec.pick(BY_KEY.get(e.key) ?? { key: e.key, path: e.path }));
   }
 
   function renderTuningSection(svc, secId, { profile, sourceOf }) {

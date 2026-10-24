@@ -9,6 +9,9 @@
   "screeningSource": "meteora",
   "activeStrategy": "classic",
   "strategy": "bid_ask",
+  "_strategy_options": "bid_ask | spot | hybrid  # hybrid = ONE single-sided SOL position holding a Bid-Ask layer + a Spot layer",
+  "hybridBidAskPct": 60,
+  "_hybridBidAskPct_note": "only used when strategy is hybrid: Bid-Ask share 1-100 (default 60). The Spot share is DERIVED (100 - this) and cannot be set separately.",
 
   "llmProvider": "claude",
 

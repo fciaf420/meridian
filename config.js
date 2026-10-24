@@ -312,6 +312,8 @@ export const config = {
     solanaTrackerDailyCap: S("solanaTrackerDailyCap"), // SolanaTracker fallback calls per UTC day (free-plan credits)
     ohlcvTiers: S("ohlcvTiers"), // token-age → candle timeframe tiers; null = DEFAULT_OHLCV_TIERS in tools/ohlcv.js
     strategy:   S("strategy"),
+    hybridBidAskPct: S("hybridBidAskPct"), // "hybrid" shape: Bid-Ask layer share (%)
+    hybridSpotPct: S("hybridSpotPct"),     // derived = 100 - hybridBidAskPct (never set directly)
     binsBelow:  S("binsBelow"),  // activeBin - 69 to activeBin = 70 bins total (program max)
     evilPanda: {
       minTokenVolume24h: S("evilPandaMinTokenVolume24h"),
@@ -618,7 +620,7 @@ export const INTEGER_KEYS = new Set([
   "maxPositions", "maxDeployAmount",
   "managementIntervalMin", "screeningIntervalMin",
   "pnlWatcherIntervalSec",
-  "maxTokens", "maxSteps", "solanaTrackerDailyCap",
+  "maxTokens", "maxSteps", "solanaTrackerDailyCap", "hybridBidAskPct",
 ]);
 
 function findSection(key) {
