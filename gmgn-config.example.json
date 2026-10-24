@@ -27,9 +27,6 @@
   "maxRatTraderRate": 0.2,
   "athFilterPct": null,
 
-  "minSmartDegenCount": 1,
-  "requireKol": true,
-  "minKolCount": 1,
   "maxRugRatio": 0.3,
   "maxSniperCount": 20,
 

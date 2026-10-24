@@ -5,12 +5,13 @@
 // Path: MERIDIAN_CONFIG_STATE_PATH, else config-state.json beside user-config.json.
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 
 export function statePath() {
   if (process.env.MERIDIAN_CONFIG_STATE_PATH) return process.env.MERIDIAN_CONFIG_STATE_PATH;
   const userPath = process.env.MERIDIAN_USER_CONFIG_PATH;
-  const dir = userPath ? path.dirname(userPath) : path.dirname(new URL(import.meta.url).pathname);
+  const dir = userPath ? path.dirname(userPath) : path.dirname(fileURLToPath(import.meta.url));
   return path.join(dir, "config-state.json");
 }
 
@@ -40,6 +41,12 @@ export function migrateLegacyBookkeeping(userConfigPath) {
     const patch = {};
     for (const k of found) if (existing[LEGACY[k]] === undefined) patch[LEGACY[k]] = raw[k];
     if (Object.keys(patch).length) updateConfigState(patch);
+    // One-time safety copy of the pre-migration file (sizing + dryRun live here). Never overwrite an existing backup.
+    const bak = userConfigPath + ".pre-profiles.bak";
+    if (!fs.existsSync(bak)) {
+      fs.copyFileSync(userConfigPath, bak, fs.constants.COPYFILE_EXCL);
+      try { fs.chmodSync(bak, fs.statSync(userConfigPath).mode & 0o777); } catch { /* best effort */ }
+    }
     for (const k of found) delete raw[k];
     writeJsonAtomicSync(userConfigPath, raw);
     return true;

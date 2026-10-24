@@ -13,6 +13,9 @@
 import { PROFILES, UNTESTED_PROFILES, PROFILE_NAMES, diffProfile, tierCounts, BY_KEY } from "./settings-schema.js";
 
 /** Basics shown first, in order. Keys not present in the registry (e.g. a removed key) are skipped. */
+import bs58 from "bs58";
+import { Keypair } from "@solana/web3.js";
+
 export const BASIC_KEYS = ["dryRun", "maxPositions", "positionSizePct", "maxDeployAmount", "screeningSource", "activeStrategy", "strategy", "llmProvider"];
 
 /** Tuning sections: the profile-governed keys, grouped by what they control. */
@@ -26,10 +29,27 @@ export const TUNING_SECTIONS = [
 
 const fmt = (v) => (v === null || v === undefined ? "off" : typeof v === "boolean" ? (v ? "on" : "off") : Array.isArray(v) ? v.join(", ") : String(v));
 
-/** True for text that looks like a wallet private key (base58 secret key, byte-array JSON, 64-hex). */
-export function looksLikeSecret(text) {
+/**
+ * True for text that looks like a wallet private key. Only meaningful while the console is awaiting a typed
+ * value (`awaiting: true`); in free chat nothing is flagged, so a pasted tx signature or address reaches the LLM.
+ *
+ * Ambiguity: a Solana secret key (64 bytes) and a tx signature (64 bytes) both base58-encode to 87-88 chars.
+ * So for 87-88 char base58 we decode and check the 64 bytes really are a keypair (last 32 bytes = public key of
+ * the first 32); a signature fails that check and is not flagged. Other base58 lengths in 80-92 never fit a
+ * setting value or a signature, so they are still refused. JSON byte arrays and 64-hex are distinctive, flagged.
+ */
+export function looksLikeSecret(text, { awaiting = false } = {}) {
+  if (!awaiting) return false;
   const t = String(text ?? "").trim();
-  if (/^[1-9A-HJ-NP-Za-km-z]{80,92}$/.test(t)) return true; // base58 64-byte secret key
+  if (/^[1-9A-HJ-NP-Za-km-z]{80,92}$/.test(t)) {
+    if (t.length < 87 || t.length > 88) return true;
+    try {
+      const bytes = bs58.decode(t);
+      if (bytes.length !== 64) return true;
+      Keypair.fromSecretKey(bytes); // throws unless pubkey matches the seed
+      return true;
+    } catch { return false; } // 64 bytes that are not a keypair: a tx signature
+  }
   if (/^(0x)?[0-9a-fA-F]{64}$/.test(t) || /^[0-9a-fA-F]{128}$/.test(t)) return true;
   if (/^\[\s*\d{1,3}(\s*,\s*\d{1,3}){31,}\s*\]$/.test(t)) return true; // [12,34,...] keypair file contents
   return false;

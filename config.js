@@ -1,4 +1,5 @@
 import fs from "fs";
+import { isTruthyDryRun } from "./env-flags.js";
 import path from "path";
 import { fileURLToPath } from "url";
 import { writeJsonAtomicSync } from "./atomic-write.js";
@@ -55,10 +56,10 @@ if (!process.env.GMGN_API_KEY && (gmgnUserConfig.apiKey || u.gmgnApiKey)) {
 // True when DRY_RUN=true is in the environment (`npm run dev`, a .env line, a service unit). That is the ONE
 // env value that still beats user-config.json, because it can only make the bot safer: it forces dry run for
 // this process. DRY_RUN=false in the environment never overrides a dry-run user-config.
-export const DRY_RUN_SET_IN_ENV = process.env.DRY_RUN === "true";
+export const DRY_RUN_SET_IN_ENV = isTruthyDryRun(process.env.DRY_RUN);
 
 const ENV_FALLBACKS = [
-  ["dryRun", "DRY_RUN", (v) => String(v) === "true"],
+  ["dryRun", "DRY_RUN", (v) => isTruthyDryRun(v)],
   ["usdcMode", "USDC_MODE", (v) => String(v) === "true"],
   ["llmProvider", "LLM_PROVIDER", (v) => v],
   ["llmModel", "LLM_MODEL", (v) => v],
@@ -66,7 +67,7 @@ const ENV_FALLBACKS = [
 ];
 for (const [key, envName, parse] of ENV_FALLBACKS) {
   const envVal = process.env[envName];
-  if (key === "dryRun" && envVal === "true") {
+  if (key === "dryRun" && DRY_RUN_SET_IN_ENV) {
     if (u.dryRun === false) warn("DRY_RUN=true in the environment forces DRY RUN for this run; user-config.json dryRun=false is NOT used while it is set. Unset DRY_RUN (or remove it from .env) to go live.");
     else if (u.dryRun === undefined) warn("DRY_RUN in .env is deprecated (used as a fallback for one more release). Set dryRun in user-config.json or Telegram instead.");
     u.dryRun = true;
@@ -81,6 +82,7 @@ for (const [key, envName, parse] of ENV_FALLBACKS) {
   } else if (envVal !== undefined && envVal !== "") {
     warn(`${envName} in .env is deprecated (used as a fallback for one more release). Set ${key} in user-config.json or Telegram instead.`);
     u[key] = parse(envVal);
+    if (key === "dryRun") process.env.DRY_RUN = u.dryRun ? "true" : "false"; // normalize: downstream readers see exactly true/false
   }
 }
 if (u.profile !== undefined && !PROFILE_NAMES.includes(String(u.profile).toLowerCase())) {

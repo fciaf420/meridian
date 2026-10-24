@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { isDryRun } from "./env-flags.js";
 import fs from "fs";
 import path from "path";
 import cron from "node-cron";
@@ -55,7 +56,7 @@ import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buil
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
 log("startup", "DLMM LP Agent starting...");
-log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
+log("startup", `Mode: ${isDryRun() ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${config.llm.managementModel} (provider: ${process.env.LLM_PROVIDER || "openrouter"})`);
 
 // Crash handlers first, so a throw anywhere below is logged, alerted and exits 1
@@ -770,7 +771,7 @@ function startCronJobs() {
           isCloseInflight,
           management: config.management,
           log,
-          dryRun: process.env.DRY_RUN === "true",
+          dryRun: isDryRun(),
         },
       });
       fallbackSummary = mgmtRun.fallbackSummary;

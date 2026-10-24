@@ -166,9 +166,17 @@ test("a private key typed into the chat is refused, never stored, never forwarde
   assert.ok(!calls.at(-1).text.includes(key));
   assert.notEqual(config.screening.category, key);
   assert.ok(!fs.readFileSync(USER_CFG, "utf8").includes(key));
-  assert.equal(sc.looksLikeSecret("[" + Array.from({ length: 64 }, (_, i) => i).join(",") + "]"), true);
-  assert.equal(sc.looksLikeSecret("0.5"), false);
-  assert.equal(sc.looksLikeSecret("So11111111111111111111111111111111111111112"), false);
+  const A = { awaiting: true };
+  assert.equal(sc.looksLikeSecret("[" + Array.from({ length: 64 }, (_, i) => i).join(",") + "]", A), true);
+  assert.equal(sc.looksLikeSecret(key, A), true);
+  assert.equal(sc.looksLikeSecret("0.5", A), false);
+  assert.equal(sc.looksLikeSecret("So11111111111111111111111111111111111111112", A), false);
+  // nit3: only checked while the console awaits input; a tx signature (64 bytes, 87-88 base58) is not a key
+  assert.equal(sc.looksLikeSecret(key), false);
+  const sig = bs58.encode(Uint8Array.from({ length: 64 }, (_, i) => (i * 37 + 11) % 256));
+  assert.ok(sig.length >= 86 && sig.length <= 88);
+  assert.equal(sc.looksLikeSecret(sig, A), false);
+  assert.equal(sc.looksLikeSecret(sig), false);
 });
 
 test("LLM provider is the only Basics key flagged restart; secrets never in the registry", async () => {
@@ -202,4 +210,20 @@ test("lessons: evolution only proposes (and logs) unless autoTune is on; explici
   const on = lessons.evolveThresholds(perf, mk(), {});
   assert.deepEqual(Object.keys(on.changes).sort(), Object.keys(off.proposed).sort());
   for (const [k, v] of Object.entries(on.changes)) assert.equal(readJson(USER_CFG)[k], v);
+});
+
+test("nit3: a tx signature in free chat is not refused (no pending input)", async () => {
+  const { u, calls } = makeUI();
+  const sig = bs58.encode(Uint8Array.from({ length: 64 }, (_, i) => (i * 53 + 7) % 256));
+  const n = calls.length;
+  await u.handleMessage(sig, { chatId: OWNER }).catch(() => {});
+  assert.ok(!calls.slice(n).some((c) => /private key/.test(c.text || "")));
+});
+
+test("nit5: turning autoTune ON needs the risk confirm; turning it off is one tap", () => {
+  const { svc } = makeUI();
+  const e = svc.find("autoTune");
+  assert.ok(e);
+  assert.ok(svc.risk(e, true).length > 0);
+  assert.equal(svc.risk(e, false).length, 0);
 });

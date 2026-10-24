@@ -10,6 +10,7 @@
 // Everything with side effects is injected (createAllSettings(deps)), so tests
 // run against temp files and mocks.
 import { CONFIG_KEY_MAP } from "./runtime-helpers.js";
+import { isTruthyDryRun } from "./env-flags.js";
 import { SCHEMA } from "./settings-schema.js";
 import { validateTradingValue, riskIncreases, readTradingSettings, TRADING_KEYS } from "./trading-settings.js";
 
@@ -149,7 +150,7 @@ export function createAllSettings(deps) {
   }
 
   function currentOf(entry) {
-    if (entry.special === "dryRun") return env.DRY_RUN === "true";
+    if (entry.special === "dryRun") return isTruthyDryRun(env.DRY_RUN);
     if (entry.path) return getPath(config, entry.path);
     if (entry.key === "llmProvider") return env.LLM_PROVIDER ?? null;
     return undefined;
@@ -233,6 +234,7 @@ export function createAllSettings(deps) {
     const before = currentOf(entry);
     const k = entry.key;
     if (entry.special === "dryRun") return [value ? "switches to DRY RUN (no transactions are sent)" : "switches to LIVE trading with real funds"];
+    if (k === "autoTune") return value === true && before !== true ? ["turns on auto-tune: the bot will rewrite screening thresholds on its own after closed positions"] : [];
     if (entryKeys.has(k)) return deps.entryFilters?.isLoosening?.(k, before, value) ? ["turns an entry-safety guard off or loosens it"] : [];
     if (["stopLossPct", "deployAmountSol", "maxPositions", "trailingTakeProfit"].includes(k)) {
       return riskIncreases({ [k]: value }, readTradingSettings(config));

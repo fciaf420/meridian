@@ -13,6 +13,7 @@
 // i.e. the same path the agent's tools use, with every DRY_RUN guard and safety
 // check intact.
 import crypto from "crypto";
+import { isDryRun as envDryRun } from "./env-flags.js";
 import fs from "fs";
 import path from "path";
 import { escapeHtml, clipText, CALLBACK_DATA_MAX_BYTES } from "./telegram.js";
@@ -1300,7 +1301,7 @@ export function createTelegramUI(deps) {
     customDeploy: null, // { chatId, expiresAt } while waiting for a "Custom…" deploy size
     cfgInput: null, // { chatId, id, expiresAt } while waiting for an All-settings value
   };
-  const isDryRun = () => process.env.DRY_RUN === "true";
+  const isDryRun = () => envDryRun();
   const unit = () => deps.config.management?.pnlUnit || "sol";
   const source = () => deps.config.screening?.source || "meteora";
 
@@ -1851,7 +1852,7 @@ export function createTelegramUI(deps) {
 
     // A private key must never be typed into the chat (secrets are .env-only): refuse it before it
     // can become a setting value or reach the LLM, and tell the owner to delete the message.
-    if (looksLikeSecret(text)) {
+    if (looksLikeSecret(text, { awaiting: !!(svc() && cfgPending(ctx.chatId)) })) {
       state.cfgInput = null;
       logf("telegram_warn", "Refused a message that looks like a private key (not stored, not forwarded)");
       await deps.tg.sendHTML("🔐 That looks like a <b>private key</b>. I did not store or use it. Delete that message from this chat now, and never send keys here: the wallet key, RPC URL, bot token and API keys live in <code>.env</code> only. If it was a real key, treat it as exposed and move funds to a new wallet.");

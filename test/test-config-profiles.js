@@ -151,3 +151,40 @@ test("autoTune defaults off", () => {
   assert.equal(load("new", {}, {}).config.learning.autoTune, false);
   assert.equal(load("new", { autoTune: true }, {}).config.learning.autoTune, true);
 });
+
+test("nit1: DRY_RUN=1/yes/ON/TRUE are normalized to dry run (not silently LIVE) and written back as exact true/false", () => {
+  for (const v of ["1", "yes", "ON", "TRUE", "True"]) {
+    assert.equal(load("new", { dryRun: false }, {}, { DRY_RUN: v }).env.DRY_RUN, "true", v);
+    assert.equal(load("new", {}, {}, { DRY_RUN: v }).env.DRY_RUN, "true", v);
+  }
+  assert.equal(load("new", {}, {}, { DRY_RUN: "no" }).env.DRY_RUN, "false");
+  assert.equal(load("new", {}, {}, { DRY_RUN: "0" }).env.DRY_RUN, "false");
+});
+
+test("nit2: one-time user-config.json.pre-profiles.bak is written before the rewrite and never overwritten", () => {
+  const u = readFix("live-user-config.json");
+  const r = load("new", u, readFix("live-gmgn-config.json"));
+  const bak = r.userPath + ".pre-profiles.bak";
+  assert.deepEqual(JSON.parse(fs.readFileSync(bak, "utf8")), u);
+  const again = { ...JSON.parse(fs.readFileSync(r.userPath, "utf8")), _lastEvolved: "newer" };
+  fs.writeFileSync(r.userPath, JSON.stringify(again));
+  const dir = path.dirname(r.userPath);
+  spawnSync(process.execPath, [path.join(FIX, "dump-config.mjs"), "config.js"], { cwd: ROOT, encoding: "utf8", env: { ...process.env, MERIDIAN_USER_CONFIG_PATH: r.userPath, MERIDIAN_GMGN_CONFIG_PATH: path.join(dir, "gmgn-config.json"), MERIDIAN_LOG_DIR: dir } });
+  assert.ok(!("_lastEvolved" in JSON.parse(fs.readFileSync(r.userPath, "utf8"))), "second migration ran");
+  assert.deepEqual(JSON.parse(fs.readFileSync(bak, "utf8")), u, "backup untouched");
+});
+
+test("nit6: statePath decodes the module URL (checkout path with a space)", () => {
+  const dir = fs.mkdtempSync(path.join(TMP, "dir with space "));
+  for (const f of ["config-state.js", "atomic-write.js"]) fs.copyFileSync(path.join(ROOT, f), path.join(dir, f));
+  const env = { ...process.env }; delete env.MERIDIAN_USER_CONFIG_PATH; delete env.MERIDIAN_CONFIG_STATE_PATH;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", `import { statePath, updateConfigState } from ${JSON.stringify(path.join(dir, "config-state.js"))}; updateConfigState({ a: 1 }); console.log(statePath());`], { encoding: "utf8", env });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), path.join(dir, "config-state.json"));
+  assert.ok(fs.existsSync(path.join(dir, "config-state.json")));
+});
+
+test("nit4: gmgn-config.example.json has none of the removed keys", () => {
+  const ex = fs.readFileSync(path.join(ROOT, "gmgn-config.example.json"), "utf8");
+  for (const k of ["minSmartDegenCount", "requireKol", "minKolCount"]) assert.ok(!ex.includes(k), k);
+});
