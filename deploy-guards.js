@@ -336,3 +336,13 @@ async function swapBackInner({ swapFn, baseMint, amount, solMint, log }) {
     return { ok: false, note: `swap-back errored (${e.message}); token ${baseMint} remains in the wallet` };
   }
 }
+
+/**
+ * D7: record an auto-swap for unwinding the moment the swap succeeds, before any
+ * further RPC (decimals / balance reads) that could throw. `amount` is a provisional
+ * UI-unit figure (9-decimals default, same as the later fallback) refined afterwards.
+ */
+export function provisionalAutoSwap(baseMint, amountOutRaw, decimals = 9) {
+  const n = Number(amountOutRaw);
+  return { baseMint, amount: Number.isFinite(n) && n > 0 ? n / Math.pow(10, decimals) : 0, provisional: true };
+}

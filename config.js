@@ -461,8 +461,8 @@ export const config = {
     mode:          S("bidAskFlipMode"),         // "off" | "shadow" | "live"
     fillPct:       S("bidAskFlipFillPct"),      // first flip at this % of deposited SOL converted
     reflipStepPct: S("bidAskFlipReflipStepPct"),// re-flip only a fresh tranche worth ≥ this % of the deposit
-    minTrancheSol: S("bidAskFlipMinTrancheSol"),
-    timeoutSec:    S("bidAskFlipTimeoutSec"),   // M1: flip-pass deadline (s)// never flip a tranche worth less than this
+    minTrancheSol: S("bidAskFlipMinTrancheSol"),  // never flip a tranche worth less than this
+    timeoutSec:    S("bidAskFlipTimeoutSec"),   // M1: flip-pass deadline (s)
   },
 
   // ─── Common Token Mints ────────────────

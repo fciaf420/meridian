@@ -825,3 +825,88 @@ test("M1: schema row is Advanced (tier 3), default 30, wired into config.bidAskF
   const { config } = await import("../config.js");
   assert.equal(config.bidAskFlip.timeoutSec >= 5, true);
 });
+
+test("D1: deadline fires during chunk 2's rebuild ⇒ the abandoned run never sends (exactly one send)", async () => {
+  const wb = wideBand();
+  const pool = fakePool({ active: -560, b: wb });
+  const h = hookDeps({ mode: "live", tracked: trackedWide(), pool });
+  h.deps.noWalletLock = true;
+  h.deps.timeoutMs = 150;
+  let sentOnce = false;
+  const baseRefetch = pool.refetchStates;
+  pool.refetchStates = async () => { if (sentOnce) await new Promise((r) => setTimeout(r, 400)); return baseRefetch(); };
+  h.deps.sendTx = async () => { sentOnce = true; h.sends.push(1); return `sig${h.sends.length}`; };
+  await runBidAskFlips([posRow()], h.deps);
+  await new Promise((r) => setTimeout(r, 600)); // let the abandoned rebuild finish
+  assert.equal(h.sends.length, 1, "chunk 2 must not be sent after the deadline");
+});
+
+test("D2: time queued behind the wallet lock is deducted; an expired pass does nothing once it gets the lock", async () => {
+  const wl = await import("../wallet-lock.js");
+  const pool = fakePool();
+  const h = hookDeps({ mode: "live", tracked: trackedBidAsk(), pool });
+  let poolReads = 0;
+  h.deps.getPool = async () => { poolReads++; return pool; };
+  h.deps.timeoutMs = 80;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const holder = wl.withWalletLock(() => gate, 0, "closer");
+  const flips = runBidAskFlips([posRow()], h.deps);
+  await new Promise((r) => setTimeout(r, 200)); // queued past the 80ms deadline
+  release();
+  await holder;
+  const res = await flips;
+  assert.deepEqual(res, []);
+  assert.equal(h.sends.length, 0);
+  assert.equal(poolReads, 0, "flipOne never started");
+});
+
+test("D3: a pending (possibly landed) first flip also takes on-chain PnL", async () => {
+  const dlmm = await import("../tools/dlmm.js");
+  const oc = async () => ({ pnlPct: 4.2, pnlUsd: 1, pnlSol: 0.01, pnlUnitPct: 4.2 });
+  const row = { position: "P", pool: "Q", pnl_pct: 99, sol_price: 100 };
+  const withoutOc = await dlmm.applyFlipOnchainPnl({ ...row }, { bid_ask_flip: { flips: 0 } }, { getOnchain: oc });
+  assert.equal(withoutOc.pnl_pct, 99);
+  let called = 0;
+  const r = await dlmm.applyFlipOnchainPnl({ ...row }, { bid_ask_flip: { flips: 0, pending: { at: "x", activeId: -1, xSig: "" } } }, { getOnchain: async (...a) => { called++; return oc(...a); } });
+  assert.equal(called, 1, "on-chain valuation consulted for a pending flip");
+  assert.notEqual(r.pnl_source, undefined);
+  assert.notEqual(r.pnl_pct, 99);
+});
+
+test("D4: remainingMs honors its deadline argument", () => {
+  assert.equal(flip.remainingMs(1_000, 400), 600);
+  assert.equal(flip.remainingMs(1_000, 5_000), 0);
+});
+
+test("D6: an abandoned run that lands after tracked state advanced does not overwrite it", async () => {
+  const pool = fakePool();
+  const tracked = trackedBidAsk();
+  const h = hookDeps({ mode: "live", tracked, pool });
+  h.deps.noWalletLock = true;
+  h.deps.timeoutMs = 60;
+  h.deps.updateTrackedPosition = (pos, patch) => { h.updates.push({ pos, patch }); Object.assign(tracked, patch); };
+  h.deps.sendTx = async () => { await new Promise((r) => setTimeout(r, 250)); h.sends.push(1); return "sigLate"; };
+  await runBidAskFlips([posRow()], h.deps);
+  assert.ok(tracked.bid_ask_flip?.pending, "pending marker written at timeout");
+  // next cycle resolves the pending flip as landed (newer state)
+  tracked.bid_ask_flip = { flips: 1, last_flip_active_bin: -455, last_flip_at: "2099-01-01T00:00:00.000Z", txs: ["sigNewer"] };
+  await new Promise((r) => setTimeout(r, 500));
+  assert.equal(h.sends.length, 1, "the abandoned send did land");
+  assert.equal(tracked.bid_ask_flip.flips, 1);
+  assert.equal(tracked.bid_ask_flip.last_flip_active_bin, -455);
+  assert.deepEqual(tracked.bid_ask_flip.txs, ["sigNewer"]);
+});
+
+test("D7: a successful auto-swap is recorded for unwinding before the decimals read", async () => {
+  const g = await import("../deploy-guards.js");
+  const rec = g.provisionalAutoSwap("MINTX", "2500000000");
+  assert.equal(rec.baseMint, "MINTX");
+  assert.equal(rec.amount, 2.5);
+  assert.equal(g.provisionalAutoSwap("M", undefined).amount, 0);
+  const src = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  const iRec = src.indexOf("autoSwapped = provisionalAutoSwap(");
+  const iDec = src.indexOf("getParsedAccountInfo(new PublicKey(baseMint))");
+  assert.ok(iRec > 0 && iDec > iRec, "swap recorded before any further RPC");
+  assert.match(src, /catch \(swapErr\)[\s\S]{0,400}unwindAutoSwap\(\)/, "fallback sells the swapped token back");
+});

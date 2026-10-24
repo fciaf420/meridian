@@ -498,10 +498,16 @@ export async function runBidAskFlips(positions = [], deps = {}) {
     for (const p of positions) {
       const ctl = { aborted: false, sending: false, snapshot: null };
       try {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) { log("bidask_flip", `flip pass deadline reached; skipping ${p?.pair ?? "?"} until next cycle`); continue; }
+        if (deadline - Date.now() <= 0) { log("bidask_flip", `flip pass deadline reached; skipping ${p?.pair ?? "?"} until next cycle`); continue; }
         const inner = () => flipOne(p, { ...deps, log, cfg, state, getPool, sdk, dlmm, ctl });
-        const run = () => raceFlipTimeout(inner(), remaining, ctl);
+        // D2: the budget is computed after the wallet lock is acquired, so time spent
+        // queued behind closes/claims is deducted; a pass whose deadline already
+        // elapsed while queued does nothing (it must not sign later with a stale budget).
+        const run = () => {
+          const left = deadline - Date.now();
+          if (left <= 0) { ctl.aborted = true; log("bidask_flip", `flip pass deadline elapsed while waiting for the wallet lock; skipping ${p?.pair ?? "?"} until next cycle`); return null; }
+          return raceFlipTimeout(inner(), left, ctl);
+        };
         // Live flips sign: serialize with closes/claims/swaps/deploys through the wallet
         // lock (above deploys, below closes). flipOne re-reads tracked state inside the lock,
         // so a position closed while we queued is skipped. Shadow/dry-run never signs.
@@ -510,7 +516,7 @@ export async function runBidAskFlips(positions = [], deps = {}) {
         if (r) results.push(r);
       } catch (e) {
         if (e?.flipTimeout) {
-          log("bidask_flip", `${p?.pair ?? "?"} ${String(p?.position ?? "").slice(0, 8)}: flip timed out after ${Math.round(remainingMs(deadline, deps, cfg) / 1000)}s; skipped this cycle${ctl.sending ? " (tx may be in flight: marked pending, next cycle re-reads on-chain)" : ""}`);
+          log("bidask_flip", `${p?.pair ?? "?"} ${String(p?.position ?? "").slice(0, 8)}: flip timed out after ${Math.round(totalBudgetMs(deadline, deps, cfg) / 1000)}s; skipped this cycle${ctl.sending ? " (tx may be in flight: marked pending, next cycle re-reads on-chain)" : ""}`);
           if (ctl.sending && ctl.snapshot) {
             try {
               const prev = state.getTrackedPosition(p.position)?.bid_ask_flip || {};
@@ -528,7 +534,10 @@ export async function runBidAskFlips(positions = [], deps = {}) {
   return results;
 }
 
-function remainingMs(deadline, deps, cfg) { return deps.timeoutMs ?? cfg.timeoutSec * 1000; }
+// D4: the budget this pass was given (for the log line). The deadline argument is the
+// absolute end of the pass; it is the source of truth once it has passed.
+function totalBudgetMs(deadline, deps, cfg) { return Math.max(0, deps.timeoutMs ?? cfg.timeoutSec * 1000); }
+export function remainingMs(deadline, now = Date.now()) { return Math.max(0, deadline - now); }
 
 /** M1: reject with a tagged error after `ms`; flags ctl.aborted so an abandoned run never sends. */
 function raceFlipTimeout(promise, ms, ctl) {
@@ -709,6 +718,8 @@ async function flipOne(p, ctx) {
       }
       // Each chunk is atomic and net-zero, so stopping after a failed chunk
       // leaves a valid (partially flipped) position — never stranded token.
+      // D1: the deadline may have fired during the rebuild awaits above; an abandoned run must never sign.
+      if (ctx.ctl?.aborted) throw new Error("flip pass timed out");
       sigs.push(await sendTx(new Transaction().add(...b.ixs), [wallet], `bid-ask flip ${sigs.length + 1}/${built.length}`));
     } catch (e) {
       sendError = e.message;
@@ -745,7 +756,18 @@ async function flipOne(p, ctx) {
   } catch (e) {
     verified = { error: e.message };
   }
-  const prev = tracked.bid_ask_flip || {};
+  // D6: if this run was abandoned (timeout) and the tracked flip state advanced since we
+  // read it (pending resolution or a newer flip), do not overwrite it with cycle-start data.
+  if (ctx.ctl?.aborted) {
+    const cur = state.getTrackedPosition(p.position)?.bid_ask_flip || {};
+    const advanced = Number(cur.flips || 0) > Number(plan.flips || 0) || (cur.last_flip_at && cur.last_flip_at !== (tracked.bid_ask_flip || {}).last_flip_at);
+    if (advanced) {
+      ctx.ctl.sending = false;
+      log("bidask_flip", `[live] abandoned flip run landed ${sigs.length}/${built.length} (${sigs.join(",")}) but tracked state already advanced; not overwriting`);
+      return { position: p.position, ...plan, simErr: null, cu, mode: "live", sent: true, sigs, sendError, verified, stateSkipped: true };
+    }
+  }
+  const prev = (ctx.ctl?.aborted ? state.getTrackedPosition(p.position)?.bid_ask_flip : null) || tracked.bid_ask_flip || {};
   const pct = Math.round(plan.fill.fillPct * 10) / 10;
   // L1: chunks run top-first. When only some landed, bins between active+1 and
   // the lowest landed chunk are still unflipped, so the next fresh tranche must

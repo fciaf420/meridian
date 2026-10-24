@@ -10,7 +10,7 @@ import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
-import { preSubmitGate, depositSlippage, swapBackAfterRefusal, recordRefusal } from "../deploy-guards.js";
+import { preSubmitGate, depositSlippage, swapBackAfterRefusal, recordRefusal, provisionalAutoSwap } from "../deploy-guards.js";
 import { beginAttempt, markAttempt, trackInFlightAttempt, releaseInFlightAttempt } from "../deploy-checkpoint.js";
 import { emit } from "../notifier.js";
 import {
@@ -1015,6 +1015,9 @@ export async function deployPosition({
       });
 
       if (swapResult.success) {
+        // D7: record the swap for unwinding BEFORE any further RPC, so a throw in the
+        // decimals/balance reads below still sells the token back. Refined after reads.
+        autoSwapped = provisionalAutoSwap(baseMint, swapResult.amount_out);
         // Read actual wallet token balance after swap — more reliable than
         // swapResult.amount_out which can differ from what's actually available
         // due to fees, rounding, or existing token dust in the wallet.
@@ -1057,6 +1060,8 @@ export async function deployPosition({
       }
     } catch (swapErr) {
       log("deploy", `WARNING: Auto-swap error (${swapErr.message}), falling back to SOL-only deployment`);
+      // D7: if the swap itself succeeded and a later read threw, sell the token back before the SOL-only fallback.
+      { const u = await unwindAutoSwap(); if (u) log("deploy", u.trim()); }
       // Fall back: keep original amounts, revert to the full SOL-only range.
       activeBinsAbove = 0;
       activeBinsBelow = totalRangeBins ?? bins_below ?? config.strategy.binsBelow;
@@ -2188,7 +2193,8 @@ export async function getMyPositions({ force = false } = {}) {
  * row is tagged pnl_source "api_after_flip".
  */
 export async function applyFlipOnchainPnl(row, tracked, { getOnchain = null } = {}) {
-  if (!(Number(tracked?.bid_ask_flip?.flips) > 0)) return row;
+  // D3: a flip whose send timed out may have landed: `pending` counts as flipped until resolved.
+  if (!(Number(tracked?.bid_ask_flip?.flips) > 0 || tracked?.bid_ask_flip?.pending)) return row;
   try {
     const get = getOnchain || (await import("./onchain-pnl.js")).getOnchainPnl;
     const oc = await get({ position: row.position, pool: row.pool, sol_price: row.sol_price }, { force: true });
