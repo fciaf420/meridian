@@ -25,7 +25,11 @@ import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing, recordBriefing, latestBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
+import { updatePnlAndCheckExits, getTrackedPosition, registerExitTick, recordPnlHold, recordAutoClose } from "./state.js";
+import { runManagementCodeRules, formatCodeRuleResults } from "./management-rules.js";
+import { getOnchainPnl } from "./tools/onchain-pnl.js";
+import { closePosition } from "./tools/dlmm.js";
+import { withTimeout } from "./tools/bin-visual.js";
 import { emit, on } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
@@ -623,14 +627,9 @@ function startCronJobs() {
             import("./tools/recenter-shadow.js").then((m) => m.logRecenterShadow(p)).catch(() => {});
           }
 
-          // Trailing TP / stop loss check
-          if (p.pnl_pct != null) {
-            const exitAction = updatePnlAndCheckExits(p.position, p.pnl_pct, config);
-            if (exitAction) {
-              exits.push(`⚠ ${p.pair}: ${exitAction}`);
-              log("exit_check", `${p.pair}: ${exitAction}`);
-            }
-          }
+          // Stop loss / trailing / TP are no longer evaluated here as LLM
+          // "exit alerts": the code rules below run the shared exit engine
+          // (exit-engine.js) and close in code.
 
           // Study hold time context — compare your age to top LPers
           if (p.study_avg_hold_hours != null) {
@@ -706,43 +705,50 @@ function startCronJobs() {
         if (kbHints) kbContext = `\n\n${kbHints}`;
       } catch { /* best-effort */ }
 
-      // Hard-close rules 2-6 are threshold checks on data already in hand. Evaluate them
-      // here and start a model session only when a position carries a free-text
-      // instruction, a rule fired, a rule could not be evaluated, or there are exit
-      // alerts. All-HOLD cycles skip the LLM call. This only gates the LLM: nothing is
-      // closed in code here, and the PnL watcher's own exits are unaffected.
-      if (precheckedPositions?.length && !exitAlerts) {
-        const m = config.management;
-        const ruleHits = [];
-        const closeReasons = []; // [position, label] for the close history (tools/executor.js withCloseReason)
-        for (const p of precheckedPositions) {
-          if (getTrackedPosition(p.position)?.instruction) { ruleHits.push(`${p.pair}: instruction`); closeReasons.push([p.position, "rule 1: instruction met"]); }
-          else if (p.pnl_pct == null) ruleHits.push(`${p.pair}: pnl unknown`);
-          // A PnL the warm-up guard (state.js) is holding as a likely spike is not a
-          // take-profit signal; the PnL watcher re-checks it on its next tick.
-          else if (p.pnl_pct >= m.takeProfitFeePct && getTrackedPosition(p.position)?._pnl_pending_extreme) { /* warm-up spike: hold */ }
-          else if (p.pnl_pct >= m.takeProfitFeePct) { ruleHits.push(`${p.pair}: rule 3`); closeReasons.push([p.position, `rule 3: take profit (${p.pnl_pct}% ≥ ${m.takeProfitFeePct}%)`]); }
-          else if ((p.minutes_out_of_range ?? 0) >= m.outOfRangeWaitMinutes) { ruleHits.push(`${p.pair}: rule 4`); closeReasons.push([p.position, `rule 4: OOR timeout${p.oor_direction ? ` (OOR ${p.oor_direction})` : ""}`]); }
-          else if (p.pnl_pct <= m.emergencyPriceDropPct) { ruleHits.push(`${p.pair}: rule 6`); closeReasons.push([p.position, `rule 6: emergency stop (${p.pnl_pct}%)`]); }
-          else if (!p.pool) ruleHits.push(`${p.pair}: pool unknown`);
-          else {
-            const d = await getPoolDetail({ pool_address: p.pool, timeframe: config.screening.timeframe || "5m" }).catch(() => null);
-            if (!d || !Number.isFinite(d.fee_active_tvl_ratio) || !Number.isFinite(d.volume)) ruleHits.push(`${p.pair}: rule 5 unverified`);
-            else if (d.fee_active_tvl_ratio < config.screening.minFeeActiveTvlRatio && d.volume < config.screening.minVolume) {
-              ruleHits.push(`${p.pair}: rule 5`);
-              closeReasons.push([p.position, "rule 5: yield dead"]);
-            }
-          }
-        }
-        setManagementCloseReasons(closeReasons);
-        if (ruleHits.length === 0) {
-          log("cron", `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD (LLM skipped)`);
-          mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD.`;
+      // Hard-close rules 3-6 are decided AND executed in code (management-rules.js):
+      // PnL rules through the shared exit engine (on-chain confirmation + N
+      // consecutive ticks, same streak as the PnL watcher), rule 4 / rule 5 by
+      // threshold. The LLM runs only for free-text position instructions
+      // (rules 1/2) and strategy exit alerts, and cannot veto a code close:
+      // those have already happened before the model is asked anything.
+      if (precheckedPositions?.length) {
+        const codeRules = await runManagementCodeRules(precheckedPositions, {
+          config,
+          getTracked: getTrackedPosition,
+          getPoolDetail,
+          executeTool,
+          log,
+          engineDeps: {
+            update: updatePnlAndCheckExits,
+            register: registerExitTick,
+            recordHold: recordPnlHold,
+            readOnchain: getOnchainPnl,
+          },
+          closeDeps: {
+            closePosition,
+            getTracked: getTrackedPosition,
+            isCloseInflight,
+            recordAutoClose,
+            emit,
+            getPositionBins,
+            withTimeout,
+          },
+        });
+        const ruleHits = codeRules.llmNeeded;
+        // Rule-1 closes by the model are labelled as such (tools/executor.js withCloseReason).
+        setManagementCloseReasons(precheckedPositions
+          .filter((p) => getTrackedPosition(p.position)?.instruction)
+          .map((p) => [p.position, "rule 1: instruction met"]));
+        if (codeRules.closed.length || codeRules.failed.length) mgmtRuleFired = true;
+        const codeSummary = codeRules.lines.length ? `\n${codeRules.lines.join("\n")}` : "";
+        if (ruleHits.length === 0 && !exitAlerts) {
+          log("cron", `Management: ${precheckedPositions.length} position(s) checked in code — ${codeRules.closed.length} closed, ${codeRules.held.length} held for confirmation (LLM skipped)`);
+          mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code — ${codeRules.closed.length} closed in code${codeRules.failed.length ? `, ${codeRules.failed.length} close(s) failed` : ""}${codeRules.closed.length || codeRules.failed.length ? "" : ", no close rule triggered — HOLD"}.${codeSummary}`;
           return; // finally{} still releases the lock and emits the report
         }
-        log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
+        log("cron", `Management: LLM needed — ${[...ruleHits, ...(exitAlerts ? ["strategy exit alert"] : [])].join(", ")}`);
         memoryHints += formatRunnerPrecheck(ruleHits);
-        mgmtRuleFired = ruleHits.some((h) => /: rule [3-6]$/.test(h));
+        memoryHints += formatCodeRuleResults(codeRules);
       }
 
       if (exitAlerts) mgmtRuleFired = true;
