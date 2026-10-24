@@ -2004,7 +2004,7 @@ export async function getMyPositions({ force = false } = {}) {
         };
       }
 
-      return {
+      const row = {
         position: r.position,
         pool: r.pool,
         pair: r.pair,
@@ -2037,6 +2037,7 @@ export async function getMyPositions({ force = false } = {}) {
         minutes_out_of_range: minutesOutOfRange(r.position),
         study_avg_hold_hours: trackedFinal?.study_avg_hold_hours || null,
       };
+      return applyFlipOnchainPnl(row, trackedFinal);
     }));
 
     const result = { wallet: walletAddress, total_positions: positions.length, positions };
@@ -2062,6 +2063,38 @@ export async function getMyPositions({ force = false } = {}) {
   }
   })();
   return _positionsInflight;
+}
+
+/**
+ * M2: after a LIVE bid-ask flip the PnL APIs (LP Agent / Meteora) may book the
+ * in-place withdraw+redeposit as flows. For such positions pnl_pct (which feeds
+ * trailing-TP peaks, the warm-up guard and every PnL exit rule) comes from the
+ * on-chain valuation (tools/onchain-pnl.js) instead; the API figure is kept as
+ * pnl_api_pct so the flip hook can stop when the two diverge. If the on-chain
+ * read is unavailable the API value is kept (so stop-loss still works) and the
+ * row is tagged pnl_source "api_after_flip".
+ */
+export async function applyFlipOnchainPnl(row, tracked, { getOnchain = null } = {}) {
+  if (!(Number(tracked?.bid_ask_flip?.flips) > 0)) return row;
+  try {
+    const get = getOnchain || (await import("./onchain-pnl.js")).getOnchainPnl;
+    const oc = await get({ position: row.position, pool: row.pool, sol_price: row.sol_price }, { force: true });
+    const pct = onchainPctForUnit(oc, config.management.pnlUnit);
+    if (pct == null) return { ...row, pnl_source: "api_after_flip" };
+    const sol = Number.isFinite(Number(oc.pnlSol)) ? oc.pnlSol : null;
+    const sp = Number(row.sol_price) > 0 ? Number(row.sol_price) : null;
+    const out = { ...row, pnl_pct: pct, pnl_api_pct: row.pnl_pct, pnl_source: "onchain" };
+    delete out.pnl_unknown;
+    delete out.pnl_error;
+    if (sol != null) {
+      out.pnl_sol = sol;
+      if (sp) out.pnl_usd = Math.round(sol * sp * 100) / 100;
+    }
+    return out;
+  } catch (e) {
+    log("onchain_pnl", `flip on-chain PnL failed for ${String(row.position).slice(0, 8)}: ${e.message}`);
+    return { ...row, pnl_source: "api_after_flip" };
+  }
 }
 
 // ─── Get Positions for Any Wallet ─────────────────────────────
@@ -2782,7 +2815,8 @@ export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
 // Read-only access for the re-center shadow log (tools/recenter-shadow.js).
 export { getPool as getPoolForRead, initializedBinArrayWindow };
 // Bid-Ask flip live mode (tools/bidask-flip.js) signs its rebalance with the bot wallet.
-export { getWallet as _getWalletForFlip };
+export { getWallet as _getWalletForFlip, getWallet as getWalletForFlip };
+export { sendManagedTransaction as sendManagedTransactionForFlip };
 
 /** Test hook: seed the pool cache with a mock DLMM instance. */
 const _poolOverridesForTest = new Map(); // test seam only; production never populates it
