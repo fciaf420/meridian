@@ -15,10 +15,7 @@ export const CONFIG_KEY_MAP = {
   category: ["screening", "category"],
   minTokenFeesSol: ["screening", "minTokenFeesSol"],
   athTopThresholdPct: ["screening", "athTopThresholdPct"],
-  minClaimAmount: ["management", "minClaimAmount"],
-  outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
   outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
-  minVolumeToRebalance: ["management", "minVolumeToRebalance"],
   emergencyPriceDropPct: ["management", "emergencyPriceDropPct"],
   stopLossPct: ["management", "stopLossPct"],
   takeProfitFeePct: ["management", "takeProfitFeePct"],
@@ -219,4 +216,54 @@ export function fitDeployAmount({ freeSol, reserve, amount, totalBins }) {
   const fitted = Math.floor(Math.max(0, available) * 100) / 100;
   if (Number(amount) <= fitted + 1e-9) return { amount: Number(amount), shrunk: false, overhead, available };
   return { amount: fitted, shrunk: true, overhead, available };
+}
+
+/**
+ * Why is a candidate's global_fees_sol unknown? "fetch_failed" = the holders/fees request threw
+ * (datapi/Jupiter down, 429, 5xx); "not_indexed" = it answered but had no fee figure for this token.
+ * Returns null when the fee is known.
+ */
+export function classifyGlobalFeesUnknown({ holdersSettled, holdResult } = {}) {
+  if (holdResult?.global_fees_sol != null) return null;
+  if (!holdersSettled || holdersSettled.status === "rejected" || holdResult == null) return "fetch_failed";
+  // getTokenHolders reports whether the Jupiter/datapi fee sources errored (vs answered with no fee).
+  if (holdResult.global_fees_source_status === "fetch_failed") return "fetch_failed";
+  return "not_indexed";
+}
+
+/** Default share of candidates with a failed fee fetch that counts as a fee-data outage. */
+export const FEE_DATA_DOWN_DEFAULT_RATIO = 0.8;
+let _feeOutageActive = false;
+
+/**
+ * Fee-data outage detector: true (notify) when at least `ratio` (default 0.8) of the candidates have
+ * fee data unknown because the fetch FAILED, once per outage. Re-arms after a cycle below the ratio.
+ * Candidates with known fees or "not_indexed" count against the ratio. Empty input is neutral.
+ * Returns { down, notify, failed, total }.
+ */
+export function evaluateFeeDataOutage(candidates = [], { ratio = FEE_DATA_DOWN_DEFAULT_RATIO } = {}) {
+  const total = candidates.length;
+  if (total === 0) return { down: false, notify: false, failed: 0, total };
+  const failed = candidates.filter((c) => c?._globalFeesSol == null && c?._feesUnknownReason === "fetch_failed").length;
+  const r = Number.isFinite(Number(ratio)) && Number(ratio) > 0 ? Math.min(1, Number(ratio)) : FEE_DATA_DOWN_DEFAULT_RATIO;
+  const down = failed / total >= r - 1e-9;
+  const notify = down && !_feeOutageActive;
+  _feeOutageActive = down;
+  return { down, notify, failed, total };
+}
+export function _resetFeeOutageForTest() { _feeOutageActive = false; }
+
+/**
+ * Fail-closed fee hard skip (unknown fees are NOT a pass). Pure so it is testable.
+ * `c._globalFeesSol` null => skip; below minimum => skip.
+ */
+export function globalFeesHardSkipReason(c, minTokenFeesSol) {
+  if (c?._globalFeesSol == null) return `global_fees unknown (${c?._feesUnknownReason ?? "unknown"}) (fail closed)`;
+  if (c._globalFeesSol < minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${minTokenFeesSol}`;
+  return null;
+}
+
+/** True when EVERY candidate was skipped because its fee fetch failed (a data outage, not a verdict on tokens). */
+export function allSkippedForFeeFetchFailure(candidates = []) {
+  return candidates.length > 0 && candidates.every((c) => c?._globalFeesSol == null && c?._feesUnknownReason === "fetch_failed");
 }

@@ -219,7 +219,10 @@ async function deployInto(pool, args = {}) {
   const addr = `Pool${Math.random().toString(36).slice(2, 10)}`;
   dlmm._setPoolForTest(addr, pool);
   try {
-    return await dlmm.deployPosition({ pool_address: addr, amount_y: 0.5, strategy: "bid_ask", price_range_pct: 50, bin_step: 100, ...args });
+    const r = await dlmm.deployPosition({ pool_address: addr, amount_y: 0.5, strategy: "bid_ask", price_range_pct: 50, bin_step: 100, ...args });
+    // L2: a throw after the entry checks is now caught by the unwind-protected try and returned as a failure.
+    if (r?.success === false && /PAST_ENTRY_CHECKS/.test(r.error || "")) throw new Error("PAST_ENTRY_CHECKS");
+    return r;
   } finally {
     dlmm._setPoolForTest(addr, null);
   }

@@ -76,6 +76,9 @@ test("young position: a stale pending spike cannot confirm a later one", () => {
 test("mature position: large readings are trusted as before", () => {
   const p = open({ ageMin: 60 });
   assert.equal(updatePnlAndCheckExits(p, 48.6, config), null);
+  // a new peak needs 2 consecutive readings (peakConfirmTicks, fix/exits-in-code)
+  assert.equal(getTrackedPosition(p).trailing_active ?? false, false);
+  assert.equal(updatePnlAndCheckExits(p, 48.6, config), null);
   assert.equal(getTrackedPosition(p).trailing_active, true);
   assert.match(updatePnlAndCheckExits(p, 40, config) ?? "", /^TRAILING_TP/);
 });

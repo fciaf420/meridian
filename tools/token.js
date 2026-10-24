@@ -1,4 +1,4 @@
-import { searchTokens, getTokenInfo as getJupTokenInfo, datapiSearchRaw } from "./jup-tokens.js";
+import { searchTokens, getTokenInfoResult as getJupTokenInfoResult, datapiSearchRaw, datapiSearchRawResult } from "./jup-tokens.js";
 
 // Token search + metadata use Jupiter's official Tokens API V2 (tools/jup-tokens.js,
 // datapi search fallback). The internal datapi below is kept only for what the
@@ -102,11 +102,13 @@ export async function getTokenHolders({ mint, limit = 20 }) {
   // Holders and holder PnL stay on datapi: the official Tokens API has no
   // holder-list or PnL endpoint. Supply comes from the Tokens API; global fees
   // are a datapi-only extra.
-  const [holdersRes, tokenInfo, legacy] = await Promise.all([
+  const [holdersRes, jupRes, legacyRes] = await Promise.all([
     fetch(`${DATAPI_BASE}/holders/${mint}?limit=100`),
-    getJupTokenInfo(mint),
-    datapiSearchRaw(mint),
+    getJupTokenInfoResult(mint),
+    datapiSearchRawResult(mint),
   ]);
+  const tokenInfo = jupRes.info;
+  const legacy = legacyRes.ok ? legacyRes.data : null;
   if (!holdersRes.ok) throw new Error(`Holders API error: ${holdersRes.status}`);
   const data = await holdersRes.json();
   const legacyInfo = (legacy || []).find((t) => t?.id === mint) || null;
@@ -249,9 +251,13 @@ export async function getTokenHolders({ mint, limit = 20 }) {
     }));
   }
 
+  const globalFees = fix(tokenInfo?.global_fees_sol ?? legacyInfo?.fees, 2);
   return {
     mint,
-    global_fees_sol: fix(tokenInfo?.global_fees_sol ?? legacyInfo?.fees, 2),
+    global_fees_sol: globalFees,
+    // "ok" = fee figure present; "fetch_failed" = the fee source (datapi search, and/or Jupiter) errored,
+    // so absence says nothing about the token; "absent" = the sources answered but had no fee for it.
+    global_fees_source_status: globalFees != null ? "ok" : (legacyRes.ok && !jupRes.failed ? "absent" : "fetch_failed"),
     total_fetched: holders.length,
     showing: mapped.length,
     top_10_real_holders_pct: fixStr(top10Pct, 2),

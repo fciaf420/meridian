@@ -1,3 +1,4 @@
+import { isDryRun } from "../env-flags.js";
 import {
   Connection,
   ComputeBudgetProgram,
@@ -9,6 +10,8 @@ import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { preSubmitGate, depositSlippage, swapBackAfterRefusal, recordRefusal, provisionalAutoSwap, resolveProvisionalAmount } from "../deploy-guards.js";
+import { beginAttempt, markAttempt, trackInFlightAttempt, releaseInFlightAttempt } from "../deploy-checkpoint.js";
 import { emit } from "../notifier.js";
 import {
   trackPosition,
@@ -54,6 +57,7 @@ const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const CLOSE_VERIFY_READS = 4;
 const CLOSE_VERIFY_DELAY_MS = 1500;
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
+import { flipCloseTags } from "./bidask-flip.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -524,6 +528,7 @@ export async function deployPosition({
   base_mint,
   bin_step,
   volatility,
+  screen_price, // eslint-disable-line no-unused-vars -- consumed by the executor's drift guard
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
@@ -900,7 +905,7 @@ export async function deployPosition({
     };
   }
 
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     const dryRunResult = {
       dry_run: true,
       would_deploy: {
@@ -934,6 +939,39 @@ export async function deployPosition({
   const pool = _poolOverridesForTest.get(String(pool_address))
     ?? await DLMM.create(getConnection(), new PublicKey(pool_address));
   const activeIdAtLoad = pool.lbPair.activeId;
+  // (Screening -> deploy price drift lives in the executor's safety checks, using
+  // the code-recorded Pool Discovery price; there is no screening active-bin source.)
+  // Set once the two-sided auto-swap has bought the token; any refusal after that
+  // point sells it back (see unwindAutoSwap) so a refusal never strands a bag.
+  let autoSwapped = null;
+  const unwindAutoSwap = async () => {
+    if (!autoSwapped) return "";
+    const rec = autoSwapped;
+    autoSwapped = null;
+    const { baseMint } = rec;
+    let amount = rec.amount;
+    if (rec.provisional) {
+      const pairName = pool_name || String(pool_address).slice(0, 8);
+      const r = await resolveProvisionalAmount({
+        rawAmount: rec.rawAmount,
+        readDecimals: async () => (await getConnection().getParsedAccountInfo(new PublicKey(baseMint))).value?.data?.parsed?.info?.decimals,
+        readBalance: async () => (await getWalletBalances({ fresh: true })).tokens?.find(t => t.mint === baseMint)?.balance,
+      });
+      if (!r.ok) {
+        emit("swap_unwind_failed", { pair: pairName, pool: pool_address, mint: baseMint, rawAmount: rec.rawAmount, note: r.note });
+        log("deploy_warn", `Auto-swap unwind: ${r.note}; token ${baseMint} remains in the wallet`);
+        return ` Auto-swap unwind: ${r.note}; token ${baseMint} remains in the wallet.`;
+      }
+      amount = r.amount;
+    }
+    const r = await swapBackAfterRefusal({
+      swapFn: swapToken, baseMint, amount, solMint: WSOL_MINT,
+      log: (m) => log("deploy", m),
+      onFail: (res) => emit("swap_unwind_failed", { pair: pool_name || String(pool_address).slice(0, 8), pool: pool_address, mint: baseMint, amount, note: res.note }),
+    });
+    if (!r.ok) log("deploy_warn", `Auto-swap unwind: ${r.note}`);
+    return ` Auto-swap unwind: ${r.note}.`;
+  };
   // Deploys fund the Y side with SOL (both SOL and USDC mode swap to SOL first),
   // so a pool whose token Y isn't wrapped SOL would be funded with the wrong token.
   const tokenYMint = pool.lbPair?.tokenYMint?.toBase58?.() ?? String(pool.lbPair?.tokenYMint ?? "");
@@ -993,11 +1031,16 @@ export async function deployPosition({
       });
 
       if (swapResult.success) {
+        // D7: record the swap for unwinding BEFORE any further RPC, so a throw in the
+        // decimals/balance reads below still sells the token back. Refined after reads.
+        autoSwapped = provisionalAutoSwap(baseMint, swapResult.amount_out);
         // Read actual wallet token balance after swap — more reliable than
         // swapResult.amount_out which can differ from what's actually available
         // due to fees, rounding, or existing token dust in the wallet.
         const mintInfo = await getConnection().getParsedAccountInfo(new PublicKey(baseMint));
-        const decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+        const decimals = mintInfo.value?.data?.parsed?.info?.decimals;
+        // Fail closed: never guess 9. The provisional record is still set, so the catch unwinds it with a fresh read.
+        if (!Number.isInteger(decimals)) throw new Error(`could not read decimals for ${baseMint}`);
         const swapReceived = Number(swapResult.amount_out) / Math.pow(10, decimals);
 
         // Query actual on-chain balance to use for deploy
@@ -1014,6 +1057,7 @@ export async function deployPosition({
         } catch { /* use swap output as fallback */ }
 
         // Apply 2% buffer so SDK simulation doesn't fail on rounding
+        autoSwapped = { baseMint, amount: swapReceived > 0 ? Math.min(swapReceived, actualBalance) : actualBalance };
         amount_x = actualBalance * 0.98;
         amount_y = totalSolAmount - tokenSolAmount;
         hasBaseToken = true;
@@ -1034,6 +1078,8 @@ export async function deployPosition({
       }
     } catch (swapErr) {
       log("deploy", `WARNING: Auto-swap error (${swapErr.message}), falling back to SOL-only deployment`);
+      // D7: if the swap itself succeeded and a later read threw, sell the token back before the SOL-only fallback.
+      { const u = await unwindAutoSwap(); if (u) log("deploy", u.trim()); }
       // Fall back: keep original amounts, revert to the full SOL-only range.
       activeBinsAbove = 0;
       activeBinsBelow = totalRangeBins ?? bins_below ?? config.strategy.binsBelow;
@@ -1047,6 +1093,24 @@ export async function deployPosition({
     }
   }
 
+  // L2: everything after the auto-swap lives inside ONE try, so any throw (refetch, bin-array
+  // window, SOL price, decimals, checkpoint) unwinds the swapped token via the outer catch.
+  const newPosition = Keypair.generate(); // declared before the try: settleFailedAttempt (and the catch) use it
+  let attemptId = null;
+  let txMaybeSent = false;
+  const settleFailedAttempt = async (reason) => {
+    if (!attemptId) return;
+    if (!txMaybeSent) return markAttempt(attemptId, "failed", { error: reason, txs: 0 });
+    try {
+      const info = await getConnection().getAccountInfo(newPosition.publicKey, "confirmed");
+      markAttempt(attemptId, info ? "landed_unconfirmed" : "failed", { error: reason });
+      if (info) log("deploy_warn", `Deploy errored but position ${newPosition.publicKey.toString().slice(0, 8)} EXISTS on-chain; it will be managed/adopted`);
+    } catch {
+      markAttempt(attemptId, "uncertain", { error: reason }); // chain unreadable: stays blocking until boot reconcile
+    }
+  };
+
+  try {
   // ─── Fresh active bin, one snapshot for range AND build ────────
   // initializePositionAndAddLiquidityByStrategy (≤69 bins) anchors the deposit
   // and its bin-slippage check to this.lbPair.activeId, which getActiveBin()
@@ -1075,7 +1139,7 @@ export async function deployPosition({
     if (w.missing.length > 0) {
       if (w.min == null) {
         log("deploy", `Refusing deploy into ${pool_address}: range needs uninitialized bin arrays ${w.missing.join(",")} (rent is non-refundable)`);
-        return { success: false, error: `Range needs new bin arrays (${w.missing.length} × ~0.0714 SOL non-refundable rent) and no initialized window exists around the active bin. Not deployed.` };
+        return { success: false, error: `Range needs new bin arrays (${w.missing.length} × ~0.0714 SOL non-refundable rent) and no initialized window exists around the active bin. Not deployed.${await unwindAutoSwap()}` };
       }
       const newBelow = Math.max(0, activeBin.binId - w.min);
       const newAbove = Math.max(0, w.max - activeBin.binId);
@@ -1084,7 +1148,7 @@ export async function deployPosition({
       const newRangePct = stepPct > 0 ? (1 - Math.pow(1 + stepPct, -Math.max(newBelow, newAbove))) * 100 : 0;
       if (newTotal < MIN_BINS || (stepPct > 0 && newRangePct < MIN_RANGE_PCT)) {
         log("deploy", `Refusing deploy into ${pool_address}: only ${newTotal} bins (${newRangePct.toFixed(1)}%) are in initialized bin arrays; minimum is ${MIN_BINS} bins / ${MIN_RANGE_PCT}%`);
-        return { success: false, error: `Only ${newTotal} bins (${newRangePct.toFixed(1)}% range) fall in already-initialized bin arrays — below the ${MIN_BINS}-bin / ${MIN_RANGE_PCT}% minimum. Not deployed (won't pay non-refundable bin-array rent).` };
+        return { success: false, error: `Only ${newTotal} bins (${newRangePct.toFixed(1)}% range) fall in already-initialized bin arrays — below the ${MIN_BINS}-bin / ${MIN_RANGE_PCT}% minimum. Not deployed (won't pay non-refundable bin-array rent).${await unwindAutoSwap()}` };
       }
       log("deploy", `Trimmed range to initialized bin arrays: ${minBinId}..${maxBinId} → ${w.min}..${w.max} (${totalBins} → ${newTotal} bins, ~${newRangePct.toFixed(1)}%); avoided ${w.missing.length} new bin array(s)`);
       minBinId = w.min;
@@ -1103,12 +1167,12 @@ export async function deployPosition({
 
   const strategyType = strategyMap[activeStrategy];
   if (strategyType === undefined) {
-    throw new Error(`Invalid strategy: ${activeStrategy}. Use spot, curve, or bid_ask.`);
+    return { success: false, error: `Invalid strategy: ${activeStrategy}. Use spot, curve, or bid_ask.${await unwindAutoSwap()}` };
   }
 
   // Calculate amounts
   // If amount_y is not provided but amount_sol is, use amount_sol (for backward compatibility)
-  const finalAmountY = amount_y ?? amount_sol ?? 0;
+  let finalAmountY = amount_y ?? amount_sol ?? 0;
   // USD value at deploy, for PnL history. The screener passes it; manual Telegram
   // deploys don't, which left it 0 and made the close fall back to the final
   // value (PnL 0%). Estimate it from the SOL committed (before any auto-swap).
@@ -1150,7 +1214,7 @@ export async function deployPosition({
   if (finalAmountY > 0) {
     const yDecimals = await getMintDecimals(pool.lbPair.tokenYMint);
     if (yDecimals == null) {
-      throw new Error(`Could not resolve token Y decimals for ${pool.lbPair.tokenYMint.toBase58()}; refusing to size deposit.`);
+      return { success: false, error: `Could not resolve token Y decimals for ${pool.lbPair.tokenYMint.toBase58()}; refusing to size deposit.${await unwindAutoSwap()}` };
     }
     totalYLamports = uiToRawBN(finalAmountY, yDecimals);
   }
@@ -1158,20 +1222,70 @@ export async function deployPosition({
   if (finalAmountX > 0) {
     const xDecimals = await getMintDecimals(pool.lbPair.tokenXMint);
     if (xDecimals == null) {
-      throw new Error(`Could not resolve token X decimals for ${pool.lbPair.tokenXMint.toBase58()}; refusing to size deposit.`);
+      return { success: false, error: `Could not resolve token X decimals for ${pool.lbPair.tokenXMint.toBase58()}; refusing to size deposit.${await unwindAutoSwap()}` };
     }
     totalXLamports = uiToRawBN(finalAmountX, xDecimals);
   }
 
   const isWideRange = totalBins > 69;
-  const newPosition = Keypair.generate();
 
   log("deploy", `Pool: ${pool_address}`);
   log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
-  try {
+  // Deposit slippage -> allowed active-bin drift (SDK: ceil(pct / (binStep/100))).
+  const depositSlip = depositSlippage(resolvedBinStep ?? pool.lbPair?.binStep, config.safety?.depositSlippagePct);
+  log("deploy", `Deposit slippage ${depositSlip.slippagePct}%${depositSlip.driftBins != null ? ` (= max ${depositSlip.driftBins} active-bin drift at bin step ${resolvedBinStep})` : ""}`);
+
+  // Crash checkpoint (`submitting`) BEFORE any tx is built or sent, then a last
+  // price-move + balance gate on the first tx only. A failed checkpoint write
+  // aborts the deploy (fail closed): an unrecorded position is the risk.
+    try {
+      attemptId = beginAttempt({
+        pool: pool_address,
+        mint: pool.lbPair.tokenXMint.toBase58(),
+        position: newPosition.publicKey.toString(),
+        amountSol: finalAmountY,
+      });
+      trackInFlightAttempt(attemptId); // reconcile / clear must leave it alone until this deploy ends
+    } catch (e) {
+      log("deploy_error", `Could not write deploy checkpoint: ${e.message}`);
+      return { success: false, error: `Deploy refused: could not persist the crash checkpoint (${e.message}).${await unwindAutoSwap()}` };
+    }
+    {
+      const gate = await preSubmitGate({
+        refetch: () => pool.refetchStates(),
+        getActiveId: () => pool.lbPair.activeId,
+        readFreeSol: async () => (await getConnection().getBalance(wallet.publicKey, "confirmed")) / 1e9,
+        binStep: resolvedBinStep ?? pool.lbPair?.binStep,
+        // After an auto-swap the load-time bin predates the bot's OWN swap impact,
+        // so anchor only on the post-swap refetch (activeBin) and skip the load bin.
+        loadBinId: autoSwapped ? null : activeIdAtLoad,
+        anchorBinId: activeBin.binId,
+        maxMovePct: config.safety?.maxEntryPriceMovePct ?? 5,
+        reserve: Number(config.management.gasReserve ?? 0.2),
+        amount: finalAmountY,
+        totalBins,
+        // With a swapped token in hand, fit the SOL leg to the balance instead of refusing.
+        allowShrink: !!autoSwapped,
+        // SOL-only deposit sits below the active bin: a price RISE is harmless, only a drop refuses.
+        dropOnly: !(finalAmountX > 0),
+      });
+      if (!gate.pass) {
+        markAttempt(attemptId, "aborted", { error: gate.reason });
+        recordRefusal("pre_submit", gate.reason);
+        log("deploy", `Pre-submit gate refused deploy into ${pool_address}: ${gate.reason}`);
+        return { success: false, blocked_by: "pre_submit", error: `Pre-submit recheck failed: ${gate.reason}.${await unwindAutoSwap()}` };
+      }
+      if (gate.shrunk && gate.amount > 0 && gate.amount < finalAmountY) {
+        log("deploy", `Pre-submit gate: SOL leg shrunk ${finalAmountY} → ${gate.amount} to fit balance after swap fees/rent`);
+        finalAmountY = gate.amount;
+        totalYLamports = uiToRawBN(finalAmountY, 9);
+      }
+      log("deploy", `Pre-submit gate ok (price move ${gate.movePct.toFixed(2)}%, free SOL ${gate.freeSol == null ? "n/a" : gate.freeSol.toFixed(4)})`);
+    }
+    txMaybeSent = true; // from here a tx may land even if we see an error
     const txHashes = [];
 
     if (isWideRange) {
@@ -1234,7 +1348,7 @@ export async function deployPosition({
           totalXAmount: totalXLamports,
           totalYAmount: totalYLamports,
           strategy: { minBinId, maxBinId, strategyType },
-          slippage: 10, // 10%
+          slippage: depositSlip.slippagePct,
         });
         const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
         const { chunkBinRange } = await import("@meteora-ag/dlmm");
@@ -1303,6 +1417,7 @@ export async function deployPosition({
             log("deploy_warn", `Could not close empty position ${posAddr.slice(0, 8)} (rent stays locked until closed): ${closeErr.message}`);
           }
           recordClose(posAddr, "deploy failed (liquidity add error, verified empty on-chain)");
+          markAttempt(attemptId, "failed", { error: liqErr.message, txs: txHashes.length });
           return {
             success: false,
             error: `Position created on-chain but liquidity add failed: ${liqErr.message}. Position ${posAddr.slice(0, 8)} verified empty on-chain and marked closed.`,
@@ -1345,6 +1460,7 @@ export async function deployPosition({
         }, note);
         _positionsCacheAt = 0;
         log("deploy_warn", `Position ${posAddr.slice(0, 8)} is ${status} — kept open for management/close. ${note}`);
+        markAttempt(attemptId, "failed", { error: liqErr.message, txs: txHashes.length, partial_tracked: true });
         emit("deploy_partial", { pair: pool_name || pool_address.slice(0, 8), position: posAddr, status, amountX: partialX, amountY: partialY, error: liqErr.message });
         return {
           success: false,
@@ -1364,13 +1480,14 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { maxBinId, minBinId, strategyType },
-        slippage: 10, // 10% (SDK liquidity slippage is a percentage, NOT bps)
+        slippage: depositSlip.slippagePct, // percentage (NOT bps); the SDK derives the max active-bin drift from it
       });
       const txHash = await sendManagedTransaction(tx, [wallet, newPosition], "deploy standard");
       txHashes.push(txHash);
     }
 
     log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
+    markAttempt(attemptId, "entered", { txs: txHashes.length });
 
     _positionsCacheAt = 0;
     const signal_snapshot = getAndClearStagedSignals(pool_address);
@@ -1411,7 +1528,27 @@ export async function deployPosition({
     };
   } catch (error) {
     log("deploy_error", error.message);
-    return { success: false, error: error.message };
+    await settleFailedAttempt(error.message);
+    // Thrown before any tx could have been sent (e.g. SDK tx-build error): do not
+    // leave the auto-swapped token stranded.
+    const unwound = txMaybeSent ? "" : await unwindAutoSwap();
+    return { success: false, error: `${error.message}${unwound}` };
+  } finally {
+    releaseInFlightAttempt(attemptId);
+  }
+}
+
+/**
+ * Does this position account exist on-chain? true / false, or null when the RPC
+ * read fails (unknown). Used by the boot-time deploy-checkpoint reconcile.
+ */
+export async function positionAccountExists(positionPubkey) {
+  try {
+    const info = await getConnection().getAccountInfo(new PublicKey(positionPubkey), "confirmed");
+    return info != null;
+  } catch (e) {
+    log("deploy_warn", `positionAccountExists(${String(positionPubkey).slice(0, 8)}) read failed: ${e.message}`);
+    return null;
   }
 }
 
@@ -2003,7 +2140,7 @@ export async function getMyPositions({ force = false } = {}) {
         };
       }
 
-      return {
+      const row = {
         position: r.position,
         pool: r.pool,
         pair: r.pair,
@@ -2036,6 +2173,7 @@ export async function getMyPositions({ force = false } = {}) {
         minutes_out_of_range: minutesOutOfRange(r.position),
         study_avg_hold_hours: trackedFinal?.study_avg_hold_hours || null,
       };
+      return applyFlipOnchainPnl(row, trackedFinal);
     }));
 
     const result = { wallet: walletAddress, total_positions: positions.length, positions };
@@ -2061,6 +2199,39 @@ export async function getMyPositions({ force = false } = {}) {
   }
   })();
   return _positionsInflight;
+}
+
+/**
+ * M2: after a LIVE bid-ask flip the PnL APIs (LP Agent / Meteora) may book the
+ * in-place withdraw+redeposit as flows. For such positions pnl_pct (which feeds
+ * trailing-TP peaks, the warm-up guard and every PnL exit rule) comes from the
+ * on-chain valuation (tools/onchain-pnl.js) instead; the API figure is kept as
+ * pnl_api_pct so the flip hook can stop when the two diverge. If the on-chain
+ * read is unavailable the API value is kept (so stop-loss still works) and the
+ * row is tagged pnl_source "api_after_flip".
+ */
+export async function applyFlipOnchainPnl(row, tracked, { getOnchain = null } = {}) {
+  // D3: a flip whose send timed out may have landed: `pending` counts as flipped until resolved.
+  if (!(Number(tracked?.bid_ask_flip?.flips) > 0 || tracked?.bid_ask_flip?.pending)) return row;
+  try {
+    const get = getOnchain || (await import("./onchain-pnl.js")).getOnchainPnl;
+    const oc = await get({ position: row.position, pool: row.pool, sol_price: row.sol_price }, { force: true });
+    const pct = onchainPctForUnit(oc, config.management.pnlUnit);
+    if (pct == null) return { ...row, pnl_source: "api_after_flip" };
+    const sol = Number.isFinite(Number(oc.pnlSol)) ? oc.pnlSol : null;
+    const sp = Number(row.sol_price) > 0 ? Number(row.sol_price) : null;
+    const out = { ...row, pnl_pct: pct, pnl_api_pct: row.pnl_pct, pnl_source: "onchain" };
+    delete out.pnl_unknown;
+    delete out.pnl_error;
+    if (sol != null) {
+      out.pnl_sol = sol;
+      if (sp) out.pnl_usd = Math.round(sol * sp * 100) / 100;
+    }
+    return out;
+  } catch (e) {
+    log("onchain_pnl", `flip on-chain PnL failed for ${String(row.position).slice(0, 8)}: ${e.message}`);
+    return { ...row, pnl_source: "api_after_flip" };
+  }
 }
 
 // ─── Get Positions for Any Wallet ─────────────────────────────
@@ -2157,7 +2328,7 @@ export async function searchPools({ query, limit = 10 }) {
 // ─── Claim Fees ────────────────────────────────────────────────
 export async function claimFees({ position_address }) {
   position_address = normalizeMint(position_address);
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
 
@@ -2250,7 +2421,7 @@ export function getInflightCloses() {
 // closes such as the OOR fallback); the LLM-facing tool schema does not expose it.
 export async function closePosition({ position_address, _pnlOverride = null, _close_reason = null }) {
   position_address = normalizeMint(position_address);
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }
 
@@ -2595,6 +2766,7 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         close_reason: closeReason,
         ...depthUseAtClose(tracked, closeReason),
         ...trailingAtClose(tracked, closeReason, config.management),
+        ...flipCloseTags(tracked),
         deployed_at: tracked.deployed_at,
         signal_snapshot: tracked.signal_snapshot || null,
         ...(tracked.experiment_id && { experiment_id: tracked.experiment_id, experiment_arm: tracked.experiment_arm }),
@@ -2779,6 +2951,9 @@ export { sendManagedTransaction as _sendManagedTransactionForTest };
 export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
 // Read-only access for the re-center shadow log (tools/recenter-shadow.js).
 export { getPool as getPoolForRead, initializedBinArrayWindow };
+// Bid-Ask flip live mode (tools/bidask-flip.js) signs its rebalance with the bot wallet.
+export { getWallet as getWalletForFlip };
+export { sendManagedTransaction as sendManagedTransactionForFlip };
 
 /** Test hook: seed the pool cache with a mock DLMM instance. */
 const _poolOverridesForTest = new Map(); // test seam only; production never populates it

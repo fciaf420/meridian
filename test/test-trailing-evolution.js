@@ -206,6 +206,7 @@ test("state: the close record carries peak, arm level, trailing settings, exit f
   const c = { management: { stopLossPct: -40, trailingTakeProfit: true, trailingTriggerPct: 5, trailingDropPct: 4, pnlWarmupMinutes: 15, pnlWarmupMaxAbsPct: 25 } };
   assert.equal(state.updatePnlAndCheckExits(position, 2, c), null);
   assert.equal(state.updatePnlAndCheckExits(position, 5.11, c), null);
+  assert.equal(state.updatePnlAndCheckExits(position, 5.11, c), null); // peak confirmed on the 2nd tick
   const action = state.updatePnlAndCheckExits(position, 1.0, c);
   assert.match(action, /^TRAILING_TP/);
   const pos = state.getTrackedPosition(position);

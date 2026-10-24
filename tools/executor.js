@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidatesForTool } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -13,11 +13,13 @@ import { getWalletBalances, swapToken } from "./wallet.js";
 import { usdcModeEnabled, prepareUsdcEntry, settleToUsdc } from "./usdc-mode.js";
 import { studyTopLPers, getPoolInfo } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded } from "../state.js";
+import { setPositionInstruction, getTrackedPosition, recordPnlHold, noteAgentExposureSwap, isStateDegraded, getDeployCooldown, getActiveCooldowns } from "../state.js";
+import { withWalletLock, priorityForTool, outsideWalletLock } from "../wallet-lock.js";
 import { checkAgentSwap } from "./swap-guard.js";
 import { isManagementBusy, getManagementCloseReason, isDraining, trackInflightOp } from "../session.js";
 import { managementPnlCloseGate } from "../pnl-confirm.js";
 import { getOnchainPnl } from "./onchain-pnl.js";
+import { updateConfigState } from "../config-state.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
@@ -30,6 +32,8 @@ import { execSync, spawn } from "child_process";
 import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } from "../runtime-helpers.js";
 
 import { log, logAction } from "../logger.js";
+import { checkVolatilityKnown, pickVolatility, evaluatePoolThresholds, fetchPoolForRecheck, checkScreenPriceDrift, getScreenedPrice, isScreenPriceUncomparable, recordRefusal } from "../deploy-guards.js";
+import { findBlockingAttempt } from "../deploy-checkpoint.js";
 import { getPositionBins, withTimeout } from "./bin-visual.js";
 import { emit } from "../notifier.js";
 import { kbRead, kbWrite, kbSearch, kbList, kbDelete, kbMigrate, kbGetStats, kbRebuildIndexes } from "./knowledge-base-tools.js";
@@ -41,7 +45,7 @@ export function registerCronRestarter(fn) { _cronRestarter = fn; }
 // Map tool names to implementations
 const toolMap = {
   discover_pools: discoverPools,
-  get_top_candidates: getTopCandidates,
+  get_top_candidates: getTopCandidatesForTool, // shadow-gate verdict stripped: shadow stays a pure log
   get_pool_detail: getPoolDetail,
   get_position_pnl: getPositionPnl,
   get_active_bin: getActiveBin,
@@ -204,12 +208,14 @@ const toolMap = {
     }
 
     // Persist to user-config.json
-    persistUserConfig(applied, { _lastAgentTune: new Date().toISOString() });
+    persistUserConfig(applied);
+    try { updateConfigState({ lastAgentTune: new Date().toISOString() }); } catch { /* best effort */ }
 
     // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null || applied.pnlWatcherIntervalSec != null;
     if (intervalChanged && _cronRestarter) {
-      _cronRestarter();
+      // C1: timers created here would inherit this lock's ALS context forever.
+      outsideWalletLock(() => _cronRestarter());
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
     }
 
@@ -358,7 +364,11 @@ function startCloseBinsSnapshot(positionAddress) {
 // Fund-moving tools: tracked as in-flight so the shutdown drain waits for them.
 const FUND_TOOLS = new Set(["deploy_position", "close_position", "swap_token", "claim_fees"]);
 
-export async function executeTool(name, args, { manual = false } = {}) {
+// `codeExit` is set only by the runner's own code-fired rule closes
+// (management rules 4/5 in index.js): the rule was already decided in code,
+// so the LLM-oriented management PnL gate does not apply. The LLM never
+// reaches this option (agent.js passes name + args only).
+export async function executeTool(name, args, { manual = false, codeExit = false } = {}) {
   // Gate new exposure BEFORE anything runs (the USDC-mode entry swaps first).
   if (name === "deploy_position") {
     if (isDraining()) {
@@ -370,11 +380,27 @@ export async function executeTool(name, args, { manual = false } = {}) {
       return { blocked: true, reason: "state.json is corrupt and saves are disabled, so a new position could not be tracked. Restore state.json first." };
     }
   }
-  if (FUND_TOOLS.has(name)) return trackInflightOp(name, executeToolInner(name, args, { manual }));
-  return executeToolInner(name, args, { manual });
+  // Fund-moving tools run one at a time through the priority wallet lock:
+  // close > claim / swap > deploy (wallet-lock.js).
+  if (FUND_TOOLS.has(name)) {
+    return trackInflightOp(name, withWalletLock(
+      () => {
+        // L4: a deploy that queued behind a long close/claim must not start
+        // once a shutdown drain has begun in the meantime.
+        if (name === "deploy_position" && isDraining()) {
+          log("safety_block", "deploy_position blocked: shutdown drain began while queued for the wallet lock");
+          return { blocked: true, reason: "Bot is shutting down (drain in progress); no new deploys." };
+        }
+        return executeToolInner(name, args, { manual, codeExit });
+      },
+      priorityForTool(name),
+      name,
+    ));
+  }
+  return executeToolInner(name, args, { manual, codeExit });
 }
 
-async function executeToolInner(name, args, { manual = false } = {}) {
+async function executeToolInner(name, args, { manual = false, codeExit = false } = {}) {
   const startTime = Date.now();
   // `_manual` (skip the token-age window) is only honoured for owner-initiated
   // Telegram deploys, which pass { manual: true }; strip it from anything else
@@ -398,6 +424,7 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   if (name === "deploy_position" && usdcModeEnabled()) {
     const elig = await checkDeployEligibility(args);
     if (!elig.pass) {
+      recordRefusal("eligibility", elig.reason);
       log("safety_block", `deploy_position blocked (usdc preflight): ${elig.reason}`);
       return { blocked: true, reason: elig.reason };
     }
@@ -422,7 +449,7 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   // ─── Pre-execution safety checks ──────────
   let swapGuard = null;
   if (WRITE_TOOLS.has(name)) {
-    const safetyCheck = await runSafetyChecks(name, args, { manual });
+    const safetyCheck = await runSafetyChecks(name, args, { manual, codeExit, eligibilityChecked: usdcModeEnabled() });
     if (!safetyCheck.pass) {
       log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
       return {
@@ -538,24 +565,118 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   }
 }
 
+// Injectable for tests: (poolAddress, timeframe) -> raw Pool Discovery record | null.
+let _fetchPoolForRecheck = fetchPoolForRecheck;
+export function __setDeployRecheckFetch(fn) { _fetchPoolForRecheck = fn || fetchPoolForRecheck; }
+
+/**
+ * Deploy-time guards from upstream yunus-0x/meridian:
+ *  - 3427771: screening thresholds re-enforced against fresh pool data, so a stale
+ *    or model-chosen candidate cannot slip past the filters between screening and deploy
+ *  - exit-rules.js computeBinsBelow: never deploy when volatility is unknown
+ */
+export async function checkDeploySafetyGuards(args) {
+  const sf = config.safety || {};
+  if (args._manual) return { pass: true };
+  const wantRecheck = sf.recheckScreeningAtDeploy !== false;
+  const wantVol = sf.requireKnownVolatility !== false;
+  const maxDrop = Number(sf.maxScreenToDeployDropPct ?? 12);
+  const wantDrift = maxDrop > 0 && config.screening.source !== "gmgn";
+  if (!wantRecheck && !wantVol && !wantDrift) return { pass: true };
+
+  let pool = null;
+  let fetchError = null;
+  try {
+    pool = await _fetchPoolForRecheck(args.pool_address, config.screening.timeframe || "5m");
+  } catch (e) {
+    fetchError = e;
+  }
+
+  // The thresholds come from Meteora's screener. With screening.source "gmgn" those
+  // pool filters were never applied, so there is nothing to "re-check" against.
+  if (wantRecheck && config.screening.source !== "gmgn") {
+    if (fetchError) {
+      recordRefusal("recheck", fetchError.message);
+      return { pass: false, reason: `Could not verify pool screening thresholds before deploy: ${fetchError.message}` };
+    }
+    const r = evaluatePoolThresholds(pool, config.screening);
+    if (!r.pass) { recordRefusal("recheck", r.reason); return { pass: false, reason: `Deploy-time screening re-check failed: ${r.reason}` }; }
+    for (const n of r.notes || []) log("deploy", `Screening re-check: ${n}`);
+  }
+
+  if (wantVol) {
+    // A fresh positive reading beats a stale screener 0; 0 itself is valid.
+    const v = checkVolatilityKnown(pickVolatility(args.volatility, pool?.volatility));
+    if (!v.pass) { recordRefusal("volatility", v.reason); return { pass: false, reason: v.reason }; }
+  }
+
+  // Screening -> deploy gap: compare the price the candidate was shown at with
+  // the fresh pool price. Code-recorded screening price first (the model cannot
+  // dodge it by omitting the arg), then the model-supplied screen_price. When
+  // neither exists, or the fresh read failed, this check is skipped with a log.
+  if (wantDrift) {
+    if (isScreenPriceUncomparable(args.pool_address)) {
+      log("deploy", "Screening->deploy price drift not checked (candidate came from GMGN with a USD price; units differ from pool_price)");
+      return { pass: true };
+    }
+    const screenPrice = getScreenedPrice(args.pool_address) ?? args.screen_price;
+    const d = checkScreenPriceDrift({ screenPrice, freshPrice: pool?.pool_price, maxDropPct: maxDrop });
+    if (!d.checked) log("deploy", "Screening->deploy price drift not checked (no screening price or no fresh price available)");
+    else if (d.pass && d.rose) log("deploy", `Price rose ${d.movePct.toFixed(1)}% since screening (not refused: rises are harmless for SOL-only deposits)`);
+    else if (!d.pass) { recordRefusal("screen_drift", d.reason); return { pass: false, reason: `Screening→deploy price drift: ${d.reason}` }; }
+  }
+  return { pass: true };
+}
+
 /**
  * Amount-independent deploy eligibility checks (bin step, position count,
  * duplicate pool/token). Shared between the USDC-mode entry preflight and the
  * standard safety checks so USDC mode never swaps before confirming the deploy
  * is even allowed.
  */
-async function checkDeployEligibility(args) {
-  // Resolve bin_step — fall back to the pool detail API if the caller didn't pass it.
-  let effectiveBinStep = args.bin_step;
-  if (effectiveBinStep == null && args.pool_address) {
-    try {
-      const { getPoolDetail } = await import("./screening.js");
-      const poolDetail = await getPoolDetail({ pool_address: args.pool_address });
-      effectiveBinStep = poolDetail?.bin_step ?? null;
-    } catch {
-      effectiveBinStep = null;
+export const POOL_DETAIL_TIMEOUT_MS = 8_000;
+
+export async function checkDeployEligibility(args, { getPoolDetailFn = getPoolDetail, getPositionsFn = getMyPositions } = {}) {
+  // Resolve the pool's own facts. bin_step falls back to the pool detail when the
+  // caller omitted it; the BASE MINT is always taken from the pool (H3): the
+  // tool-call `base_mint` is optional LLM input that may be omitted or wrong,
+  // and the mint cooldown / duplicate-token guard must not depend on it.
+  // Local, network-free: a pool/token with an interrupted, unreconciled deploy is refused first.
+  {
+    const early = findBlockingAttempt({ pool: args.pool_address, mint: args.base_mint });
+    if (early) {
+      return {
+        pass: false,
+        reason: `A previous deploy into this pool/token (attempt ${early.id}, status ${early.status}) was interrupted and not yet reconciled on-chain. Check the position, then retry after the next restart reconciles it.`,
+      };
     }
   }
+  let poolDetail = null;
+  if (args.pool_address) {
+    // N2: bounded (this runs under the wallet lock — a hung fetch would block exits).
+    let timedOut = false;
+    try {
+      poolDetail = await new Promise((resolve, reject) => {
+        const t = setTimeout(() => { timedOut = true; resolve(null); }, POOL_DETAIL_TIMEOUT_MS);
+        t.unref?.();
+        Promise.resolve().then(() => getPoolDetailFn({ pool_address: args.pool_address }))
+          .then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+      });
+    } catch {
+      poolDetail = null;
+    }
+    // Fail closed: without the pool's own facts the base mint (cooldown / duplicate-token
+    // guards) cannot be verified, so refuse the deploy.
+    if (!poolDetail || timedOut) {
+      return {
+        pass: false,
+        reason: `Could not fetch pool detail for ${args.pool_address}${timedOut ? ` within ${POOL_DETAIL_TIMEOUT_MS / 1000}s` : ""}; cannot verify its base mint against cooldowns / duplicate-token limits. Refusing deploy (fail closed) — retry later.`,
+      };
+    }
+  }
+  const effectiveBinStep = args.bin_step ?? poolDetail?.bin_step ?? null;
+  const poolMint = poolDetail?.base?.mint || null;
+  const mints = [...new Set([poolMint, args.base_mint].filter((m) => typeof m === "string" && m))];
 
   // Reject pools with bin_step out of configured range. Fail closed: if we could
   // not resolve a numeric bin_step (caller omitted it AND the pool detail lookup
@@ -575,8 +696,48 @@ async function checkDeployEligibility(args) {
     };
   }
 
+  // Re-entry cooldown after a stop loss / repeated OOR-timeout closes (state.js).
+  // Owner (Telegram) deploys override it, logged.
+  let cooldown = getDeployCooldown({ pool: args.pool_address, base_mint: null });
+  for (const mint of mints) {
+    cooldown = cooldown || getDeployCooldown({ pool: null, base_mint: mint });
+  }
+  if (!cooldown && mints.length === 0) {
+    // Mint unresolvable: fail closed while ANY mint cooldown is active (the
+    // deploy could be a sibling pool of a token we are cooling down on).
+    const anyMint = getActiveCooldowns().find((c) => c.scope === "mint");
+    if (anyMint) cooldown = { scope: "mint-unresolved", key: anyMint.key, until: anyMint.until, reason: `base mint of this pool could not be resolved and token ${anyMint.key} is cooling down: ${anyMint.reason}` };
+  }
+  if (cooldown) {
+    const what = cooldown.scope === "pool" ? `pool ${args.pool_name || args.pool_address}`
+      : cooldown.scope === "mint" ? `token ${cooldown.key}`
+      : "this pool (base mint unresolved)";
+    if (args._manual) {
+      log("cooldown", `Owner deploy overrides cooldown on ${what} (until ${cooldown.until}: ${cooldown.reason})`);
+    } else {
+      const reason = `Re-entry cooldown: ${what} is blocked until ${cooldown.until} (${cooldown.reason}). Pick a different pool.`;
+      log("cooldown", `deploy_position blocked — ${reason}`);
+      return { pass: false, reason };
+    }
+  }
+
+  // An interrupted deploy (crash checkpoint still `submitting`/`uncertain`) must
+  // be reconciled against the chain before this pool/token is entered again.
+  const blocking = findBlockingAttempt({ pool: args.pool_address, mint: poolMint || args.base_mint });
+  if (blocking) {
+    return {
+      pass: false,
+      reason: `A previous deploy into this pool/token (attempt ${blocking.id}, status ${blocking.status}) was interrupted and not yet reconciled on-chain. Check the position, then retry after the next restart reconciles it.`,
+    };
+  }
+
+  // Deploy-time re-check of screening thresholds + known volatility. The owner's
+  // manual Telegram deploys (args._manual) are exempt, like the token-age window.
+  const safetyGate = await checkDeploySafetyGuards(args);
+  if (!safetyGate.pass) return safetyGate;
+
   // Check position count limit + duplicate pool guard
-  const positions = await getMyPositions();
+  const positions = await getPositionsFn();
   if (positions.total_positions >= config.risk.maxPositions) {
     return {
       pass: false,
@@ -591,18 +752,46 @@ async function checkDeployEligibility(args) {
     };
   }
 
-  // Block same base token across different pools
-  if (args.base_mint) {
-    const alreadyHasMint = positions.positions.some((p) => p.base_mint === args.base_mint);
-    if (alreadyHasMint) {
+  // Block same base token across different pools (pool-resolved mint AND the caller's)
+  for (const mint of mints) {
+    if (positions.positions.some((p) => p.base_mint === mint)) {
       return {
         pass: false,
-        reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
+        reason: `Already holding base token ${mint} in another pool. One position per token only.`,
       };
     }
   }
 
   return { pass: true };
+}
+
+/**
+ * M3: bookkeeping a code-fired PnL close (exit-engine closeForExit) must do
+ * for parity with a close made through executeTool: actions log, USDC settle
+ * (usdcMode), screening-signal capture. The close alert is emitted by
+ * closeForExit itself (pnl_watcher_close), so it is not emitted twice here.
+ */
+export async function finalizeCodeClose(args, result, durationMs = 0) {
+  logAction({
+    tool: "close_position",
+    args,
+    result: summarizeResult(result),
+    duration_ms: durationMs,
+    success: true,
+  });
+  if (usdcModeEnabled()) {
+    try {
+      const settle = await settleToUsdc();
+      result.usdc_settled = settle;
+      log("usdc", `Post-close settle: ${settle.settled ?? 0} swap(s) to USDC${settle.dry_run ? " [DRY RUN]" : ""}`);
+    } catch (e) {
+      log("usdc", `Post-close settle failed: ${e.message}`);
+      result.usdc_settle_error = e.message;
+    }
+  }
+  try {
+    captureToolSignals("close_position", args, result);
+  } catch { /* signal capture is best-effort */ }
 }
 
 /**
@@ -617,6 +806,7 @@ async function confirmManagementPnlClose(args) {
       getPositions: () => getMyPositions(),
       getTracked: getTrackedPosition,
       getOnchain: getOnchainPnl,
+      requiredTicks: Number(config.exits?.confirmTicks ?? 2),
       onHold: (cls, decision) => recordPnlHold(args.position_address, null, `${cls.rule}: ${decision.why}`, { onchainPct: decision.onchainPct, config }),
     });
   } catch (e) {
@@ -629,18 +819,23 @@ async function confirmManagementPnlClose(args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args, { manual = false } = {}) {
+async function runSafetyChecks(name, args, { manual = false, codeExit = false, eligibilityChecked = false } = {}) {
   switch (name) {
     case "close_position":
       // Management closes on rule 3 (take profit) / rule 6 (emergency stop) and
       // EXIT ALERTS read pnl_pct from the PnL API; confirm those on-chain first.
       // Owner closes (Telegram, REPL) never run inside a management cycle.
-      if (manual || !isManagementBusy()) return { pass: true };
+      // Code-fired rule closes were decided by the runner and are not gated.
+      if (manual || codeExit || !isManagementBusy()) return { pass: true };
       return confirmManagementPnlClose(args);
 
     case "deploy_position": {
-      const elig = await checkDeployEligibility(args);
-      if (!elig.pass) return elig;
+      // USDC mode already ran this (amount-independent) check in its preflight,
+      // before swapping; don't pay for a second Pool Discovery fetch.
+      if (!eligibilityChecked) {
+        const elig = await checkDeployEligibility(args);
+        if (!elig.pass) { recordRefusal("eligibility", elig.reason); return elig; }
+      }
 
       const usdc = usdcModeEnabled();
 

@@ -30,6 +30,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { log } from "../logger.js";
 import { buildCliEnv } from "../child-env.js";
+import { config } from "../config.js";
+import {
+  GMGN_STATUS, commandWeight, paceGapMs, ratePerSecForPlan, looksRateLimited, looksForbidden, looksUnauthorized,
+  cooldownUntilMs, numOrNull, gmgnSetting,
+} from "./gmgn-policy.js";
+
+export { GMGN_STATUS };
 
 const GMGN_BIN = "gmgn-cli";
 const CHAIN = "sol";
@@ -54,19 +61,14 @@ export function gmgnSpawnOptions() {
 
 // Caches (mirror okx.js TTLs).
 const TOKEN_INFO_TTL = 60_000;
+const TOKEN_INFO_MISS_TTL = 15_000; // genuine misses only; a rate-limit is NEVER cached as a miss
 const PRICE_CACHE_TTL = 60_000;
 const SIGNAL_CACHE_TTL = 30_000;
 const SIGNAL_EMPTY_TTL = 60_000;
 const TRACK_SNAPSHOT_TTL = 30_000;
 const TRACK_EMPTY_TTL = 60_000;
-
-// GMGN uses a leaky-bucket limiter (rate=10/cap=10). Serialize spawns with a
-// min-gap so we never burst; a 429 -> RATE_LIMIT_BANNED can extend the ban.
-const GMGN_MIN_REQUEST_GAP_MS = 200;
-
-// When a spawn comes back rate-limited (429 / RATE_LIMIT), back off for this long
-// so queued calls fail fast instead of hammering the limiter and extending the ban.
-const GMGN_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const TRACK_MISS_TTL = 15_000;
+const MAX_CACHE_ENTRIES = 500;
 
 // Global track feed size — recent trades across all tokens, filtered to the mint.
 const TRACK_LIMIT = 200;
@@ -76,6 +78,7 @@ const KLINE_RESOLUTION = "5m";
 const KLINE_WINDOW_SECONDS = 6 * 60 * 60;
 
 const _tokenInfoCache = new Map();
+const _tokenInfoInflight = new Map();
 const _priceCache = new Map();
 const _signalCache = new Map();
 
@@ -83,29 +86,75 @@ let _trackSnapshot = null;
 let _trackSnapshotExpiresAt = 0;
 let _trackSnapshotInflight = null;
 
+// ── request pacing / ban state ────────────────────────────────────────────────
+// GMGN is a weighted leaky bucket (Free 5/s, Plus 20/s, Pro 50/s). `token holders`
+// and `token traders` cost 5, the rest 1. After each request we leave
+// weight / rate seconds before the next one so a burst of heavy calls cannot
+// drain the bucket and trigger RATE_LIMIT_BANNED.
 let _gmgnRequestChain = Promise.resolve();
-let _lastGmgnRequestAt = 0;
-// Epoch-ms until which we treat GMGN as rate-limited and skip spawning.
+let _nextAllowedAt = 0;
+// Epoch-ms until which we treat GMGN as rate-limited and do not spawn at all.
 let _rateLimitedUntil = 0;
+let _rateLimitStrikes = 0;
+let _forbiddenLogged = false;
+// Transport health (read by the Meteora-source outage detector).
+let _binaryMissing = false;   // gmgn-cli ENOENT
+let _authFailed = false;      // 401 / bad API key (cleared by the next OK response)
+let _authLogged = false;
+let _binaryLogged = false;
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Transport health: missing binary / rejected API key. */
+export function getGmgnTransportState() {
+  return { binaryMissing: _binaryMissing, authFailed: _authFailed };
+}
+
+const _deps = {
+  exec: (...a) => execFile(...a),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+  ratePerSec: () => ratePerSecForPlan(gmgnSetting(config, "plan")),
+};
+
+/** Test hook: inject exec / sleep / now / ratePerSec; null restores defaults and clears state. */
+export function _setGmgnDepsForTest(d) {
+  _deps.exec = d?.exec ?? ((...a) => execFile(...a));
+  _deps.sleep = d?.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  _deps.now = d?.now ?? (() => Date.now());
+  _deps.ratePerSec = d?.ratePerSec ?? (() => ratePerSecForPlan(gmgnSetting(config, "plan")));
+  _gmgnRequestChain = Promise.resolve();
+  _nextAllowedAt = 0;
+  _rateLimitedUntil = 0;
+  _rateLimitStrikes = 0;
+  _forbiddenLogged = false;
+  _binaryMissing = false; _authFailed = false; _authLogged = false; _binaryLogged = false;
+  for (const m of [_tokenInfoCache, _tokenInfoInflight, _priceCache, _signalCache, _holdersCache, _holdersInflight, _klineInflight]) m.clear();
+  _trackSnapshot = null;
+  _trackSnapshotExpiresAt = 0;
+  _trackSnapshotInflight = null;
+}
+
+/** Current rate-limit state, for logs / callers deciding to skip the cycle. */
+export function getGmgnRateLimitState() {
+  const now = _deps.now();
+  return { limited: now < _rateLimitedUntil, retryAfterMs: Math.max(0, _rateLimitedUntil - now), strikes: _rateLimitStrikes };
 }
 
 /**
- * Serialized request queue with a min-gap between gmgn-cli spawns.
- * Same idea as okx.js queueOkxRequest — protects the leaky-bucket limiter.
+ * Serialized request queue, paced by command weight. While a rate-limit/ban
+ * cooldown is active this returns a distinct RATE_LIMITED result WITHOUT
+ * spawning (spawning into a ban extends it by 5s per request).
  */
-async function queueGmgnRequest(task) {
+async function queueGmgnRequest(task, weight) {
   const run = _gmgnRequestChain.then(async () => {
-    // Fail fast while a rate-limit cooldown is in effect — don't spawn into a ban.
-    if (Date.now() < _rateLimitedUntil) return null;
-    const waitMs = Math.max(0, GMGN_MIN_REQUEST_GAP_MS - (Date.now() - _lastGmgnRequestAt));
-    if (waitMs > 0) await sleep(waitMs);
+    if (_deps.now() < _rateLimitedUntil) {
+      return { status: GMGN_STATUS.RATE_LIMITED, data: null, retryAfterMs: _rateLimitedUntil - _deps.now() };
+    }
+    const waitMs = Math.max(0, _nextAllowedAt - _deps.now());
+    if (waitMs > 0) await _deps.sleep(waitMs);
     try {
       return await task();
     } finally {
-      _lastGmgnRequestAt = Date.now();
+      _nextAllowedAt = _deps.now() + paceGapMs(weight, _deps.ratePerSec());
     }
   });
 
@@ -116,7 +165,7 @@ async function queueGmgnRequest(task) {
 function readCache(cache, key) {
   const hit = cache.get(key);
   if (!hit) return null;
-  if (Date.now() > hit.expiresAt) {
+  if (_deps.now() > hit.expiresAt) {
     cache.delete(key);
     return null;
   }
@@ -124,60 +173,103 @@ function readCache(cache, key) {
 }
 
 function writeCache(cache, key, data, ttlMs) {
-  cache.set(key, { data, expiresAt: Date.now() + ttlMs });
-}
-
-function looksRateLimited(text) {
-  if (!text) return false;
-  return /RATE_LIMIT|429/i.test(text);
+  if (cache.size >= MAX_CACHE_ENTRIES) {
+    const now = _deps.now();
+    for (const [k, v] of cache) if (now > v.expiresAt) cache.delete(k);
+    while (cache.size >= MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value);
+  }
+  cache.set(key, { data, expiresAt: _deps.now() + ttlMs });
 }
 
 /**
- * Spawn `gmgn-cli <...args> --raw`, JSON.parse stdout. The CLI prints the
- * unwrapped API `data` object (e.g. the token object, or { list: [...] }) on
- * success and exits non-zero (error on stderr) on failure. Returns null on
- * spawn/timeout/non-zero/parse/rate-limit.
+ * Spawn `gmgn-cli <...args> --raw` and return a status-tagged result:
+ *   { status: "ok", data }                     parsed JSON
+ *   { status: "rate_limited", retryAfterMs }   429 / ban / cooldown in effect
+ *   { status: "forbidden" }                    403 PLAN_UPGRADE_REQUIRED (do not retry)
+ *   { status: "empty" }                        exit 0 with empty stdout
+ *   { status: "error" }                        spawn / timeout / parse failure
+ * The CLI prints the unwrapped API `data` object on success.
  */
-export function spawnGmgn(args) {
+export function spawnGmgnResult(args) {
+  const weight = commandWeight(args);
   return queueGmgnRequest(
     () =>
       new Promise((resolve) => {
         const fullArgs = [...args, "--raw"];
-        execFile(
+        _deps.exec(
           GMGN_BIN,
           fullArgs,
           gmgnSpawnOptions(),
           (error, stdout, stderr) => {
             if (error) {
-              const blob = `${stderr || ""}${error.message || ""}`;
+              const blob = `${stderr || ""}${stdout || ""}${error.message || ""}`;
               if (looksRateLimited(blob)) {
-                _rateLimitedUntil = Date.now() + GMGN_RATE_LIMIT_COOLDOWN_MS;
-                log("gmgn", `Rate limited: ${args.join(" ")} (backing off ${Math.round(GMGN_RATE_LIMIT_COOLDOWN_MS / 1000)}s)`);
-              } else if (error.killed) {
-                log("gmgn", `Timeout: ${args.join(" ")}`);
-              } else {
-                log("gmgn", `Spawn error (${args.join(" ")}): ${(stderr || error.message || "").trim().slice(0, 200)}`);
+                _rateLimitStrikes += 1;
+                _rateLimitedUntil = cooldownUntilMs({ errorText: blob, strikes: _rateLimitStrikes, now: _deps.now() });
+                const retryAfterMs = _rateLimitedUntil - _deps.now();
+                log("gmgn", `Rate limited: ${args.join(" ")} (strike ${_rateLimitStrikes}, no GMGN calls for ${Math.round(retryAfterMs / 1000)}s)`);
+                resolve({ status: GMGN_STATUS.RATE_LIMITED, data: null, retryAfterMs });
+                return;
               }
-              resolve(null);
+              if (looksForbidden(blob)) {
+                if (!_forbiddenLogged) log("gmgn", `Plan upgrade required for: ${args.slice(0, 2).join(" ")} (not retrying)`);
+                _forbiddenLogged = true;
+                resolve({ status: GMGN_STATUS.FORBIDDEN, data: null });
+                return;
+              }
+              if (error.code === "ENOENT") {
+                _binaryMissing = true;
+                if (!_binaryLogged) log("gmgn", "gmgn-cli not found on PATH (ENOENT): every GMGN call will fail until it is installed");
+                _binaryLogged = true;
+                resolve({ status: GMGN_STATUS.ERROR, data: null, transport: "binary_missing" });
+                return;
+              }
+              if (looksUnauthorized(blob)) {
+                _authFailed = true;
+                if (!_authLogged) log("gmgn", "GMGN auth failed (401): check GMGN_API_KEY / gmgn-config.json apiKey (further 401s are not logged)");
+                _authLogged = true;
+                resolve({ status: GMGN_STATUS.ERROR, data: null, transport: "auth_failed" });
+                return;
+              }
+              if (error.killed) log("gmgn", `Timeout: ${args.join(" ")}`);
+              else log("gmgn", `Spawn error (${args.join(" ")}): ${(stderr || error.message || "").trim().slice(0, 200)}`);
+              resolve({ status: GMGN_STATUS.ERROR, data: null });
               return;
             }
 
             const out = (stdout || "").trim();
             if (!out) {
-              resolve(null);
+              resolve({ status: GMGN_STATUS.EMPTY, data: null });
               return;
             }
 
             try {
-              resolve(JSON.parse(out));
+              const data = JSON.parse(out);
+              _rateLimitStrikes = 0; // a good response clears the escalation
+              _binaryMissing = false;
+              _authFailed = false;
+              // Recovered: re-arm the one-shot error logs so a later episode is logged again.
+              _binaryLogged = false;
+              _authLogged = false;
+              resolve({ status: GMGN_STATUS.OK, data });
             } catch (e) {
               log("gmgn", `Parse error (${args.join(" ")}): ${e.message}`);
-              resolve(null);
+              resolve({ status: GMGN_STATUS.ERROR, data: null });
             }
           },
         );
       }),
+    weight,
   );
+}
+
+/**
+ * Back-compat wrapper: parsed JSON or null. null conflates rate-limit with
+ * no-data, so fail-closed callers must use spawnGmgnResult instead.
+ */
+export async function spawnGmgn(args) {
+  const res = await spawnGmgnResult(args);
+  return res.status === GMGN_STATUS.OK ? res.data : null;
 }
 
 function toNum(v) {
@@ -186,10 +278,11 @@ function toNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** % change, or null when either price is missing (null = unknown, NOT 0 = "flat"). */
 function pct(cur, ref) {
-  const c = toNum(cur);
-  const r = toNum(ref);
-  if (!(r > 0)) return 0;
+  const c = numOrNull(cur);
+  const r = numOrNull(ref);
+  if (c == null || r == null || !(r > 0) || !(c > 0)) return null;
   return Math.round(((c - r) / r) * 10000) / 100;
 }
 
@@ -303,7 +396,7 @@ function supertrend(candles, period = 10, multiplier = 3) {
       : prev.finalLower;
 
     let direction = "green";
-    let value = finalLower;
+    let value;
     if (prev?.direction === "green") {
       direction = candle.close < finalLower ? "red" : "green";
     } else if (prev?.direction === "red") {
@@ -337,20 +430,93 @@ function roundTo(value, decimals = 2) {
 
 /* ============================== TOKEN INFO (shared) ============================== */
 
+/** Normalize the (inconsistently wrapped) `token info` payload to the info object. */
+function unwrapInfo(out) {
+  if (!out || typeof out !== "object" || Array.isArray(out)) return null;
+  const inner = out.data?.data && typeof out.data.data === "object" ? out.data.data : out.data;
+  return inner && typeof inner === "object" && !Array.isArray(inner) && !("price" in out) ? inner : out;
+}
+
 /**
- * Fetch + cache `token info` once per mint; both price and signal read from it.
+ * Fetch + cache `token info` once per mint (shared by price, signal, screening
+ * stages and the Meteora-source safety gates; concurrent callers share one spawn).
+ * Returns { status, info }. Rate-limited results are NEVER cached, so a 429 cannot
+ * poison the mint for the cache TTL; only genuine empty/error misses are, briefly.
  */
-async function fetchTokenInfo(mint) {
+export async function fetchGmgnTokenInfoResult(mint) {
+  if (!mint) return { status: GMGN_STATUS.ERROR, info: null };
   const cached = readCache(_tokenInfoCache, mint);
-  if (cached !== null) return cached || null; // cached `false` => known-miss
-  const info = await spawnGmgn(["token", "info", "--chain", CHAIN, "--address", mint]);
-  writeCache(_tokenInfoCache, mint, info || false, TOKEN_INFO_TTL);
-  return info || null;
+  if (cached) return cached.info ? { status: GMGN_STATUS.OK, info: cached.info } : { status: cached.status, info: null };
+  if (_tokenInfoInflight.has(mint)) return _tokenInfoInflight.get(mint);
+
+  const p = (async () => {
+    const res = await spawnGmgnResult(["token", "info", "--chain", CHAIN, "--address", mint]);
+    const info = res.status === GMGN_STATUS.OK ? unwrapInfo(res.data) : null;
+    if (info) {
+      writeCache(_tokenInfoCache, mint, { info }, TOKEN_INFO_TTL);
+      return { status: GMGN_STATUS.OK, info };
+    }
+    const status = res.status === GMGN_STATUS.OK ? GMGN_STATUS.EMPTY : res.status;
+    if (status === GMGN_STATUS.EMPTY || status === GMGN_STATUS.ERROR) {
+      writeCache(_tokenInfoCache, mint, { info: null, status }, TOKEN_INFO_MISS_TTL);
+    }
+    return { status, info: null, retryAfterMs: res.retryAfterMs };
+  })().finally(() => _tokenInfoInflight.delete(mint));
+  _tokenInfoInflight.set(mint, p);
+  return p;
+}
+
+async function fetchTokenInfo(mint) {
+  return (await fetchGmgnTokenInfoResult(mint)).info;
 }
 
 /** `token info` for one mint (cached 60s), or null. Read-only; used by tools/token-age.js. */
 export function fetchGmgnTokenInfo(mint) {
   return mint ? fetchTokenInfo(mint) : Promise.resolve(null);
+}
+
+/**
+ * `token security` (weight 1) for one mint, status-tagged. Cached 5 min on success.
+ * Used LOG-ONLY (tools/gmgn-policy.js summarizeSecurity), never as a gate.
+ */
+const _securityCache = new Map();
+export async function fetchGmgnSecurityResult(mint) {
+  if (!mint) return { status: GMGN_STATUS.ERROR, security: null };
+  const cached = readCache(_securityCache, mint);
+  if (cached) return { status: GMGN_STATUS.OK, security: cached };
+  const res = await spawnGmgnResult(["token", "security", "--chain", CHAIN, "--address", mint]);
+  if (res.status !== GMGN_STATUS.OK) return { status: res.status, security: null, retryAfterMs: res.retryAfterMs };
+  const security = unwrapInfo(res.data);
+  if (!security) return { status: GMGN_STATUS.EMPTY, security: null };
+  writeCache(_securityCache, mint, security, 5 * 60_000);
+  return { status: GMGN_STATUS.OK, security };
+}
+
+/**
+ * `token holders` (weight 5) for one mint, status-tagged, cached 60s on OK results only
+ * (never rate_limited/error) with in-flight dedupe, so repeated getTopCandidates() calls
+ * (cycle, dashboard, deploy path, LLM tool) never re-spend the weight-5 call within the TTL.
+ * Returns { status, data, retryAfterMs? } (same shape as spawnGmgnResult).
+ */
+const HOLDERS_TTL = 60_000;
+const _holdersCache = new Map();
+const _holdersInflight = new Map();
+export async function fetchGmgnHoldersResult(mint, limit = 100) {
+  if (!mint) return { status: GMGN_STATUS.ERROR, data: null };
+  const key = `${mint}:${limit}`;
+  const cached = readCache(_holdersCache, key);
+  if (cached) return { status: GMGN_STATUS.OK, data: cached };
+  if (_holdersInflight.has(key)) return _holdersInflight.get(key);
+  const p = (async () => {
+    const res = await spawnGmgnResult([
+      "token", "holders", "--chain", CHAIN, "--address", mint,
+      "--limit", String(limit), "--order-by", "amount_percentage", "--direction", "desc",
+    ]);
+    if (res.status === GMGN_STATUS.OK && res.data != null) writeCache(_holdersCache, key, res.data, HOLDERS_TTL);
+    return res;
+  })().finally(() => _holdersInflight.delete(key));
+  _holdersInflight.set(key, p);
+  return p;
 }
 
 /* ============================== PRICE / CANDLES ============================== */
@@ -359,17 +525,25 @@ export function fetchGmgnTokenInfo(mint) {
  * Fetch 5m klines for the candle summary + min price.
  * Returns candles sorted oldest -> newest, or null.
  */
-async function fetchKlines(mint) {
+const _klineInflight = new Map();
+function fetchKlinesResult(mint) {
+  if (_klineInflight.has(mint)) return _klineInflight.get(mint);
+  const p = fetchKlinesUncached(mint).finally(() => _klineInflight.delete(mint));
+  _klineInflight.set(mint, p);
+  return p;
+}
+async function fetchKlinesUncached(mint) {
   const now = Math.floor(Date.now() / 1000);
   const from = now - KLINE_WINDOW_SECONDS;
-  const json = await spawnGmgn([
+  const res = await spawnGmgnResult([
     "market", "kline", "--chain", CHAIN, "--address", mint,
     "--resolution", KLINE_RESOLUTION, "--from", String(from), "--to", String(now),
   ]);
+  if (res.status !== GMGN_STATUS.OK) return { status: res.status, candles: null };
 
-  if (!json) return null;
+  const json = res.data;
   const list = Array.isArray(json) ? json : Array.isArray(json?.list) ? json.list : null;
-  if (!list?.length) return null;
+  if (!list?.length) return { status: GMGN_STATUS.EMPTY, candles: null };
 
   const candles = list
     .map((c) => ({
@@ -383,7 +557,7 @@ async function fetchKlines(mint) {
     .filter((c) => c.time > 0)
     .sort((a, b) => a.time - b.time);
 
-  return candles.length ? candles : null;
+  return candles.length ? { status: GMGN_STATUS.OK, candles } : { status: GMGN_STATUS.EMPTY, candles: null };
 }
 
 /**
@@ -435,6 +609,7 @@ function summarizeCandles(allCandles) {
   const bbMid = sma(allCloses, 20);
   const bbStd = stddev(allCloses, 20);
   const bbUpper = bbMid != null && bbStd != null ? bbMid + (2 * bbStd) : null;
+  const bbLower = bbMid != null && bbStd != null ? bbMid - (2 * bbStd) : null;
   const latestClose = allCloses.at(-1);
   const latestRsi2 = rsi(allCloses, 2);
   const macdResult = macd(allCloses);
@@ -454,6 +629,8 @@ function summarizeCandles(allCandles) {
     rsi_2: roundTo(latestRsi2, 2),
     rsi_2_above_90: rsi2Above90,
     bb_upper: roundTo(bbUpper, 12),
+    bb_lower: roundTo(bbLower, 12),
+    close_below_bb_lower: bbLower != null && latestClose < bbLower,
     close_above_bb_upper: closesAboveBbUpper,
     macd: macdResult,
     macd_first_green_histogram: macdFirstGreen,
@@ -480,21 +657,28 @@ function summarizeCandles(allCandles) {
  * history. ATH proximity uses the true top-level `ath_price`. change_4h is
  * derived from `price_6h` (GMGN exposes 6h, not 4h) as the closest proxy.
  */
-export async function fetchGmgnPriceInfo(mint) {
-  if (!mint) return null;
+export async function fetchGmgnPriceInfoResult(mint) {
+  if (!mint) return { status: GMGN_STATUS.ERROR, data: null };
 
   const cached = readCache(_priceCache, mint);
-  if (cached) return cached;
+  if (cached) return { status: GMGN_STATUS.OK, data: cached };
 
   try {
-    const [info, candles] = await Promise.all([fetchTokenInfo(mint), fetchKlines(mint)]);
+    const [infoRes, klineRes] = await Promise.all([fetchGmgnTokenInfoResult(mint), fetchKlinesResult(mint)]);
+    const info = infoRes.info;
+    const candles = klineRes.candles;
+    const limited = infoRes.status === GMGN_STATUS.RATE_LIMITED || klineRes.status === GMGN_STATUS.RATE_LIMITED;
 
     if (!info && !candles) {
+      if (limited) {
+        log("gmgn", `Rate limited, no price data for ${mint.slice(0, 8)}`);
+        return { status: GMGN_STATUS.RATE_LIMITED, data: null };
+      }
       log("gmgn", `No data for ${mint.slice(0, 8)}`);
-      return null;
+      return { status: GMGN_STATUS.EMPTY, data: null };
     }
 
-    const p = info?.price || {};
+    const p = info?.price && typeof info.price === "object" ? info.price : {};
     const lastClose = candles?.length ? candles[candles.length - 1].close : 0;
     const price = toNum(p.price) || lastClose;
     const athPrice = toNum(info?.ath_price);
@@ -513,12 +697,16 @@ export async function fetchGmgnPriceInfo(mint) {
     const marketCap =
       mcapPrice > 0 && mcapSupply > 0 ? Math.round(mcapPrice * mcapSupply * 100) / 100 : null;
 
-    // Token age in hours from the on-chain creation time (GMGN gives epoch seconds).
-    // Fall back to open_timestamp if creation_timestamp is absent.
-    const createdSec = toNum(info?.creation_timestamp) || toNum(info?.open_timestamp);
+    // Token age in hours from creation_timestamp (epoch seconds) ONLY. open_timestamp
+    // is the migration/open event (much younger for Pump.fun graduates) and is no
+    // longer mixed in, so age means the same thing in every stage and the prompt.
+    const createdSec = toNum(info?.creation_timestamp);
     const tokenAgeHours = createdSec > 0
       ? Math.round(((Date.now() / 1000 - createdSec) / 3600) * 100) / 100
       : null;
+
+    // info.liquidity is sometimes 0 while pool.liquidity holds the real value.
+    const liq = numOrNull(info?.liquidity) > 0 ? numOrNull(info.liquidity) : (numOrNull(info?.pool?.liquidity) > 0 ? numOrNull(info.pool.liquidity) : null);
 
     const data = {
       token_age_hours: tokenAgeHours,
@@ -527,25 +715,36 @@ export async function fetchGmgnPriceInfo(mint) {
       price,
       max_price: maxPrice,
       min_price: minPrice,
+      // null = reference price missing (unknown), never 0 ("flat").
       change_5m: pct(p.price, p.price_5m),
       change_1h: pct(p.price, p.price_1h),
       change_4h: pct(p.price, p.price_6h), // GMGN exposes 6h, not 4h — closest proxy.
       change_24h: pct(p.price, p.price_24h),
-      volume_5m: Math.round(toNum(p.volume_5m) * 100) / 100,
-      volume_1h: Math.round(toNum(p.volume_1h) * 100) / 100,
-      volume_24h: Math.round(toNum(p.volume_24h) * 100) / 100,
+      volume_5m: numOrNull(p.volume_5m) == null ? null : Math.round(toNum(p.volume_5m) * 100) / 100,
+      volume_1h: numOrNull(p.volume_1h) == null ? null : Math.round(toNum(p.volume_1h) * 100) / 100,
+      volume_24h: numOrNull(p.volume_24h) == null ? null : Math.round(toNum(p.volume_24h) * 100) / 100,
       market_cap: marketCap,
       holders: Math.trunc(toNum(info?.holder_count)) || null,
-      liquidity: Math.round(toNum(info?.liquidity) * 100) / 100,
+      liquidity: liq == null ? null : Math.round(liq * 100) / 100,
       candles: summarizeCandles(candles),
+      // Provenance so fail-closed callers can tell "missing" from "rate limited".
+      info_status: infoRes.status,
+      kline_status: klineRes.status,
     };
 
-    writeCache(_priceCache, mint, data, PRICE_CACHE_TTL);
-    return data;
+    // Never cache a result that is missing a half only because we were rate limited.
+    if (!limited) writeCache(_priceCache, mint, data, PRICE_CACHE_TTL);
+    return { status: limited ? GMGN_STATUS.RATE_LIMITED : GMGN_STATUS.OK, data };
   } catch (e) {
     log("gmgn", `Price fetch error for ${mint.slice(0, 8)}: ${e.message}`);
-    return null;
+    return { status: GMGN_STATUS.ERROR, data: null };
   }
+}
+
+/** Back-compat wrapper: price info object or null (null = unknown, includes rate-limited). */
+export async function fetchGmgnPriceInfo(mint) {
+  const res = await fetchGmgnPriceInfoResult(mint);
+  return res.data;
 }
 
 /* ================================= SIGNAL ================================= */
@@ -556,6 +755,10 @@ function emptySignalMetrics(tokenAddress) {
     latest_signal_age_min: null,
     signal_count_30m: 0,
     signal_count_2h: 0,
+    signal_count_semantics: "tagged_holder_snapshot",
+    tagged_holder_count: 0,
+    trade_events_30m: 0,
+    trade_events_2h: 0,
     signal_amount_usd_30m: 0,
     signal_amount_usd_2h: 0,
     latest_sold_ratio_percent: null,
@@ -628,12 +831,24 @@ async function fetchTrackSnapshot() {
   if (_trackSnapshotInflight) return _trackSnapshotInflight;
 
   _trackSnapshotInflight = (async () => {
-    const [smJson, kolJson] = await Promise.all([
-      spawnGmgn(["track", "smartmoney", "--chain", CHAIN, "--limit", String(TRACK_LIMIT)]),
-      spawnGmgn(["track", "kol", "--chain", CHAIN, "--limit", String(TRACK_LIMIT)]),
+    const [smRes, kolRes] = await Promise.all([
+      spawnGmgnResult(["track", "smartmoney", "--chain", CHAIN, "--limit", String(TRACK_LIMIT)]),
+      spawnGmgnResult(["track", "kol", "--chain", CHAIN, "--limit", String(TRACK_LIMIT)]),
     ]);
+    const smJson = smRes.status === GMGN_STATUS.OK ? smRes.data : null;
+    const kolJson = kolRes.status === GMGN_STATUS.OK ? kolRes.data : null;
 
-    if (!smJson && !kolJson) return _trackSnapshot || new Map();
+    if (!smJson && !kolJson) {
+      // Both feeds failed. Back off briefly so every later mint does not re-spawn
+      // two track calls (the old code set no expiry). Rate limits are handled by
+      // the global cooldown, so do not also pin a miss for them.
+      const limited = smRes.status === GMGN_STATUS.RATE_LIMITED || kolRes.status === GMGN_STATUS.RATE_LIMITED;
+      if (!limited) {
+        _trackSnapshot = _trackSnapshot || new Map();
+        _trackSnapshotExpiresAt = Date.now() + TRACK_MISS_TTL;
+      }
+      return _trackSnapshot || new Map();
+    }
 
     const rows = [
       ...rowsFromTrackFeed(smJson, "smart_money"),
@@ -662,14 +877,14 @@ function overlayFromTrackRows(rows, now = Date.now()) {
   const cutoff30m = now - 30 * 60_000;
   const cutoff2h = now - 2 * 60 * 60_000;
 
-  let amt30 = 0, amt2h = 0, n2h = 0, sells2h = 0;
+  let amt30 = 0, amt2h = 0, n2h = 0, n30 = 0, sells2h = 0;
   for (const r of rows) {
     if (r.ts >= cutoff2h) {
       amt2h += r.amountUsd;
       n2h += 1;
       if (r.side === "sell") sells2h += 1;
     }
-    if (r.ts >= cutoff30m) amt30 += r.amountUsd;
+    if (r.ts >= cutoff30m) { amt30 += r.amountUsd; n30 += 1; }
   }
 
   // Only treat the overlay as a live signal when there's at least one row inside
@@ -680,6 +895,8 @@ function overlayFromTrackRows(rows, now = Date.now()) {
   const latest = hasInWindow ? inWindow.slice().sort((a, b) => b.ts - a.ts)[0] : null;
   return {
     has_in_window: hasInWindow,
+    trade_events_30m: n30,
+    trade_events_2h: n2h,
     signal_amount_usd_30m: Math.round(amt30 * 100) / 100,
     signal_amount_usd_2h: Math.round(amt2h * 100) / 100,
     latest_signal_age_min: latest ? Math.max(0, Math.round((now - latest.ts) / 60_000)) : null,
@@ -692,8 +909,9 @@ function overlayFromTrackRows(rows, now = Date.now()) {
  * Per-token GMGN conviction signal. Mirrors okx.js fetchOkxDexSignal shape.
  *
  * Backbone: `token info.wallet_tags_stat` gives reliable per-token counts of
- * smart-money / KOL / whale HOLDERS (a snapshot, not a time window) — so the
- * 30m and 2h count fields are set to the same snapshot count. Overlay: when the
+ * smart-money / KOL / whale HOLDERS (a snapshot, not a time window). The legacy
+ * signal_count_30m/2h fields carry that snapshot (deprecated aliases of
+ * tagged_holder_count); real windowed counts are trade_events_30m/2h. Overlay: when the
  * mint appears in the global track feed, real trade recency, USD flow, and
  * sold-ratio are layered on top. Returns an empty (but shaped) object when the
  * token has no tagged holders, or null only on hard error.
@@ -704,10 +922,11 @@ export async function fetchGmgnSignal(mint) {
   if (cached) return cached;
 
   try {
-    const [info, trackSnapshot] = await Promise.all([
-      fetchTokenInfo(mint),
+    const [infoRes, trackSnapshot] = await Promise.all([
+      fetchGmgnTokenInfoResult(mint),
       fetchTrackSnapshot().catch(() => new Map()),
     ]);
+    const info = infoRes.info;
 
     const tags = info?.wallet_tags_stat || {};
     const smart = Math.trunc(toNum(tags.smart_wallets));
@@ -721,6 +940,10 @@ export async function fetchGmgnSignal(mint) {
     // does not, and leaves latest_signal_age_min null.
     const overlayInWindow = !!overlay?.has_in_window;
     const present = smart > 0 || kol > 0 || whale > 0 || nativeSignals > 0 || overlayInWindow;
+
+    // No token info (rate limited / error) and no feed overlay: the answer is
+    // UNKNOWN, not "no smart money". Do not cache it as an empty signal.
+    if (!info && !overlayInWindow) return null;
 
     if (!present) {
       const empty = emptySignalMetrics(mint);
@@ -738,8 +961,18 @@ export async function fetchGmgnSignal(mint) {
       kol_count_2h: kol,
       whale_count_30m: whale,
       whale_count_2h: whale,
+      // DEPRECATED aliases: these two have ALWAYS held the tagged-holder snapshot
+      // (smart + KOL + whale), never a 30m/2h event count. Kept with the same
+      // values so stored lessons and the Darwin series stay comparable; read
+      // tagged_holder_count (same number) or trade_events_* (real windows) instead.
       signal_count_30m: totalConviction,
       signal_count_2h: totalConviction,
+      signal_count_semantics: "tagged_holder_snapshot",
+      tagged_holder_count: totalConviction,
+      // Real time-windowed smart-money/KOL trade counts from the global feed
+      // (0 when the mint is not in the last-200-row feed).
+      trade_events_30m: overlay?.trade_events_30m ?? 0,
+      trade_events_2h: overlay?.trade_events_2h ?? 0,
       // Overlay (trade flow) — null/0 when the mint isn't in the global feed.
       signal_amount_usd_30m: overlay?.signal_amount_usd_30m ?? 0,
       signal_amount_usd_2h: overlay?.signal_amount_usd_2h ?? 0,

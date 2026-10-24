@@ -15,6 +15,7 @@
  * All swaps honor DRY_RUN (no transaction is sent; sizing is estimated).
  */
 import { config } from "../config.js";
+import { isDryRun } from "../env-flags.js";
 import { log } from "../logger.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 
@@ -90,7 +91,7 @@ export async function prepareUsdcEntry({ amountUsd } = {}) {
   }
 
   // ── DRY RUN: estimate, no swap ───────────────────────────────
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return {
       ok: true,
       dry_run: true,
@@ -132,7 +133,7 @@ export async function prepareUsdcEntry({ amountUsd } = {}) {
  * @returns {Promise<{ settled: number, results: object[], dry_run?: boolean }>}
  */
 export async function settleToUsdc() {
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return { dry_run: true, settled: 0, results: [] };
   }
 

@@ -1,3 +1,4 @@
+import { isDryRun } from "../env-flags.js";
 import {
   Connection,
   PublicKey,
@@ -618,7 +619,7 @@ export async function swapToken({
   input_mint  = normalizeMint(input_mint);
   output_mint = normalizeMint(output_mint);
 
-  if (process.env.DRY_RUN === "true") {
+  if (isDryRun()) {
     return {
       dry_run: true,
       would_swap: { input_mint, output_mint, amount },

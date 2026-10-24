@@ -7,9 +7,10 @@
 //   gmgn-config.json  → ONLY the GMGN screening filters. Only when screeningSource = "gmgn" or "both".
 
 import fs from "fs";
+import { isDryRun, isTruthyDryRun } from "./env-flags.js";
 import path from "path";
 import { fileURLToPath } from "url";
-import { config } from "./config.js";
+import { config, CONFIG_WARNINGS } from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = (f) => {
@@ -52,7 +53,7 @@ export function buildSettingsReport({ color = false } = {}) {
   const row = (label, value, src) =>
     L.push(`  ${String(label).padEnd(22)} ${String(value).padEnd(24)} ${src ? C.dim(src) : ""}`.trimEnd());
 
-  const dryRun = process.env.DRY_RUN === "true" || u.dryRun === true;
+  const dryRun = isDryRun() || u.dryRun === true;
   const srcSource = config.screening.source;
   const gmgnActive = srcSource === "gmgn" || srcSource === "both";
   const meteoraActive = srcSource !== "gmgn";
@@ -64,7 +65,8 @@ export function buildSettingsReport({ color = false } = {}) {
     "  " +
       (dryRun ? C.green("○ DRY RUN — no on-chain txns") : C.red(C.bold("● LIVE — real funds"))) +
       "   " + C.bold(`screening: ${srcSource}`) +
-      "   " + C.bold(`capital: ${usdc ? "USDC" : "SOL"}`)
+      "   " + C.bold(`capital: ${usdc ? "USDC" : "SOL"}`) +
+      "   " + C.bold(`profile: ${config.profile ?? "custom"}`)
   );
 
   // ── config-file map ──
@@ -82,11 +84,14 @@ export function buildSettingsReport({ color = false } = {}) {
     ["RPC_URL", "rpcUrl"], ["WALLET_PRIVATE_KEY", "walletKey"],
   ];
   const conflicts = [];
+  const SECRET_ENV = new Set(["RPC_URL", "WALLET_PRIVATE_KEY"]);
   for (const [envKey, ucKey] of envWins) {
-    if (rawEnv[envKey] && u[ucKey] !== undefined) {
-      conflicts.push(`${envKey} (.env) overrides ${ucKey} (user-config.json) → using .env`);
-    }
+    if (!rawEnv[envKey] || u[ucKey] === undefined) continue;
+    if (SECRET_ENV.has(envKey)) conflicts.push(`${envKey} (.env) overrides ${ucKey} (user-config.json) → using .env; delete ${ucKey} from user-config.json`);
+    else if (envKey === "DRY_RUN" && isTruthyDryRun(rawEnv[envKey])) conflicts.push("DRY_RUN=true (.env) forces DRY RUN over user-config.json dryRun (safe override) → remove it from .env to go live");
+    else if (String(rawEnv[envKey]) !== String(u[ucKey])) conflicts.push(`${envKey} (.env) is IGNORED: ${ucKey} in user-config.json wins → remove ${envKey} from .env`);
   }
+  for (const w of CONFIG_WARNINGS) if (/deprecated/.test(w)) conflicts.push(w);
   for (const k of Object.keys(gmgn)) {
     const legacy = "gmgn" + k.charAt(0).toUpperCase() + k.slice(1);
     if (u[legacy] !== undefined) {
@@ -175,7 +180,6 @@ export function buildSettingsReport({ color = false } = {}) {
     row("token age", `${config.gmgn.minTokenAgeHours}–${config.gmgn.maxTokenAgeHours} h`, "min/maxTokenAgeHours");
     row("min holders", config.gmgn.minHolders, "minHolders");
     row("min volume", `$${Number(config.gmgn.minVolume).toLocaleString()}`, "minVolume");
-    row("require KOL", config.gmgn.requireKol, "requireKol");
     row("max sniper count", config.gmgn.maxSniperCount, "maxSniperCount");
     row("indicator filter", config.gmgn.indicatorFilter ? "on (Evil Panda gates)" : "off", "indicatorFilter");
   }

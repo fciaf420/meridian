@@ -2,16 +2,17 @@
 // (and gmgn-config) key config.js reads, grouped, typed, validated, risk-checked
 // and applied live where the running config supports it.
 //
-// The key list is derived from config.js's own source (every `u.<key>`,
-// `nullable("<key>")` and `gmgnValue/gmgnArray("<key>")` it reads), so a new key
-// added there shows up here without a hand-written list. Live locations come
-// from CONFIG_KEY_MAP first, then from where the key sits in the `config`
-// object literal.
+// The key list comes from settings-schema.js (the single source of truth for
+// user-config keys: type, range, tier, profile governance) plus the gmgn-config.json
+// keys present in config.gmgn, so a new schema row shows up here without a
+// hand-written list. Live locations come from CONFIG_KEY_MAP first, then the schema path.
 //
 // Everything with side effects is injected (createAllSettings(deps)), so tests
 // run against temp files and mocks.
-import fs from "fs";
 import { CONFIG_KEY_MAP } from "./runtime-helpers.js";
+import { isTruthyDryRun } from "./env-flags.js";
+import { SCHEMA } from "./settings-schema.js";
+import { syncWalletLockFromConfig } from "./wallet-lock.js";
 import { validateTradingValue, riskIncreases, readTradingSettings, TRADING_KEYS } from "./trading-settings.js";
 
 // Never listed or editable: credentials, endpoints, owner identity.
@@ -37,7 +38,7 @@ const OTHER_FIELDS = new Set(["pnlUnit", "priorityFeeLevel"]);
 const SECTION_GROUP = {
   risk: "cap", strategy: "strat", screening: "scrm", gmgn: "scrg", entryFilters: "entry",
   schedule: "sched", llm: "llm", darwin: "learn", autoresearch: "learn", knowledgeBase: "learn",
-  usdc: "usdc", web: "other",
+  usdc: "usdc", web: "other", learning: "learn",
 };
 
 /** Keys with a fixed set of valid values. `null` in a list means "unset / default". */
@@ -63,7 +64,7 @@ export const RESTART_KEYS = new Set(["llmProvider", "webPort"]);
 
 /** Explicit numeric bounds; other numbers get generic checks (see validate). */
 const BOUNDS = {
-  managementIntervalMin: [1, 1440], screeningIntervalMin: [1, 1440], healthCheckIntervalMin: [1, 1440],
+  managementIntervalMin: [1, 1440], screeningIntervalMin: [1, 1440],
   positionSizePct: [0.01, 1], gasReserve: [0, 5], gasReserveSol: [0, 5],
   deployAmountUsd: [1, 100_000], maxDeployUsd: [1, 100_000], minUsdcToOpen: [0, 1_000_000],
   maxDeployAmount: [0.1, Infinity], maxSwapPriceImpactPct: [0.1, 50], maxCloseSwapPriceImpactPct: [0.1, 90],temperature: [0, 2], maxTokens: [256, 200_000], maxSteps: [1, 100],
@@ -72,48 +73,19 @@ const BOUNDS = {
 };
 
 /**
- * Parse config.js source → the keys it reads.
- * Returns [{ key, file: "user"|"gmgn"|"env", path: [section, field(, sub)] | null }].
+ * The keys the editor can list: [{ key, file: "user"|"gmgn", path, row }].
+ * user keys = settings-schema rows (minus the profile switch and hidden rows);
+ * gmgn keys = scalar/list keys present in config.gmgn.
  */
-export function parseConfigKeys(src) {
+export function registryKeys(config) {
   const out = [];
-  const seen = new Set();
-  const add = (key, file, pathArr) => {
-    const id = `${file}:${key}`;
-    if (seen.has(id)) return;
-    seen.add(id);
-    out.push({ key, file, path: pathArr });
-  };
-  const lines = String(src).split("\n");
-  let inConfig = false;
-  let section = null;
-  let nested = null;
-  for (const line of lines) {
-    if (!inConfig) {
-      if (/^export const config = \{/.test(line)) { inConfig = true; continue; }
-      if (/^\s*(\/\/|\*)/.test(line)) continue;
-      for (const m of line.matchAll(/\bu\.(\w+)\b(?!\?\.)/g)) add(m[1], "env", null);
-      continue;
-    }
-    if (/^\};/.test(line)) { inConfig = false; section = null; continue; }
-    let m;
-    if ((m = /^ {2}(\w+):\s*\{/.exec(line))) { section = m[1]; nested = null; continue; }
-    if (/^ {2}\},?/.test(line)) { section = null; continue; }
-    if (!section) continue;
-    if ((m = /^ {4}(\w+):\s*(?:\(\(\) => )?\{\s*$/.exec(line)) || (m = /^ {4}(\w+):\s*\{\s*$/.exec(line))) { nested = m[1]; continue; }
-    if (nested && /^ {4}\}/.test(line)) { nested = null; continue; }
-    const field = /^ {4}(\w+):/.exec(line)?.[1] ?? /^ {6}(\w+):/.exec(line)?.[1];
-    if (!field) continue;
-    const inner = /^ {6}/.test(line);
-    // Inner lines of a call like getEffectiveMinSolToOpen({ … }) belong to the
-    // parent field; the live location then comes from CONFIG_KEY_MAP.
-    const pathArr = inner ? (nested ? [section, nested, field] : null) : [section, field];
-    const g = /gmgn(?:Value|Array)\("(\w+)"/.exec(line);
-    if (g) { add(g[1], "gmgn", pathArr); continue; }
-    const n = /nullable\("(\w+)"/.exec(line);
-    if (n) { add(n[1], "user", pathArr); continue; }
-    const uref = /\bu\.(\w+)\b(\?\.)?/.exec(line);
-    if (uref && !uref[2]) add(uref[1], "user", pathArr);
+  for (const row of SCHEMA) {
+    if (row.key === "profile") continue; // switched from the console (it rewrites many keys at once)
+    out.push({ key: row.key, file: "user", path: row.path, row });
+  }
+  for (const [k, v] of Object.entries(config.gmgn || {})) {
+    if (k === "apiKey") continue;
+    out.push({ key: k, file: "gmgn", path: ["gmgn", k], row: null, isObject: v !== null && typeof v === "object" && !Array.isArray(v) });
   }
   return out;
 }
@@ -134,7 +106,7 @@ export function fmtValue(v) {
 
 /**
  * deps: {
- *   config, source (config.js text; default: read it), lockedKeys, integerKeys,
+ *   config, lockedKeys, integerKeys,
  *   persistUserConfig(changes), persistGmgnConfig(changes),
  *   entryFilters: { normalize(key, v) → {value}|{error}, isLoosening(key, before, after) },
  *   dryRunInEnv, env (default process.env), onScheduleChange(key, value)?, log?
@@ -146,30 +118,28 @@ export function createAllSettings(deps) {
   const log = deps.log ?? (() => {});
   const locked = deps.lockedKeys ?? new Set(["walletKey", "rpcUrl", "llmModel"]);
   const integers = deps.integerKeys ?? new Set();
-  const source = deps.source ?? fs.readFileSync(new URL("./config.js", import.meta.url), "utf8");
   const entryKeys = new Set(Object.keys(config.entryFilters || {}));
 
   // ── registry ──
-  const parsed = parseConfigKeys(source);
-  const mappedUser = new Set(parsed.filter((e) => e.file === "user").map((e) => e.key));
   const entries = [];
-  for (const e of parsed) {
-    if (locked.has(e.key) || SECRET_KEY_RE.test(e.key) || HIDDEN_KEYS.has(e.key)) continue;
-    if (e.file === "env" && mappedUser.has(e.key)) continue; // e.g. usdcMode → usdc.enabled
+  for (const e of registryKeys(config)) {
+    if (locked.has(e.key) || SECRET_KEY_RE.test(e.key) || HIDDEN_KEYS.has(e.key) || e.row?.hidden) continue;
+    const row = e.row;
     const livePath = e.file === "user" && CONFIG_KEY_MAP[e.key] ? CONFIG_KEY_MAP[e.key] : e.path;
-    const entry = { key: e.key, file: e.file === "gmgn" ? "gmgn" : "user", path: livePath, special: null };
-    if (e.key === "dryRun") entry.special = "dryRun";
+    const entry = { key: e.key, file: e.file, path: livePath, special: row?.special === "dryRun" ? "dryRun" : null, tier: row?.tier ?? 3, governed: !!row?.gov, unit: row?.unit ?? null, label: row?.label ?? null };
     const cur = currentOf(entry);
-    if (cur !== null && typeof cur === "object" && !Array.isArray(cur)) continue; // nested objects aren't edited here
-    entry.type = ENUMS[e.key] ? "enum"
-      : entry.special === "dryRun" || typeof cur === "boolean" ? "boolean"
-        : Array.isArray(cur) ? "list"
-          : typeof cur === "number" ? "number"
+    if (e.isObject || (cur !== null && typeof cur === "object" && !Array.isArray(cur))) continue; // nested objects aren't edited here
+    const enumVals = ENUMS[e.key] ?? row?.enum ?? null;
+    entry.type = enumVals ? "enum"
+      : entry.special === "dryRun" || typeof cur === "boolean" || row?.type === "bool" ? "boolean"
+        : Array.isArray(cur) || row?.type === "list" ? "list"
+          : typeof cur === "number" || row?.type === "int" || row?.type === "float" ? "number"
             : cur === null || cur === undefined ? (/Model$/.test(e.key) ? "string" : "number")
               : "string";
-    entry.nullable = cur === null || ["blockTransferFeeAbovePct", "twapSpikeMaxPct"].includes(e.key) || /Model$/.test(e.key);
-    entry.enum = ENUMS[e.key] ?? null;
-    entry.restart = RESTART_KEYS.has(e.key) || (!entry.path && entry.special !== "dryRun");
+    entry.nullable = cur === null || !!row?.nullable || ["blockTransferFeeAbovePct", "twapSpikeMaxPct"].includes(e.key) || /Model$/.test(e.key);
+    entry.enum = enumVals;
+    entry.schema = row ?? null;
+    entry.restart = RESTART_KEYS.has(e.key) || !!row?.restart || (!entry.path && entry.special !== "dryRun");
     const section = entry.path?.[0];
     const field = entry.path?.at(-1);
     entry.group = entry.special === "dryRun" ? "mode"
@@ -181,7 +151,7 @@ export function createAllSettings(deps) {
   }
 
   function currentOf(entry) {
-    if (entry.special === "dryRun") return env.DRY_RUN === "true";
+    if (entry.special === "dryRun") return isTruthyDryRun(env.DRY_RUN);
     if (entry.path) return getPath(config, entry.path);
     if (entry.key === "llmProvider") return env.LLM_PROVIDER ?? null;
     return undefined;
@@ -248,7 +218,10 @@ export function createAllSettings(deps) {
           return r.error ? { error: r.error } : { value: r.value };
         }
         if (integers.has(entry.key) && !Number.isInteger(n)) return { error: "must be a whole number" };
-        const b = BOUNDS[entry.key] ?? (/Pct$/.test(entry.key) ? [-100, 1000] : null);
+        const sch = entry.schema;
+        const b = BOUNDS[entry.key]
+          ?? (sch && (sch.max !== undefined || (sch.min ?? 0) !== 0) ? [sch.min ?? -Infinity, sch.max ?? Infinity] : null)
+          ?? (/Pct$/.test(entry.key) ? [-100, 1000] : null);
         if (b && (n < b[0] || n > b[1])) return { error: `must be between ${b[0]} and ${b[1]}` };
         const cur = currentOf(entry);
         if (!b && typeof cur === "number" && cur >= 0 && n < 0) return { error: "must not be negative" };
@@ -262,6 +235,8 @@ export function createAllSettings(deps) {
     const before = currentOf(entry);
     const k = entry.key;
     if (entry.special === "dryRun") return [value ? "switches to DRY RUN (no transactions are sent)" : "switches to LIVE trading with real funds"];
+    if (k === "bidAskFlipMode") return value === "live" && before !== "live" ? ["turns the bid-ask flip to LIVE: the bot will sign and send real flip transactions on open positions"] : [];
+    if (k === "autoTune") return value === true && before !== true ? ["turns on auto-tune: the bot will rewrite screening thresholds on its own after closed positions"] : [];
     if (entryKeys.has(k)) return deps.entryFilters?.isLoosening?.(k, before, value) ? ["turns an entry-safety guard off or loosens it"] : [];
     if (["stopLossPct", "deployAmountSol", "maxPositions", "trailingTakeProfit"].includes(k)) {
       return riskIncreases({ [k]: value }, readTradingSettings(config));
@@ -291,6 +266,7 @@ export function createAllSettings(deps) {
     }
     if (entry.special === "dryRun") env.DRY_RUN = value ? "true" : "false";
     else if (entry.path && !RESTART_KEYS.has(entry.key)) setPath(config, entry.path, value);
+    if (entry.path?.[0] === "exits") syncWalletLockFromConfig(config);
     const text = `${entry.key}: ${fmtValue(before)} → ${fmtValue(value)}`;
     log("config", `Setting (telegram, ${entry.file === "gmgn" ? "gmgn-config.json" : "user-config.json"}): ${text}${entry.restart ? " (applies after restart)" : ""}`);
     if (entry.path?.[0] === "schedule" && value !== before) {

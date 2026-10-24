@@ -1,31 +1,43 @@
 import "dotenv/config";
+import { isDryRun } from "./env-flags.js";
 import fs from "fs";
 import path from "path";
 import cron from "node-cron";
 import readline from "readline";
 import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./agent.js";
 import { log, enableLogPathFile } from "./logger.js";
-import { getMyPositions, isCloseInflight, getInflightCloses } from "./tools/dlmm.js";
+import { getMyPositions, isCloseInflight, getInflightCloses, positionAccountExists } from "./tools/dlmm.js";
+import { acquireInstanceLock, releaseInstanceLock } from "./instance-lock.js";
+import { reconcileAttempts, getUnresolvedAttempts, clearAttempt, isAttemptInFlight, setCorruptionHandler } from "./deploy-checkpoint.js";
+import { getRefusalStats } from "./deploy-guards.js";
+import { activeRpcHosts, formatRpcHosts } from "./rpc-hosts.js";
 import { llmHealth, isLlmUnavailableError } from "./llm-health.js";
 import { runManagementWithOorFallback, formatOorFallbackReport } from "./oor-fallback.js";
 import { getPositionBins } from "./tools/bin-visual.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, rankCandidatesByDarwin, getPoolDetail, formatCandidateSources } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount, resolveDeploySizing, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV } from "./config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, resolveDeploySizing, persistUserConfig, persistGmgnConfig, LOCKED_KEYS, INTEGER_KEYS, DRY_RUN_SET_IN_ENV, switchProfile, currentGovernedValues, settingSource } from "./config.js";
+import { createProfileService } from "./settings-console.js";
 import { createAllSettings } from "./all-settings.js";
 import { normalizeEntryFilterValue, isLooseningChange } from "./tools/entry-safety.js";
 import { applyTradingSettings } from "./trading-settings.js";
 import { evolveThresholds, getPerformanceSummary, deduplicateLessons } from "./lessons.js";
-import { registerCronRestarter, executeTool } from "./tools/executor.js";
+import { registerCronRestarter, executeTool, finalizeCodeClose } from "./tools/executor.js";
+import { setWalletLockOptions, outsideWalletLock } from "./wallet-lock.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, editHTML, answerCallback, setMyCommands, isEnabled as telegramEnabled } from "./telegram.js";
 import { createTelegramUI, BOT_COMMANDS, readRecentErrors } from "./telegram-ui.js";
 import { lookupToken, parseMint } from "./tools/token-lookup.js";
 import { isScreeningPaused, setScreeningPaused } from "./state.js";
+import { pnlExitsWarning } from "./exit-engine.js";
 import { usdcModeEnabled } from "./tools/usdc-mode.js";
 import { generateBriefing, recordBriefing, latestBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { updatePnlAndCheckExits, getTrackedPosition } from "./state.js";
+import { updatePnlAndCheckExits, getTrackedPosition, registerExitTick, recordPnlHold, recordAutoClose, markOnchainRead } from "./state.js";
+import { runManagementCodeRules, formatCodeRuleResults } from "./management-rules.js";
+import { getOnchainPnl } from "./tools/onchain-pnl.js";
+import { closePosition } from "./tools/dlmm.js";
+import { withTimeout } from "./tools/bin-visual.js";
 import { emit, on } from "./notifier.js";
 import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
@@ -49,12 +61,27 @@ import {
 import { startServer } from "./server.js";
 import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
-import { getScreeningThresholdSummary, getStartupMode, screeningCronGate } from "./runtime-helpers.js";
+import {
+  getScreeningThresholdSummary, getStartupMode, screeningCronGate,
+  classifyGlobalFeesUnknown, globalFeesHardSkipReason, evaluateFeeDataOutage,
+} from "./runtime-helpers.js";
 import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal, formatRunnerPrecheck } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
+// M1/Nit: stale / hung wallet-lock holder → Telegram alert. Timeouts come from config (config.js syncs them at load and on change).
+setWalletLockOptions({
+  onAlert: ({ kind, label, heldMs, queued }) => {
+    const secs = Math.round(heldMs / 1000);
+    const text = kind === "abandoned"
+      ? `Wallet lock RELEASED after ${secs}s: "${label}" never finished (hung RPC?). It may still land on chain. ${queued} operation(s) were queued.`
+      : `Wallet lock held ${secs}s by "${label}" (${queued} queued). Closes cannot run until it finishes; check RPC health.`;
+    log("wallet_lock", text);
+    emit("ops_alert", { key: `lock:${kind}`, title: kind === "abandoned" ? "Wallet lock released after timeout" : "Wallet lock held too long", text });
+  },
+});
+
 log("startup", "DLMM LP Agent starting...");
-log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
+log("startup", `Mode: ${isDryRun() ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${config.llm.managementModel} (provider: ${process.env.LLM_PROVIDER || "openrouter"})`);
 
 // Crash handlers first, so a throw anywhere below is logged, alerted and exits 1
@@ -65,13 +92,98 @@ installCrashHandlers({
 });
 
 // Let operators find this process and its log without guessing (ops/README.md).
+// logs/bot.pid doubles as the single-instance lock: a second bot on the same
+// wallet would double-deploy and double-close, so refuse to start while the
+// first is alive. A stale pidfile (crash, reboot, recycled pid) is reclaimed.
+// MERIDIAN_SKIP_INSTANCE_LOCK=1 bypasses the lock (tests / deliberate overrides,
+// and sandboxes/containers where kill(pid, 0) returns EPERM for every pid and `ps`
+// is unavailable: the lock then fails closed on any stale pidfile).
 const PID_FILE = path.join("logs", "bot.pid");
 try {
   fs.mkdirSync("logs", { recursive: true });
-  fs.writeFileSync(PID_FILE, `${process.pid}\n`);
+  if (process.env.MERIDIAN_SKIP_INSTANCE_LOCK === "1") {
+    fs.writeFileSync(PID_FILE, `${process.pid}\n`);
+    log("startup_warn", "Instance lock bypassed (MERIDIAN_SKIP_INSTANCE_LOCK=1)");
+  } else {
+    acquireInstanceLock(PID_FILE, { log: (m) => log("startup_warn", m) });
+  }
   enableLogPathFile(path.join("logs", "bot.logpath"));
 } catch (e) {
+  if (e.code === "INSTANCE_LOCKED") {
+    log("startup_error", e.message);
+    console.error(e.message);
+    process.exit(1);
+  }
   log("startup_warn", `Could not write logs/bot.pid / logs/bot.logpath: ${e.message}`);
+}
+log("startup", `RPC hosts: ${formatRpcHosts()}`);
+
+// A corrupt deploy-attempts.json is moved aside and the checkpoint restarts
+// empty (deploy-checkpoint.js); tell the owner, because anything in-flight that
+// was recorded there is no longer tracked.
+setCorruptionHandler(({ backup, error }) => {
+  if (telegramEnabled()) sendMessage(`⚠️ deploy-attempts.json was corrupt (${error}). Moved to ${path.basename(backup)}; starting with an empty checkpoint. Check your wallet for any position opened by an interrupted deploy.`).catch(() => {});
+});
+
+// Reconcile unresolved deploy attempts ("submitting" after a crash, or "uncertain"
+// after an RPC blip) against the chain: at boot, then on every management tick
+// while any remain, and on demand via /reconcile. Until an attempt resolves,
+// re-entry into its pool/token stays blocked (findBlockingAttempt).
+const reconcileNotified = new Set(); // unverified attempts already announced (no per-tick spam)
+let reconcileInFlight = false;
+// Periodic ticks leave attempts younger than this alone (a deploy may still be running).
+const PERIODIC_RECONCILE_MIN_AGE_MS = 10 * 60_000;
+async function reconcileDeployAttemptsNow({ source = "periodic", announceAll = false } = {}) {
+  if (reconcileInFlight) return [];
+  reconcileInFlight = true;
+  try {
+    return await reconcileAttempts({
+      positionExists: positionAccountExists,
+      minAgeMs: source === "periodic" ? PERIODIC_RECONCILE_MIN_AGE_MS : 0,
+      notify: async (results) => {
+        const fresh = results.filter(({ attempt, outcome }) => announceAll || outcome !== "unverified" || !reconcileNotified.has(attempt.id));
+        for (const { attempt, outcome } of results) if (outcome === "unverified") reconcileNotified.add(attempt.id);
+        if (!fresh.length) return;
+        const lines = fresh.map(({ attempt, outcome }) =>
+          `${outcome === "landed" ? "⚠️ position EXISTS" : outcome === "absent" ? "no position created" : "❓ unverified (still blocking; /reconcile to retry)"}: pool ${String(attempt.pool).slice(0, 8)} pos ${String(attempt.position).slice(0, 8)} id ${attempt.id}`);
+        if (telegramEnabled()) await sendMessage(`Deploy attempt reconcile (${source}):\n${lines.join("\n")}`);
+      },
+    });
+  } finally {
+    reconcileInFlight = false;
+  }
+}
+function unresolvedDeployCount() {
+  try { return getUnresolvedAttempts().length; } catch { return 0; }
+}
+reconcileDeployAttemptsNow({ source: "boot" }).catch((e) => log("startup_warn", `Deploy-attempt reconcile failed: ${e.message}`));
+
+/**
+ * /reconcile            re-check every unresolved attempt against the chain now
+ * /reconcile clear <id|all> force   operator override after checking the chain
+ *                                   yourself (Solscan); marks them cleared_manual
+ */
+async function handleReconcileCommand(rawArgs = "") {
+  const parts = String(rawArgs).trim().split(/\s+/).filter(Boolean);
+  if (parts[0] === "clear") {
+    const target = parts[1];
+    const open = getUnresolvedAttempts();
+    if (!target) return `Usage: /reconcile clear <id|all> force\nUnresolved: ${open.map((a) => a.id).join(", ") || "none"}`;
+    if (parts[2] !== "force") {
+      return `This marks the attempt resolved WITHOUT trusting the bot's own chain read. First confirm on an explorer that the position account does not exist (or is already managed), then repeat:\n/reconcile clear ${target} force`;
+    }
+    const ids = target === "all" ? open.map((a) => a.id) : [target];
+    const busy = ids.filter((id) => isAttemptInFlight(id));
+    const cleared = ids.filter((id) => !isAttemptInFlight(id) && clearAttempt(id, "cleared by operator via /reconcile"));
+    const busyNote = busy.length ? `\nRefused (deploy in flight in this process, even with force): ${busy.join(", ")}` : "";
+    return (cleared.length ? `Cleared ${cleared.length} attempt(s): ${cleared.join(", ")}` : "No matching unresolved attempt.") + busyNote;
+  }
+  const results = await reconcileDeployAttemptsNow({ source: "manual", announceAll: false });
+  const remaining = getUnresolvedAttempts();
+  const summary = results.length
+    ? results.map(({ attempt, outcome }) => `${outcome}: pool ${String(attempt.pool).slice(0, 8)} id ${attempt.id}`).join("\n")
+    : "No unresolved deploy attempts.";
+  return `${summary}${remaining.length ? `\nStill blocking: ${remaining.map((a) => `${a.id} (${a.status})`).join(", ")}` : ""}`;
 }
 
 // One-time lesson dedup on startup
@@ -360,6 +472,7 @@ async function screeningCycleBody() {
         const smartWalletCount = swResult?.in_pool?.length || 0;
         c._smartWalletCount = smartWalletCount;
         c._globalFeesSol = holdResult?.global_fees_sol ?? null;
+        c._feesUnknownReason = classifyGlobalFeesUnknown({ holdersSettled: holders, holdResult });
         c._top10Pct = holdResult?.top_10_real_holders_pct != null ? Number(holdResult.top_10_real_holders_pct) : null;
 
         let block = `[${c.name}] pool: ${c.pool} | darwin: ${c.darwin_score ?? "?"}/100 | bin_step: ${c.bin_step} | fee/aTVL: ${c.fee_active_tvl_ratio}% | vol: $${c.volume} | organic: ${c.organic_score} | holders: ${c.holders} | volatility: ${c.volatility ?? "?"}`;
@@ -427,9 +540,11 @@ async function screeningCycleBody() {
       );
       // Hard skips are threshold checks on pre-loaded data: drop failing candidates in
       // code so the model only judges the survivors (narrative, momentum, pick-or-skip).
-      // Unknown values (null) never cause a skip here; the model still sees them.
+      // Unknown global_fees_sol fails CLOSED (skip); other unknown values (e.g. top10 null) do not skip
+      // here and the model still sees them. A fee-fetch outage hitting most candidates raises one alert below.
       const hardSkipReason = (c) => {
-        if (c._globalFeesSol != null && c._globalFeesSol < config.screening.minTokenFeesSol) return `global_fees ${c._globalFeesSol} SOL < ${config.screening.minTokenFeesSol}`;
+        const feeReason = globalFeesHardSkipReason(c, config.screening.minTokenFeesSol);
+        if (feeReason) return feeReason;
         if (Number.isFinite(c._top10Pct) && c._top10Pct > 60) return `top10 ${c._top10Pct}% > 60%`;
         if (config.strategy.activeStrategy === "evil_panda" && c._evilPandaPass === false) return "Evil Panda entry FAIL";
         return null;
@@ -441,6 +556,10 @@ async function screeningCycleBody() {
         else survivors.push(c);
       }
       if (hardSkipped.length > 0) log("cron", `Screening hard-skipped in code: ${hardSkipped.join("; ")}`);
+      const feeOutage = evaluateFeeDataOutage(rankedCandidates, { ratio: config.screening.feeDataDownRatio });
+      if (feeOutage.notify) {
+        emit("fee_data_down", { reason: `global_fees fetch failed for ${feeOutage.failed}/${feeOutage.total} candidate(s) (Meteora datapi holders / Jupiter fee data); those are skipped (fail closed) until it recovers.` });
+      }
       const validBlocks = survivors
         .map((c) => blockMap.get(c.pool))
         .filter(Boolean);
@@ -523,7 +642,7 @@ SCREENING CYCLE — DEPLOY ONLY${signalWeightsBlock}${kbScreenContext}${candidat
 ${strategyBlock}
 ${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and GMGN signal data.
 Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
-HARD SKIP rules still apply (code has already dropped candidates whose known global_fees_sol or top_10 value fails the first two):
+HARD SKIP rules still apply (code has already dropped candidates whose global_fees_sol is below the minimum or UNKNOWN (fail closed), or whose known top_10 value fails the second):
 - global_fees_sol < ${config.screening.minTokenFeesSol} SOL → skip (bundled/scam)
 - top_10_real_holders_pct > 60% OR bundlers > 30% → skip
 - No smart wallets or GMGN confirmation + empty/hype narrative → skip
@@ -563,11 +682,21 @@ ${getRangeSelectionText(deployAmount, currentBalance?.sol)}${usdcModeEnabled()
 }
 
 function startCronJobs() {
+  // C1: never create cron/watcher timers inside a wallet-lock ALS context.
+  return outsideWalletLock(startCronJobsInner);
+}
+
+function startCronJobsInner() {
   stopCronJobs(); // stop any running tasks before (re)starting
   if (isDraining()) return; // shutting down: never (re)start cycles
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
     if (isDraining()) return;
+    // Retry unresolved deploy attempts (one getAccountInfo each) every tick, before
+    // any early return below, so an RPC blip does not block a pool until restart.
+    if (unresolvedDeployCount() > 0) {
+      reconcileDeployAttemptsNow({ source: "periodic" }).catch((e) => log("cron_warn", `Deploy-attempt reconcile failed: ${e.message}`));
+    }
     if (isBusy()) {
       timers.managementLastRun = Date.now();
       log("cron", "Management deferred — position action in progress");
@@ -610,6 +739,7 @@ function startCronJobs() {
       // Set only when the exit pre-check below ran to completion; the code-side
       // HOLD gate further down requires it so a partial pre-check never skips the LLM.
       let precheckedPositions = null;
+      const flipExitPositions = new Set(); // positions with a strategy exit alert this tick (the bid-ask flip yields to them)
       try {
         const pos = await getMyPositions();
         const exits = [];
@@ -623,14 +753,9 @@ function startCronJobs() {
             import("./tools/recenter-shadow.js").then((m) => m.logRecenterShadow(p)).catch(() => {});
           }
 
-          // Trailing TP / stop loss check
-          if (p.pnl_pct != null) {
-            const exitAction = updatePnlAndCheckExits(p.position, p.pnl_pct, config);
-            if (exitAction) {
-              exits.push(`⚠ ${p.pair}: ${exitAction}`);
-              log("exit_check", `${p.pair}: ${exitAction}`);
-            }
-          }
+          // Stop loss / trailing / TP are no longer evaluated here as LLM
+          // "exit alerts": the code rules below run the shared exit engine
+          // (exit-engine.js) and close in code.
 
           // Study hold time context — compare your age to top LPers
           if (p.study_avg_hold_hours != null) {
@@ -647,7 +772,7 @@ function startCronJobs() {
                 const pnlPositive = (p.pnl_pct ?? 0) > 0;
                 const exitOk = pnlPositive && c.evil_panda_exit_signal;
                 const line = `${p.pair}: Evil Panda exit check - pnl=${p.pnl_pct ?? "?"}% (${pnlPositive ? "positive" : "not positive"}), RSI(2)=${c.rsi_2 ?? "?"}, close>BB_upper=${!!c.close_above_bb_upper}, MACD_first_green=${!!c.macd_first_green_histogram}, exit=${exitOk ? "YES" : "NO"}${c.evil_panda_exit_reason ? ` (${c.evil_panda_exit_reason})` : ""}`;
-                if (exitOk) exits.push(line);
+                if (exitOk) { exits.push(line); flipExitPositions.add(p.position); }
                 else holdTimeHints.push(line);
               }
             } catch { /* GMGN exit context is best-effort */ }
@@ -706,43 +831,72 @@ function startCronJobs() {
         if (kbHints) kbContext = `\n\n${kbHints}`;
       } catch { /* best-effort */ }
 
-      // Hard-close rules 2-6 are threshold checks on data already in hand. Evaluate them
-      // here and start a model session only when a position carries a free-text
-      // instruction, a rule fired, a rule could not be evaluated, or there are exit
-      // alerts. All-HOLD cycles skip the LLM call. This only gates the LLM: nothing is
-      // closed in code here, and the PnL watcher's own exits are unaffected.
-      if (precheckedPositions?.length && !exitAlerts) {
-        const m = config.management;
-        const ruleHits = [];
-        const closeReasons = []; // [position, label] for the close history (tools/executor.js withCloseReason)
-        for (const p of precheckedPositions) {
-          if (getTrackedPosition(p.position)?.instruction) { ruleHits.push(`${p.pair}: instruction`); closeReasons.push([p.position, "rule 1: instruction met"]); }
-          else if (p.pnl_pct == null) ruleHits.push(`${p.pair}: pnl unknown`);
-          // A PnL the warm-up guard (state.js) is holding as a likely spike is not a
-          // take-profit signal; the PnL watcher re-checks it on its next tick.
-          else if (p.pnl_pct >= m.takeProfitFeePct && getTrackedPosition(p.position)?._pnl_pending_extreme) { /* warm-up spike: hold */ }
-          else if (p.pnl_pct >= m.takeProfitFeePct) { ruleHits.push(`${p.pair}: rule 3`); closeReasons.push([p.position, `rule 3: take profit (${p.pnl_pct}% ≥ ${m.takeProfitFeePct}%)`]); }
-          else if ((p.minutes_out_of_range ?? 0) >= m.outOfRangeWaitMinutes) { ruleHits.push(`${p.pair}: rule 4`); closeReasons.push([p.position, `rule 4: OOR timeout${p.oor_direction ? ` (OOR ${p.oor_direction})` : ""}`]); }
-          else if (p.pnl_pct <= m.emergencyPriceDropPct) { ruleHits.push(`${p.pair}: rule 6`); closeReasons.push([p.position, `rule 6: emergency stop (${p.pnl_pct}%)`]); }
-          else if (!p.pool) ruleHits.push(`${p.pair}: pool unknown`);
-          else {
-            const d = await getPoolDetail({ pool_address: p.pool, timeframe: config.screening.timeframe || "5m" }).catch(() => null);
-            if (!d || !Number.isFinite(d.fee_active_tvl_ratio) || !Number.isFinite(d.volume)) ruleHits.push(`${p.pair}: rule 5 unverified`);
-            else if (d.fee_active_tvl_ratio < config.screening.minFeeActiveTvlRatio && d.volume < config.screening.minVolume) {
-              ruleHits.push(`${p.pair}: rule 5`);
-              closeReasons.push([p.position, "rule 5: yield dead"]);
-            }
-          }
+      // Hard-close rules 3-6 are decided AND executed in code (management-rules.js):
+      // PnL rules through the shared exit engine (on-chain confirmation + N
+      // consecutive ticks, same streak as the PnL watcher), rule 4 / rule 5 by
+      // threshold. The LLM runs only for free-text position instructions
+      // (rules 1/2) and strategy exit alerts, and cannot veto a code close:
+      // those have already happened before the model is asked anything.
+      if (precheckedPositions?.length) {
+        const codeRules = await runManagementCodeRules(precheckedPositions, {
+          config,
+          getTracked: getTrackedPosition,
+          getPoolDetail,
+          executeTool,
+          log,
+          engineDeps: {
+            update: updatePnlAndCheckExits,
+            register: registerExitTick,
+            recordHold: recordPnlHold,
+            readOnchain: (pos) => withTimeout(getOnchainPnl(pos), 20_000),
+            markOnchain: markOnchainRead,
+          },
+          closeDeps: {
+            closePosition,
+            getTracked: getTrackedPosition,
+            isCloseInflight,
+            recordAutoClose,
+            emit,
+            getPositionBins,
+            withTimeout,
+            postClose: finalizeCodeClose,
+          },
+        });
+        const ruleHits = codeRules.llmNeeded;
+        // Rule-1 closes by the model are labelled as such (tools/executor.js withCloseReason).
+        setManagementCloseReasons(precheckedPositions
+          .filter((p) => getTrackedPosition(p.position)?.instruction)
+          .map((p) => [p.position, "rule 1: instruction met"]));
+        if (codeRules.closed.length || codeRules.failed.length) mgmtRuleFired = true;
+        // Bid-Ask flip (tools/bidask-flip.js): runs AFTER the code-fired closes above and
+        // under the management lock; live flips additionally take the wallet lock. Any
+        // exit rule wins: positions just closed, failed to close, held for exit
+        // confirmation, or carrying a strategy exit alert are skipped. "shadow" only
+        // simulates and logs.
+        if (config.bidAskFlip?.mode && config.bidAskFlip.mode !== "off") {
+          const exitBusy = new Set([...codeRules.closed, ...codeRules.failed, ...codeRules.held].map((r) => r.position));
+          for (const id of flipExitPositions) exitBusy.add(id);
+          const flipCandidates = precheckedPositions.filter((p) => !exitBusy.has(p.position));
+          // M1: backstop on top of runBidAskFlips' own deadline, so a hang can never hold the cycle.
+          const flipMs = ((config.bidAskFlip?.timeoutSec ?? 30) + 10) * 1000;
+          let flipTimer;
+          await Promise.race([
+            import("./tools/bidask-flip.js")
+              .then((m) => m.runBidAskFlips(flipCandidates, { config, exitAlerts: exitBusy, isBusy, isCloseInflight, dryRun: isDryRun() })),
+            new Promise((_, rej) => { flipTimer = setTimeout(() => rej(new Error(`flip pass exceeded ${Math.round(flipMs / 1000)}s; skipped this cycle`)), flipMs); }),
+          ])
+            .catch((e) => log("bidask_flip", `flip pass failed: ${e.message}`))
+            .finally(() => clearTimeout(flipTimer));
         }
-        setManagementCloseReasons(closeReasons);
-        if (ruleHits.length === 0) {
-          log("cron", `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD (LLM skipped)`);
-          mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code, no close rule triggered — HOLD.`;
+        const codeSummary = codeRules.lines.length ? `\n${codeRules.lines.join("\n")}` : "";
+        if (ruleHits.length === 0 && !exitAlerts) {
+          log("cron", `Management: ${precheckedPositions.length} position(s) checked in code — ${codeRules.closed.length} closed, ${codeRules.held.length} held for confirmation (LLM skipped)`);
+          mgmtReport = `Management: ${precheckedPositions.length} position(s) checked in code — ${codeRules.closed.length} closed in code${codeRules.failed.length ? `, ${codeRules.failed.length} close(s) failed` : ""}${codeRules.closed.length || codeRules.failed.length ? "" : ", no close rule triggered — HOLD"}.${codeSummary}`;
           return; // finally{} still releases the lock and emits the report
         }
-        log("cron", `Management: LLM needed — ${ruleHits.join(", ")}`);
+        log("cron", `Management: LLM needed — ${[...ruleHits, ...(exitAlerts ? ["strategy exit alert"] : [])].join(", ")}`);
         memoryHints += formatRunnerPrecheck(ruleHits);
-        mgmtRuleFired = ruleHits.some((h) => /: rule [3-6]$/.test(h));
+        memoryHints += formatCodeRuleResults(codeRules);
       }
 
       if (exitAlerts) mgmtRuleFired = true;
@@ -769,7 +923,7 @@ function startCronJobs() {
           isCloseInflight,
           management: config.management,
           log,
-          dryRun: process.env.DRY_RUN === "true",
+          dryRun: isDryRun(),
         },
       });
       fallbackSummary = mgmtRun.fallbackSummary;
@@ -875,6 +1029,8 @@ function startCronJobs() {
   _cronTasks = [mgmtTask, screenTask, briefingTask, briefingWatchdog, kbHealthTask];
 
   // Start lightweight PnL watcher (sub-minute interval, no LLM)
+  // M1: stale / hung wallet-lock holder → Telegram alert, hard release after the timeout.
+  // (wallet-lock timeouts + alert sink are applied at module init / config change, not here.)
   startPnlWatcher(config.schedule.pnlWatcherIntervalSec);
 
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m, pnl watcher every ${config.schedule.pnlWatcherIntervalSec}s`);
@@ -907,13 +1063,22 @@ const shutdownController = createShutdownController({
   onDrained: async () => {
     const positions = await getMyPositions().catch(() => null);
     log("shutdown", `Open positions at shutdown: ${positions?.total_positions ?? "unknown"}`);
+    // Liveness: tell the owner the bot is going down (bounded, never blocks exit).
+    if (telegramEnabled()) {
+      await Promise.race([
+        sendMessage(`🛑 Meridian stopped (${lastShutdownSignal}) — open positions: ${positions?.total_positions ?? "unknown"}`),
+        new Promise((r) => setTimeout(r, 3000)),
+      ]).catch(() => {});
+    }
     try {
-      if (fs.readFileSync(PID_FILE, "utf8").trim() === String(process.pid)) fs.unlinkSync(PID_FILE);
+      releaseInstanceLock(PID_FILE); // only removes the file if it still names this pid
     } catch { /* already gone */ }
   },
 });
 
+let lastShutdownSignal = "signal";
 function shutdown(signal, opts) {
+  if (!shutdownController.isShuttingDown()) lastShutdownSignal = signal;
   return shutdownController.handleSignal(signal, opts);
 }
 
@@ -1004,6 +1169,7 @@ const TELEGRAM_HELP = [
   "/learn [pool] — study top LPers (all top pools, or one address)",
   "/evolve — evolve thresholds from performance",
   "/autoresearch [list|show|revert|restore|approve|reject …] — prompt overrides (operator only)",
+  "/reconcile — re-check unresolved deploy attempts on-chain (/reconcile clear <id|all> force after checking an explorer)",
   "/stop — shut the agent down",
   "/help — this list",
   "",
@@ -1096,6 +1262,19 @@ const tgUI = createTelegramUI({
     },
     log,
   }),
+  // Settings console: profile picker (diff + confirm) and "✎ overridden" tags.
+  settingSource,
+  profiles: createProfileService({
+    config,
+    switchProfile,
+    currentGovernedValues,
+    onScheduleChange: (key, value) => {
+      if (!cronStarted) return;
+      if (key === "pnlWatcherIntervalSec") startPnlWatcher(value);
+      else startCronJobs();
+    },
+    log,
+  }),
   applyTradingSettings: (changes) => applyTradingSettings(changes, {
     config,
     persistUserConfig,
@@ -1147,6 +1326,9 @@ const tgUI = createTelegramUI({
     screeningBusy: isScreeningBusy(),
     cronStarted,
     usdcMode: usdcModeEnabled(),
+    rpcHosts: formatRpcHosts(activeRpcHosts()), // hostnames only, never keys
+    unresolvedDeploys: unresolvedDeployCount(),
+    deployRefusals: getRefusalStats(), // since boot
   }),
   buildSettingsReport: () => buildSettingsReportSync(),
   handleAutoresearchCommand: (args) => handleAutoresearchCommand(args),
@@ -1160,10 +1342,17 @@ const telegramHandlers = {
   onCallback: (data, ctx) => tgUI.handleCallback(data, ctx),
 };
 
+let startupAnnounced = false;
 function startTelegram() {
   if (!telegramEnabled()) return;
   setMyCommands(BOT_COMMANDS).catch(() => {}); // best-effort
   startPolling(telegramHandlers);
+  // Liveness: a restart (crash loop, launchd, manual) is visible in the chat.
+  if (!startupAnnounced) {
+    startupAnnounced = true;
+    sendMessage(`🟢 Meridian started — ${isDryRun() ? "DRY RUN" : "LIVE"}, pid ${process.pid}, strategy ${config.strategy.activeStrategy ?? config.strategy.strategy}, RPC ${formatRpcHosts()}`)
+      .catch(() => {});
+  }
 }
 
 async function handleTelegramCommand(rawText, ctx = {}) {
@@ -1179,6 +1368,11 @@ async function handleTelegramCommand(rawText, ctx = {}) {
 
   // ── Menu, /candidates, number-reply deploy and "auto" (all confirm first) ──
   if (await tgUI.handleMessage(text, ctx)) return;
+
+  // ── Unresolved deploy attempts ──
+  if (text === "/reconcile" || text.startsWith("/reconcile ")) {
+    return runRemote(async () => tgSend(await handleReconcileCommand(text.slice("/reconcile".length))));
+  }
 
   // ── Shutdown ──
   if (text === "/stop") {
@@ -1208,6 +1402,8 @@ async function handleTelegramCommand(rawText, ctx = {}) {
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
         const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
         lines.push(`• ${p.pair}  ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
+        const exitWarn = pnlExitsWarning(p, getTrackedPosition(p.position));
+        if (exitWarn) lines.push(`   ⚠ ${exitWarn}`);
       }
       await tgSend(lines.join("\n"));
     });
@@ -1386,6 +1582,8 @@ if (runtimeMode.interactive) {
         const fees = unit === "sol" ? `${p.unclaimed_fees_sol ?? "?"} SOL` : `$${p.unclaimed_fees_usd}`;
         const pnl = unit === "sol" ? `${p.pnl_sol ?? "?"} SOL` : `$${p.pnl_usd ?? "?"}`;
         console.log(`  ${p.pair.padEnd(16)} ${status}  fees: ${fees}  pnl: ${pnl} (${p.pnl_pct != null ? `${p.pnl_pct}%` : "PnL unknown"})`);
+        const exitWarn = pnlExitsWarning(p, getTrackedPosition(p.position));
+        if (exitWarn) console.log(`    ! ${exitWarn}`);
       }
       console.log();
     }
@@ -1419,6 +1617,7 @@ Commands:
   /thresholds    Show current screening thresholds + performance stats
   /evolve        Manually trigger threshold evolution from performance data
   /autoresearch  Prompt overrides: list | show | revert | restore <section>
+  /reconcile     Re-check unresolved deploy attempts (/reconcile clear <id|all> force)
   /stop          Shut down
 `);
 
@@ -1472,6 +1671,11 @@ Commands:
     }
 
     // ── Slash commands ───────────────────────
+    if (input === "/reconcile" || input.startsWith("/reconcile ")) {
+      console.log(`\n${await handleReconcileCommand(input.slice("/reconcile".length))}\n`);
+      rl.prompt();
+      return;
+    }
     if (input === "/stop") { await shutdown("user command", { force: false }); return; }
 
     if (input === "/status") {

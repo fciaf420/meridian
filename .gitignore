@@ -55,3 +55,9 @@ signal-weights.json
 # Crash-safety artifacts: corrupt-file backups and atomic-write temp files
 *.corrupt-*
 .*.tmp
+deploy-attempts.json
+config-state.json
+
+# One-time pre-migration backups (may hold walletKey/rpcUrl)
+*.pre-profiles.bak
+user-config.json.pre-profiles.bak

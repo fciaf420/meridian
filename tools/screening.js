@@ -3,6 +3,7 @@ import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
 import { instrumentConnection } from "./rpc-stats.js";
 import { scoreSignalSnapshot } from "../signal-weights.js";
+import { meteoraGateMode } from "./gmgn-policy.js";
 import { fetchGmgnSignalMap, attachGmgnSignals, gmgnSignalBooleans } from "./gmgn-signals.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -88,7 +89,57 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
+// Concurrent callers (screening cycle, dashboard, deploy-request path, the LLM get_top_candidates
+// tool) with the same limit share ONE in-flight run instead of each re-spending GMGN weight.
+const _topInflight = new Map();
+export function getTopCandidates({ limit = 10 } = {}) {
+  const key = String(limit);
+  let p = _topInflight.get(key);
+  if (!p) {
+    p = getTopCandidatesUncached({ limit }).finally(() => _topInflight.delete(key));
+    _topInflight.set(key, p);
+  }
+  // Each caller gets its own candidate objects (callers attach _gmgnResult etc. in place).
+  return p.then((r) => (r && Array.isArray(r.candidates) ? { ...r, candidates: r.candidates.map((c) => ({ ...c })) } : r));
+}
+
+/** Shadow-gate verdict keys: pure log data, never shown to the LLM (it would turn shadow into a soft gate). */
+const SHADOW_GATE_KEYS = ["gmgn_gate_would_drop", "gmgn_gate_would_drop_reasons", "gmgn_gate_would_drop_kind"];
+
+/** Copy of a candidate without the shadow-gate verdict (the log-only nested block is also removed). */
+export function stripShadowGateFields(candidate) {
+  if (!candidate || typeof candidate !== "object") return candidate;
+  const c = { ...candidate };
+  for (const k of SHADOW_GATE_KEYS) delete c[k];
+  if (c.gmgn_risk_log_only && typeof c.gmgn_risk_log_only === "object") {
+    c.gmgn_risk_log_only = { ...c.gmgn_risk_log_only };
+    for (const k of SHADOW_GATE_KEYS) delete c.gmgn_risk_log_only[k];
+  }
+  return c;
+}
+
+/** get_top_candidates as exposed to the LLM tool layer: same data, shadow-gate fields removed. */
+export async function getTopCandidatesForTool(args = {}) {
+  const r = await getTopCandidates(args);
+  if (!r || !Array.isArray(r.candidates)) return r;
+  const { gmgn_gate_would_drop, ...rest } = r; // eslint-disable-line no-unused-vars
+  return { ...rest, candidates: r.candidates.map(stripShadowGateFields) };
+}
+
+/**
+ * Gate-module crash handler (exported for tests). Hard mode: do not wave non-GMGN candidates through.
+ * Shadow mode never drops, so keep them. Either way the operator hears once.
+ */
+export async function handleGateCrash(error, open, { mode = meteoraGateMode(config), report } = {}) {
+  log("gmgn_gate", `Safety gate failed (${error?.message || error}); ${mode === "hard" ? "dropping non-GMGN candidates this cycle" : "shadow mode: keeping candidates"}`);
+  try {
+    const fn = report || (await import("./gmgn-outage.js")).reportGmgnOutage;
+    fn(`Meteora-source GMGN gate crashed: ${String(error?.message || error).slice(0, 160)}`);
+  } catch { /* best effort */ }
+  return mode === "hard" ? open.filter((p) => p.gmgn || p.gmgn_gated) : open;
+}
+
+async function getTopCandidatesUncached({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
 
   // Route to the opt-in GMGN screening source. Defaults to Meteora when
@@ -136,15 +187,50 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
-  const eligible = rankCandidatesByDarwin(
-    pools.filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
-  );
+  let open = pools.filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint));
+
+  // GMGN safety gates for candidates that did NOT come through the GMGN pipeline
+  // (default Meteora source + Meteora-only rows in "both"). Fail closed on unknown
+  // data; skipped when no GMGN key is configured. Runs after the occupied-pool
+  // filter so no weighted GMGN calls are spent on pools we already hold.
+  let gmgnGate = null;
+  try {
+    const { gateMeteoraSourceCandidates } = await import("./gmgn-screen.js");
+    // Darwin-rank first so the weight-limited gate verifies the pools most likely to be picked.
+    gmgnGate = await gateMeteoraSourceCandidates(open, { limit, deps: { rankFn: rankCandidatesByDarwin } });
+    open = gmgnGate.kept;
+  } catch (e) {
+    open = await handleGateCrash(e, open);
+  }
+
+  const eligible = rankCandidatesByDarwin(open);
+
+  // Remember what price each candidate was shown at (deploy-time drift guard).
+  // ONLY Pool Discovery `pool_price` (SOL per token) is recorded: that is the unit
+  // the deploy-time check compares against. GMGN rows carry a USD token price, so
+  // they are skipped (logged), including GMGN-only rows in "both" mode.
+  if (config.screening.source !== "gmgn") {
+    const { noteScreenedPrice, noteUncomparableScreenPrice } = await import("../deploy-guards.js");
+    for (const p of eligible) {
+      const fromPoolDiscovery = !Array.isArray(p.sources) || p.sources.includes("meteora");
+      if (!fromPoolDiscovery) {
+        noteUncomparableScreenPrice(p.pool);
+        log("screening", `Screen price not recorded for ${p.pool}: GMGN-only candidate (USD price, not comparable to pool_price)`);
+        continue;
+      }
+      noteScreenedPrice(p.pool, p.price);
+    }
+  }
 
   return {
     candidates: eligible.slice(0, limit).map(normalizeCandidateForUi),
     total_eligible: eligible.length,
     total_screened: screenedCount,
     entry_filtered: entry.dropped.length,
+    gmgn_gate_dropped: gmgnGate?.dropped?.length ?? 0,
+    gmgn_gate_would_drop: gmgnGate?.would_drop?.length ?? 0,
+    gmgn_gate_outage: gmgnGate?.outage ?? false,
+    gmgn_gate_rate_limited: gmgnGate?.rate_limited ?? false,
   };
 }
 
@@ -196,12 +282,34 @@ export function getCandidateSignalSnapshot(candidate) {
     volatility: c.volatility ?? null,
     ath_proximity: c._gmgnResult?.ath_proximity_pct ?? c.ath_proximity ?? null,
     volume_trend: c._gmgnResult?.candles?.volume_trend ?? c.volume_trend ?? null,
-    gmgn_signal_present: c._gmgnSignal ? ((c._gmgnSignal.signal_count_30m || 0) > 0) : c.gmgn_signal_present ?? null,
+    // Series continuity: this signal has always meant "tagged smart/KOL/whale holders present"
+    // (signal_count_30m was a holder snapshot, not a 30m event count). tagged_holder_count is the
+    // honest name for the same number; the legacy field is the fallback for older snapshots.
+    gmgn_signal_present: c._gmgnSignal ? (((c._gmgnSignal.tagged_holder_count ?? c._gmgnSignal.signal_count_30m) || 0) > 0) : c.gmgn_signal_present ?? null,
     change_1h: c._gmgnResult?.change_1h ?? c.change_1h ?? null,
     candle_price_range: c._gmgnResult?.candles?.price_range_pct ?? c.candle_price_range ?? null,
     // GMGN market-signal feed (tools/gmgn-signals.js); null = not fetched.
     ...gmgnSignalBooleans(c.gmgn_signals),
+    // LOG-ONLY GMGN risk fields (security + extra stat/pool metrics): recorded for later
+    // per-origin analysis, NEVER read by scoreSignalSnapshot or any gate.
+    gmgn_risk_log_only: gmgnRiskLogOnly(c),
   };
+}
+
+const GMGN_RISK_LOG_KEYS = [
+  "gmgn_creator_hold_pct", "gmgn_top70_sniper_hold_pct", "gmgn_entrapment_trader_pct", "gmgn_private_vault_hold_pct",
+  "gmgn_creator_created_count", "gmgn_creator_token_status", "gmgn_pool_liquidity_ratio",
+  "gmgn_renounced_mint", "gmgn_renounced_freeze", "gmgn_lp_burned", "gmgn_lp_locked", "gmgn_buy_tax", "gmgn_sell_tax",
+  "gmgn_security_status", "gmgn_risk_log_only_flags", "gmgn_sniper_supply_share_pct", "gmgn_sniper_row_rate_pct",
+  // Meteora-source GMGN gate verdict (shadow mode records it without dropping).
+  "gmgn_gate_would_drop", "gmgn_gate_would_drop_reasons", "gmgn_gate_would_drop_kind",
+];
+
+function gmgnRiskLogOnly(c) {
+  if (c?.gmgn_security_status == null && c?.gmgn_gate_would_drop == null && c?.gmgn_gate_would_drop_kind == null) return null;
+  const out = {};
+  for (const k of GMGN_RISK_LOG_KEYS) if (c[k] !== undefined) out[k] = c[k];
+  return out;
 }
 
 export function rankCandidatesByDarwin(candidates = []) {

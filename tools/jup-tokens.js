@@ -127,14 +127,23 @@ async function fetchArray(url, opts = {}) {
   throw new Error("unexpected response body");
 }
 
-/** Raw datapi search (legacy, internal). Returns the raw array or null. */
-export async function datapiSearchRaw(query) {
+/**
+ * Raw datapi search that surfaces failure: { ok: true, data: [] | [...] } or { ok: false, error }.
+ * "ok with no match" (token not indexed) is distinguishable from "request failed".
+ */
+export async function datapiSearchRawResult(query) {
   try {
-    return await fetchArray(`${DATAPI_BASE}/assets/search?query=${encodeURIComponent(query)}`);
+    return { ok: true, data: await fetchArray(`${DATAPI_BASE}/assets/search?query=${encodeURIComponent(query)}`) };
   } catch (e) {
     log("jup_tokens_warn", `datapi search failed (${String(query).slice(0, 40)}): ${e.message}`);
-    return null;
+    return { ok: false, data: null, error: e.message };
   }
+}
+
+/** Raw datapi search (legacy, internal). Returns the raw array or null. */
+export async function datapiSearchRaw(query) {
+  const r = await datapiSearchRawResult(query);
+  return r.ok ? r.data : null;
 }
 
 /**
@@ -151,7 +160,7 @@ export async function searchTokens(query) {
   } catch (e) {
     log("jup_tokens_warn", `Tokens API search failed (${q.slice(0, 40)}): ${e.message}; falling back to datapi`);
     const raw = await datapiSearchRaw(q);
-    if (!raw) return null;
+    if (!raw) return null; // both the official API and datapi failed
     list = raw.map((t) => normalizeJupToken(t, "datapi")).filter(Boolean);
   }
   const at = Date.now();
@@ -199,6 +208,19 @@ export async function getTokenInfo(mint) {
   if (c !== undefined) return c;
   const list = await searchTokens(mint);
   return list?.find((t) => t.mint === mint) ?? null;
+}
+
+/**
+ * Like getTokenInfo but tells "unknown" from "lookup failed": { info, failed }.
+ * failed=true means both the Tokens API and the datapi fallback errored (info is null then).
+ */
+export async function getTokenInfoResult(mint) {
+  if (!mint) return { info: null, failed: false };
+  const c = cached(mint);
+  if (c !== undefined) return { info: c, failed: false };
+  const list = await searchTokens(mint);
+  if (list === null) return { info: null, failed: true };
+  return { info: list.find((t) => t.mint === mint) ?? null, failed: false };
 }
 
 /** Why Jupiter flags this token ([] = not flagged). */
