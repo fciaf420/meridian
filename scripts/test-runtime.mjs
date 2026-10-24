@@ -36,9 +36,10 @@ export function diffSnapshots(a, b) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const files = process.argv.slice(2);
   const mk = (n) => fs.mkdtempSync(path.join(os.tmpdir(), `meridian-runtime-${n}-`));
-  const env = { ...process.env, MERIDIAN_CONFIG_DIR: mk("config"), MERIDIAN_DATA_DIR: mk("data"), MERIDIAN_LOG_DIR: mk("logs"), MERIDIAN_RUNTIME_GUARD: "1" };
+  const env = { ...process.env, MERIDIAN_CONFIG_DIR: mk("config"), MERIDIAN_DATA_DIR: mk("data"), MERIDIAN_LOG_DIR: mk("logs") };
   const before = snapshotTree(ROOT);
   const r = spawnSync(process.execPath, ["--test", ...files], { cwd: ROOT, env, stdio: "inherit" });
+  for (const k of ["MERIDIAN_CONFIG_DIR", "MERIDIAN_DATA_DIR", "MERIDIAN_LOG_DIR"]) fs.rmSync(env[k], { recursive: true, force: true });
   const diff = diffSnapshots(before, snapshotTree(ROOT));
   if (diff.length) {
     console.error("\nCHECKOUT-WRITE GUARD FAILED: the suite changed files in the repo root:\n  " + diff.join("\n  "));

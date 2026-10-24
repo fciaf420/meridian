@@ -12,6 +12,7 @@
 // double-execute. Execution goes through deps.executeTool (tools/executor.js),
 // i.e. the same path the agent's tools use, with every DRY_RUN guard and safety
 // check intact.
+import { logDir } from "./config-paths.js";
 import crypto from "crypto";
 import { isDryRun as envDryRun } from "./env-flags.js";
 import fs from "fs";
@@ -326,12 +327,14 @@ const ERROR_LINE_RE = /\[[A-Z0-9_]*(?:ERROR|WARN)[A-Z0-9_]*\]/;
  * Last `n` ERROR/WARN lines from the current log (logs/bot.logpath, else today's
  * logs/agent-YYYY-MM-DD.log), redacted. Reads only the file's tail.
  */
-export function readRecentErrors({ n = 15, repoDir = process.cwd(), maxBytes = 512 * 1024 } = {}) {
-  const logsDir = path.join(repoDir, "logs");
+export function readRecentErrors({ n = 15, repoDir = null, maxBytes = 512 * 1024 } = {}) {
+  // Explicit repoDir (tests) -> <repoDir>/logs; otherwise the resolved log dir (MERIDIAN_LOG_DIR / MERIDIAN_DATA_DIR aware).
+  const base = repoDir || process.cwd();
+  const logsDir = repoDir ? path.join(repoDir, "logs") : path.resolve(logDir());
   const candidates = [];
   try {
     const p = fs.readFileSync(path.join(logsDir, "bot.logpath"), "utf8").trim();
-    if (p) candidates.push(path.isAbsolute(p) ? p : path.join(repoDir, p));
+    if (p) candidates.push(path.isAbsolute(p) ? p : path.join(base, p));
   } catch { /* no bot.logpath */ }
   candidates.push(path.join(logsDir, `agent-${new Date().toISOString().slice(0, 10)}.log`));
   for (const file of candidates) {

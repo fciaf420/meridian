@@ -51,7 +51,9 @@ export function logDir(env = process.env) {
 export function repoRoot() { return ROOT; }
 
 // ── Boot guard (F1) ────────────────────────────────────────────────────────
-const OVERRIDE_RE = /^MERIDIAN_.*(CONFIG|DATA)/;
+// Every MERIDIAN_* variable that redirects a path (CONFIG/DATA/DIR/PATH/FILE).
+// MERIDIAN_SKIP_INSTANCE_LOCK, MERIDIAN_OHLCV_OFFLINE etc. are flags, not paths.
+const OVERRIDE_RE = /^MERIDIAN_.*(CONFIG|DATA|DIR|PATH|FILE)/;
 export function activeOverrides(env = process.env) {
   return Object.keys(env).filter((k) => OVERRIDE_RE.test(k) && env[k]).sort();
 }
@@ -64,19 +66,30 @@ export function resolvedPaths(env = process.env) {
     logDir: logDir(env),
   };
 }
+const dryRunEnv = (env) => /^(true|1|yes|on)$/i.test(String(env.DRY_RUN ?? "").trim());
 /**
- * Pure decision: { paths, overrides, ok, error }. An override that points at a
- * directory with no user-config.json would boot on schema defaults (dryRun
- * default is false = LIVE), so that case refuses to start.
+ * Pure decision: { paths, overrides, ok, error }. Refuses (unless DRY_RUN is truthy
+ * in env, which cannot trade) when:
+ *  - user-config.json is missing (override OR default root): schema defaults are LIVE;
+ *  - MERIDIAN_DATA_DIR points at a dir with neither state.json nor deploy-attempts.json
+ *    (empty data dir: no position state, no deploy checkpoint to reconcile).
  */
 export function evaluateBootConfig(env = process.env, exists = (p) => fs.existsSync(p)) {
   const overrides = activeOverrides(env);
   const paths = resolvedPaths(env);
-  if (overrides.length && !exists(paths.userConfig)) {
-    return {
-      paths, overrides, ok: false,
-      error: `Refusing to start: ${overrides.join(", ")} is set but ${paths.userConfig} does not exist. Booting would use built-in defaults (live trading). Unset the override, or create that user-config.json.`,
-    };
+  const dry = dryRunEnv(env);
+  const fail = (error) => ({ paths, overrides, ok: false, error });
+  if (!dry && !exists(paths.userConfig)) {
+    const via = overrides.length ? `${overrides.join(", ")} is set but ` : "";
+    return fail(`Refusing to start: ${via}${paths.userConfig} does not exist. Booting would use built-in defaults (live trading). Run \`npm run setup\` or create user-config.json${overrides.length ? ", or unset the override" : ""}. (DRY_RUN=true skips this check.)`);
+  }
+  const dataDir = dataDirOverride(env);
+  if (!dry && dataDir) {
+    const state = path.join(dataDir, "state.json");
+    const attempts = env.MERIDIAN_DEPLOY_ATTEMPTS_FILE || path.join(dataDir, "deploy-attempts.json");
+    if (!exists(state) && !exists(attempts)) {
+      return fail(`Refusing to start: MERIDIAN_DATA_DIR=${dataDir} has no state.json and no deploy-attempts.json (empty data dir). Booting would lose position state and the deploy checkpoint. Point it at the real data dir, or copy state.json / deploy-attempts.json there. (DRY_RUN=true skips this check.)`);
+    }
   }
   return { paths, overrides, ok: true, error: null };
 }

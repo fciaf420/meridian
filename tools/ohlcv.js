@@ -54,8 +54,6 @@ import { rootDataPath } from "../config-paths.js";
  */
 
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { log as defaultLog } from "../logger.js";
 import { MIN_RANGE_PCT } from "../runtime-helpers.js";
 import { config } from "../config.js";

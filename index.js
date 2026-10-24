@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./boot-guard.js";
 import { isDryRun } from "./env-flags.js";
 import fs from "fs";
 import path from "path";
@@ -6,7 +7,6 @@ import cron from "node-cron";
 import readline from "readline";
 import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./agent.js";
 import { log, enableLogPathFile } from "./logger.js";
-import "./boot-guard.js";
 import { logDir, dataPath, dataDirOverride } from "./config-paths.js";
 import { getMyPositions, isCloseInflight, getInflightCloses, positionAccountExists } from "./tools/dlmm.js";
 import { acquireInstanceLock, releaseInstanceLock } from "./instance-lock.js";

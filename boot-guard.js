@@ -1,6 +1,6 @@
 // boot-guard.js — import right after dotenv in index.js. Logs resolved config/data
-// paths, warns on MERIDIAN_*CONFIG*/*DATA* overrides, and exits non-zero when an
-// override is set but user-config.json is missing (would run live on defaults).
+// paths, warns on every MERIDIAN_* path override, and exits non-zero (unless DRY_RUN) when
+// user-config.json is missing or MERIDIAN_DATA_DIR is an empty data dir.
 import { evaluateBootConfig } from "./config-paths.js";
 import { log } from "./logger.js";
 
