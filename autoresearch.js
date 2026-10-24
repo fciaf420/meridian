@@ -68,7 +68,7 @@ const MANAGEMENT_THRESHOLD_KEYS = ["stopLossPct", "takeProfitFeePct", "trailingT
 
 /**
  * Fingerprint of the threshold VALUES that shape which pools get deployed and
- * when they exit. evolveThresholds rewrites _lastEvolved/_positionsAtEvolution
+ * when they exit. evolveThresholds updates lastEvolved/positionsAtEvolution (config-state.json)
  * every 5 closes even when it changes nothing (lessons.js "Always update the
  * counter"), so those counters must not be what invalidates an experiment.
  */
