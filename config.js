@@ -52,8 +52,10 @@ if (u.walletKey) {
 if (!process.env.GMGN_API_KEY && (gmgnUserConfig.apiKey || u.gmgnApiKey)) {
   warn("GMGN api key in gmgn-config.json / user-config.json is deprecated; put GMGN_API_KEY in .env.");
 }
-// True when DRY_RUN is coming from .env because user-config.json has no dryRun (so a restart keeps using .env).
-export const DRY_RUN_SET_IN_ENV = process.env.DRY_RUN !== undefined && u.dryRun === undefined;
+// True when DRY_RUN=true is in the environment (`npm run dev`, a .env line, a service unit). That is the ONE
+// env value that still beats user-config.json, because it can only make the bot safer: it forces dry run for
+// this process. DRY_RUN=false in the environment never overrides a dry-run user-config.
+export const DRY_RUN_SET_IN_ENV = process.env.DRY_RUN === "true";
 
 const ENV_FALLBACKS = [
   ["dryRun", "DRY_RUN", (v) => String(v) === "true"],
@@ -64,6 +66,13 @@ const ENV_FALLBACKS = [
 ];
 for (const [key, envName, parse] of ENV_FALLBACKS) {
   const envVal = process.env[envName];
+  if (key === "dryRun" && envVal === "true") {
+    if (u.dryRun === false) warn("DRY_RUN=true in the environment forces DRY RUN for this run; user-config.json dryRun=false is NOT used while it is set. Unset DRY_RUN (or remove it from .env) to go live.");
+    else if (u.dryRun === undefined) warn("DRY_RUN in .env is deprecated (used as a fallback for one more release). Set dryRun in user-config.json or Telegram instead.");
+    u.dryRun = true;
+    process.env.DRY_RUN = "true";
+    continue;
+  }
   if (u[key] !== undefined && u[key] !== null) {
     if (envVal !== undefined && String(envVal) !== String(u[key])) {
       warn(`${envName}=${envVal} in .env is ignored: user-config.json ${key}=${u[key]} wins. Remove ${envName} from .env.`);
@@ -81,7 +90,9 @@ if (u.profile !== undefined && !PROFILE_NAMES.includes(String(u.profile).toLower
 const R = makeResolver(u);
 const S = (key) => R.get(key);
 /** Where an effective value came from: "user" | "profile" | "default". */
-export const settingSource = (key) => R.source(key);
+export const settingSource = (key) => {
+  try { return makeResolver(readJsonIfExists(USER_CONFIG_PATH)).source(key); } catch { return R.source(key); }
+};
 
 if (gmgnUserConfig.apiKey || u.gmgnApiKey) {
   process.env.GMGN_API_KEY ||= gmgnUserConfig.apiKey || u.gmgnApiKey;

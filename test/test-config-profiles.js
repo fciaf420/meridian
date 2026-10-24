@@ -89,11 +89,19 @@ test("migration: `_last*` bookkeeping leaves user-config.json for config-state.j
 });
 
 test("precedence: user-config wins over a stale non-secret env value (and warns)", () => {
-  const r = load("new", { dryRun: false, usdcMode: false, llmProvider: "codex", llmModel: "m-user" }, {}, { DRY_RUN: "true", USDC_MODE: "true", LLM_PROVIDER: "claude", LLM_MODEL: "m-env" });
-  assert.deepEqual(r.env, { DRY_RUN: "false", USDC_MODE: "false", LLM_PROVIDER: "codex", LLM_MODEL: "m-user" });
+  const r = load("new", { dryRun: true, usdcMode: false, llmProvider: "codex", llmModel: "m-user" }, {}, { DRY_RUN: "false", USDC_MODE: "true", LLM_PROVIDER: "claude", LLM_MODEL: "m-env" });
+  assert.deepEqual(r.env, { DRY_RUN: "true", USDC_MODE: "false", LLM_PROVIDER: "codex", LLM_MODEL: "m-user" });
   assert.equal(r.config.usdc.enabled, false);
-  assert.match(r.stderr, /DRY_RUN=true in \.env is ignored/);
+  assert.match(r.stderr, /DRY_RUN=false in \.env is ignored/);
   assert.match(r.stderr, /USDC_MODE=true in \.env is ignored/);
+});
+
+test("safety: DRY_RUN=true in the environment (npm run dev) still forces dry run over a live user-config; DRY_RUN=false never forces live", () => {
+  const forced = load("new", { dryRun: false }, {}, { DRY_RUN: "true" });
+  assert.equal(forced.env.DRY_RUN, "true");
+  assert.match(forced.stderr, /forces DRY RUN for this run/);
+  const stay = load("new", { dryRun: true }, {}, { DRY_RUN: "false" });
+  assert.equal(stay.env.DRY_RUN, "true");
 });
 
 test("precedence: with no user-config value the old env name still works for one release, with a deprecation warning", () => {
