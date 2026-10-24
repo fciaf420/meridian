@@ -38,6 +38,7 @@ import { loadWeights } from "./signal-weights.js";
 import { getActiveExperiment, loadAutoresearch, describeOverrides } from "./autoresearch.js";
 import { buildKnowledgeGraph } from "./tools/knowledge-graph.js";
 import { log } from "./logger.js";
+import { userConfigPath } from "./config-paths.js";
 import { getScreeningThresholdSummary, normalizeCandidatesPayload } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -803,7 +804,7 @@ export function startServer(timersFn) {
           break;
         }
         case "settings": {
-          const raw = fs.readFileSync(path.join(__dirname, "user-config.json"), "utf8");
+          const raw = fs.readFileSync(userConfigPath(), "utf8");
           const parsed = JSON.parse(raw);
           // Always strip secret fields (walletKey, *Key, *token, private*, …) so
           // the wallet key is never sent to any client.

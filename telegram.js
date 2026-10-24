@@ -17,10 +17,11 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { userConfigPath } from "./config-paths.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+const USER_CONFIG_PATH = userConfigPath();
 
 export const TELEGRAM_MAX_TEXT = 4096;
 export const CALLBACK_DATA_MAX_BYTES = 64;

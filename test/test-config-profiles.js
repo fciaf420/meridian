@@ -176,8 +176,8 @@ test("nit2: one-time user-config.json.pre-profiles.bak is written before the rew
 
 test("nit6: statePath decodes the module URL (checkout path with a space)", () => {
   const dir = fs.mkdtempSync(path.join(TMP, "dir with space "));
-  for (const f of ["config-state.js", "atomic-write.js"]) fs.copyFileSync(path.join(ROOT, f), path.join(dir, f));
-  const env = { ...process.env }; delete env.MERIDIAN_USER_CONFIG_PATH; delete env.MERIDIAN_CONFIG_STATE_PATH;
+  for (const f of ["config-state.js", "config-paths.js", "atomic-write.js"]) fs.copyFileSync(path.join(ROOT, f), path.join(dir, f));
+  const env = { ...process.env }; delete env.MERIDIAN_USER_CONFIG_PATH; delete env.MERIDIAN_CONFIG_STATE_PATH; delete env.MERIDIAN_CONFIG_DIR;
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", `import { statePath, updateConfigState } from ${JSON.stringify(path.join(dir, "config-state.js"))}; updateConfigState({ a: 1 }); console.log(statePath());`], { encoding: "utf8", env });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout.trim(), path.join(dir, "config-state.json"));
