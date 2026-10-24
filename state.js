@@ -11,6 +11,7 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
+import { config as liveConfig } from "./config.js";
 
 const STATE_FILE = "./state.json";
 
@@ -349,10 +350,170 @@ export function recordClose(position_address, reason) {
   if (!pos) return;
   pos.closed = true;
   pos.closed_at = new Date().toISOString();
+  pos.close_reason = typeof reason === "string" ? reason.slice(0, 160) : null;
+  if (!Array.isArray(pos.notes)) pos.notes = [];
   pos.notes.push(`Closed at ${pos.closed_at}: ${reason}`);
+  delete pos.exit_streak;
+  delete pos.pending_peak;
   pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
+  try {
+    applyCloseCooldown(state, pos, reason, liveConfig);
+  } catch (e) {
+    log("state_error", `Cooldown bookkeeping failed for ${position_address}: ${e.message}`);
+  }
   save(state);
   log("state", `Position ${position_address} marked closed: ${reason}`);
+}
+
+// ─── Re-entry cooldowns ────────────────────────────────────────
+// After a stop loss (or N consecutive OOR-timeout closes in one pool) the pool
+// AND its base mint are blocked for new deploys (tools/executor.js deploy
+// eligibility). 3 of 5 historical stop losses were re-entries of the same pool
+// 5-31 min after the previous close. Ported idea: yunus-0x/meridian@d7ac2b2.
+
+/** "stop_loss" | "oor" | null for a recorded close reason. */
+export function cooldownKindForReason(reason) {
+  const r = String(reason || "");
+  if (/^(STOP_LOSS|EMERGENCY)/.test(r) || /^rule 6\b/i.test(r) || /\bstop[ _-]?loss\b/i.test(r) || /emergency stop/i.test(r)) return "stop_loss";
+  // Only the automatic OOR-timeout closes: "(OOR upside)" suffixes on other
+  // reasons (FIXED_TP …, agent decision …) are a direction tag, not the cause.
+  if (/^rule 4\b/i.test(r) || /OOR timeout/i.test(r) || /^OOR fallback/i.test(r)) return "oor";
+  return null;
+}
+
+function cooldownSettings(config) {
+  const e = config?.exits || {};
+  const n = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+  return {
+    stopLossMinutes: n(e.stopLossCooldownMinutes, 240),
+    oorTrigger: Math.max(1, Math.floor(n(e.oorCooldownTriggerCount, 3))),
+    oorMinutes: n(e.oorCooldownMinutes, 360),
+  };
+}
+
+function setCooldownEntry(state, bucket, key, untilMs, reason, nowMs) {
+  if (!key) return;
+  state.cooldowns ||= { pools: {}, mints: {} };
+  state.cooldowns[bucket] ||= {};
+  const prev = state.cooldowns[bucket][key];
+  if (prev && Date.parse(prev.until) >= untilMs) return; // keep the longer one
+  state.cooldowns[bucket][key] = { until: new Date(untilMs).toISOString(), reason, set_at: new Date(nowMs).toISOString() };
+}
+
+/** Mutates `state` (the caller saves). Exported for tests. */
+export function applyCloseCooldown(state, pos, reason, config, nowMs = Date.now()) {
+  const kind = cooldownKindForReason(reason);
+  if (!kind || !pos?.pool) return null;
+  const cfg = cooldownSettings(config);
+  let minutes = 0;
+  let why = null;
+  if (kind === "stop_loss") {
+    minutes = cfg.stopLossMinutes;
+    why = `stop loss close (${String(reason).slice(0, 60)})`;
+  } else {
+    // N most recent closes in this pool (this one included) all OOR timeouts.
+    const closes = Object.values(state.positions || {})
+      .filter((p) => p?.pool === pos.pool && p.closed && p.closed_at)
+      .sort((a, b) => Date.parse(b.closed_at) - Date.parse(a.closed_at))
+      .slice(0, cfg.oorTrigger);
+    if (closes.length >= cfg.oorTrigger && closes.every((p) => cooldownKindForReason(p.close_reason) === "oor")) {
+      minutes = cfg.oorMinutes;
+      why = `${cfg.oorTrigger} consecutive OOR-timeout closes`;
+    }
+  }
+  if (!(minutes > 0)) return null;
+  const untilMs = nowMs + minutes * 60_000;
+  setCooldownEntry(state, "pools", pos.pool, untilMs, why, nowMs);
+  setCooldownEntry(state, "mints", pos.base_mint, untilMs, why, nowMs);
+  log("cooldown", `Cooldown set for ${pos.pool_name || pos.pool}${pos.base_mint ? ` and mint ${pos.base_mint.slice(0, 8)}` : ""} until ${new Date(untilMs).toISOString()} (${minutes}m) — ${why}`);
+  return { until: new Date(untilMs).toISOString(), reason: why };
+}
+
+/**
+ * Active cooldown blocking a deploy into `pool` / `base_mint`, or null.
+ * Returns { scope: "pool" | "mint", key, until, reason }.
+ */
+export function getDeployCooldown({ pool = null, base_mint = null } = {}, nowMs = Date.now()) {
+  const cds = load().cooldowns;
+  if (!cds) return null;
+  const check = (bucket, key, scope) => {
+    const e = key ? cds[bucket]?.[key] : null;
+    return e && Date.parse(e.until) > nowMs ? { scope, key, until: e.until, reason: e.reason } : null;
+  };
+  return check("pools", pool, "pool") || check("mints", base_mint, "mint");
+}
+
+/** All active cooldowns (for status / prompts). */
+export function getActiveCooldowns(nowMs = Date.now()) {
+  const cds = load().cooldowns || {};
+  const out = [];
+  for (const [bucket, scope] of [["pools", "pool"], ["mints", "mint"]]) {
+    for (const [key, e] of Object.entries(cds[bucket] || {})) {
+      if (Date.parse(e.until) > nowMs) out.push({ scope, key, until: e.until, reason: e.reason });
+    }
+  }
+  return out;
+}
+
+// ─── Exit tick confirmation ────────────────────────────────────
+// A PnL exit closes only after `confirmTicks` consecutive CONFIRMING ticks of
+// the same kind (stop_loss / trailing / take_profit). Idea from
+// yunus-0x/meridian@e559081 (state.js registerExitSignal), without its bugs:
+//  - keyed by exit kind, not the reason string (which embeds the PnL and so
+//    changed every tick, resetting the streak);
+//  - a tick the on-chain read could not verify, or a suspicious (unpriceable)
+//    tick, neither counts nor resets: the streak is frozen;
+//  - a stop loss whose on-chain read keeps failing still exits on the API value
+//    once the signal has persisted stopLossUnverifiedMaxWaitSec over at least
+//    confirmTicks priced ticks — never on a suspicious tick.
+//
+// outcome: "confirm" (on-chain confirms) | "unverified" (on-chain unavailable)
+//          | "refute" (on-chain contradicts) | "clear" (no signal this tick)
+// Returns { fire, fireOnApi, count, seen, kind, waitedMs }.
+
+export function registerExitTick(position_address, { kind = null, outcome = "clear", suspicious = false, reason = null, config = liveConfig, now = Date.now() } = {}) {
+  const none = { fire: false, fireOnApi: false, count: 0, seen: 0, kind, waitedMs: 0 };
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return none;
+  const { confirmTicks, minSpacingMs, stopLossUnverifiedMaxWaitMs } = exitSettings(config);
+
+  if (!kind || outcome === "clear" || outcome === "refute") {
+    if (pos.exit_streak) {
+      log("exit_confirm", `${pos.pool_name || position_address.slice(0, 8)}: ${pos.exit_streak.kind} streak reset (${outcome}${reason ? `: ${reason}` : ""})`);
+      delete pos.exit_streak;
+      save(state);
+    }
+    return none;
+  }
+
+  let st = pos.exit_streak;
+  if (!st || st.kind !== kind) {
+    st = { kind, confirms: 0, seen: 0, started_at: new Date(now).toISOString(), last_counted_at: null };
+  }
+  const spaced = st.last_counted_at == null || now - Date.parse(st.last_counted_at) >= minSpacingMs;
+  if (spaced && !suspicious) {
+    if (outcome === "confirm") st.confirms += 1;
+    st.seen += 1;
+    st.last_counted_at = new Date(now).toISOString();
+  }
+  st.last_outcome = suspicious ? "suspicious" : outcome;
+  if (reason) st.last_reason = String(reason).slice(0, 160);
+
+  const waitedMs = now - Date.parse(st.started_at);
+  const fire = st.confirms >= confirmTicks;
+  const fireOnApi = !fire && kind === "stop_loss" && outcome === "unverified" && !suspicious
+    && st.seen >= confirmTicks && waitedMs >= stopLossUnverifiedMaxWaitMs;
+  const result = { fire, fireOnApi, count: st.confirms, seen: st.seen, kind, waitedMs };
+  if (fire || fireOnApi) delete pos.exit_streak;
+  else pos.exit_streak = st;
+  save(state);
+  return result;
+}
+
+/** Current exit streak for a position (read-only), or null. */
+export function getExitStreak(position_address) {
+  return load().positions[position_address]?.exit_streak ?? null;
 }
 
 // ─── Close exposure (what an agent swap_token may sell) ────────
@@ -448,11 +609,60 @@ export function setPositionInstruction(position_address, instruction) {
   return true;
 }
 
+/** Exit-safety settings with the defaults config.js uses. */
+function exitSettings(config) {
+  const e = config?.exits || {};
+  const ticks = (v, d) => (Number.isFinite(Number(v)) && Number(v) >= 1 ? Math.floor(Number(v)) : d);
+  return {
+    confirmTicks: ticks(e.confirmTicks, 2),
+    peakConfirmTicks: ticks(e.peakConfirmTicks, 2),
+    // No `exits` block (hand-built test configs): no spacing.
+    minSpacingMs: Math.max(0, Number(e.confirmMinSpacingSec ?? 0) * 1000) || 0,
+    stopLossUnverifiedMaxWaitMs: Math.max(0, Number(e.stopLossUnverifiedMaxWaitSec ?? 120) * 1000),
+  };
+}
+
+/**
+ * One peak-confirmation tick (mutates pos; the caller saves). The peak rises
+ * to the lowest of the last `peakConfirmTicks` consecutive readings above it,
+ * i.e. a level every one of those ticks actually saw. Unlike upstream's
+ * confirmPeak there is no single-tick path: a lone spike after a normal
+ * reading confirms only the normal reading.
+ */
+function confirmPeakTick(pos, position_address, candidate, config, now) {
+  const { peakConfirmTicks, minSpacingMs } = exitSettings(config);
+  const current = pos.peak_pnl_pct || 0;
+  if (!(candidate > current)) {
+    if (pos.pending_peak) delete pos.pending_peak;
+    return false;
+  }
+  const pend = pos.pending_peak && Array.isArray(pos.pending_peak.window) ? pos.pending_peak : null;
+  if (pend && now - (pend.last_at ?? 0) < minSpacingMs) {
+    // Too close to the last counted tick: no new count, keep the lower reading.
+    pend.window[pend.window.length - 1] = Math.min(pend.window[pend.window.length - 1], candidate);
+    return false;
+  }
+  const window = [...(pend?.window || []).filter((v) => v > current), candidate].slice(-peakConfirmTicks);
+  if (window.length >= peakConfirmTicks) {
+    const level = Math.min(...window);
+    if (level > current) {
+      pos.peak_pnl_pct = level;
+      if (peakConfirmTicks > 1) log("state", `Position ${position_address} peak PnL confirmed at ${level.toFixed(2)}% (${peakConfirmTicks} ticks)`);
+    }
+    const rest = window.slice(1).filter((v) => v > pos.peak_pnl_pct);
+    if (rest.length) pos.pending_peak = { window: rest, last_at: now };
+    else delete pos.pending_peak;
+    return level > current;
+  }
+  pos.pending_peak = { window, last_at: now };
+  return false;
+}
+
 /**
  * Update peak PnL and check trailing take profit / stop loss.
  * Returns an action string if a threshold is hit, or null.
  */
-export function updatePnlAndCheckExits(position_address, currentPnlPct, config, { onchainPct = null } = {}) {
+export function updatePnlAndCheckExits(position_address, currentPnlPct, config, { onchainPct = null, strict = false, now = Date.now() } = {}) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
@@ -498,35 +708,44 @@ export function updatePnlAndCheckExits(position_address, currentPnlPct, config, 
     save(state);
   }
 
-  // Hard stop loss
-  if (mgmt.stopLossPct && currentPnlPct <= mgmt.stopLossPct) {
-    action = `STOP_LOSS: PnL ${currentPnlPct.toFixed(1)}% hit stop loss (${mgmt.stopLossPct}%)`;
+  // Hard stop loss. On-chain is the truth: a stale API reading must not mask a
+  // real crash the chain already shows, so the lower of the two is used.
+  const ocForStop = onchainPct == null ? NaN : Number(onchainPct);
+  const stopPct = Number.isFinite(ocForStop) ? Math.min(ocForStop, currentPnlPct) : currentPnlPct;
+  if (mgmt.stopLossPct && stopPct <= mgmt.stopLossPct) {
+    action = `STOP_LOSS: PnL ${stopPct.toFixed(1)}% hit stop loss (${mgmt.stopLossPct}%)`;
     pos.notes.push(action);
     save(state);
     return action;
   }
 
-  // Track peak PnL. When the caller has an on-chain reading (pnl-watcher) that
-  // disagrees with the API by more than 2 points, the on-chain value sets the
-  // peak and arms trailing: a bad API reading must not become the trailing peak.
-  let peakCandidate = currentPnlPct;
+  // Track peak PnL. A new peak is only accepted after `peakConfirmTicks`
+  // consecutive readings above the current peak (ticks closer together than
+  // confirmMinSpacingSec count once). When an on-chain reading is supplied the
+  // candidate is min(API, on-chain): both sources must show the level, so a
+  // bad reading from either one can never become the trailing peak (P(DOOM):
+  // armed at +5.1% off a disagreeing source, closed at -1.23%). With
+  // `strict` (the exit engine) and no on-chain reading, the peak is left alone.
   const oc = onchainPct == null ? NaN : Number(onchainPct);
+  let peakCandidate = currentPnlPct;
   if (Number.isFinite(oc)) {
     if (oc > (pos.peak_onchain_pnl_pct ?? -Infinity)) pos.peak_onchain_pnl_pct = oc;
-    if (Math.abs(oc - currentPnlPct) > PNL_MISMATCH_PTS) peakCandidate = oc;
+    peakCandidate = Math.min(oc, currentPnlPct);
+  } else if (strict) {
+    peakCandidate = null;
+    // Not a new high on the API alone either: a pending peak streak is broken.
+    if (currentPnlPct <= (pos.peak_pnl_pct || 0)) delete pos.pending_peak;
   }
-  if (peakCandidate > (pos.peak_pnl_pct || 0)) {
-    pos.peak_pnl_pct = peakCandidate;
-  }
+  if (peakCandidate != null) confirmPeakTick(pos, position_address, peakCandidate, config, now);
 
   // Trailing take profit
   if (mgmt.trailingTakeProfit) {
-    // Activate trailing once profit exceeds trigger
-    if (!pos.trailing_active && peakCandidate >= mgmt.trailingTriggerPct) {
+    // Activate trailing once the CONFIRMED peak exceeds the trigger
+    if (!pos.trailing_active && (pos.peak_pnl_pct || 0) >= mgmt.trailingTriggerPct) {
       pos.trailing_active = true;
-      pos.trailing_armed_pct = Math.round(peakCandidate * 100) / 100;
-      pos.notes.push(`Trailing TP activated at ${peakCandidate.toFixed(1)}%`);
-      log("state", `Position ${position_address} trailing TP activated (peak: ${peakCandidate.toFixed(1)}%)`);
+      pos.trailing_armed_pct = Math.round(pos.peak_pnl_pct * 100) / 100;
+      pos.notes.push(`Trailing TP activated at ${pos.peak_pnl_pct.toFixed(1)}%`);
+      log("state", `Position ${position_address} trailing TP activated (peak: ${pos.peak_pnl_pct.toFixed(1)}%)`);
     }
 
     // Check if profit has dropped from peak by trailingDropPct.

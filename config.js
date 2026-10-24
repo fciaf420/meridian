@@ -241,6 +241,25 @@ export const config = {
     pnlWatcherIntervalSec: u.pnlWatcherIntervalSec ?? 30,
   },
 
+  // ─── Exit safety (fix/exits-in-code) ────
+  // Read-only from user-config.json; not exposed to update_config / auto-tune.
+  exits: {
+    // Consecutive confirming ticks before a PnL exit (stop loss, emergency,
+    // trailing, take profit) closes, and before a new trailing peak counts.
+    confirmTicks:              u.exitConfirmTicks ?? 2,
+    peakConfirmTicks:          u.peakConfirmTicks ?? u.exitConfirmTicks ?? 2,
+    // Two ticks closer together than this count once (the management cycle and
+    // the watcher can tick seconds apart on the same ~20s-cached on-chain read).
+    confirmMinSpacingSec:      u.exitConfirmMinSpacingSec ?? 20,
+    // Stop loss whose on-chain read keeps failing: exit on the API value once the
+    // signal has persisted this long (and on >= confirmTicks priced ticks).
+    stopLossUnverifiedMaxWaitSec: u.stopLossUnverifiedMaxWaitSec ?? 120,
+    // Re-entry cooldowns (pool + base mint), checked at deploy time.
+    stopLossCooldownMinutes:   u.stopLossCooldownMinutes ?? 240,
+    oorCooldownTriggerCount:   u.oorCooldownTriggerCount ?? 3,
+    oorCooldownMinutes:        u.oorCooldownMinutes ?? 360,
+  },
+
   // ─── LLM Settings ──────────────────────
   llm: {
     temperature: u.temperature ?? 0.373,

@@ -13,8 +13,12 @@
  *  - API and on-chain more than 2 points apart: hold take profit / trailing and
  *    log pnl_mismatch. A stop loss still exits when on-chain itself crosses it
  *    (on-chain is the truth and it shows the loss).
- *  - on-chain read failed: stop loss exits on the API value (today's
- *    behaviour, safety first); take profit and trailing hold until next tick.
+ *  - on-chain read failed: every kind holds ("unverified") and retries next
+ *    tick. A stop loss used to exit on the API value here, which is exactly
+ *    where an unpriced tick (Jupiter outage → value ~0 → "-100%") hurts. The
+ *    bounded fallback lives in the exit engine (exit-engine.js): a stop loss
+ *    whose on-chain read keeps failing exits on the API value after
+ *    config.exits.stopLossUnverifiedMaxWaitSec, so a real crash still exits.
  */
 
 import { log } from "./logger.js";
@@ -45,15 +49,13 @@ export function decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dr
   const api = Number(apiPct);
   const hasOnchain = onchainPct != null && Number.isFinite(Number(onchainPct));
   if (!hasOnchain) {
-    const close = kind === "stop_loss";
     return {
-      close,
+      close: false,
+      unverified: true,
       pnlPct: Number.isFinite(api) ? api : null,
       source: "api",
       mismatch: false,
-      why: close
-        ? "on-chain PnL unavailable — stop loss exits on the API value (safety first)"
-        : "on-chain PnL unavailable — holding, retry next tick",
+      why: "on-chain PnL unavailable — needs confirmation, retry next tick",
     };
   }
   const oc = Number(onchainPct);
@@ -75,9 +77,14 @@ export function decidePnlExit({ kind, apiPct, onchainPct, threshold, peakPct, dr
   }
   // A stop loss that on-chain itself confirms exits even when the API is off;
   // for take profit / trailing a >2pt disagreement means one source is wrong: hold.
-  const close = crosses && (kind === "stop_loss" || !mismatch);
+  // Trailing additionally needs the API itself at/below the trail level, i.e.
+  // both sources agree the drop happened.
+  const apiAgrees = kind !== "trailing" || !Number.isFinite(api) || api <= Number(peakPct) - Number(dropPct) + tol;
+  const close = crosses && apiAgrees && (kind === "stop_loss" || !mismatch);
   const why = !crosses
     ? `not confirmed: ${rule}`
+    : !apiAgrees
+      ? `API ${fmt(api)} has not dropped to the trail level — holding (both sources must agree)`
     : !close
       ? `API ${fmt(api)} and on-chain ${fmt(oc)} disagree by more than ${PNL_MISMATCH_PTS}pt — holding`
       : `confirmed: ${rule}`;
@@ -139,7 +146,7 @@ export function classifyManagementClose(p, tracked, mgmt) {
  * Returns { pass: true } or { pass: false, reason }. Deps are injected so the
  * executor (and tests) can supply them.
  */
-export async function managementPnlCloseGate({ position_address, mgmt, getPositions, getTracked, getOnchain, onHold }) {
+export async function managementPnlCloseGate({ position_address, mgmt, getPositions, getTracked, getOnchain, onHold, requiredTicks = 1 }) {
   let p;
   try {
     const res = await getPositions();
@@ -149,6 +156,17 @@ export async function managementPnlCloseGate({ position_address, mgmt, getPositi
   const tracked = getTracked(position_address);
   const cls = classifyManagementClose(p, tracked, mgmt);
   if (!cls) return { pass: true };
+  // The runner executes PnL rules itself after N confirming ticks
+  // (exit-engine.js). A model close on the same rule must not short-cut a
+  // streak the runner is still confirming.
+  const streak = tracked?.exit_streak;
+  if (requiredTicks > 1 && streak && streak.kind === cls.kind && Number(streak.confirms) < requiredTicks) {
+    onHold?.(cls, { why: `awaiting tick confirmation (${streak.confirms}/${requiredTicks})`, onchainPct: null });
+    return {
+      pass: false,
+      reason: `close_position held: ${cls.rule} is being confirmed by the runner (${streak.confirms}/${requiredTicks} ticks); the runner closes it in code once confirmed. Treat this position as HOLD for PnL rules this cycle.`,
+    };
+  }
   const decision = await confirmPnlExit({
     position: p,
     kind: cls.kind,
@@ -162,7 +180,7 @@ export async function managementPnlCloseGate({ position_address, mgmt, getPositi
   });
   if (decision.close) return { pass: true, onchainPct: decision.onchainPct };
   onHold?.(cls, decision);
-  const ocText = decision.onchainPct != null ? `${decision.onchainPct}%` : "unavailable";
+  const ocText = decision.onchainPct != null ? `${decision.onchainPct}%` : "unavailable (re-checked next cycle; the runner's bounded stop-loss fallback still applies)";
   return {
     pass: false,
     reason: `close_position held: ${cls.rule} was read from the PnL API (pnl_pct ${p.pnl_pct}%), but on-chain PnL is ${ocText} — ${decision.why}. Treat this position as HOLD for PnL rules this cycle; it is re-checked next cycle (rule 4 OOR-timeout closes are not gated).`,
