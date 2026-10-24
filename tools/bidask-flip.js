@@ -41,7 +41,7 @@ import { withWalletLock } from "../wallet-lock.js";
 import { isDryRun } from "../env-flags.js";
 
 export const FLIP_MODES = ["off", "shadow", "live"];
-export const FLIP_DEFAULTS = Object.freeze({ mode: "shadow", fillPct: 30, reflipStepPct: 20, minTrancheSol: 0.05 });
+export const FLIP_DEFAULTS = Object.freeze({ mode: "shadow", fillPct: 30, reflipStepPct: 20, minTrancheSol: 0.05, timeoutSec: 30 });
 // The ask must span at least this many bins above active, otherwise there is
 // nowhere meaningfully higher to move the token to.
 export const MIN_ASK_BINS = 3;
@@ -86,6 +86,8 @@ export function normalizeFlipConfig(c = {}) {
     fillPct: num(c?.fillPct, FLIP_DEFAULTS.fillPct),
     reflipStepPct: num(c?.reflipStepPct, FLIP_DEFAULTS.reflipStepPct),
     minTrancheSol: num(c?.minTrancheSol, FLIP_DEFAULTS.minTrancheSol),
+    // M1: overall deadline for one flip pass (and for each locked live flip).
+    timeoutSec: Math.max(1, num(c?.timeoutSec, FLIP_DEFAULTS.timeoutSec)),
   };
 }
 
@@ -489,9 +491,17 @@ export async function runBidAskFlips(positions = [], deps = {}) {
     const dlmm = deps.getPool ? null : await import("./dlmm.js");
     const getPool = deps.getPool || dlmm.getPoolForRead;
     const sdk = deps.sdk || await import("@meteora-ag/dlmm");
+    // M1: one deadline for the whole pass. A hung RPC read must never stall the
+    // management cycle or hold the wallet lock: on timeout we log, skip, and (live,
+    // mid-send only) mark the flip pending so the next cycle re-reads on-chain.
+    const deadline = Date.now() + (deps.timeoutMs ?? cfg.timeoutSec * 1000);
     for (const p of positions) {
+      const ctl = { aborted: false, sending: false, snapshot: null };
       try {
-        const run = () => flipOne(p, { ...deps, log, cfg, state, getPool, sdk, dlmm });
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) { log("bidask_flip", `flip pass deadline reached; skipping ${p?.pair ?? "?"} until next cycle`); continue; }
+        const inner = () => flipOne(p, { ...deps, log, cfg, state, getPool, sdk, dlmm, ctl });
+        const run = () => raceFlipTimeout(inner(), remaining, ctl);
         // Live flips sign: serialize with closes/claims/swaps/deploys through the wallet
         // lock (above deploys, below closes). flipOne re-reads tracked state inside the lock,
         // so a position closed while we queued is skipped. Shadow/dry-run never signs.
@@ -499,7 +509,17 @@ export async function runBidAskFlips(positions = [], deps = {}) {
         const r = signs && !deps.noWalletLock ? await withWalletLock(run, 1, "bidask_flip") : await run();
         if (r) results.push(r);
       } catch (e) {
-        log("bidask_flip", `${p?.pair ?? "?"} ${String(p?.position ?? "").slice(0, 8)}: flip check failed: ${e.message}`);
+        if (e?.flipTimeout) {
+          log("bidask_flip", `${p?.pair ?? "?"} ${String(p?.position ?? "").slice(0, 8)}: flip timed out after ${Math.round(remainingMs(deadline, deps, cfg) / 1000)}s; skipped this cycle${ctl.sending ? " (tx may be in flight: marked pending, next cycle re-reads on-chain)" : ""}`);
+          if (ctl.sending && ctl.snapshot) {
+            try {
+              const prev = state.getTrackedPosition(p.position)?.bid_ask_flip || {};
+              state.updateTrackedPosition(p.position, { bid_ask_flip: { ...prev, pending: { at: new Date().toISOString(), ...ctl.snapshot } } }, "bid-ask flip timed out mid-send: pending on-chain re-read");
+            } catch (e2) { log("bidask_flip", `could not persist pending flip marker: ${e2.message}`); }
+          }
+        } else {
+          log("bidask_flip", `${p?.pair ?? "?"} ${String(p?.position ?? "").slice(0, 8)}: flip check failed: ${e.message}`);
+        }
       }
     }
   } catch (e) {
@@ -507,6 +527,20 @@ export async function runBidAskFlips(positions = [], deps = {}) {
   }
   return results;
 }
+
+function remainingMs(deadline, deps, cfg) { return deps.timeoutMs ?? cfg.timeoutSec * 1000; }
+
+/** M1: reject with a tagged error after `ms`; flags ctl.aborted so an abandoned run never sends. */
+function raceFlipTimeout(promise, ms, ctl) {
+  let timer;
+  const t = new Promise((_, reject) => {
+    timer = setTimeout(() => { ctl.aborted = true; const e = new Error("flip timed out"); e.flipTimeout = true; reject(e); }, ms);
+  });
+  promise.catch(() => {}); // the abandoned run may still reject later
+  return Promise.race([promise, t]).finally(() => clearTimeout(timer));
+}
+
+const xSig = (bins, activeId) => bins.filter((b) => b.binId > activeId && b.xRaw > 0n).map((b) => `${b.binId}:${b.xRaw}`).join(",");
 
 async function flipOne(p, ctx) {
   const { log, cfg, state, getPool, sdk } = ctx;
@@ -559,6 +593,21 @@ async function flipOne(p, ctx) {
   const positionPk = new PublicKey(p.position);
   const lbPos = await pool.getPosition(positionPk);
   const pd = lbPos.positionData;
+  // M1: a previous live flip timed out mid-send. Re-read on-chain before any re-flip:
+  // if the token-X layout above the active bin changed, the flip landed (record it,
+  // conservatively, as done); otherwise nothing landed. Either way hold this cycle.
+  const pend = !shadow ? tracked.bid_ask_flip?.pending : null;
+  if (pend) {
+    const landed = xSig(normalizeBins(pd.positionBinData), Number(pend.activeId)) !== pend.xSig;
+    const { pending: _drop, ...rest } = tracked.bid_ask_flip;
+    state.updateTrackedPosition(p.position, {
+      bid_ask_flip: landed
+        ? { ...rest, flips: (Number(rest.flips) || 0) + 1, last_flip_active_bin: Number(pend.activeId), last_flip_at: new Date().toISOString(), partial: true, uncertain: true }
+        : rest,
+    }, `bid-ask flip pending resolved on-chain: ${landed ? "landed" : "not landed"}`);
+    log("bidask_flip", `${p.pair ?? "?"} ${String(p.position).slice(0, 8)}: pending flip re-read on-chain: ${landed ? "landed (recorded)" : "not landed (cleared)"}; no new flip this cycle`);
+    return { position: p.position, action: "hold", reason: `pending flip resolved (${landed ? "landed" : "not landed"})` };
+  }
   const plan = planBidAskFlip({
     bins: normalizeBins(pd.positionBinData),
     activeId: Number(pool.lbPair.activeId),
@@ -644,9 +693,11 @@ async function flipOne(p, ctx) {
   const { Transaction } = await import("@solana/web3.js");
   const sigs = [];
   let sendError = null;
+  if (ctx.ctl) { ctx.ctl.snapshot = { activeId: plan.activeId, xSig: xSig(normalizeBins(pd.positionBinData), plan.activeId) }; ctx.ctl.sending = true; }
   for (const [i, b0] of built.entries()) {
     let b = b0;
     try {
+      if (ctx.ctl?.aborted) throw new Error("flip pass timed out");
       if (i > 0) {
         // Later chunks are rebuilt from the post-previous-chunk state.
         await pool.refetchStates();
@@ -665,6 +716,7 @@ async function flipOne(p, ctx) {
     }
   }
   if (!sigs.length) {
+    if (ctx.ctl) ctx.ctl.sending = false;
     log("bidask_flip", `[live] ${formatFlipPlan(p.pair, p.position, plan, extra)} — send failed: ${sendError}`);
     return { position: p.position, ...plan, simErr: null, cu, mode: "live", sent: false, sendError };
   }
@@ -715,6 +767,7 @@ async function flipOne(p, ctx) {
       txs: [...(prev.txs || []), ...sigs].slice(-10),
     },
   }, `bid-ask flip #${plan.flips + 1} at fill ${pct}% (${sigs.length}/${built.length} tx): ${sigs.join(", ")}`);
+  if (ctx.ctl) ctx.ctl.sending = false;
   log("bidask_flip", `[live] ${formatFlipPlan(p.pair, p.position, plan, extra)} — SENT ${sigs.length}/${built.length} ${sigs.join(",")}${sendError ? ` (stopped: ${sendError})` : ""} verify=${JSON.stringify(verified)}`);
   return { position: p.position, ...plan, simErr: null, cu, mode: "live", sent: true, sigs, sendError, verified };
 }

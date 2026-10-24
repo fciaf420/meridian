@@ -40,6 +40,15 @@ export function setWalletLockOptions({ warnMs, hardMs, onAlert } = {}) {
   if (onAlert !== undefined) options.onAlert = typeof onAlert === "function" ? onAlert : null;
 }
 
+/** Nit: apply config.exits wallet-lock timeouts (seconds → ms). Call at config load and on every exits.* change. */
+export function syncWalletLockFromConfig(cfg) {
+  const ex = cfg?.exits || {};
+  setWalletLockOptions({
+    warnMs: ex.walletLockWarnSec != null ? Number(ex.walletLockWarnSec) * 1000 : undefined,
+    hardMs: ex.walletLockTimeoutSec != null ? Number(ex.walletLockTimeoutSec) * 1000 : undefined,
+  });
+}
+
 function alertStale(kind, info) {
   try { options.onAlert?.({ kind, ...info }); } catch { /* alerts are best-effort */ }
 }

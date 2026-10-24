@@ -71,7 +71,7 @@ function expectedFill(b) {
 }
 
 test("config: defaults, invalid mode falls back to shadow, numbers coerced", () => {
-  assert.deepEqual(normalizeFlipConfig({}), { mode: "shadow", fillPct: 30, reflipStepPct: 20, minTrancheSol: 0.05 });
+  assert.deepEqual(normalizeFlipConfig({}), { mode: "shadow", fillPct: 30, reflipStepPct: 20, minTrancheSol: 0.05, timeoutSec: 30 });
   assert.equal(normalizeFlipConfig({ mode: "yolo" }).mode, "shadow");
   assert.equal(normalizeFlipConfig({ mode: "off" }).mode, "off");
   assert.equal(normalizeFlipConfig({ mode: "live", fillPct: "45" }).fillPct, 45);
@@ -757,4 +757,71 @@ test("M2: flipped positions take pnl_pct from on-chain; unflipped keep the API v
   assert.equal(r.action, "hold");
   assert.match(r.reason, /diverge/);
   assert.equal(poolReads, 0);
+});
+
+// ─── Final Opus review (PR #134): M1 flip-pass timeout ────────────────
+test("M1: normalizeFlipConfig carries a 30s default timeout", () => {
+  assert.equal(normalizeFlipConfig({}).timeoutSec, 30);
+  assert.equal(normalizeFlipConfig({ timeoutSec: 12 }).timeoutSec, 12);
+});
+
+test("M1: a hung RPC read times out, logs, skips the cycle and never holds the wallet lock", async () => {
+  const wl = await import("../wallet-lock.js");
+  const h = hookDeps({ mode: "live", tracked: trackedBidAsk(), pool: fakePool() });
+  h.deps.getPool = () => new Promise(() => {}); // never resolves
+  h.deps.timeoutMs = 60;
+  const t0 = Date.now();
+  const r = await runBidAskFlips([posRow()], h.deps);
+  assert.deepEqual(r, []);
+  assert.ok(Date.now() - t0 < 2000, "returns promptly");
+  assert.ok(h.logs.some((l) => /timed out/.test(l)));
+  assert.equal(h.sends.length, 0);
+  assert.equal(h.updates.length, 0, "nothing was in flight: no pending marker");
+  // the lock was released at the timeout: a new op runs immediately
+  assert.equal(await Promise.race([wl.withWalletLock(async () => "ok", 0, "after-timeout"), new Promise((res) => setTimeout(() => res("STUCK"), 1000))]), "ok");
+});
+
+test("M1: timeout mid-send marks the flip pending; next cycle re-reads on-chain before any re-flip", async () => {
+  const pool = fakePool();
+  const tracked = trackedBidAsk();
+  const h = hookDeps({ mode: "live", tracked, pool });
+  h.deps.timeoutMs = 80;
+  h.deps.sendTx = () => new Promise(() => {}); // tx in flight, never confirms
+  h.deps.updateTrackedPosition = (pos, patch) => { h.updates.push({ pos, patch }); Object.assign(tracked, patch); };
+  await runBidAskFlips([posRow()], h.deps);
+  const pend = tracked.bid_ask_flip?.pending;
+  assert.ok(pend, "pending marker persisted");
+  assert.ok(h.logs.some((l) => /may be in flight/.test(l)));
+  // next cycle: chain unchanged (our fake pool never moved tokens) ⇒ cleared, NO new send
+  h.deps.timeoutMs = 5000;
+  let sent = 0;
+  h.deps.sendTx = async () => { sent++; return "sigX"; };
+  const [r] = await runBidAskFlips([posRow()], h.deps);
+  assert.equal(r.action, "hold");
+  assert.match(r.reason, /pending flip resolved \(not landed\)/);
+  assert.equal(sent, 0, "no re-flip in the same cycle that resolves the marker");
+  assert.ok(!tracked.bid_ask_flip?.pending);
+});
+
+test("M1: a pending flip whose on-chain token layout changed is recorded as landed", async () => {
+  const pool = fakePool();
+  const tracked = trackedBidAsk({ bid_ask_flip: { flips: 0, pending: { at: new Date().toISOString(), activeId: -460, xSig: "nonsense" } } });
+  const h = hookDeps({ mode: "live", tracked, pool });
+  h.deps.updateTrackedPosition = (pos, patch) => { h.updates.push({ pos, patch }); Object.assign(tracked, patch); };
+  const [r] = await runBidAskFlips([posRow()], h.deps);
+  assert.match(r.reason, /landed/);
+  assert.equal(tracked.bid_ask_flip.flips, 1);
+  assert.equal(tracked.bid_ask_flip.last_flip_active_bin, -460);
+  assert.ok(!tracked.bid_ask_flip.pending);
+  assert.equal(h.sends.length, 0);
+});
+
+test("M1: schema row is Advanced (tier 3), default 30, wired into config.bidAskFlip", async () => {
+  const { BY_KEY } = await import("../settings-schema.js");
+  const row = BY_KEY.get("bidAskFlipTimeoutSec");
+  assert.ok(row);
+  assert.equal(row.tier, 3);
+  assert.equal(row.def, 30);
+  const { config } = await import("../config.js");
+  assert.equal(config.bidAskFlip.timeoutSec >= 5, true);
 });

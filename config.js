@@ -8,6 +8,7 @@ import { getDefaultModelForProvider, getLlmProvider } from "./llm-provider.js";
 import { computePortfolioSol } from "./portfolio-value.js";
 import { BY_KEY, GOVERNED_KEYS, makeResolver, normalizeProfile, PROFILE_NAMES } from "./settings-schema.js";
 import { migrateLegacyBookkeeping } from "./config-state.js";
+import { syncWalletLockFromConfig } from "./wallet-lock.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // MERIDIAN_USER_CONFIG_PATH lets tests point every reader/writer at a temp file.
@@ -460,7 +461,8 @@ export const config = {
     mode:          S("bidAskFlipMode"),         // "off" | "shadow" | "live"
     fillPct:       S("bidAskFlipFillPct"),      // first flip at this % of deposited SOL converted
     reflipStepPct: S("bidAskFlipReflipStepPct"),// re-flip only a fresh tranche worth ≥ this % of the deposit
-    minTrancheSol: S("bidAskFlipMinTrancheSol"),// never flip a tranche worth less than this
+    minTrancheSol: S("bidAskFlipMinTrancheSol"),
+    timeoutSec:    S("bidAskFlipTimeoutSec"),   // M1: flip-pass deadline (s)// never flip a tranche worth less than this
   },
 
   // ─── Common Token Mints ────────────────
@@ -470,6 +472,9 @@ export const config = {
     USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
   },
 };
+
+// Nit: wallet-lock timeouts follow config from load onward (not only once cycles start).
+syncWalletLockFromConfig(config);
 
 /** "total" unless positionSizeBase is "wallet" (case-insensitive). */
 export function getPositionSizeBase() {
@@ -713,6 +718,7 @@ export function applyConfigChanges({ changes = {}, source = "manual", reason = "
     if (Object.keys(rejected[bucket]).length === 0) delete rejected[bucket];
   }
 
+  syncWalletLockFromConfig(config);
   return {
     success: Object.keys(applied).length > 0,
     applied,
@@ -826,5 +832,6 @@ export function switchProfile(name) {
     setConfigPath(row.path, to);
   }
   refreshMinSolToOpen(res);
+  syncWalletLockFromConfig(config);
   return { profile: target, changed, scheduleChanged };
 }

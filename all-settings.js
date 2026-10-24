@@ -12,6 +12,7 @@
 import { CONFIG_KEY_MAP } from "./runtime-helpers.js";
 import { isTruthyDryRun } from "./env-flags.js";
 import { SCHEMA } from "./settings-schema.js";
+import { syncWalletLockFromConfig } from "./wallet-lock.js";
 import { validateTradingValue, riskIncreases, readTradingSettings, TRADING_KEYS } from "./trading-settings.js";
 
 // Never listed or editable: credentials, endpoints, owner identity.
@@ -234,6 +235,7 @@ export function createAllSettings(deps) {
     const before = currentOf(entry);
     const k = entry.key;
     if (entry.special === "dryRun") return [value ? "switches to DRY RUN (no transactions are sent)" : "switches to LIVE trading with real funds"];
+    if (k === "bidAskFlipMode") return value === "live" && before !== "live" ? ["turns the bid-ask flip to LIVE: the bot will sign and send real flip transactions on open positions"] : [];
     if (k === "autoTune") return value === true && before !== true ? ["turns on auto-tune: the bot will rewrite screening thresholds on its own after closed positions"] : [];
     if (entryKeys.has(k)) return deps.entryFilters?.isLoosening?.(k, before, value) ? ["turns an entry-safety guard off or loosens it"] : [];
     if (["stopLossPct", "deployAmountSol", "maxPositions", "trailingTakeProfit"].includes(k)) {
@@ -264,6 +266,7 @@ export function createAllSettings(deps) {
     }
     if (entry.special === "dryRun") env.DRY_RUN = value ? "true" : "false";
     else if (entry.path && !RESTART_KEYS.has(entry.key)) setPath(config, entry.path, value);
+    if (entry.path?.[0] === "exits") syncWalletLockFromConfig(config);
     const text = `${entry.key}: ${fmtValue(before)} → ${fmtValue(value)}`;
     log("config", `Setting (telegram, ${entry.file === "gmgn" ? "gmgn-config.json" : "user-config.json"}): ${text}${entry.restart ? " (applies after restart)" : ""}`);
     if (entry.path?.[0] === "schedule" && value !== before) {

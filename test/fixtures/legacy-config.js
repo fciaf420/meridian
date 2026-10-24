@@ -390,6 +390,7 @@ export const config = {
     fillPct:       u.bidAskFlip?.fillPct       ?? 30,   // first flip at this % of deposited SOL converted
     reflipStepPct: u.bidAskFlip?.reflipStepPct ?? 20,   // re-flip only a fresh tranche worth ≥ this % of the deposit
     minTrancheSol: u.bidAskFlip?.minTrancheSol ?? 0.05, // never flip a tranche worth less than this
+    timeoutSec:    u.bidAskFlip?.timeoutSec    ?? 30,   // flip-pass deadline (s)
   },
 
   // ─── Common Token Mints ────────────────

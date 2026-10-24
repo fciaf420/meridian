@@ -240,3 +240,12 @@ test("review PR131 #1: a real private key in normal chat is refused and never re
   assert.ok(calls.slice(n).some((c) => /private key/.test(c.text || "")));
   assert.ok(!calls.slice(n).some((c) => (c.text || "").includes(key)));
 });
+
+test("final review nit: switching bidAskFlip mode to live needs the risk confirm; off/shadow are one tap", () => {
+  const { svc } = makeUI();
+  const e = svc.find("bidAskFlipMode");
+  assert.ok(e);
+  assert.ok(svc.risk(e, "live").length > 0);
+  assert.equal(svc.risk(e, "shadow").length, 0);
+  assert.equal(svc.risk(e, "off").length, 0);
+});

@@ -68,6 +68,18 @@ import {
 import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal, formatRunnerPrecheck } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
 
+// M1/Nit: stale / hung wallet-lock holder → Telegram alert. Timeouts come from config (config.js syncs them at load and on change).
+setWalletLockOptions({
+  onAlert: ({ kind, label, heldMs, queued }) => {
+    const secs = Math.round(heldMs / 1000);
+    const text = kind === "abandoned"
+      ? `Wallet lock RELEASED after ${secs}s: "${label}" never finished (hung RPC?). It may still land on chain. ${queued} operation(s) were queued.`
+      : `Wallet lock held ${secs}s by "${label}" (${queued} queued). Closes cannot run until it finishes; check RPC health.`;
+    log("wallet_lock", text);
+    emit("ops_alert", { key: `lock:${kind}`, title: kind === "abandoned" ? "Wallet lock released after timeout" : "Wallet lock held too long", text });
+  },
+});
+
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${isDryRun() ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${config.llm.managementModel} (provider: ${process.env.LLM_PROVIDER || "openrouter"})`);
@@ -865,9 +877,16 @@ function startCronJobsInner() {
           const exitBusy = new Set([...codeRules.closed, ...codeRules.failed, ...codeRules.held].map((r) => r.position));
           for (const id of flipExitPositions) exitBusy.add(id);
           const flipCandidates = precheckedPositions.filter((p) => !exitBusy.has(p.position));
-          await import("./tools/bidask-flip.js")
-            .then((m) => m.runBidAskFlips(flipCandidates, { config, exitAlerts: exitBusy, isBusy, isCloseInflight, dryRun: isDryRun() }))
-            .catch((e) => log("bidask_flip", `flip pass failed: ${e.message}`));
+          // M1: backstop on top of runBidAskFlips' own deadline, so a hang can never hold the cycle.
+          const flipMs = ((config.bidAskFlip?.timeoutSec ?? 30) + 10) * 1000;
+          let flipTimer;
+          await Promise.race([
+            import("./tools/bidask-flip.js")
+              .then((m) => m.runBidAskFlips(flipCandidates, { config, exitAlerts: exitBusy, isBusy, isCloseInflight, dryRun: isDryRun() })),
+            new Promise((_, rej) => { flipTimer = setTimeout(() => rej(new Error(`flip pass exceeded ${Math.round(flipMs / 1000)}s; skipped this cycle`)), flipMs); }),
+          ])
+            .catch((e) => log("bidask_flip", `flip pass failed: ${e.message}`))
+            .finally(() => clearTimeout(flipTimer));
         }
         const codeSummary = codeRules.lines.length ? `\n${codeRules.lines.join("\n")}` : "";
         if (ruleHits.length === 0 && !exitAlerts) {
@@ -1011,18 +1030,7 @@ function startCronJobsInner() {
 
   // Start lightweight PnL watcher (sub-minute interval, no LLM)
   // M1: stale / hung wallet-lock holder → Telegram alert, hard release after the timeout.
-  setWalletLockOptions({
-    warnMs: (config.exits?.walletLockWarnSec ?? 300) * 1000,
-    hardMs: (config.exits?.walletLockTimeoutSec ?? 900) * 1000,
-    onAlert: ({ kind, label, heldMs, queued }) => {
-      const secs = Math.round(heldMs / 1000);
-      const text = kind === "abandoned"
-        ? `Wallet lock RELEASED after ${secs}s: "${label}" never finished (hung RPC?). It may still land on chain. ${queued} operation(s) were queued.`
-        : `Wallet lock held ${secs}s by "${label}" (${queued} queued). Closes cannot run until it finishes; check RPC health.`;
-      log("wallet_lock", text);
-      emit("ops_alert", { key: `lock:${kind}`, title: kind === "abandoned" ? "Wallet lock released after timeout" : "Wallet lock held too long", text });
-    },
-  });
+  // (wallet-lock timeouts + alert sink are applied at module init / config change, not here.)
   startPnlWatcher(config.schedule.pnlWatcherIntervalSec);
 
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m, pnl watcher every ${config.schedule.pnlWatcherIntervalSec}s`);

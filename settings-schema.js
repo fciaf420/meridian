@@ -117,6 +117,7 @@ export const SCHEMA = [
   row("bidAskFlipMode", ["bidAskFlip", "mode"], "enum", "shadow", { tier: 1, enum: ["off", "shadow", "live"], label: "Bid-ask flip (off | shadow | live)" }),
   row("bidAskFlipFillPct", ["bidAskFlip", "fillPct"], "float", 30, { min: 1, max: 100, unit: "%" }),
   row("bidAskFlipReflipStepPct", ["bidAskFlip", "reflipStepPct"], "float", 20, { min: 1, max: 100, unit: "%" }),
+  row("bidAskFlipTimeoutSec", ["bidAskFlip", "timeoutSec"], "int", 30, { min: 5, max: 300, unit: "s", label: "Bid-ask flip pass timeout" }),
   row("bidAskFlipMinTrancheSol", ["bidAskFlip", "minTrancheSol"], "float", 0.05, { min: 0, unit: "SOL" }),
 
   // ── Entry-safety filters ──
@@ -207,7 +208,7 @@ export const SCHEMA = [
 
 /** Nested user-config.json objects accepted as an alias for flat schema keys (flat key wins). */
 export const NESTED_KEYS = {
-  bidAskFlip: { mode: "bidAskFlipMode", fillPct: "bidAskFlipFillPct", reflipStepPct: "bidAskFlipReflipStepPct", minTrancheSol: "bidAskFlipMinTrancheSol" },
+  bidAskFlip: { mode: "bidAskFlipMode", fillPct: "bidAskFlipFillPct", reflipStepPct: "bidAskFlipReflipStepPct", minTrancheSol: "bidAskFlipMinTrancheSol", timeoutSec: "bidAskFlipTimeoutSec" },
 };
 export function flattenNested(raw = {}) {
   let out = raw;
