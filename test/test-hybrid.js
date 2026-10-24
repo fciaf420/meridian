@@ -178,37 +178,23 @@ test("standard path: ONE tx = initialize + Bid-Ask add + Spot add, legs sum exac
 });
 
 test("standard path: a merged tx that cannot fit returns null + reason (caller falls back to chunked path)", async () => {
-  const big = await build.buildHybridStandardTx({ pool: fakePool({ extraBytes: 700 }), ...common, legs: mix.splitHybridLamports(new BN(10), 60) });
+  const big = await build.buildHybridStandardTx({ pool: fakePool({ extraBytes: 1000 }), ...common, legs: mix.splitHybridLamports(new BN(10), 60) });
   assert.equal(big.tx, null);
   assert.match(big.reason, /merged hybrid tx is \d+ bytes/);
 });
 
-test("spot share 0 (Bid-Ask 100%): chunk path returns the plain Bid-Ask txs, no second build", async () => {
-  const pool = fakePool({ chunks: 2 });
-  const txs = await build.buildHybridChunkTxs({ pool, ...common, maxBinId: 130, legs: mix.splitHybridLamports(new BN(1000), 100) });
-  assert.equal(txs.length, 2);
-  assert.equal(pool.calls.length, 1);
-});
-
-test("wide path: one tx PER CHUNK, each carrying both legs (all-or-nothing per chunk)", async () => {
-  const pool = fakePool({ chunks: 3 });
-  const legs = mix.splitHybridLamports(new BN("2000000001"), 60);
-  const txs = await build.buildHybridChunkTxs({ pool, ...common, minBinId: -140, maxBinId: 0, legs });
-  assert.equal(txs.length, 3);
-  assert.equal(pool.calls.length, 2, "Bid-Ask chunk set + Spot chunk set");
-  assert.equal(pool.calls[0][1].totalYAmount.add(pool.calls[1][1].totalYAmount).toString(), "2000000001");
-  txs.forEach((tx, i) => {
-    const tags = tx.instructions.filter((x) => x.programId.equals(DLMM_ID)).map((x) => `${x.data[0]}:${x.data[1]}`);
-    assert.deepEqual(tags, ["1:1", `30:${i}`, `31:${i}`], `chunk ${i}: leg A's init + Bid-Ask deposit + Spot deposit; leg B's duplicate init dropped`);
-    assert.equal(tx.instructions.at(-1).data[0], 9);
-  });
-  // chunking mismatch is refused before anything is sent
-  const bad = fakePool({ chunks: 2 });
-  const orig = bad.addLiquidityByStrategyChunkable;
-  bad.addLiquidityByStrategyChunkable = async (a) => (a.strategy.strategyType === sdk.StrategyType.Spot ? (await orig(a)).slice(0, 1) : orig(a));
-  await assert.rejects(build.buildHybridChunkTxs({ pool: bad, ...common, legs }), /chunking mismatch/);
-  // a merged chunk that is too big is refused
-  await assert.rejects(build.buildHybridChunkTxs({ pool: fakePool({ chunks: 2, extraBytes: 700 }), ...common, legs }), /too large/);
+test("wide path: per-chunk reconcile for the SECOND layer compares against what the chunk held BEFORE it", async () => {
+  const ranges = [{ lowerBinId: -140, upperBinId: -71 }, { lowerBinId: -70, upperBinId: -1 }];
+  const bin = (binId, y) => ({ binId, positionXAmount: "0", positionYAmount: String(y) });
+  const mkPool = (bins) => ({ getPosition: async () => ({ positionData: { positionBinData: bins } }) });
+  // after the Bid-Ask layer: both chunks funded
+  const afterBA = [bin(-100, 500), bin(-30, 700)];
+  assert.deepEqual(await dlmm._readChunkFundingForTest(mkPool(afterBA), "p", ranges), [true, true], "plain read (first layer / non-hybrid): any liquidity = funded");
+  const before = [500n, 700n];
+  assert.deepEqual(await dlmm._readChunkFundingForTest(mkPool(afterBA), "p", ranges, before), [false, false], "Spot layer sent nothing yet: still the Bid-Ask amounts => NOT landed");
+  const afterSpotChunk0 = [bin(-100, 500 + 300), bin(-30, 700)];
+  assert.deepEqual(await dlmm._readChunkFundingForTest(mkPool(afterSpotChunk0), "p", ranges, before), [true, false], "only chunk 0 got its Spot layer");
+  assert.equal(await dlmm._readChunkFundingForTest({ getPosition: async () => { throw new Error("rpc"); } }, "p", ranges, before), null, "unreadable => unknown (fail closed)");
 });
 
 test("mergeLegInstructions refuses foreign programs in leg B (never silently drops a deposit-relevant ix)", () => {
@@ -226,7 +212,10 @@ test("deploy source: hybrid is built AFTER the checkpoint + pre-submit gate and 
   assert.ok(at("beginAttempt({") < at("await preSubmitGate("));
   assert.ok(at("await preSubmitGate(") < at("buildHybridStandardTx({"));
   assert.ok(at("buildHybridStandardTx({") < at('sendManagedTransaction(hybridStandard.tx, [wallet, newPosition], "deploy hybrid standard")'));
-  assert.ok(at("buildHybridChunkTxs({") > at("await pool.refetchStates();"), "chunk txs priced off a fresh active bin");
+  assert.ok(at("const addLayers = isHybrid") > at("await pool.refetchStates();"), "chunk txs priced off a fresh active bin");
+  assert.ok(at('name: "bid-ask"') < at('name: "spot"'), "Bid-Ask layer first, Spot layer second");
+  assert.match(deployBody, /layersLanded\.push\(layer\.name\)/, "a layer is only counted after its chunks reconcile on-chain");
+  assert.match(deployBody, /layers_landed: layersLanded/, "partial hybrid deploys record which layer landed");
   assert.match(deployBody, /slippage: depositSlip\.slippagePct/);
   assert.ok(at("initializedBinArrayWindow(") < at("let hybridLegs"), "no-bin-array-init trimming runs before the legs are sized");
   assert.match(deployBody, /markAttempt\(attemptId, "entered"/);

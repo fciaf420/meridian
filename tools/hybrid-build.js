@@ -13,15 +13,21 @@
 // fee, one confirmation. A separate rebalance_liquidity with two `adds`
 // (option c) cannot create the position, so it would still need a second tx.
 // If the merged tx would not fit in 1232 bytes (e.g. Token-2022 hook accounts)
-// the caller falls back to the chunked path (see buildHybridChunkTxs).
+// the caller falls back to the chunked path. There the two layers are NOT merged:
+// measured on mainnet, one merged chunk tx needs ~1.37M CU (the SDK's chunk path
+// uses rebalance_liquidity, ~680k CU per layer per 70 bins) and ~1.15 KB, too
+// close to the 1.4M CU / 1232 B ceilings, so tools/dlmm.js sends the Bid-Ask
+// layer's chunk txs, reconciles them on-chain, then the Spot layer's.
 
 import { Transaction } from "@solana/web3.js";
 import { mergeLegInstructions } from "../hybrid-mix.js";
 import { legacyTxSize, MAX_TX_BYTES } from "./tx-send.js";
 
-// compute-budget limit + price ixs (≈ 2×~20 B), a possible Sender tip (~70 B)
-// and slack are added later by applyPriorityFee; leave room for them.
-export const HYBRID_SIZE_HEADROOM = 110;
+// applyPriorityFee later adds the compute-budget program key + limit ix + price ix
+// (32 + 8 + 12 = 52 B). A Sender tip (~70 B) is NOT reserved: when it would not fit
+// applyPriorityFee drops it and sends via RPC only (logged), so a tx that fits
+// without the tip is good enough. 60 B = those 52 + slack.
+export const HYBRID_SIZE_HEADROOM = 60;
 
 /** hex discriminators of the bin-array / bitmap initialisers (dropped from leg B). */
 export function initDiscriminators(pool) {
@@ -37,6 +43,19 @@ export function initDiscriminators(pool) {
 const zero = (BN) => new BN(0);
 
 /**
+ * The SDK sizes every tx it builds by simulating it. For leg B (the Spot add) the position
+ * does not exist yet, so that internal simulation fails and the SDK logs
+ * "Error::getEstimatedComputeUnitUsageWithBuffer" before falling back to a 1.4M CU limit.
+ * That limit is discarded here anyway (applyPriorityFee re-measures the MERGED tx), so the
+ * log line is noise; swallow exactly that line and nothing else.
+ */
+export async function quietSdkEstimator(fn) {
+  const orig = console.error;
+  console.error = (...a) => { if (typeof a[0] === "string" && a[0].startsWith("Error::getEstimatedComputeUnitUsageWithBuffer")) return; orig.apply(console, a); };
+  try { return await fn(); } finally { console.error = orig; }
+}
+
+/**
  * One atomic tx: initialize_position + Bid-Ask deposit + Spot deposit.
  * @returns {Promise<{ tx: Transaction|null, size: number, reason?: string, txA: Transaction, txB: Transaction }>}
  *   tx is null (with a reason) when the merged tx would not fit.
@@ -46,10 +65,10 @@ export async function buildHybridStandardTx({ pool, StrategyType, BN, positionPu
     positionPubKey, user, totalXAmount: zero(BN), totalYAmount: legs.bidAsk,
     strategy: { minBinId, maxBinId, strategyType: StrategyType.BidAsk }, slippage,
   });
-  const txB = await pool.addLiquidityByStrategy({
+  const txB = await quietSdkEstimator(() => pool.addLiquidityByStrategy({
     positionPubKey, user, totalXAmount: zero(BN), totalYAmount: legs.spot,
     strategy: { minBinId, maxBinId, strategyType: StrategyType.Spot }, slippage,
-  });
+  }));
   const merged = mergeLegInstructions(txA.instructions, txB.instructions, pool.program.programId.toBase58(), initDiscriminators(pool));
   const tx = new Transaction({ blockhash: txA.recentBlockhash, lastValidBlockHeight: txA.lastValidBlockHeight, feePayer: user }).add(...merged);
   const size = legacyTxSize(tx);
@@ -57,36 +76,4 @@ export async function buildHybridStandardTx({ pool, StrategyType, BN, positionPu
     return { tx: null, size, reason: `merged hybrid tx is ${size} bytes (+${HYBRID_SIZE_HEADROOM} headroom > ${MAX_TX_BYTES})`, txA, txB };
   }
   return { tx, size, txA, txB };
-}
-
-/**
- * Per-chunk hybrid txs for the chunked path (wide ranges). For each bin chunk the
- * SDK's Bid-Ask chunk tx and Spot chunk tx are merged into ONE tx, so a chunk is
- * all-or-nothing and the existing per-chunk reconcile (bins funded on-chain)
- * keeps working unchanged. Position must already exist when these are SENT; it
- * need not exist to build them.
- * @returns {Promise<Transaction[]>}
- * @throws if the two legs chunk differently or a merged chunk would not fit.
- */
-export async function buildHybridChunkTxs({ pool, StrategyType, BN, positionPubKey, user, minBinId, maxBinId, legs, slippage }) {
-  const build = async (amount, strategyType) => {
-    const r = await pool.addLiquidityByStrategyChunkable({
-      positionPubKey, user, totalXAmount: zero(BN), totalYAmount: amount,
-      strategy: { minBinId, maxBinId, strategyType }, slippage,
-    });
-    return Array.isArray(r) ? r : [r];
-  };
-  const a = await build(legs.bidAsk, StrategyType.BidAsk);
-  if (legs.spot.isZero()) return a;
-  const b = await build(legs.spot, StrategyType.Spot);
-  if (a.length !== b.length) throw new Error(`hybrid chunking mismatch: Bid-Ask leg has ${a.length} chunk txs, Spot leg ${b.length}`);
-  const pid = pool.program.programId.toBase58();
-  const discs = initDiscriminators(pool);
-  return a.map((txA, i) => {
-    const tx = new Transaction({ blockhash: txA.recentBlockhash, lastValidBlockHeight: txA.lastValidBlockHeight, feePayer: user })
-      .add(...mergeLegInstructions(txA.instructions, b[i].instructions, pid, discs));
-    const size = legacyTxSize(tx);
-    if (size + HYBRID_SIZE_HEADROOM > MAX_TX_BYTES) throw new Error(`merged hybrid chunk ${i + 1}/${a.length} is ${size} bytes — too large to carry both legs`);
-    return tx;
-  });
 }

@@ -59,7 +59,7 @@ const CLOSE_VERIFY_DELAY_MS = 1500;
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
 import { flipCloseTags } from "./bidask-flip.js";
 import { HYBRID, normalizeHybridMix, splitHybridLamports, hybridTrackFields } from "../hybrid-mix.js";
-import { buildHybridStandardTx, buildHybridChunkTxs } from "./hybrid-build.js";
+import { buildHybridStandardTx } from "./hybrid-build.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -1390,30 +1390,40 @@ export async function deployPosition({
       // Refresh pool state after the create txs so the strategy/slippage math
       // uses a fresh activeId rather than the stale pre-create snapshot.
       await pool.refetchStates();
+      const layersLanded = []; // hybrid: layers fully confirmed on-chain so far
       try {
-        const addTxs = isHybrid
-          // one tx per chunk, each carrying BOTH legs (all-or-nothing per chunk)
-          ? await buildHybridChunkTxs({
-            pool, StrategyType, BN, positionPubKey: newPosition.publicKey, user: wallet.publicKey,
-            minBinId, maxBinId, legs: hybridLegs, slippage: depositSlip.slippagePct,
-          })
-          : await pool.addLiquidityByStrategyChunkable({
-            positionPubKey: newPosition.publicKey,
-            user: wallet.publicKey,
-            totalXAmount: totalXLamports,
-            totalYAmount: totalYLamports,
-            strategy: { minBinId, maxBinId, strategyType },
-            slippage: depositSlip.slippagePct,
-          });
+        // Hybrid: the Bid-Ask layer's chunk txs go first, the Spot layer's second (a merged
+        // chunk tx would need ~1.37M CU and ~1.15 KB: measured on mainnet, too close to the
+        // 1.4M / 1232 B ceilings). Each layer is reconciled against the position on-chain
+        // before the next starts, so a failure leaves a known, tracked, bid-ask-only position.
+        const addLayers = isHybrid
+          ? [
+            { name: "bid-ask", y: hybridLegs.bidAsk, type: StrategyType.BidAsk },
+            ...(hybridLegs.spot.isZero() ? [] : [{ name: "spot", y: hybridLegs.spot, type: StrategyType.Spot }]),
+          ]
+          : [{ name: null, y: totalYLamports, type: strategyType }];
+        for (const layer of addLayers) {
+        const layerTag = layer.name ? ` [${layer.name} layer]` : "";
+        const addTxs = await pool.addLiquidityByStrategyChunkable({
+          positionPubKey: newPosition.publicKey,
+          user: wallet.publicKey,
+          totalXAmount: totalXLamports,
+          totalYAmount: layer.y,
+          strategy: { minBinId, maxBinId, strategyType: layer.type },
+          slippage: depositSlip.slippagePct,
+        });
         const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
         const { chunkBinRange } = await import("@meteora-ag/dlmm");
         const chunkRanges = chunkBinRange(minBinId, maxBinId);
+        // Per-chunk holdings BEFORE this layer: the Spot layer lands on bins the Bid-Ask layer
+        // already funded, so "landed" means "holds more than before", not "holds anything".
+        const before = layer.name ? await readChunkTotals(pool, newPosition.publicKey, chunkRanges) : null;
         if (chunkRanges.length !== addTxArray.length) {
           // Unexpected SDK chunking: can't map txs to bins for reconcile, so
           // keep the old one-at-a-time behaviour.
           log("deploy_warn", `SDK returned ${addTxArray.length} add txs for ${chunkRanges.length} bin chunks — sending sequentially`);
           for (let i = 0; i < addTxArray.length; i++) {
-            const txHash = await sendManagedTransaction(addTxArray[i], [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`);
+            const txHash = await sendManagedTransaction(addTxArray[i], [wallet], `deploy add-liquidity${layerTag} ${i + 1}/${addTxArray.length}`);
             txHashes.push(txHash);
             log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
           }
@@ -1426,9 +1436,9 @@ export async function deployPosition({
           // once (each signed once, with its own rebroadcast + confirm): one
           // confirmation window instead of N, and every chunk is priced off
           // the same activeId.
-          const readFunded = () => readChunkFunding(pool, newPosition.publicKey, chunkRanges);
+          const readFunded = () => readChunkFunding(pool, newPosition.publicKey, chunkRanges, before);
           const results = await Promise.allSettled(addTxArray.map((tx, i) =>
-            sendManagedTransaction(tx, [wallet], `deploy add-liquidity ${i + 1}/${addTxArray.length}`, {
+            sendManagedTransaction(tx, [wallet], `deploy add-liquidity${layerTag} ${i + 1}/${addTxArray.length}`, {
               // Resend only if this chunk's bins are verified still empty.
               beforeResend: async () => (await readFunded())?.[i] === false,
             })));
@@ -1444,8 +1454,10 @@ export async function deployPosition({
           if (rec.failed.length || rec.unknown.length) {
             const why = [...rec.failed, ...rec.unknown].sort((a, b) => a - b)
               .map((i) => `chunk ${i + 1}/${addTxArray.length} (bins ${chunkRanges[i].lowerBinId}..${chunkRanges[i].upperBinId}) ${rec.failed.includes(i) ? "empty on-chain" : "unverified"}: ${results[i].reason?.message || results[i].reason}`);
-            throw new Error(`${rec.failed.length + rec.unknown.length}/${addTxArray.length} add-liquidity chunk(s) did not land — ${why.join("; ")}`);
+            throw new Error(`${rec.failed.length + rec.unknown.length}/${addTxArray.length} add-liquidity chunk(s)${layerTag} did not land — ${why.join("; ")}`);
           }
+        }
+        if (layer.name) layersLanded.push(layer.name);
         }
       } catch (liqErr) {
         // Liquidity add failed partway. Earlier chunks may already have landed
@@ -1512,6 +1524,10 @@ export async function deployPosition({
           ...(partialX != null && { amount_x: partialX }),
           ...(partialUsd != null && { initial_value_usd: partialUsd }),
           partial_deploy: true,
+          ...(isHybrid && {
+            layers_landed: layersLanded, // fully confirmed layers; a failed layer may still hold some chunks (amount_sol is the on-chain total)
+            legs: { bid_ask_sol: layersLanded.includes("bid-ask") ? legSol().bid_ask_sol : null, spot_sol: layersLanded.includes("spot") ? legSol().spot_sol : null, landed_total_sol: partialY },
+          }),
         }, note);
         _positionsCacheAt = 0;
         log("deploy_warn", `Position ${posAddr.slice(0, 8)} is ${status} — kept open for management/close. ${note}`);
@@ -2890,17 +2906,37 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
 }
 
 // ─── Helpers ──────────────────────────────────────────────────
+/** Per-chunk total (X + Y raw units, BigInt) of a position's bins. */
+function chunkTotals(bins, ranges) {
+  const big = (v) => { try { return BigInt(String(v ?? "0").split(".")[0] || "0"); } catch { return 0n; } };
+  return ranges.map(({ lowerBinId, upperBinId }) =>
+    bins.filter((b) => b.binId >= lowerBinId && b.binId <= upperBinId)
+      .reduce((sum, b) => sum + big(b.positionXAmount) + big(b.positionYAmount), 0n));
+}
+
+/** Per-chunk totals read on-chain; throws when unreadable (the layer then fails closed, before anything is sent). */
+async function readChunkTotals(pool, positionPubKey, ranges) {
+  const pd = (await pool.getPosition(positionPubKey))?.positionData;
+  if (!pd) throw new Error("could not read the position's bins before the next hybrid layer");
+  return chunkTotals(pd.positionBinData || [], ranges);
+}
+
 /**
  * Per-chunk funding of a position, read on-chain in one call: for each
  * { lowerBinId, upperBinId } range, true if any of its bins holds liquidity,
  * false if all are empty. Returns null when the read fails (unknown).
  */
-async function readChunkFunding(pool, positionPubKey, ranges) {
+async function readChunkFunding(pool, positionPubKey, ranges, before = null) {
   try {
     const pd = (await pool.getPosition(positionPubKey))?.positionData;
     if (!pd) return null;
     const bins = pd.positionBinData || [];
     const has = (b) => Number(b.positionXAmount || 0) > 0 || Number(b.positionYAmount || 0) > 0;
+    // `before` (hybrid second layer): a chunk counts as funded only if it holds MORE than it did before this layer.
+    if (before) {
+      const now = chunkTotals(bins, ranges);
+      return now.map((v, i) => v > before[i]);
+    }
     return ranges.map(({ lowerBinId, upperBinId }) =>
       bins.some((b) => b.binId >= lowerBinId && b.binId <= upperBinId && has(b)));
   } catch (e) {
