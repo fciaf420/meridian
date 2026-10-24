@@ -171,8 +171,11 @@ test("a private key typed into the chat is refused, never stored, never forwarde
   assert.equal(sc.looksLikeSecret(key, A), true);
   assert.equal(sc.looksLikeSecret("0.5", A), false);
   assert.equal(sc.looksLikeSecret("So11111111111111111111111111111111111111112", A), false);
-  // nit3: only checked while the console awaits input; a tx signature (64 bytes, 87-88 base58) is not a key
-  assert.equal(sc.looksLikeSecret(key), false);
+  // review PR131 #1: high-confidence key shapes are refused even in free chat; a tx signature never is
+  assert.equal(sc.looksLikeSecret(key), true);
+  assert.equal(sc.looksLikeSecret("["+Array.from({ length: 64 }, (_, i) => i).join(",")+"]"), true);
+  assert.equal(sc.looksLikeSecret("ab".repeat(64)), true);
+  assert.equal(sc.looksLikeSecret("ab".repeat(32)), false);
   const sig = bs58.encode(Uint8Array.from({ length: 64 }, (_, i) => (i * 37 + 11) % 256));
   assert.ok(sig.length >= 86 && sig.length <= 88);
   assert.equal(sc.looksLikeSecret(sig, A), false);
@@ -212,7 +215,7 @@ test("lessons: evolution only proposes (and logs) unless autoTune is on; explici
   for (const [k, v] of Object.entries(on.changes)) assert.equal(readJson(USER_CFG)[k], v);
 });
 
-test("nit3: a tx signature in free chat is not refused (no pending input)", async () => {
+test("nit3: a tx signature in normal chat is not refused (no pending input)", async () => {
   const { u, calls } = makeUI();
   const sig = bs58.encode(Uint8Array.from({ length: 64 }, (_, i) => (i * 53 + 7) % 256));
   const n = calls.length;
@@ -226,4 +229,14 @@ test("nit5: turning autoTune ON needs the risk confirm; turning it off is one ta
   assert.ok(e);
   assert.ok(svc.risk(e, true).length > 0);
   assert.equal(svc.risk(e, false).length, 0);
+});
+
+test("review PR131 #1: a real private key in normal chat is refused and never reaches the LLM", async () => {
+  const { u, calls } = makeUI();
+  const key = bs58.encode(Keypair.generate().secretKey);
+  const n = calls.length;
+  const handled = await u.handleMessage(key, { chatId: OWNER });
+  assert.equal(handled, true);
+  assert.ok(calls.slice(n).some((c) => /private key/.test(c.text || "")));
+  assert.ok(!calls.slice(n).some((c) => (c.text || "").includes(key)));
 });

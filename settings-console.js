@@ -10,12 +10,11 @@
 // everything with side effects is injected. Secrets (private key, RPC URL, bot token, API keys)
 // are .env-only and never listed; typed values that look like a private key are refused
 // (looksLikeSecret) so a key pasted into the chat never reaches a setting or the LLM.
+import bs58 from "bs58";
+import { Keypair } from "@solana/web3.js";
 import { PROFILES, UNTESTED_PROFILES, PROFILE_NAMES, diffProfile, tierCounts, BY_KEY } from "./settings-schema.js";
 
 /** Basics shown first, in order. Keys not present in the registry (e.g. a removed key) are skipped. */
-import bs58 from "bs58";
-import { Keypair } from "@solana/web3.js";
-
 export const BASIC_KEYS = ["dryRun", "maxPositions", "positionSizePct", "maxDeployAmount", "screeningSource", "activeStrategy", "strategy", "llmProvider"];
 
 /** Tuning sections: the profile-governed keys, grouped by what they control. */
@@ -30,28 +29,27 @@ export const TUNING_SECTIONS = [
 const fmt = (v) => (v === null || v === undefined ? "off" : typeof v === "boolean" ? (v ? "on" : "off") : Array.isArray(v) ? v.join(", ") : String(v));
 
 /**
- * True for text that looks like a wallet private key. Only meaningful while the console is awaiting a typed
- * value (`awaiting: true`); in free chat nothing is flagged, so a pasted tx signature or address reaches the LLM.
- *
- * Ambiguity: a Solana secret key (64 bytes) and a tx signature (64 bytes) both base58-encode to 87-88 chars.
- * So for 87-88 char base58 we decode and check the 64 bytes really are a keypair (last 32 bytes = public key of
- * the first 32); a signature fails that check and is not flagged. Other base58 lengths in 80-92 never fit a
- * setting value or a signature, so they are still refused. JSON byte arrays and 64-hex are distinctive, flagged.
+ * True for text that looks like a wallet private key. In free chat (`awaiting: false`) only HIGH-confidence shapes are
+ * refused: base58 (87-88 chars) that decodes to a valid ed25519 keypair, a 64-number JSON byte array, and 128-char hex.
+ * While the console awaits a typed value (`awaiting: true`) the broader heuristics also apply (other 80-92 char base58,
+ * 64-hex, 32+ number arrays). A tx signature (64 bytes, also 87-88 base58) fails the keypair check and always passes.
  */
 export function looksLikeSecret(text, { awaiting = false } = {}) {
-  if (!awaiting) return false;
   const t = String(text ?? "").trim();
   if (/^[1-9A-HJ-NP-Za-km-z]{80,92}$/.test(t)) {
-    if (t.length < 87 || t.length > 88) return true;
+    if (t.length < 87 || t.length > 88) return awaiting;
     try {
       const bytes = bs58.decode(t);
-      if (bytes.length !== 64) return true;
+      if (bytes.length !== 64) return awaiting;
       Keypair.fromSecretKey(bytes); // throws unless pubkey matches the seed
       return true;
     } catch { return false; } // 64 bytes that are not a keypair: a tx signature
   }
-  if (/^(0x)?[0-9a-fA-F]{64}$/.test(t) || /^[0-9a-fA-F]{128}$/.test(t)) return true;
-  if (/^\[\s*\d{1,3}(\s*,\s*\d{1,3}){31,}\s*\]$/.test(t)) return true; // [12,34,...] keypair file contents
+  if (/^[0-9a-fA-F]{128}$/.test(t)) return true;
+  if (/^\[\s*\d{1,3}(\s*,\s*\d{1,3}){63}\s*\]$/.test(t)) return true; // 64-byte keypair file contents
+  if (!awaiting) return false;
+  if (/^(0x)?[0-9a-fA-F]{64}$/.test(t)) return true;
+  if (/^\[\s*\d{1,3}(\s*,\s*\d{1,3}){31,}\s*\]$/.test(t)) return true;
   return false;
 }
 

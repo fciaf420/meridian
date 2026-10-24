@@ -56,3 +56,7 @@ signal-weights.json
 *.corrupt-*
 .*.tmp
 config-state.json
+
+# One-time pre-migration backups (may hold walletKey/rpcUrl)
+*.pre-profiles.bak
+user-config.json.pre-profiles.bak
