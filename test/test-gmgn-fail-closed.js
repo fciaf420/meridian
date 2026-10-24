@@ -725,3 +725,171 @@ test("F4/F11: fee-unknown classification, pure hard-skip reason, and all-fetch-f
   assert.match(src, /globalFeesHardSkipReason\(c, config\.screening\.minTokenFeesSol\)/);
   assert.match(src, /emit\("fee_data_down"/);
 });
+
+/* ===================== Opus 5.5 review fixes (N1-N6) ===================== */
+const jup = await import("../tools/jup-tokens.js");
+const executor = await import("../tools/executor.js");
+
+test("N1: shadow would-drop fields never reach the LLM tool output; the cron prompt blocks never reference them", async () => {
+  const c = { pool: "p1", name: "M1-SOL", gmgn_gate_would_drop: true, gmgn_gate_would_drop_reasons: ["stat block unpopulated (fail closed)"], gmgn_gate_would_drop_kind: "unknown",
+    gmgn_risk_log_only: { gmgn_security_status: "ok", gmgn_gate_would_drop: true, gmgn_gate_would_drop_reasons: ["x"], gmgn_gate_would_drop_kind: "unknown" } };
+  const stripped = screening.stripShadowGateFields(c);
+  const json = JSON.stringify(stripped);
+  assert.ok(!/would_drop/.test(json), "no would_drop key anywhere in the tool-facing candidate");
+  assert.equal(stripped.gmgn_risk_log_only.gmgn_security_status, "ok", "other log-only data is kept");
+  assert.equal(c.gmgn_gate_would_drop, true, "input is not mutated (internal snapshot logging keeps the verdict)");
+  // the snapshot (internal log) still carries the verdict
+  assert.equal(screening.getCandidateSignalSnapshot(c).gmgn_risk_log_only.gmgn_gate_would_drop, true);
+  // the LLM tool is the stripped variant
+  assert.equal(typeof screening.getTopCandidatesForTool, "function");
+  const exSrc = fs.readFileSync(path.join(REPO, "tools/executor.js"), "utf8");
+  assert.match(exSrc, /get_top_candidates:\s*getTopCandidatesForTool/);
+  assert.equal(typeof executor.executeTool, "function");
+  const idx = fs.readFileSync(path.join(REPO, "index.js"), "utf8");
+  assert.ok(!/gmgn_gate_would_drop/.test(idx), "index.js prompt building never mentions the shadow verdict");
+  assert.ok(!/gmgn_gate_would_drop/.test(fs.readFileSync(path.join(REPO, "prompt.js"), "utf8")));
+});
+
+test("N2: deferred-by-limit candidates are would_drop=null (not evaluated); best-ranked candidates are verified first", async () => {
+  const { deps, calls } = makeDeps();
+  deps.cfg = { ...config, gmgn: { ...config.gmgn, meteoraShadowBudget: 1000 } };
+  const pools = [mPool(1), mPool(2), mPool(3), mPool(4), mPool(5), mPool(6), mPool(7), mPool(8)];
+  // rank: reverse order (8 is best)
+  const rankFn = (list) => [...list].reverse();
+  const res = await screen.gateMeteoraSourceCandidates(pools, { limit: 5, deps: { ...deps, force: true, mode: "shadow", rankFn } });
+  assert.equal(res.kept.length, 8, "shadow never drops");
+  const byName = Object.fromEntries(res.kept.map((p) => [p.name, p]));
+  const verified = res.kept.filter((p) => p.gmgn_gated);
+  assert.equal(verified.length, 5);
+  assert.deepEqual(verified.map((p) => p.name).sort(), ["M4-SOL", "M5-SOL", "M6-SOL", "M7-SOL", "M8-SOL"], "top-ranked verified first");
+  for (const n of ["M1-SOL", "M2-SOL", "M3-SOL"]) {
+    assert.equal(byName[n].gmgn_gate_would_drop, null, `${n} not evaluated`);
+    assert.equal(byName[n].gmgn_gate_would_drop_kind, "deferred");
+  }
+  assert.equal(res.would_drop.length, 0, "deferred rows are not counted as would-drops");
+  // hard mode still defers (drops) them
+  const hard = await screen.gateMeteoraSourceCandidates(pools, { limit: 5, deps: { ...makeDeps().deps, force: true, mode: "hard", rankFn } });
+  assert.equal(hard.kept.length, 5);
+  assert.equal(hard.dropped.filter((d) => d.kind === "deferred").length, 3);
+  // the verdict null is still recorded in the log-only snapshot block
+  assert.ok(screening.getCandidateSignalSnapshot(byName["M1-SOL"]).gmgn_risk_log_only, "deferred rows keep their kind in the snapshot");
+  assert.ok(calls.info.length > 0);
+});
+
+test("N5: shadow mode respects gmgn.meteoraShadowBudget (hard mode is unbudgeted)", async () => {
+  const pools = Array.from({ length: 10 }, (_, i) => mPool(i + 1));
+  const cfg = { ...config, gmgn: { ...config.gmgn, meteoraShadowBudget: 8 } };
+  const a = makeDeps(); a.deps.cfg = cfg;
+  const res = await screen.gateMeteoraSourceCandidates(pools, { limit: 10, deps: { ...a.deps, force: true, mode: "shadow" } });
+  assert.equal(res.kept.length, 10);
+  assert.equal(a.calls.info.length, 8, "info lookups stop at the budget");
+  assert.equal(a.calls.security.length, 0, "no weight left for security/holders");
+  assert.equal(res.kept.filter((p) => p.gmgn_gate_would_drop === null).length, 10, "everything unspent is not-evaluated");
+  const b = makeDeps(); b.deps.cfg = cfg;
+  const hard = await screen.gateMeteoraSourceCandidates(pools, { limit: 10, deps: { ...b.deps, force: true, mode: "hard" } });
+  assert.equal(b.calls.info.length, 10, "hard mode ignores the shadow budget");
+  assert.ok(hard.kept.length > 0);
+  assert.equal(policy.GMGN_FIX_DEFAULTS.meteoraShadowBudget, 30);
+});
+
+test("N4: <3 candidates all failing at transport level over 2 consecutive cycles is an outage; EMPTY is not a failure; one-shot logs re-arm; crash path", async () => {
+  gmgn._setGmgnDepsForTest(null);
+  outageMod._resetGmgnOutageForTest();
+  const events = [];
+  const h = (d) => events.push(d);
+  notifier.on("gmgn_outage", h);
+  try {
+    const dead = makeDeps({ info: async () => ({ status: GMGN_STATUS.ERROR, info: null }) });
+    const run = (list) => screen.gateMeteoraSourceCandidates(list, { deps: { ...dead.deps, force: true, mode: "hard" } });
+    const c1 = await run([mPool(1), mPool(2)]);
+    assert.equal(c1.outage, false, "first all-failed cycle with <3 candidates: not enough evidence");
+    const c2 = await run([mPool(1)]);
+    assert.equal(c2.outage, true, "second consecutive all-failed cycle trips it");
+    assert.equal(events.length, 1);
+    // a healthy cycle in between resets the streak
+    outageMod._resetGmgnOutageForTest();
+    await run([mPool(1)]);
+    await screen.gateMeteoraSourceCandidates([mPool(1)], { deps: { ...makeDeps().deps, force: true, mode: "hard" } });
+    const afterHealthy = await run([mPool(1)]);
+    assert.equal(afterHealthy.outage, false, "streak was reset by the healthy cycle");
+    // EMPTY ("not found") answers are not transport failures, even for 3+ candidates
+    outageMod._resetGmgnOutageForTest();
+    const empty = makeDeps({ info: async () => ({ status: GMGN_STATUS.EMPTY, info: null }) });
+    for (let i = 0; i < 3; i++) {
+      const r = await screen.gateMeteoraSourceCandidates([mPool(1), mPool(2), mPool(3)], { deps: { ...empty.deps, force: true, mode: "hard" } });
+      assert.equal(r.outage, false);
+    }
+  } finally { notifier.off("gmgn_outage", h); outageMod._resetGmgnOutageForTest(); }
+
+  // one-shot ENOENT / 401 logs re-arm after a good response
+  const logs = [];
+  const mkExec = (script) => (bin, args, opts, cb) => { const r = script.shift(); setImmediate(() => cb(r.err || null, r.out || "", r.stderr || "")); };
+  const enoent = Object.assign(new Error("spawn gmgn-cli ENOENT"), { code: "ENOENT" });
+  const script = [{ err: enoent }, { err: enoent }, { out: JSON.stringify({ ok: 1 }) }, { err: enoent }];
+  gmgn._setGmgnDepsForTest({ exec: mkExec(script), sleep: async () => {}, now: () => Date.now() });
+  const origLog = console.log; console.log = (...a) => { logs.push(a.join(" ")); };
+  try {
+    for (let i = 0; i < 4; i++) await gmgn.spawnGmgnResult(["token", "info", "--address", "x"]);
+  } finally { console.log = origLog; gmgn._setGmgnDepsForTest(null); }
+  const src = fs.readFileSync(path.join(REPO, "tools/gmgn.js"), "utf8");
+  assert.match(src, /Recovered: re-arm[\s\S]{0,120}_binaryLogged = false;[\s\S]{0,40}_authLogged = false;/);
+
+  // crash path: shadow keeps everything, hard keeps only GMGN-gated, both report once
+  const pools = [mPool(1), { ...mPool(2), gmgn_gated: true }, { ...mPool(3), gmgn: true }];
+  const reports = [];
+  const shadowOut = await screening.handleGateCrash(new Error("boom"), pools, { mode: "shadow", report: (r) => reports.push(r) });
+  assert.equal(shadowOut.length, 3);
+  const hardOut = await screening.handleGateCrash(new Error("boom"), pools, { mode: "hard", report: (r) => reports.push(r) });
+  assert.deepEqual(hardOut.map((p) => p.pool), ["mpool2", "mpool3"]);
+  assert.equal(reports.length, 2);
+  assert.match(reports[0], /crashed: boom/);
+});
+
+test("N3: Jupiter/datapi fetch failures are surfaced; classifier + majority (>=80%) fee_data_down fires once per outage", async () => {
+  // classifier reads the source status
+  assert.equal(helpers.classifyGlobalFeesUnknown({ holdersSettled: { status: "fulfilled" }, holdResult: { global_fees_sol: null, global_fees_source_status: "fetch_failed" } }), "fetch_failed");
+  assert.equal(helpers.classifyGlobalFeesUnknown({ holdersSettled: { status: "fulfilled" }, holdResult: { global_fees_sol: null, global_fees_source_status: "absent" } }), "not_indexed");
+  assert.equal(helpers.classifyGlobalFeesUnknown({ holdersSettled: { status: "fulfilled" }, holdResult: { global_fees_sol: 3, global_fees_source_status: "ok" } }), null);
+  // datapi search surfaces its failure (previously a bare null, same as "not found")
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => ({ ok: false, status: 503, json: async () => ({}) });
+    const failed = await jup.datapiSearchRawResult("MintX");
+    assert.equal(failed.ok, false);
+    const ji = await jup.getTokenInfoResult("MintNoCache");
+    assert.equal(ji.failed, true, "both sources down => failed, not 'unknown token'");
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => [] });
+    const none = await jup.datapiSearchRawResult("MintY");
+    assert.deepEqual([none.ok, none.data], [true, []]);
+    const ji2 = await jup.getTokenInfoResult("MintNoCache2");
+    assert.deepEqual([ji2.failed, ji2.info], [false, null], "answered with no match => not failed");
+  } finally { globalThis.fetch = realFetch; }
+  // majority detector
+  helpers._resetFeeOutageForTest();
+  const f = () => ({ _globalFeesSol: null, _feesUnknownReason: "fetch_failed" });
+  const known = () => ({ _globalFeesSol: 50 });
+  const ni = () => ({ _globalFeesSol: null, _feesUnknownReason: "not_indexed" });
+  const mixed = [f(), f(), f(), f(), known()]; // 80%
+  const r1 = helpers.evaluateFeeDataOutage(mixed);
+  assert.deepEqual([r1.down, r1.notify], [true, true], "80% fetch_failed fires even though one candidate has known fees");
+  assert.equal(helpers.evaluateFeeDataOutage(mixed).notify, false, "once per outage");
+  assert.equal(helpers.evaluateFeeDataOutage([f(), known(), known()]).down, false, "below threshold clears");
+  assert.equal(helpers.evaluateFeeDataOutage(mixed).notify, true, "re-armed after recovery");
+  helpers._resetFeeOutageForTest();
+  assert.equal(helpers.evaluateFeeDataOutage([f(), f(), f(), ni(), known()]).down, false, "60% < 80%");
+  assert.equal(helpers.evaluateFeeDataOutage([f(), f(), f(), ni()], { ratio: 0.5 }).down, true, "configurable ratio");
+  assert.equal(helpers.evaluateFeeDataOutage([]).down, false);
+  assert.equal(config.screening.feeDataDownRatio, 0.8);
+  const idx = fs.readFileSync(path.join(REPO, "index.js"), "utf8");
+  assert.match(idx, /evaluateFeeDataOutage\(rankedCandidates/);
+});
+
+test("N6: in-flight dedupe hands each caller its own candidate objects; prompt wording and unused mint fixed", async () => {
+  const idx = fs.readFileSync(path.join(REPO, "index.js"), "utf8");
+  assert.ok(!/known global_fees_sol or top_10 value fails/.test(idx));
+  assert.match(idx, /UNKNOWN \(fail closed\)/);
+  const gs = fs.readFileSync(path.join(REPO, "tools/gmgn-screen.js"), "utf8");
+  assert.ok(!/if \(pools\.length >= limit\) break;\n\s+const mint = token\.address;/.test(gs));
+  const sc = fs.readFileSync(path.join(REPO, "tools/screening.js"), "utf8");
+  assert.match(sc, /candidates\.map\(\(c\) => \(\{ \.\.\.c \}\)\)/);
+});

@@ -248,6 +248,9 @@ export function spawnGmgnResult(args) {
               _rateLimitStrikes = 0; // a good response clears the escalation
               _binaryMissing = false;
               _authFailed = false;
+              // Recovered: re-arm the one-shot error logs so a later episode is logged again.
+              _binaryLogged = false;
+              _authLogged = false;
               resolve({ status: GMGN_STATUS.OK, data });
             } catch (e) {
               log("gmgn", `Parse error (${args.join(" ")}): ${e.message}`);

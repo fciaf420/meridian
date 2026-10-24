@@ -41,7 +41,7 @@ import {
   numOrNull, isStatUnpopulated, summarizeInfoRisk, summarizeSecurity, riskSnapshotFields, gmgnSetting,
   meteoraGateMode, meteoraGateThresholds,
 } from "./gmgn-policy.js";
-import { reportGmgnOutage, clearGmgnOutage } from "./gmgn-outage.js";
+import { reportGmgnOutage, clearGmgnOutage, recordGmgnCycle } from "./gmgn-outage.js";
 
 const CHAIN = "sol";
 const METEORA_DLMM_API = "https://dlmm.datapi.meteora.ag";
@@ -817,7 +817,6 @@ export async function discoverGmgnPools({ limit = 10, deps = {} } = {}) {
   const pools = [];
   for (const { token, info, infoCheck, holdersCheck, topPools, indicatorSignal, riskFields } of s5) {
     if (pools.length >= limit) break;
-    const mint = token.address;
     try {
       const { pool, detail: poolDetail } = await pickBestPool(topPools, d.fetchPoolDetail);
       if (!pool) { note(6, token, "pool selection failed"); continue; }
@@ -874,22 +873,30 @@ export function gmgnGatesAvailable(cfg = config) {
  *                       gmgn_gate_would_drop (bool) + gmgn_gate_would_drop_reasons[] + _kind, recorded in
  *                       the signal snapshot so would-drop can be compared with realized outcomes per
  *                       origin before any hard gate exists.
+ *                       Candidates the gate did not get to (rate limit, finalist limit, shadow weight budget
+ *                       gmgn.meteoraShadowBudget) are recorded with gmgn_gate_would_drop: null (NOT evaluated).
  *   "hard"              unknown data drops the candidate for this cycle (fail closed); a rate limit
  *                       defers the rest (kind "deferred"), never passes.
  *   "off"               skipped.
  * Outage detector: gmgn-cli missing / bad key, or >= outageMinCandidates candidates whose token info
- * failed at the transport level (status error/empty) with none healthy => one notification per outage
+ * failed at the transport level (status error; EMPTY "not found" does not count) with none healthy, or
+ * ANY number of candidates (>=1) all failing that way over 2 consecutive cycles => one notification per outage
  * (tools/gmgn-outage.js) and `outage: true` on the result. In hard mode the cycle still fails closed.
  * Skipped entirely (candidates pass untouched) when no GMGN key is configured or mode is "off".
  */
 export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {} } = {}) {
   const d = { ...defaultDeps(deps.cfg || config), ...deps };
-  const input = Array.isArray(pools) ? pools : [];
+  let input = Array.isArray(pools) ? pools : [];
   if (!deps.force && !gmgnGatesAvailable(d.cfg)) return { kept: input, dropped: [], would_drop: [], rate_limited: false, skipped: true, mode: "off", outage: false };
 
   const mode = deps.mode || meteoraGateMode(d.cfg);
   const shadow = mode === "shadow";
   const g = meteoraGateThresholds(d.cfg);
+  // Best candidates first (Darwin/score order, injected by the caller): the weight-limited Phase B and
+  // rate-limit deferral then verify the pools most likely to be picked, not whatever came first.
+  if (typeof deps.rankFn === "function") {
+    try { input = deps.rankFn(input) || input; } catch { /* keep discovery order */ }
+  }
   const dropped = [];
   const wouldDrop = [];
   const label = (p) => p.base?.symbol || p.name || p.pool;
@@ -898,13 +905,23 @@ export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {}
   let rateLimited = false;
   let healthyInfo = 0;
   let transportFailures = 0;
+  let emptyAnswers = 0;
   let evaluated = 0;
   let preGated = 0;
+  // Shadow-mode weight budget (hard mode is unbudgeted: it gates real deploys).
+  const shadowBudget = shadow ? Number(gmgnSetting(d.cfg, "meteoraShadowBudget")) : Infinity;
+  const budgetOn = Number.isFinite(shadowBudget) && shadowBudget >= 0;
+  let spent = 0;
+  const canSpend = (w) => !budgetOn || spent + w <= shadowBudget;
 
   // Hard mode drops; shadow mode keeps the candidate and records what hard mode would have done.
   const reject = (p, reason, kind, extra = {}) => {
     const entry = { pool: p.pool, symbol: label(p), source: "meteora", reason, kind };
-    if (shadow) {
+    if (shadow && kind === "deferred") {
+      // Never evaluated (rate limit / weight limit / shadow budget): NOT a would-drop verdict.
+      out.push({ ...p, gmgn_gate_would_drop: null, gmgn_gate_would_drop_reasons: [String(reason)], gmgn_gate_would_drop_kind: kind, ...extra });
+      log("gmgn_gate", `SHADOW not evaluated ${label(p)} (${(p.pool || "").slice(0, 8)}) [deferred]: ${reason}`);
+    } else if (shadow) {
       wouldDrop.push(entry);
       out.push({ ...p, gmgn_gate_would_drop: true, gmgn_gate_would_drop_reasons: String(reason).split(", "), gmgn_gate_would_drop_kind: kind, ...extra });
       log("gmgn_gate", `SHADOW would drop ${label(p)} (${(p.pool || "").slice(0, 8)}) [${kind}]: ${reason}`);
@@ -920,7 +937,12 @@ export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {}
     if (p.gmgn || p.gmgn_gated) { out.push(p); preGated += 1; continue; }
     const mint = p.base?.mint;
     if (!mint) { reject(p, "no base mint to check (fail closed)", "unknown"); continue; }
+    if (!canSpend(1)) {
+      for (const rest of input.slice(i)) if (!(rest.gmgn || rest.gmgn_gated)) reject(rest, "shadow GMGN weight budget reached (not evaluated)", "deferred");
+      break;
+    }
     evaluated += 1;
+    spent += 1;
     const infoRes = await d.fetchInfo(mint);
     if (infoRes.status === GMGN_STATUS.RATE_LIMITED) {
       rateLimited = true;
@@ -928,7 +950,9 @@ export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {}
       break;
     }
     if (!infoRes.info) {
-      if (infoRes.status === GMGN_STATUS.ERROR || infoRes.status === GMGN_STATUS.EMPTY) transportFailures += 1;
+      // Only a transport ERROR is evidence of an outage; EMPTY is GMGN answering "not found" for this token.
+      if (infoRes.status === GMGN_STATUS.ERROR) transportFailures += 1;
+      else if (infoRes.status === GMGN_STATUS.EMPTY) emptyAnswers += 1;
       reject(p, `token info unavailable (${infoRes.status}) (fail closed)`, "unknown");
       continue;
     }
@@ -945,8 +969,13 @@ export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {}
   let outageReason = null;
   if (transport.binaryMissing) outageReason = "gmgn-cli is missing (ENOENT)";
   else if (transport.authFailed) outageReason = "GMGN rejected the API key (401)";
-  else if (evaluated >= minN && healthyInfo === 0 && transportFailures >= minN && transportFailures === evaluated) {
-    outageReason = `${transportFailures}/${evaluated} token-info lookups failed with no data (gmgn-cli broken or unreachable)`;
+  else if (!rateLimited && evaluated > 0) {
+    // All evaluated lookups failed at the transport level (EMPTY "not found" answers are not failures).
+    const allFailed = healthyInfo === 0 && emptyAnswers === 0 && transportFailures === evaluated;
+    const consecutive = recordGmgnCycle(allFailed);
+    if (allFailed && (evaluated >= minN || consecutive >= 2)) {
+      outageReason = `${transportFailures}/${evaluated} token-info lookups failed with no data (gmgn-cli broken or unreachable)${evaluated < minN ? ` for ${consecutive} consecutive cycles` : ""}`;
+    }
   }
   if (outageReason && !rateLimited) {
     outage = true;
@@ -960,10 +989,11 @@ export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {}
   let verified = 0;
   for (let i = 0; i < pending.length; i++) {
     const { p, info, check } = pending[i];
-    if (rateLimited || verified >= need) {
-      reject(p, rateLimited ? "GMGN rate limited (retry next cycle)" : "not needed this cycle (limit reached)", "deferred");
+    if (rateLimited || verified >= need || !canSpend(6)) {
+      reject(p, rateLimited ? "GMGN rate limited (retry next cycle)" : verified >= need ? "not needed this cycle (limit reached)" : "shadow GMGN weight budget reached (not evaluated)", "deferred");
       continue;
     }
+    spent += 6; // security (1) + holders (5)
     const mint = p.base.mint;
     const sec = await d.fetchSecurity(mint);
     const hRes = sec.status === GMGN_STATUS.RATE_LIMITED
@@ -1001,7 +1031,7 @@ export async function gateMeteoraSourceCandidates(pools, { limit = 10, deps = {}
       ...riskFields,
     });
   }
-  log("gmgn_gate", `Meteora-source GMGN gate [${mode}]: ${input.length} in → ${out.length} kept, ${dropped.length} dropped, ${wouldDrop.length} would-drop${rateLimited ? " (GMGN rate limited)" : ""}${outage ? " (OUTAGE)" : ""}`);
+  log("gmgn_gate", `Meteora-source GMGN gate [${mode}]: ${input.length} in → ${out.length} kept, ${dropped.length} dropped, ${wouldDrop.length} would-drop, weight≈${spent}${rateLimited ? " (GMGN rate limited)" : ""}${outage ? " (OUTAGE)" : ""}`);
   return { kept: out, dropped, would_drop: wouldDrop, rate_limited: rateLimited, skipped: false, mode, outage };
 }
 

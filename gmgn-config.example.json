@@ -30,6 +30,7 @@
   "plan": "free",
   "finalistLimit": 5,
   "gateMeteoraSource": "shadow",
+  "meteoraShadowBudget": 30,
   "meteoraGate": { "minHolders": 200, "minTotalFeeSol": null, "maxTop10HolderRate": 0.6 },
   "maxRugRatio": 0.3,
   "maxSniperCount": 20,

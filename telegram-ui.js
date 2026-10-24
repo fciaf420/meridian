@@ -2412,9 +2412,9 @@ export function createTelegramUI(deps) {
       "📡 <b>GMGN outage</b>",
       escapeHtml(String(d.reason ?? "GMGN data unavailable").slice(0, 400)),
     ].join("\n"), [[btn("🧯 Recent errors", "er!")]]),
-    // Every screening candidate was hard-skipped because fee data could not be fetched.
+    // Most screening candidates were hard-skipped because fee data could not be fetched.
     fee_data_down: (d) => alert("fee_data_down", "fees", 60 * 60_000, [
-      "💸 <b>Fee data unavailable — no deploys</b>",
+      "💸 <b>Fee data unavailable — most candidates skipped</b>",
       escapeHtml(String(d.reason ?? "").slice(0, 400)),
     ].join("\n"), [[btn("🧯 Recent errors", "er!")]]),
     cycle_error: (d) => alert("cycle_error", `${d.cycle}:${String(d.error).slice(0, 60)}`, 15 * 60_000,

@@ -1,4 +1,4 @@
-import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
+import { discoverPools, getPoolDetail, getTopCandidatesForTool } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
@@ -41,7 +41,7 @@ export function registerCronRestarter(fn) { _cronRestarter = fn; }
 // Map tool names to implementations
 const toolMap = {
   discover_pools: discoverPools,
-  get_top_candidates: getTopCandidates,
+  get_top_candidates: getTopCandidatesForTool, // shadow-gate verdict stripped: shadow stays a pure log
   get_pool_detail: getPoolDetail,
   get_position_pnl: getPositionPnl,
   get_active_bin: getActiveBin,

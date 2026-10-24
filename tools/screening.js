@@ -94,10 +94,49 @@ export async function discoverPools({
 const _topInflight = new Map();
 export function getTopCandidates({ limit = 10 } = {}) {
   const key = String(limit);
-  if (_topInflight.has(key)) return _topInflight.get(key);
-  const p = getTopCandidatesUncached({ limit }).finally(() => _topInflight.delete(key));
-  _topInflight.set(key, p);
-  return p;
+  let p = _topInflight.get(key);
+  if (!p) {
+    p = getTopCandidatesUncached({ limit }).finally(() => _topInflight.delete(key));
+    _topInflight.set(key, p);
+  }
+  // Each caller gets its own candidate objects (callers attach _gmgnResult etc. in place).
+  return p.then((r) => (r && Array.isArray(r.candidates) ? { ...r, candidates: r.candidates.map((c) => ({ ...c })) } : r));
+}
+
+/** Shadow-gate verdict keys: pure log data, never shown to the LLM (it would turn shadow into a soft gate). */
+const SHADOW_GATE_KEYS = ["gmgn_gate_would_drop", "gmgn_gate_would_drop_reasons", "gmgn_gate_would_drop_kind"];
+
+/** Copy of a candidate without the shadow-gate verdict (the log-only nested block is also removed). */
+export function stripShadowGateFields(candidate) {
+  if (!candidate || typeof candidate !== "object") return candidate;
+  const c = { ...candidate };
+  for (const k of SHADOW_GATE_KEYS) delete c[k];
+  if (c.gmgn_risk_log_only && typeof c.gmgn_risk_log_only === "object") {
+    c.gmgn_risk_log_only = { ...c.gmgn_risk_log_only };
+    for (const k of SHADOW_GATE_KEYS) delete c.gmgn_risk_log_only[k];
+  }
+  return c;
+}
+
+/** get_top_candidates as exposed to the LLM tool layer: same data, shadow-gate fields removed. */
+export async function getTopCandidatesForTool(args = {}) {
+  const r = await getTopCandidates(args);
+  if (!r || !Array.isArray(r.candidates)) return r;
+  const { gmgn_gate_would_drop, ...rest } = r; // eslint-disable-line no-unused-vars
+  return { ...rest, candidates: r.candidates.map(stripShadowGateFields) };
+}
+
+/**
+ * Gate-module crash handler (exported for tests). Hard mode: do not wave non-GMGN candidates through.
+ * Shadow mode never drops, so keep them. Either way the operator hears once.
+ */
+export async function handleGateCrash(error, open, { mode = meteoraGateMode(config), report } = {}) {
+  log("gmgn_gate", `Safety gate failed (${error?.message || error}); ${mode === "hard" ? "dropping non-GMGN candidates this cycle" : "shadow mode: keeping candidates"}`);
+  try {
+    const fn = report || (await import("./gmgn-outage.js")).reportGmgnOutage;
+    fn(`Meteora-source GMGN gate crashed: ${String(error?.message || error).slice(0, 160)}`);
+  } catch { /* best effort */ }
+  return mode === "hard" ? open.filter((p) => p.gmgn || p.gmgn_gated) : open;
 }
 
 async function getTopCandidatesUncached({ limit = 10 } = {}) {
@@ -157,17 +196,11 @@ async function getTopCandidatesUncached({ limit = 10 } = {}) {
   let gmgnGate = null;
   try {
     const { gateMeteoraSourceCandidates } = await import("./gmgn-screen.js");
-    gmgnGate = await gateMeteoraSourceCandidates(open, { limit });
+    // Darwin-rank first so the weight-limited gate verifies the pools most likely to be picked.
+    gmgnGate = await gateMeteoraSourceCandidates(open, { limit, deps: { rankFn: rankCandidatesByDarwin } });
     open = gmgnGate.kept;
   } catch (e) {
-    // The gate module itself failing is unknown data. Hard mode: do not wave candidates through.
-    // Shadow mode (default) never drops, so keep them; either way the operator hears once.
-    log("gmgn_gate", `Safety gate failed (${e?.message || e}); ${meteoraGateMode(config) === "hard" ? "dropping non-GMGN candidates this cycle" : "shadow mode: keeping candidates"}`);
-    try {
-      const { reportGmgnOutage } = await import("./gmgn-outage.js");
-      reportGmgnOutage(`Meteora-source GMGN gate crashed: ${String(e?.message || e).slice(0, 160)}`);
-    } catch { /* best effort */ }
-    if (meteoraGateMode(config) === "hard") open = open.filter((p) => p.gmgn || p.gmgn_gated);
+    open = await handleGateCrash(e, open);
   }
 
   const eligible = rankCandidatesByDarwin(open);
@@ -256,7 +289,7 @@ const GMGN_RISK_LOG_KEYS = [
 ];
 
 function gmgnRiskLogOnly(c) {
-  if (c?.gmgn_security_status == null && c?.gmgn_gate_would_drop == null) return null;
+  if (c?.gmgn_security_status == null && c?.gmgn_gate_would_drop == null && c?.gmgn_gate_would_drop_kind == null) return null;
   const out = {};
   for (const k of GMGN_RISK_LOG_KEYS) if (c[k] !== undefined) out[k] = c[k];
   return out;

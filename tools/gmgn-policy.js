@@ -28,6 +28,10 @@ export const GMGN_FIX_DEFAULTS = Object.freeze({
   // Meteora-source GMGN gating mode: "shadow" (default: evaluate + record gmgn_gate_would_drop,
   // never drop), "hard" (drop), or "off". Booleans map true -> "hard", false -> "off".
   gateMeteoraSource: "shadow",
+  // Max GMGN request weight a shadow-mode Meteora-source gate may spend per screening cycle (info=1,
+  // security=1, holders=5). Shadow mode only records would-drop data, so it must not eat the rate
+  // budget the GMGN pipeline / enrichment needs. Hard mode is unbudgeted (it gates real deploys).
+  meteoraShadowBudget: 30,
   outageMinCandidates: 3,  // all-unknown (transport-failed) candidates in one cycle that count as an outage
 });
 

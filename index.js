@@ -51,7 +51,7 @@ import { buildSettingsReport } from "./settings-report.js";
 import { handleAutoresearchCommand, autoresearchTelegramChunks } from "./autoresearch.js";
 import {
   getScreeningThresholdSummary, getStartupMode, screeningCronGate,
-  classifyGlobalFeesUnknown, globalFeesHardSkipReason, allSkippedForFeeFetchFailure,
+  classifyGlobalFeesUnknown, globalFeesHardSkipReason, evaluateFeeDataOutage,
 } from "./runtime-helpers.js";
 import { getRangeSelectionText, evilPandaCandidateText, evilPandaGuideLine, buildManagementGoal, formatRunnerPrecheck } from "./prompt.js";
 import { shouldFileObservations, getKbStats, migrateFromJson, kbRecallForScreening, kbRecallForManagement, fileScreeningResult } from "./knowledge-base.js";
@@ -432,7 +432,7 @@ async function screeningCycleBody() {
       // Hard skips are threshold checks on pre-loaded data: drop failing candidates in
       // code so the model only judges the survivors (narrative, momentum, pick-or-skip).
       // Unknown global_fees_sol fails CLOSED (skip); other unknown values (e.g. top10 null) do not skip
-      // here and the model still sees them. A fee-fetch outage that skips everything raises one alert below.
+      // here and the model still sees them. A fee-fetch outage hitting most candidates raises one alert below.
       const hardSkipReason = (c) => {
         const feeReason = globalFeesHardSkipReason(c, config.screening.minTokenFeesSol);
         if (feeReason) return feeReason;
@@ -447,8 +447,9 @@ async function screeningCycleBody() {
         else survivors.push(c);
       }
       if (hardSkipped.length > 0) log("cron", `Screening hard-skipped in code: ${hardSkipped.join("; ")}`);
-      if (survivors.length === 0 && allSkippedForFeeFetchFailure(rankedCandidates)) {
-        emit("fee_data_down", { reason: `global_fees fetch failed for all ${rankedCandidates.length} candidate(s) (Meteora datapi holders / Jupiter fee data); no deploys until it recovers.` });
+      const feeOutage = evaluateFeeDataOutage(rankedCandidates, { ratio: config.screening.feeDataDownRatio });
+      if (feeOutage.notify) {
+        emit("fee_data_down", { reason: `global_fees fetch failed for ${feeOutage.failed}/${feeOutage.total} candidate(s) (Meteora datapi holders / Jupiter fee data); those are skipped (fail closed) until it recovers.` });
       }
       const validBlocks = survivors
         .map((c) => blockMap.get(c.pool))
@@ -532,7 +533,7 @@ SCREENING CYCLE — DEPLOY ONLY${signalWeightsBlock}${kbScreenContext}${candidat
 ${strategyBlock}
 ${candidateBlocks ? `The candidates above are PRE-LOADED with smart wallet, holder, narrative, memory, and GMGN signal data.
 Evaluate them directly — no need to call get_top_candidates, check_smart_wallets_on_pool, get_token_holders, or get_token_narrative again.
-HARD SKIP rules still apply (code has already dropped candidates whose known global_fees_sol or top_10 value fails the first two):
+HARD SKIP rules still apply (code has already dropped candidates whose global_fees_sol is below the minimum or UNKNOWN (fail closed), or whose known top_10 value fails the second):
 - global_fees_sol < ${config.screening.minTokenFeesSol} SOL → skip (bundled/scam)
 - top_10_real_holders_pct > 60% OR bundlers > 30% → skip
 - No smart wallets or GMGN confirmation + empty/hype narrative → skip

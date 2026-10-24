@@ -88,6 +88,7 @@ export const config = {
     maxPriceChangePct: u.maxPriceChangePct ?? 300,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
+    feeDataDownRatio:  u.feeDataDownRatio  ?? 0.8,   // share of candidates with a FAILED fee fetch that raises fee_data_down (once per outage)
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     athTopThresholdPct: u.athTopThresholdPct ?? 90,
     minTokenAgeHours:  u.minTokenAgeHours  ?? null, // null = no minimum (token age from GMGN creation_timestamp)
@@ -138,6 +139,8 @@ export const config = {
     // Separate thresholds for the Meteora-source gate (see METEORA_GATE_DEFAULTS in tools/gmgn-policy.js).
     meteoraGate:       (gmgnUserConfig.meteoraGate && typeof gmgnUserConfig.meteoraGate === "object") ? gmgnUserConfig.meteoraGate : {},
     outageMinCandidates: gmgnValue("outageMinCandidates", "gmgnOutageMinCandidates", 3),
+    // Max GMGN weight the SHADOW Meteora-source gate may spend per cycle (hard mode is unbudgeted).
+    meteoraShadowBudget: gmgnValue("meteoraShadowBudget", "gmgnMeteoraShadowBudget", 30),
     // Stage-3 holders/traders enrichment + KOL config
     holdersLimit:           gmgnValue("holdersLimit",           "gmgnHoldersLimit",           100),
     maxSniperHoldRate:      gmgnValue("maxSniperHoldRate",      "gmgnMaxSniperHoldRate",      0.3),
