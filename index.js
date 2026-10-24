@@ -5,7 +5,10 @@ import cron from "node-cron";
 import readline from "readline";
 import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./agent.js";
 import { log, enableLogPathFile } from "./logger.js";
-import { getMyPositions, isCloseInflight, getInflightCloses } from "./tools/dlmm.js";
+import { getMyPositions, isCloseInflight, getInflightCloses, positionAccountExists } from "./tools/dlmm.js";
+import { acquireInstanceLock } from "./instance-lock.js";
+import { reconcileAttempts } from "./deploy-checkpoint.js";
+import { activeRpcHosts, formatRpcHosts } from "./rpc-hosts.js";
 import { llmHealth, isLlmUnavailableError } from "./llm-health.js";
 import { runManagementWithOorFallback, formatOorFallbackReport } from "./oor-fallback.js";
 import { getPositionBins } from "./tools/bin-visual.js";
@@ -65,14 +68,41 @@ installCrashHandlers({
 });
 
 // Let operators find this process and its log without guessing (ops/README.md).
+// logs/bot.pid doubles as the single-instance lock: a second bot on the same
+// wallet would double-deploy and double-close, so refuse to start while the
+// first is alive. A stale pidfile (crash, reboot, recycled pid) is reclaimed.
+// MERIDIAN_SKIP_INSTANCE_LOCK=1 bypasses the lock (tests / deliberate overrides).
 const PID_FILE = path.join("logs", "bot.pid");
 try {
   fs.mkdirSync("logs", { recursive: true });
-  fs.writeFileSync(PID_FILE, `${process.pid}\n`);
+  if (process.env.MERIDIAN_SKIP_INSTANCE_LOCK === "1") {
+    fs.writeFileSync(PID_FILE, `${process.pid}\n`);
+    log("startup_warn", "Instance lock bypassed (MERIDIAN_SKIP_INSTANCE_LOCK=1)");
+  } else {
+    acquireInstanceLock(PID_FILE, { log: (m) => log("startup_warn", m) });
+  }
   enableLogPathFile(path.join("logs", "bot.logpath"));
 } catch (e) {
+  if (e.code === "INSTANCE_LOCKED") {
+    log("startup_error", e.message);
+    console.error(e.message);
+    process.exit(1);
+  }
   log("startup_warn", `Could not write logs/bot.pid / logs/bot.logpath: ${e.message}`);
 }
+log("startup", `RPC hosts: ${formatRpcHosts()}`);
+
+// Reconcile deploys interrupted by a crash (checkpoint still "submitting")
+// against the chain. Until this finishes, re-entry into those pools/tokens stays
+// blocked (deploy-checkpoint findBlockingAttempt), so it need not delay startup.
+reconcileAttempts({
+  positionExists: positionAccountExists,
+  notify: async (results) => {
+    const lines = results.map(({ attempt, outcome }) =>
+      `${outcome === "landed" ? "⚠️ position EXISTS" : outcome === "absent" ? "no position created" : "❓ unverified"}: pool ${String(attempt.pool).slice(0, 8)} pos ${String(attempt.position).slice(0, 8)}`);
+    if (telegramEnabled()) await sendMessage(`Interrupted deploy(s) reconciled on boot:\n${lines.join("\n")}`);
+  },
+}).catch((e) => log("startup_warn", `Deploy-attempt reconcile failed: ${e.message}`));
 
 // One-time lesson dedup on startup
 deduplicateLessons();
@@ -907,13 +937,22 @@ const shutdownController = createShutdownController({
   onDrained: async () => {
     const positions = await getMyPositions().catch(() => null);
     log("shutdown", `Open positions at shutdown: ${positions?.total_positions ?? "unknown"}`);
+    // Liveness: tell the owner the bot is going down (bounded, never blocks exit).
+    if (telegramEnabled()) {
+      await Promise.race([
+        sendMessage(`🛑 Meridian stopped (${lastShutdownSignal}) — open positions: ${positions?.total_positions ?? "unknown"}`),
+        new Promise((r) => setTimeout(r, 3000)),
+      ]).catch(() => {});
+    }
     try {
       if (fs.readFileSync(PID_FILE, "utf8").trim() === String(process.pid)) fs.unlinkSync(PID_FILE);
     } catch { /* already gone */ }
   },
 });
 
+let lastShutdownSignal = "signal";
 function shutdown(signal, opts) {
+  if (!shutdownController.isShuttingDown()) lastShutdownSignal = signal;
   return shutdownController.handleSignal(signal, opts);
 }
 
@@ -1147,6 +1186,7 @@ const tgUI = createTelegramUI({
     screeningBusy: isScreeningBusy(),
     cronStarted,
     usdcMode: usdcModeEnabled(),
+    rpcHosts: formatRpcHosts(activeRpcHosts()), // hostnames only, never keys
   }),
   buildSettingsReport: () => buildSettingsReportSync(),
   handleAutoresearchCommand: (args) => handleAutoresearchCommand(args),
@@ -1160,10 +1200,17 @@ const telegramHandlers = {
   onCallback: (data, ctx) => tgUI.handleCallback(data, ctx),
 };
 
+let startupAnnounced = false;
 function startTelegram() {
   if (!telegramEnabled()) return;
   setMyCommands(BOT_COMMANDS).catch(() => {}); // best-effort
   startPolling(telegramHandlers);
+  // Liveness: a restart (crash loop, launchd, manual) is visible in the chat.
+  if (!startupAnnounced) {
+    startupAnnounced = true;
+    sendMessage(`🟢 Meridian started — ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}, pid ${process.pid}, strategy ${config.strategy.activeStrategy ?? config.strategy.strategy}, RPC ${formatRpcHosts()}`)
+      .catch(() => {});
+  }
 }
 
 async function handleTelegramCommand(rawText, ctx = {}) {

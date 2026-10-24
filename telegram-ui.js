@@ -515,6 +515,7 @@ export function renderStatus(info, now = Date.now()) {
     `Screening: every ${info.screeningIntervalMin}m · ${info.paused ? "<b>⏸ PAUSED</b>" : info.screeningBusy ? "running" : `next in ${escapeHtml(info.nextScreening ?? "?")}`}`,
     `PnL watcher: every ${info.pnlWatcherIntervalSec ?? "?"}s (runs while paused)`,
     `Autonomous cycles: ${info.cronStarted ? "running" : "not started"}${info.busy ? " · ⏳ action in progress" : ""}`,
+    ...(info.rpcHosts ? [`RPC: <code>${escapeHtml(info.rpcHosts)}</code> (resolved at boot)`] : []),
   ];
   for (const [label, c] of [["management", info.lastManagement], ["screening", info.lastScreening]]) {
     lines.push("", `<b>Last ${label}</b> (${fmtAgo(c?.at, now)}):`);
