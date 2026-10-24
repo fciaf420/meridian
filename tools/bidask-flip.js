@@ -23,6 +23,14 @@
  *  - "shadow": compute the plan, build + simulateTransaction it, log; never signs
  *  - "live":   same, then send via the managed sender and verify on-chain
  *
+ * Known, intentional deviations from the design doc (both conservative):
+ *  - L4: no full re-arm when price trades back above the previous flip point, and
+ *    an OOR-down active bin (active < lower) holds rather than flipping [L..U].
+ *  - L5: management rule 5 (yield dead) is evaluated after the flip hook in the same
+ *    cycle, so a flip can immediately precede a close. It is net-zero value and
+ *    costs only the tx fee; moving the hook after rule evaluation would mean
+ *    restructuring the management pass for no safety gain.
+ *
  * Pure helpers (planBidAskFlip, computeFill, buildFlipParams, ...) take plain
  * data so they are unit-testable without RPC.
  */
@@ -47,6 +55,20 @@ export const FLIP_SLIPPAGE_PCT = 1;
 // 202-bin flip hit the 1.4M CU ceiling (ProgramFailedToComplete). One tx may
 // therefore touch at most this many (withdraw bins + deposit bins).
 export const MAX_BIN_OPS_PER_TX = 200;
+// M3: a flip must be worth at least this many times its estimated tx cost.
+export const COST_FLOOR_MULT = 25;
+// Per tx: 5,000 base fee + 5,000 Sender tip (lamports); priority fee is capped by
+// management.maxPriorityFeeLamports (default 1,000,000, tools/tx-send.js).
+export const TX_BASE_PLUS_TIP_LAMPORTS = 10_000;
+export const DEFAULT_MAX_PRIORITY_FEE_LAMPORTS = 1_000_000;
+// Rent for a missing token-X ATA created by the SDK's pre-instruction
+// (165-byte classic account = 2,039,280; Token-2022 accounts are a little
+// larger, so use a conservative round figure).
+export const ATA_RENT_LAMPORTS = 2_100_000;
+const DLMM_PROGRAM_ID = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const ATA_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+// M2: max tolerated gap (percentage points) between on-chain and API PnL on a flipped position.
+export const FLIP_PNL_DIVERGENCE_PP = 2;
 const COOLDOWN_MS = 2 * 60_000;
 const WSOL = "So11111111111111111111111111111111111111112";
 
@@ -106,13 +128,42 @@ export function computeFill({ bins, activeId, decimalsX, decimalsY = 9, deposite
 }
 
 /**
+ * Estimated cost (lamports) of sending `chunks` flip txs: base fee + tip +
+ * worst-case priority fee each, plus ATA rent when an ATA will be created.
+ */
+export function estimateFlipCostLamports({ chunks = 1, maxPriorityFeeLamports = DEFAULT_MAX_PRIORITY_FEE_LAMPORTS, ataCreates = 0 } = {}) {
+  const prio = Number.isFinite(Number(maxPriorityFeeLamports)) ? Number(maxPriorityFeeLamports) : DEFAULT_MAX_PRIORITY_FEE_LAMPORTS;
+  return chunks * (TX_BASE_PLUS_TIP_LAMPORTS + prio) + ataCreates * ATA_RENT_LAMPORTS;
+}
+
+/**
+ * H1: strict eligibility. Only positions THIS bot deployed as a single-sided
+ * SOL Bid-Ask are flip candidates. Auto-adopted positions (which include the
+ * user's manual positions in the same wallet) get strategy "bid_ask" by default
+ * and bins_above null, so they must be excluded explicitly. Returns a blocker
+ * string, or null when eligible.
+ */
+export function flipEligibilityBlocker(tracked) {
+  if (!tracked) return "not tracked";
+  if (tracked.strategy !== "bid_ask") return `strategy ${tracked.strategy}`;
+  if (tracked.strategy_type !== "BidAsk") return `strategy_type ${tracked.strategy_type ?? "unset"} (not a bot BidAsk deploy)`;
+  if (tracked.adopted === true) return "auto-adopted position (not deployed by the bot)";
+  if (Number(tracked.bin_range?.bins_above) !== 0 || tracked.bin_range?.bins_above == null) return "bins_above is not an explicit 0";
+  if (!Number.isFinite(Number(tracked.bin_range?.max))) return "band top unknown";
+  if (Number(tracked.amount_x) > 0) return "deployed with token X (not single-sided SOL)";
+  return null;
+}
+
+/**
  * Should this tick's exit rules close the position? A flip never runs on a tick
  * where any close rule fires: the close path wins.
  */
 export function exitRuleFiresForFlip(p, tracked, mgmt = {}, { exitAlert = false } = {}) {
   if (exitAlert) return "exit alert (trailing TP / stop loss / strategy exit)";
   if (tracked?.instruction) return "rule 1: instruction";
-  if (p?.pnl_pct == null) return null;
+  // M1: with PnL unknown TP / SL / emergency cannot be evaluated; management
+  // treats "pnl unknown" as needing the LLM, so a flip must not proceed either.
+  if (p?.pnl_pct == null) return "pnl unknown — cannot evaluate exit rules";
   if (mgmt.takeProfitFeePct != null && p.pnl_pct >= mgmt.takeProfitFeePct) return "rule 3: take profit";
   if (mgmt.stopLossPct != null && p.pnl_pct <= mgmt.stopLossPct) return "stop loss";
   if (mgmt.emergencyPriceDropPct != null && p.pnl_pct <= mgmt.emergencyPriceDropPct) return "rule 6: emergency";
@@ -142,7 +193,8 @@ export function planBidAskFlip(input) {
   if (cfg.mode === "off") return hold("mode off");
   if (input.exitReason) return hold(`exit rule fires this tick (${input.exitReason}) — close path wins`);
   if (input.strategy && input.strategy !== "bid_ask") return hold(`not a bid_ask position (${input.strategy})`);
-  if (Number(input.binsAbove || 0) > 0) return hold("not single-sided (bins_above > 0)");
+  // H1: strict — null/undefined bins_above (adopted positions) is NOT single-sided.
+  if (input.binsAbove !== 0) return hold(`not single-sided (bins_above ${input.binsAbove ?? "unknown"})`);
   if (input.quoteIsSol === false) return hold("quote token is not SOL");
   if (input.tokenBlocker) return hold(`token blocked: ${input.tokenBlocker}`);
   if (![activeId, lowerBinId, upperBinId].every(Number.isFinite)) return hold("missing bin ids");
@@ -172,12 +224,21 @@ export function planBidAskFlip(input) {
   if (hi < lo) return hold("price above previous flip point — no fresh tranche", details);
   if (flips === 0 && fill.fillPct < cfg.fillPct) return hold(`fill ${fill.fillPct.toFixed(1)}% < ${cfg.fillPct}%`, details);
   if (flips > 0 && tranchePct < cfg.reflipStepPct) return hold(`fresh tranche ${tranchePct.toFixed(1)}% < re-flip step ${cfg.reflipStepPct}%`, details);
-  if (trancheSol < cfg.minTrancheSol) return hold(`tranche ${trancheSol.toFixed(4)} SOL < min ${cfg.minTrancheSol}`, details);
   const maxDelta = U - activeId;
   if (maxDelta < MIN_ASK_BINS) return hold(`ask would span ${maxDelta} bins (< ${MIN_ASK_BINS})`, details);
 
   const chunks = planFlipChunks({ bins, activeId, lo, hi, U, maxOps: input.maxBinOpsPerTx ?? MAX_BIN_OPS_PER_TX });
   if (!chunks.length) return hold("tranche too small after rounding haircut", details);
+  // M3: tranche floor = max(configured min, COST_FLOOR_MULT × estimated tx cost for this chunk count).
+  const costMult = Number.isFinite(input.costFloorMult) ? input.costFloorMult : COST_FLOOR_MULT;
+  const estCostLamports = estimateFlipCostLamports({ chunks: chunks.length, maxPriorityFeeLamports: input.maxPriorityFeeLamports });
+  const costFloorSol = (costMult * estCostLamports) / 1e9;
+  const minTranche = Math.max(cfg.minTrancheSol, costFloorSol);
+  details.estCostLamports = estCostLamports;
+  details.minTrancheSol = minTranche;
+  if (trancheSol < minTranche) {
+    return hold(`tranche ${trancheSol.toFixed(4)} SOL < min ${minTranche.toFixed(4)} (config ${cfg.minTrancheSol}, ${costMult}× est. cost of ${chunks.length} tx = ${costFloorSol.toFixed(4)})`, details);
+  }
   const depositX = chunks.reduce((s, c) => s + c.depositX, 0n);
 
   return {
@@ -287,6 +348,17 @@ export async function token2022Blocker(tokenX) {
   }
 }
 
+/**
+ * L7: the SDK's getEstimatedComputeUnitUsageWithBuffer console.error's
+ * "Transaction simulation failed" on every build before falling back. The CU ix
+ * is stripped anyway, so drop just that line instead of spamming bot logs.
+ */
+async function quietSdkSimNoise(fn) {
+  const orig = console.error;
+  console.error = (...a) => { if (/Transaction simulation failed/i.test(a.map((x) => String(x?.message ?? x)).join(" "))) return; orig.apply(console, a); };
+  try { return await fn(); } finally { console.error = orig; }
+}
+
 const isComputeBudgetIx = (ix) => ix?.programId?.toBase58?.() === "ComputeBudget111111111111111111111111111111";
 
 /**
@@ -309,13 +381,20 @@ export async function buildAtomicFlipIxs({ pool, positionPk, positionData, plan,
   if (resp.simulationResult.actualAmountYDeposited?.gtn?.(0) || resp.simulationResult.actualAmountXDeposited?.gtn?.(0)) {
     throw new Error("flip would pull tokens from the wallet (net deposit > 0) — refusing");
   }
-  const out = await pool.rebalancePosition(resp, new BN(0), rentPayer, FLIP_SLIPPAGE_PCT);
+  const out = await quietSdkSimNoise(() => pool.rebalancePosition(resp, new BN(0), rentPayer, FLIP_SLIPPAGE_PCT));
   if (!allowBinArrayInit && out.initBinArrayInstructions.length > 0) {
     throw new Error(`flip needs ${out.initBinArrayInstructions.length} bin-array init ix(s) — refusing`);
   }
   const all = out.rebalancePositionInstruction;
+  // L3: exactly one DLMM-program instruction (the rebalance_liquidity itself).
+  // A bitmap-extension init (or anything else DLMM) pushed into the pre-ixs
+  // would otherwise slip past the bin-array guards above.
+  const dlmmIxs = all.filter((ix) => ix?.programId?.toBase58?.() === DLMM_PROGRAM_ID);
+  if (dlmmIxs.length > 1) throw new Error(`flip build contains ${dlmmIxs.length} DLMM instructions (expected 1) — refusing`);
+  const ixs = all.filter((ix) => !isComputeBudgetIx(ix));
   return {
-    ixs: all.filter((ix) => !isComputeBudgetIx(ix)),
+    ataCreates: ixs.filter((ix) => ix?.programId?.toBase58?.() === ATA_PROGRAM_ID).length,
+    ixs,
     cuIx: all.find(isComputeBudgetIx) || null,
     resp,
     rentalCostLamports: rent ? rent.toString() : "0",
@@ -407,7 +486,8 @@ async function flipOne(p, ctx) {
   if (!p?.position || !p.pool) return null;
   const tracked = state.getTrackedPosition(p.position);
   if (!tracked || tracked.closed) return null;
-  if (tracked.strategy !== "bid_ask" || Number(tracked.bin_range?.bins_above || 0) > 0) return null; // silent: never applicable
+  // H1: only positions this bot deployed as single-sided SOL Bid-Ask; silent otherwise.
+  if (flipEligibilityBlocker(tracked)) return null;
   if (ctx.isBusy?.() || ctx.isCloseInflight?.(p.position)) return null;
 
   const exitReason = exitRuleFiresForFlip(p, tracked, ctx.config?.management || {}, { exitAlert: ctx.exitAlerts?.has?.(p.position) });
@@ -417,6 +497,17 @@ async function flipOne(p, ctx) {
   if (exitReason) {
     // Cheap: no RPC when the close path owns this tick.
     return { position: p.position, action: "hold", reason: `exit rule fires (${exitReason})` };
+  }
+
+  // M2: once a position has been flipped live, p.pnl_pct is the on-chain figure
+  // (tools/dlmm.js applyFlipOnchainPnl). If it still disagrees with the PnL API
+  // by more than FLIP_PNL_DIVERGENCE_PP, the API is booking the flip's
+  // withdraw+redeposit as flows (or one source is wrong): stop flipping.
+  if (!shadow && Number(tracked.bid_ask_flip?.flips) > 0 && Number.isFinite(p.pnl_api_pct) && Number.isFinite(p.pnl_pct)
+      && Math.abs(p.pnl_api_pct - p.pnl_pct) > FLIP_PNL_DIVERGENCE_PP) {
+    const reason = `PnL sources diverge after flip (on-chain ${p.pnl_pct}% vs API ${p.pnl_api_pct}%) — no further flips`;
+    log("bidask_flip", `${p.pair ?? "?"} ${String(p.position).slice(0, 8)}: ${reason}`);
+    return { position: p.position, action: "hold", reason };
   }
 
   const pool = await getPool(p.pool);
@@ -440,6 +531,7 @@ async function flipOne(p, ctx) {
     flipState,
     cfg,
     exitReason: null,
+    maxPriorityFeeLamports: ctx.config?.management?.maxPriorityFeeLamports,
     tokenBlocker: await token2022Blocker(pool.tokenX),
   });
   if (plan.action !== "flip") {
@@ -456,6 +548,19 @@ async function flipOne(p, ctx) {
     const b = await buildAtomicFlipIxs({ pool, positionPk, positionData: pd, plan, chunk, rentPayer: owner, sdk });
     const sim = await simulateFlipIxs(conn, b.ixs, owner);
     built.push({ chunk, ...b, simErr: sim?.value?.err ?? null, cu: sim?.value?.unitsConsumed ?? null });
+  }
+  // M3/M5: the SDK pre-ixs can create the owner's token-X ATA (≈0.002 SOL rent,
+  // seen on mainnet sim 38KS…). Count it in the cost floor and make it visible.
+  const ataCreates = built.reduce((n, b) => n + (b.ataCreates || 0), 0);
+  if (ataCreates > 0) {
+    const costSol = estimateFlipCostLamports({ chunks: built.length, maxPriorityFeeLamports: ctx.config?.management?.maxPriorityFeeLamports, ataCreates }) / 1e9;
+    const floorSol = COST_FLOOR_MULT * costSol;
+    log("bidask_flip", `${p.pair ?? "?"} ${String(p.position).slice(0, 8)}: flip creates ${ataCreates} token ATA(s) (~${(ataCreates * ATA_RENT_LAMPORTS / 1e9).toFixed(4)} SOL rent); est. total cost ${costSol.toFixed(4)} SOL`);
+    if (plan.trancheSol < floorSol) {
+      const reason = `tranche ${plan.trancheSol.toFixed(4)} SOL < ${COST_FLOOR_MULT}× est. cost incl. ATA rent (${floorSol.toFixed(4)})`;
+      log("bidask_flip", `[${cfg.mode}] ${formatFlipPlan(p.pair, p.position, plan)} — HOLD: ${reason}`);
+      return { position: p.position, action: "hold", reason, activeId: plan.activeId, flips: plan.flips, fill: plan.fill };
+    }
   }
   const simErr = built.find((b) => b.simErr)?.simErr ?? null;
   const cu = built.map((b) => b.cu);
@@ -484,9 +589,9 @@ async function flipOne(p, ctx) {
     log("bidask_flip", `[live] ${formatFlipPlan(p.pair, p.position, plan, extra)} — NOT sent (simulation failed)`);
     return { position: p.position, ...plan, simErr, cu, mode: "live", sent: false };
   }
-  const wallet = ctx.getWallet ? ctx.getWallet() : ctx.dlmm._getWalletForFlip();
+  const wallet = ctx.getWallet ? ctx.getWallet() : ctx.dlmm.getWalletForFlip();
   if (!wallet.publicKey.equals(owner)) throw new Error("position owner is not the bot wallet");
-  const sendTx = ctx.sendTx || ctx.dlmm._sendManagedTransactionForTest;
+  const sendTx = ctx.sendTx || ctx.dlmm.sendManagedTransactionForFlip;
   const { Transaction } = await import("@solana/web3.js");
   const sigs = [];
   let sendError = null;
@@ -520,21 +625,38 @@ async function flipOne(p, ctx) {
     await pool.refetchStates();
     const after = normalizeBins((await pool.getPosition(positionPk)).positionData.positionBinData);
     const before = normalizeBins(pd.positionBinData);
-    const ySame = before.filter((b) => b.binId <= plan.activeId).every((b) => {
+    // L2: only bins strictly below the active bin (the active bin's Y is moved by
+    // ordinary swaps), plus range unchanged. A mismatch is the only way to see an
+    // SDK-vs-program shrink divergence, so it alerts.
+    const ySame = before.filter((b) => b.binId < plan.activeId).every((b) => {
       const a = after.find((x) => x.binId === b.binId);
       return a && a.yRaw === b.yRaw;
     });
+    const afterPd = (await pool.getPosition(positionPk)).positionData;
+    const rangeSame = Number(afterPd.lowerBinId) === Number(pd.lowerBinId) && Number(afterPd.upperBinId) === Number(pd.upperBinId);
     const xAbove = after.filter((b) => b.binId > plan.activeId).reduce((s, b) => s + b.xRaw, 0n);
-    verified = { solBinsUntouched: ySame, xAboveActiveRaw: xAbove.toString() };
+    verified = { solBinsUntouched: ySame, rangeUnchanged: rangeSame, xAboveActiveRaw: xAbove.toString() };
+    if (!ySame || !rangeSame) {
+      const msg = `⚠️ Bid-Ask flip verify MISMATCH on ${p.pair ?? "?"} ${String(p.position).slice(0, 8)}: solBinsUntouched=${ySame} rangeUnchanged=${rangeSame}. Check the position manually.`;
+      log("bidask_flip", msg);
+      try { await (ctx.notify ? ctx.notify(msg) : (await import("../telegram.js")).sendMessage(msg)); } catch { /* alert is best-effort */ }
+    }
   } catch (e) {
     verified = { error: e.message };
   }
   const prev = tracked.bid_ask_flip || {};
   const pct = Math.round(plan.fill.fillPct * 10) / 10;
+  // L1: chunks run top-first. When only some landed, bins between active+1 and
+  // the lowest landed chunk are still unflipped, so the next fresh tranche must
+  // reach up to just below that chunk instead of being cut at the plan's active bin.
+  const landed = built.slice(0, sigs.length);
+  const lastFlipActiveBin = sigs.length < built.length
+    ? Math.min(...landed.map((b) => b.chunk.withdraw.minBinId)) - 1
+    : plan.activeId;
   state.updateTrackedPosition(p.position, {
     bid_ask_flip: {
       flips: plan.flips + 1,
-      last_flip_active_bin: plan.activeId,
+      last_flip_active_bin: lastFlipActiveBin,
       last_flip_fill_pct: pct,
       first_flip_fill_pct: prev.first_flip_fill_pct ?? pct,
       last_flip_at: new Date().toISOString(),

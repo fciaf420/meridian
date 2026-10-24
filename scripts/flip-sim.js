@@ -88,7 +88,7 @@ async function main() {
     decimalsX: decX, decimalsY: decY,
     depositedSol: arg("deposited-sol") != null ? Number(arg("deposited-sol")) : (tracked?.amount_sol ?? null),
     flipState: arg("last-flip-active") != null ? { flips: Number(arg("flips", 1)), last_flip_active_bin: Number(arg("last-flip-active")) } : {}, cfg: { mode: "shadow", fillPct: Number(arg("fill-pct", 0)), reflipStepPct: Number(arg("reflip-step", 20)), minTrancheSol: Number(arg("min-tranche", 0)) },
-    exitReason: null, tokenBlocker: await token2022Blocker(pool.tokenX),
+    exitReason: null, costFloorMult: Number(arg("cost-floor-mult", 0)), tokenBlocker: await token2022Blocker(pool.tokenX),
   });
 
   const report = {

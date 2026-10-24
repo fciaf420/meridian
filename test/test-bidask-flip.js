@@ -22,7 +22,7 @@ const sdk = await import("@meteora-ag/dlmm");
 const flip = await import(new URL("../tools/bidask-flip.js", import.meta.url));
 const {
   planBidAskFlip, planFlipChunks, computeFill, normalizeBins, normalizeFlipConfig, buildFlipParams,
-  exitRuleFiresForFlip, buildAtomicFlipIxs, runBidAskFlips, flipCloseTags, token2022Blocker, MAX_BIN_OPS_PER_TX, MIN_ASK_BINS,
+  exitRuleFiresForFlip, flipEligibilityBlocker, estimateFlipCostLamports, buildAtomicFlipIxs, runBidAskFlips, flipCloseTags, token2022Blocker, MAX_BIN_OPS_PER_TX, MIN_ASK_BINS,
 } = flip;
 
 const WSOL = "So11111111111111111111111111111111111111112";
@@ -268,8 +268,8 @@ const CB = new PublicKey("ComputeBudget111111111111111111111111111111");
 const fakeIx = () => new TransactionInstruction({ programId: PROG, keys: [{ pubkey: OWNER, isSigner: true, isWritable: true }], data: Buffer.from([1]) });
 const cuIx = () => new TransactionInstruction({ programId: CB, keys: [], data: Buffer.from([2, 0, 0, 0, 0]) });
 
-function fakePool({ active = -460, rent = 0, binArrayCount = 0, initIxs = 0, netDepositX = 0, simActive = active, b = band({ active }), simErr = null } = {}) {
-  const calls = { rebalance: 0, simulate: 0 };
+function fakePool({ active = -460, rent = 0, binArrayCount = 0, initIxs = 0, netDepositX = 0, simActive = active, b = band({ active }), simErr = null, extraPre = [], extraPost = [], extraDlmm = 0, getBand = null } = {}) {
+  const calls = { rebalance: 0, simulate: 0, getPosition: 0 };
   return {
     calls,
     lbPair: { activeId: active, binStep: BIN_STEP },
@@ -277,7 +277,9 @@ function fakePool({ active = -460, rent = 0, binArrayCount = 0, initIxs = 0, net
     tokenY: { publicKey: new PublicKey(WSOL), mint: { decimals: DEC_Y } },
     async refetchStates() {},
     async getPosition() {
-      return { positionData: { owner: OWNER, lowerBinId: b.L, upperBinId: b.U, positionBinData: b.bins.map((x) => ({ binId: x.binId, positionXAmount: x.xRaw.toString(), positionYAmount: x.yRaw.toString(), pricePerToken: String(x.price) })) } };
+      calls.getPosition++;
+      const b2 = getBand ? getBand(calls) : b;
+      return { positionData: { owner: OWNER, lowerBinId: b2.L, upperBinId: b2.U, positionBinData: b2.bins.map((x) => ({ binId: x.binId, positionXAmount: x.xRaw.toString(), positionYAmount: x.yRaw.toString(), pricePerToken: String(x.price) })) } };
     },
     async simulateRebalancePosition() {
       return {
@@ -288,7 +290,7 @@ function fakePool({ active = -460, rent = 0, binArrayCount = 0, initIxs = 0, net
     },
     async rebalancePosition() {
       calls.rebalance++;
-      return { initBinArrayInstructions: Array.from({ length: initIxs }, fakeIx), rebalancePositionInstruction: [cuIx(), fakeIx()] };
+      return { initBinArrayInstructions: Array.from({ length: initIxs }, fakeIx), rebalancePositionInstruction: [cuIx(), ...extraPre, fakeIx(), ...Array.from({ length: extraDlmm }, fakeIx), ...extraPost] };
     },
     program: { provider: { connection: {
       async getLatestBlockhash() { return { blockhash: Keypair.generate().publicKey.toBase58() }; },
@@ -353,7 +355,7 @@ function hookDeps({ mode, tracked, pool, exitAlerts = new Set(), management = {}
 }
 
 const POS = Keypair.generate().publicKey.toBase58();
-const trackedBidAsk = (extra = {}) => ({ position: POS, strategy: "bid_ask", bin_range: { min: -500, max: -400, bins_above: 0 }, amount_sol: band({ active: -460 }).depositedSol, ...extra });
+const trackedBidAsk = (extra = {}) => ({ position: POS, strategy: "bid_ask", strategy_type: "BidAsk", bin_range: { min: -500, max: -400, bins_above: 0 }, amount_sol: band({ active: -460 }).depositedSol, ...extra });
 const posRow = (extra = {}) => ({ position: POS, pool: Keypair.generate().publicKey.toBase58(), pair: "TEST-SOL", pnl_pct: -3, ...extra });
 
 test("hook: mode off does nothing", async () => {
@@ -439,4 +441,259 @@ test("close-record tags for flipped positions", () => {
   assert.deepEqual(flipCloseTags({}), {});
   assert.deepEqual(flipCloseTags({ bid_ask_flip: { flips: 2, first_flip_fill_pct: 31.2, last_flip_fill_pct: 55 } }), { flipped: true, flip_count: 2, flip_fill_pct: 31.2 });
   assert.deepEqual(flipCloseTags({ bid_ask_flip_shadow: { flips: 3 } }), {}, "shadow flips never tag a close as flipped");
+});
+
+// ───────────────────────── Fable 5.1 audit fixes ─────────────────────────
+
+test("H1: strict eligibility — adopted / non-BidAsk / unknown bins_above / token-X deploys are never flip candidates", () => {
+  assert.equal(flipEligibilityBlocker(trackedBidAsk()), null);
+  assert.match(flipEligibilityBlocker(trackedBidAsk({ adopted: true })), /adopted/);
+  assert.match(flipEligibilityBlocker(trackedBidAsk({ strategy_type: null })), /strategy_type/);
+  assert.match(flipEligibilityBlocker(trackedBidAsk({ strategy_type: "SpotOneSide" })), /strategy_type/);
+  assert.match(flipEligibilityBlocker(trackedBidAsk({ bin_range: { min: -500, max: -400, bins_above: null } })), /bins_above/);
+  assert.match(flipEligibilityBlocker(trackedBidAsk({ bin_range: { min: -500, max: -400 } })), /bins_above/);
+  assert.match(flipEligibilityBlocker(trackedBidAsk({ bin_range: { min: -500, bins_above: 0 } })), /band top/);
+  assert.match(flipEligibilityBlocker(trackedBidAsk({ amount_x: 5 })), /token X/);
+  assert.match(flipEligibilityBlocker(null), /not tracked/);
+  // planner is strict too
+  const b = band({ active: -460 });
+  for (const binsAbove of [null, undefined, 3]) assert.equal(planBidAskFlip(baseInput(b, { binsAbove })).action, "hold");
+  assert.equal(planBidAskFlip(baseInput(b, { binsAbove: 0 })).action, "flip");
+});
+
+test("H1: hook never touches RPC or sends for an auto-adopted bid_ask position (null bins_above)", async () => {
+  const pool = fakePool();
+  let poolReads = 0;
+  for (const tracked of [
+    trackedBidAsk({ adopted: true, strategy_type: null, bin_range: { min: -500, max: -400, bins_above: null } }),
+    trackedBidAsk({ adopted: true }),
+    trackedBidAsk({ bin_range: { min: -500, max: -400, bins_above: null } }),
+  ]) {
+    const h = hookDeps({ mode: "live", tracked, pool });
+    h.deps.getPool = async () => { poolReads++; return pool; };
+    assert.deepEqual(await runBidAskFlips([posRow()], h.deps), []);
+    assert.equal(h.sends.length, 0);
+  }
+  assert.equal(poolReads, 0);
+  assert.equal(pool.calls.rebalance, 0);
+});
+
+test("M1: unknown PnL holds the flip (no RPC, no send)", async () => {
+  assert.match(exitRuleFiresForFlip({ pnl_pct: null }, {}, {}), /pnl unknown/);
+  assert.match(exitRuleFiresForFlip({}, {}, {}), /pnl unknown/);
+  assert.equal(exitRuleFiresForFlip({ pnl_pct: 0 }, {}, {}), null);
+  const pool = fakePool();
+  let poolReads = 0;
+  const h = hookDeps({ mode: "live", tracked: trackedBidAsk(), pool });
+  h.deps.getPool = async () => { poolReads++; return pool; };
+  const [r] = await runBidAskFlips([posRow({ pnl_pct: null, pnl_unknown: true })], h.deps);
+  assert.equal(r.action, "hold");
+  assert.match(r.reason, /pnl unknown/);
+  assert.equal(poolReads, 0);
+  assert.equal(h.sends.length, 0);
+});
+
+test("M3: tranche floor scales with estimated tx cost × chunk count", () => {
+  assert.equal(estimateFlipCostLamports({ chunks: 3, maxPriorityFeeLamports: 1_000_000 }), 3 * 1_010_000);
+  assert.ok(estimateFlipCostLamports({ chunks: 1, maxPriorityFeeLamports: 0, ataCreates: 1 }) > 2_000_000);
+  // Same tranche: passes the configured 0.05 floor, but fails 25× cost of a 1-chunk flip at default prio (0.0253 SOL ok)…
+  const b = band({ active: -460, solPerUnit: 1_000_000n });
+  const inp = baseInput(b, { cfg: { mode: "shadow", fillPct: 30, reflipStepPct: 20, minTrancheSol: 0.001 } });
+  const ok = planBidAskFlip(inp);
+  assert.equal(ok.action, "flip");
+  assert.ok(ok.trancheSol > 0.0253);
+  // …and is held once priority fee ×25 exceeds the tranche (cost floor dominates the tiny configured min).
+  const held = planBidAskFlip({ ...inp, maxPriorityFeeLamports: 500_000_000 });
+  assert.equal(held.action, "hold");
+  assert.match(held.reason, /25× est\. cost/);
+  assert.ok(held.minTrancheSol > 0.001);
+  // chunk count is part of the floor: a chunked plan has a higher floor than a global one.
+  const wide = band({ L: -700, U: -300, active: -560, solPerUnit: 2_000_000n });
+  const pw = planBidAskFlip(baseInput(wide, { cfg: { mode: "shadow", fillPct: 30, reflipStepPct: 20, minTrancheSol: 0 } }));
+  assert.equal(pw.layout, "chunked");
+  assert.equal(pw.minTrancheSol, (25 * pw.chunks.length * 1_010_000) / 1e9);
+  // costFloorMult 0 disables it (used by the simulation harness only).
+  assert.equal(planBidAskFlip({ ...inp, maxPriorityFeeLamports: 500_000_000, costFloorMult: 0 }).action, "flip");
+});
+
+test("M3/M5: a flip that must create a token ATA counts the rent in its cost floor and logs it", async () => {
+  const ataIx = () => new TransactionInstruction({ programId: new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"), keys: [], data: Buffer.from([1]) });
+  // tranche ≈ 0.14 SOL clears 25×(1 tx) but not 25×(1 tx + ATA rent ≈ 0.0021 SOL → 0.0525... use bigger prio to tip it)
+  const pool = fakePool({ extraPre: [ataIx()] });
+  const h = hookDeps({ mode: "shadow", tracked: trackedBidAsk(), pool, management: { maxPriorityFeeLamports: 0 } });
+  const [r] = await runBidAskFlips([posRow()], h.deps);
+  assert.equal(r.action, "flip");
+  assert.ok(h.logs.some((l) => /creates 1 token ATA/.test(l)));
+  const h2 = hookDeps({ mode: "shadow", tracked: trackedBidAsk(), pool: fakePool({ extraPre: [ataIx()] }), management: { maxPriorityFeeLamports: 4_000_000 } });
+  const [r2] = await runBidAskFlips([posRow()], h2.deps);
+  assert.ok(r2.action === "hold" ? /incl\. ATA rent/.test(r2.reason) : r2.trancheSol >= 25 * (10_000 + 4_000_000 + 2_100_000) / 1e9);
+});
+
+test("L3: more than one DLMM-program instruction in the build is refused", async () => {
+  const b = band({ active: -460 });
+  const plan = planBidAskFlip(baseInput(b));
+  await assert.rejects(buildAtomicFlipIxs({ pool: fakePool({ extraDlmm: 1 }), positionPk: OWNER, positionData: {}, plan, rentPayer: OWNER, sdk }), /2 DLMM instructions/);
+});
+
+// ── M4: chunked live sequencing, partial failure, owner mismatch, pre/post ix retention ──
+const wideBand = () => band({ L: -700, U: -300, active: -560, solPerUnit: 2_000_000n });
+const trackedWide = (extra = {}) => ({ ...trackedBidAsk({ bin_range: { min: -700, max: -300, bins_above: 0 }, amount_sol: wideBand().depositedSol }), ...extra });
+
+test("M4: chunked live flip — each later chunk is rebuilt from a fresh getPosition after the previous chunk lands", async () => {
+  const wb = wideBand();
+  const pool = fakePool({ active: -560, b: wb });
+  const h = hookDeps({ mode: "live", tracked: trackedWide(), pool });
+  const snap = [];
+  h.deps.sendTx = async () => { snap.push({ rebalance: pool.calls.rebalance, getPosition: pool.calls.getPosition }); h.sends.push(1); return `sig${snap.length}`; };
+  const [r] = await runBidAskFlips([posRow()], h.deps);
+  assert.equal(r.layout, "chunked");
+  const n = r.chunks.length;
+  assert.ok(n >= 2);
+  assert.equal(r.sent, true);
+  assert.equal(snap.length, n);
+  // initial pass builds all n chunks; every later chunk adds one fresh getPosition + one rebuild before its send.
+  for (let i = 1; i < n; i++) {
+    assert.equal(snap[i].rebalance - snap[i - 1].rebalance, 1, `chunk ${i + 1} rebuilt once`);
+    assert.equal(snap[i].getPosition - snap[i - 1].getPosition, 1, `chunk ${i + 1} read fresh position`);
+  }
+  assert.ok(snap[0].rebalance === n, "all chunks pre-built before the first send");
+  const f = h.updates.at(-1).patch.bid_ask_flip;
+  assert.equal(f.flips, 1);
+  assert.equal(f.partial, undefined);
+  assert.equal(f.last_flip_active_bin, -560);
+  assert.equal(f.txs.length, n);
+});
+
+test("M4/L1: chunk 2 fails ⇒ partial recorded with 1 sig, and last_flip_active_bin sits just below the lowest landed chunk", async () => {
+  const wb = wideBand();
+  const pool = fakePool({ active: -560, b: wb });
+  const h = hookDeps({ mode: "live", tracked: trackedWide(), pool });
+  let n = 0;
+  h.deps.sendTx = async () => { n++; if (n === 2) throw new Error("blockhash expired"); return `sig${n}`; };
+  const [r] = await runBidAskFlips([posRow()], h.deps);
+  assert.equal(r.sent, true);
+  assert.deepEqual(r.sigs, ["sig1"]);
+  assert.match(r.sendError, /blockhash expired/);
+  const f = h.updates.at(-1).patch.bid_ask_flip;
+  assert.equal(f.partial, true);
+  assert.deepEqual(f.txs, ["sig1"]);
+  assert.equal(f.last_flip_active_bin, r.chunks[0].withdraw.minBinId - 1, "top chunk landed; un-landed lower tranche stays re-flippable");
+  assert.ok(f.last_flip_active_bin > -560);
+  // …and the next plan from that state targets exactly the stranded lower tranche.
+  const again = planBidAskFlip(baseInput(wb, { activeId: -560, flipState: { flips: 1, last_flip_active_bin: f.last_flip_active_bin }, cfg: { mode: "shadow", fillPct: 30, reflipStepPct: 1, minTrancheSol: 0 }, now: Date.now() + 10 * 60_000, costFloorMult: 0 }));
+  assert.equal(again.hi, f.last_flip_active_bin);
+  assert.equal(again.lo, -559);
+
+  // first chunk failing sends nothing recorded
+  const h2 = hookDeps({ mode: "live", tracked: trackedWide(), pool: fakePool({ active: -560, b: wb }) });
+  h2.deps.sendTx = async () => { throw new Error("boom"); };
+  const [r2] = await runBidAskFlips([posRow()], h2.deps);
+  assert.equal(r2.sent, false);
+  assert.equal(h2.updates.length, 0);
+});
+
+test("M4: chunk 2 re-simulation failure or moved active bin stops after chunk 1 (partial)", async () => {
+  const wb = wideBand();
+  const pool = fakePool({ active: -560, b: wb });
+  const h = hookDeps({ mode: "live", tracked: trackedWide(), pool });
+  // After the first send the active bin moves.
+  h.deps.sendTx = async () => { h.sends.push(1); pool.lbPair.activeId = -559; return "sigA"; };
+  const [r] = await runBidAskFlips([posRow()], h.deps);
+  assert.deepEqual(r.sigs, ["sigA"]);
+  assert.match(r.sendError, /active bin moved between chunks/);
+  assert.equal(h.updates.at(-1).patch.bid_ask_flip.partial, true);
+});
+
+test("M4: position owner that is not the bot wallet ⇒ error before any send", async () => {
+  const pool = fakePool();
+  const h = hookDeps({ mode: "live", tracked: trackedBidAsk(), pool });
+  h.deps.getWallet = () => ({ publicKey: Keypair.generate().publicKey });
+  assert.deepEqual(await runBidAskFlips([posRow()], h.deps), []);
+  assert.equal(h.sends.length, 0);
+  assert.equal(h.updates.length, 0);
+  assert.ok(h.logs.some((l) => /position owner is not the bot wallet/.test(l)));
+});
+
+test("M4: SDK pre/post instructions (ATA create, WSOL close) are retained in the sent tx; CU ixs are stripped", async () => {
+  const TOKEN = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  const ataIx = new TransactionInstruction({ programId: new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"), keys: [], data: Buffer.from([1]) });
+  const closeIx = new TransactionInstruction({ programId: TOKEN, keys: [], data: Buffer.from([9]) });
+  const pool = fakePool({ extraPre: [ataIx], extraPost: [closeIx] });
+  const h = hookDeps({ mode: "live", tracked: trackedBidAsk(), pool, management: { maxPriorityFeeLamports: 0 } });
+  const [r] = await runBidAskFlips([posRow()], h.deps);
+  assert.equal(r.sent, true);
+  const progs = h.sends[0].instructions.map((ix) => ix.programId.toBase58());
+  assert.deepEqual(progs, [
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+    TOKEN.toBase58(),
+  ]);
+});
+
+test("L2: post-flip verify ignores the active bin's Y but alerts when the range or deeper SOL bins change", async () => {
+  const mk = (mutate) => {
+    const b0 = band({ active: -460 });
+    let reads = 0;
+    const pool = fakePool({ active: -460, b: b0, getBand: () => {
+      reads++;
+      if (reads <= 1) return b0; // the plan read; everything after is post-send verify
+      return mutate(b0);
+    } });
+    return pool;
+  };
+  const clone = (b0) => ({ ...b0, bins: b0.bins.map((x) => ({ ...x })) });
+  const run = async (mutate) => {
+    const pool = mk(mutate);
+    const h = hookDeps({ mode: "live", tracked: trackedBidAsk(), pool });
+    const alerts = [];
+    h.deps.notify = async (m) => { alerts.push(m); };
+    const [r] = await runBidAskFlips([posRow()], h.deps);
+    return { r, alerts };
+  };
+  // active bin Y changed by a swap: no alert
+  let o = await run((b0) => { const c = clone(b0); c.bins.find((x) => x.binId === -460).yRaw += 12345n; return c; });
+  assert.equal(o.r.verified.solBinsUntouched, true);
+  assert.equal(o.alerts.length, 0);
+  // deeper SOL bin changed: alert
+  o = await run((b0) => { const c = clone(b0); c.bins.find((x) => x.binId === -470).yRaw += 1n; return c; });
+  assert.equal(o.r.verified.solBinsUntouched, false);
+  assert.equal(o.alerts.length, 1);
+  // range shrank: alert
+  o = await run((b0) => { const c = clone(b0); c.U = b0.U - 1; return c; });
+  assert.equal(o.r.verified.rangeUnchanged, false);
+  assert.equal(o.alerts.length, 1);
+});
+
+test("M2: flipped positions take pnl_pct from on-chain; unflipped keep the API value; divergence stops further flips", async () => {
+  const dlmm = await import(new URL("../tools/dlmm.js", import.meta.url));
+  const row = { position: "P1", pool: "POOL", pnl_pct: 7.5, pnl_usd: 1, pnl_sol: 0.01, sol_price: 100, pnl_unknown: undefined };
+  const oc = async () => ({ pnlPct: -1.25, pnlSol: -0.02 });
+  const flipped = await dlmm.applyFlipOnchainPnl({ ...row }, { bid_ask_flip: { flips: 1 } }, { getOnchain: oc });
+  assert.equal(flipped.pnl_pct, -1.25);
+  assert.equal(flipped.pnl_api_pct, 7.5);
+  assert.equal(flipped.pnl_source, "onchain");
+  assert.equal(flipped.pnl_sol, -0.02);
+  // not flipped (or only shadow-flipped) ⇒ untouched
+  assert.equal((await dlmm.applyFlipOnchainPnl({ ...row }, { bid_ask_flip_shadow: { flips: 3 } }, { getOnchain: oc })).pnl_pct, 7.5);
+  assert.equal((await dlmm.applyFlipOnchainPnl({ ...row }, null, { getOnchain: oc })).pnl_pct, 7.5);
+  // unknown API pnl is replaced by a known on-chain value and the unknown flag cleared
+  const unk = await dlmm.applyFlipOnchainPnl({ ...row, pnl_pct: null, pnl_unknown: true, pnl_error: "x" }, { bid_ask_flip: { flips: 1 } }, { getOnchain: oc });
+  assert.equal(unk.pnl_pct, -1.25);
+  assert.ok(!("pnl_unknown" in unk) && !("pnl_error" in unk));
+  // on-chain unavailable ⇒ API kept, tagged
+  const miss = await dlmm.applyFlipOnchainPnl({ ...row }, { bid_ask_flip: { flips: 1 } }, { getOnchain: async () => null });
+  assert.equal(miss.pnl_pct, 7.5);
+  assert.equal(miss.pnl_source, "api_after_flip");
+  const thrown = await dlmm.applyFlipOnchainPnl({ ...row }, { bid_ask_flip: { flips: 1 } }, { getOnchain: async () => { throw new Error("rpc"); } });
+  assert.equal(thrown.pnl_source, "api_after_flip");
+
+  // hook: API vs on-chain gap > 2pp on a live-flipped position ⇒ hold with no RPC
+  const pool = fakePool();
+  let poolReads = 0;
+  const h = hookDeps({ mode: "live", tracked: trackedBidAsk({ bid_ask_flip: { flips: 1, last_flip_active_bin: -300 } }), pool });
+  h.deps.getPool = async () => { poolReads++; return pool; };
+  const [r] = await runBidAskFlips([posRow({ pnl_pct: -1, pnl_api_pct: 6 })], h.deps);
+  assert.equal(r.action, "hold");
+  assert.match(r.reason, /diverge/);
+  assert.equal(poolReads, 0);
 });
