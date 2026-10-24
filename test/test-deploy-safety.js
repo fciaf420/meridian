@@ -614,3 +614,33 @@ test("F: instance lock path comparison uses realpath and folds case on darwin", 
   const m = (cmd, entry) => isLiveInstance(10, { exists: () => true, entry, command: () => cmd, cwdOf: () => null });
   assert.equal(m(`node ${path.join(link, "index.js")}`, file), true);
 });
+
+// ─── Final Opus review (PR #134): L1 bounded recheck fetch ────────────
+test("L1: fetchPoolForRecheck passes an 8s abort signal and fails closed when the fetch aborts", async () => {
+  let opts;
+  const ok = async (_u, o) => { opts = o; return { ok: true, status: 200, statusText: "x", json: async () => ({ data: [] }) }; };
+  await g.fetchPoolForRecheck("POOLX", "5m", ok);
+  assert.ok(opts?.signal instanceof AbortSignal);
+  assert.equal(g.RECHECK_FETCH_TIMEOUT_MS, 8000);
+  const hung = (_u, o) => new Promise((_, rej) => o.signal.addEventListener("abort", () => rej(new DOMException("aborted", "TimeoutError"))));
+  const ac = AbortSignal.timeout; // shrink the timeout for the test only
+  AbortSignal.timeout = () => ac.call(AbortSignal, 30);
+  try {
+    await assert.rejects(g.fetchPoolForRecheck("POOLX", "5m", hung), /abort/i);
+  } finally { AbortSignal.timeout = ac; }
+});
+
+// ─── L2: everything after the auto-swap is inside the unwind-protected try ───
+test("L2: refetch / bin-array window / SOL price / decimals all sit inside the try whose catch unwinds the auto-swap", () => {
+  const src = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  const tryAt = src.indexOf("L2: everything after the auto-swap");
+  const open = src.indexOf("  try {\n", tryAt);
+  const refetch = src.indexOf("await pool.refetchStates();\n  const activeBin", tryAt);
+  const window = src.indexOf("await initializedBinArrayWindow(", tryAt);
+  const price = src.indexOf("await getSolPrice()", tryAt);
+  const catchAt = src.indexOf("  } catch (error) {\n    log(\"deploy_error\"", tryAt);
+  assert.ok(tryAt > 0 && open > tryAt && catchAt > open);
+  for (const at of [refetch, window, price]) assert.ok(at > open && at < catchAt, "await is inside the protected try");
+  const catchBody = src.slice(catchAt, catchAt + 600);
+  assert.match(catchBody, /unwindAutoSwap\(\)/);
+});

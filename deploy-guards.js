@@ -114,10 +114,12 @@ export function checkScreenPriceDrift({ screenPrice, freshPrice, maxDropPct }) {
  * Fetch one pool from the Pool Discovery API (raw record). `fetchImpl` is
  * injectable. Throws on HTTP error; resolves null when the pool is not found.
  */
+export const RECHECK_FETCH_TIMEOUT_MS = 8000;
 export async function fetchPoolForRecheck(poolAddress, timeframe = "5m", fetchImpl = fetch) {
   const filter = encodeURIComponent(`pool_address=${poolAddress}`);
   const url = `${POOL_DISCOVERY_BASE}/pools?page_size=1&filter_by=${filter}&timeframe=${encodeURIComponent(timeframe)}`;
-  const res = await fetchImpl(url);
+  // L1: bounded (8s) and fail closed: a timeout/abort throws, so the deploy is refused.
+  const res = await fetchImpl(url, { signal: AbortSignal.timeout(RECHECK_FETCH_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
   const data = await res.json();
   const row = (data?.data || [])[0] ?? null;

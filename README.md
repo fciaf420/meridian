@@ -199,6 +199,14 @@ Resolution for every setting: **`user-config.json` value > profile preset > sche
 
 `autoTune` (default `false`) controls whether `lessons.js` may rewrite thresholds in `user-config.json` after closes. Off, it still runs the analysis but only **logs** (`evolve_proposed`) and records the latest proposal in `config-state.json`. Explicit owner commands (`/evolve`, dashboard) still apply immediately. Bookkeeping counters (`_lastEvolved` etc.) live in `config-state.json`, not in `user-config.json`.
 
+## Upgrade / rollback
+
+- **First boot after upgrading migrates config.** `config.js` moves the bookkeeping keys `_lastAgentTune`, `_lastEvolved` and `_positionsAtEvolution` out of `user-config.json` into `config-state.json` (next to it) and writes `user-config.json.pre-profiles.bak`, a byte-identical copy of your old file. The backup is created once and never overwritten. Your effective settings are unchanged (the profile resolves to `custom`).
+- **Rollback:** stop the bot, restore the backup (`cp user-config.json.pre-profiles.bak user-config.json`), then check out the previous version. Without the restore, the old version sees no evolution bookkeeping and may re-tune thresholds on the next close.
+- **`learning.autoTune` is now OFF by default.** Screening thresholds no longer self-evolve; the bot only logs what it would change. Turn it on in Settings (it asks for a risk confirm) if you want the old behavior.
+- **Bid-ask flip** defaults to `shadow` (simulate and log only). Switching it to `live` needs the Telegram risk-confirm card. Each flip pass is bounded by `bidAskFlip.timeoutSec` (default 30 s).
+- **Recommended first boot: dry run.** Start with `DRY_RUN=true` (or `dryRun: true`), watch a few management and screening cycles and the logs, then go live from the Settings console.
+
 ## Core Files
 
 - `.env`: secrets and endpoints only

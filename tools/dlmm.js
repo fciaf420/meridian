@@ -1070,6 +1070,24 @@ export async function deployPosition({
     }
   }
 
+  // L2: everything after the auto-swap lives inside ONE try, so any throw (refetch, bin-array
+  // window, SOL price, decimals, checkpoint) unwinds the swapped token via the outer catch.
+  const newPosition = Keypair.generate(); // declared before the try: settleFailedAttempt (and the catch) use it
+  let attemptId = null;
+  let txMaybeSent = false;
+  const settleFailedAttempt = async (reason) => {
+    if (!attemptId) return;
+    if (!txMaybeSent) return markAttempt(attemptId, "failed", { error: reason, txs: 0 });
+    try {
+      const info = await getConnection().getAccountInfo(newPosition.publicKey, "confirmed");
+      markAttempt(attemptId, info ? "landed_unconfirmed" : "failed", { error: reason });
+      if (info) log("deploy_warn", `Deploy errored but position ${newPosition.publicKey.toString().slice(0, 8)} EXISTS on-chain; it will be managed/adopted`);
+    } catch {
+      markAttempt(attemptId, "uncertain", { error: reason }); // chain unreadable: stays blocking until boot reconcile
+    }
+  };
+
+  try {
   // ─── Fresh active bin, one snapshot for range AND build ────────
   // initializePositionAndAddLiquidityByStrategy (≤69 bins) anchors the deposit
   // and its bin-slippage check to this.lbPair.activeId, which getActiveBin()
@@ -1187,7 +1205,6 @@ export async function deployPosition({
   }
 
   const isWideRange = totalBins > 69;
-  const newPosition = Keypair.generate();
 
   log("deploy", `Pool: ${pool_address}`);
   log("deploy", `Strategy: ${activeStrategy}, Bins: ${minBinId} to ${maxBinId} (${totalBins} bins${isWideRange ? " — WIDE RANGE" : ""})`);
@@ -1201,21 +1218,6 @@ export async function deployPosition({
   // Crash checkpoint (`submitting`) BEFORE any tx is built or sent, then a last
   // price-move + balance gate on the first tx only. A failed checkpoint write
   // aborts the deploy (fail closed): an unrecorded position is the risk.
-  let attemptId = null;
-  let txMaybeSent = false;
-  const settleFailedAttempt = async (reason) => {
-    if (!attemptId) return;
-    if (!txMaybeSent) return markAttempt(attemptId, "failed", { error: reason, txs: 0 });
-    try {
-      const info = await getConnection().getAccountInfo(newPosition.publicKey, "confirmed");
-      markAttempt(attemptId, info ? "landed_unconfirmed" : "failed", { error: reason });
-      if (info) log("deploy_warn", `Deploy errored but position ${newPosition.publicKey.toString().slice(0, 8)} EXISTS on-chain; it will be managed/adopted`);
-    } catch {
-      markAttempt(attemptId, "uncertain", { error: reason }); // chain unreadable: stays blocking until boot reconcile
-    }
-  };
-
-  try {
     try {
       attemptId = beginAttempt({
         pool: pool_address,
