@@ -71,6 +71,22 @@ export const config = {
     maxCloseSwapPriceImpactPct: u.maxCloseSwapPriceImpactPct ?? 25,
   },
 
+  // ─── Deploy-path safety (ported from yunus-0x/meridian) ─────────
+  // Pure guards: they only ever REFUSE a deploy, never change what is sent.
+  safety: {
+    // Re-check TVL / volume / fee-ratio / volatility / token thresholds against a
+    // fresh Pool Discovery read at deploy time (fails closed if unreadable).
+    recheckScreeningAtDeploy: u.recheckScreeningAtDeploy ?? true,
+    // Refuse a deploy when the pool's volatility is unknown or <= 0.
+    requireKnownVolatility: u.requireKnownVolatility ?? true,
+    // Max price move (%) between the start of a deploy and the first tx send.
+    maxEntryPriceMovePct: u.maxEntryPriceMovePct ?? 5,
+    // Deposit slippage (%) handed to the DLMM SDK. The SDK converts it to an
+    // allowed active-bin drift: ceil(pct / (binStep/100)) bins. Was a hard-coded
+    // 10%. See deploy-guards.js depositSlippage().
+    depositSlippagePct: u.depositSlippagePct ?? 5,
+  },
+
   // ─── Pool Screening Thresholds ───────────
   screening: {
     source:            normalizeScreeningSource(u.screeningSource), // "meteora" | "gmgn" | "both"; invalid → "meteora"

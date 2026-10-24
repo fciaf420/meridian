@@ -9,6 +9,8 @@ import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
+import { preSubmitGate, depositSlippage } from "../deploy-guards.js";
+import { beginAttempt, markAttempt } from "../deploy-checkpoint.js";
 import { emit } from "../notifier.js";
 import {
   trackPosition,
@@ -1171,7 +1173,60 @@ export async function deployPosition({
   log("deploy", `Amount: ${finalAmountX} X, ${finalAmountY} Y`);
   log("deploy", `Position: ${newPosition.publicKey.toString()}`);
 
+  // Deposit slippage -> allowed active-bin drift (SDK: ceil(pct / (binStep/100))).
+  const depositSlip = depositSlippage(resolvedBinStep ?? pool.lbPair?.binStep, config.safety?.depositSlippagePct);
+  log("deploy", `Deposit slippage ${depositSlip.slippagePct}%${depositSlip.driftBins != null ? ` (= max ${depositSlip.driftBins} active-bin drift at bin step ${resolvedBinStep})` : ""}`);
+
+  // Crash checkpoint (`submitting`) BEFORE any tx is built or sent, then a last
+  // price-move + balance gate on the first tx only. A failed checkpoint write
+  // aborts the deploy (fail closed): an unrecorded position is the risk.
+  let attemptId = null;
+  let txMaybeSent = false;
+  const settleFailedAttempt = async (reason) => {
+    if (!attemptId) return;
+    if (!txMaybeSent) return markAttempt(attemptId, "failed", { error: reason, txs: 0 });
+    try {
+      const info = await getConnection().getAccountInfo(newPosition.publicKey, "confirmed");
+      markAttempt(attemptId, info ? "landed_unconfirmed" : "failed", { error: reason });
+      if (info) log("deploy_warn", `Deploy errored but position ${newPosition.publicKey.toString().slice(0, 8)} EXISTS on-chain; it will be managed/adopted`);
+    } catch {
+      markAttempt(attemptId, "uncertain", { error: reason }); // chain unreadable: stays blocking until boot reconcile
+    }
+  };
+
   try {
+    try {
+      attemptId = beginAttempt({
+        pool: pool_address,
+        mint: pool.lbPair.tokenXMint.toBase58(),
+        position: newPosition.publicKey.toString(),
+        amountSol: finalAmountY,
+      });
+    } catch (e) {
+      log("deploy_error", `Could not write deploy checkpoint: ${e.message}`);
+      return { success: false, error: `Deploy refused: could not persist the crash checkpoint (${e.message}).` };
+    }
+    {
+      const gate = await preSubmitGate({
+        refetch: () => pool.refetchStates(),
+        getActiveId: () => pool.lbPair.activeId,
+        readFreeSol: async () => (await getConnection().getBalance(wallet.publicKey, "confirmed")) / 1e9,
+        binStep: resolvedBinStep ?? pool.lbPair?.binStep,
+        loadBinId: activeIdAtLoad,
+        anchorBinId: activeBin.binId,
+        maxMovePct: config.safety?.maxEntryPriceMovePct ?? 5,
+        reserve: Number(config.management.gasReserve ?? 0.2),
+        amount: finalAmountY,
+        totalBins,
+      });
+      if (!gate.pass) {
+        markAttempt(attemptId, "aborted", { error: gate.reason });
+        log("deploy", `Pre-submit gate refused deploy into ${pool_address}: ${gate.reason}`);
+        return { success: false, blocked_by: "pre_submit", error: `Pre-submit recheck failed: ${gate.reason}` };
+      }
+      log("deploy", `Pre-submit gate ok (price move ${gate.movePct.toFixed(2)}%, free SOL ${gate.freeSol == null ? "n/a" : gate.freeSol.toFixed(4)})`);
+    }
+    txMaybeSent = true; // from here a tx may land even if we see an error
     const txHashes = [];
 
     if (isWideRange) {
@@ -1234,7 +1289,7 @@ export async function deployPosition({
           totalXAmount: totalXLamports,
           totalYAmount: totalYLamports,
           strategy: { minBinId, maxBinId, strategyType },
-          slippage: 10, // 10%
+          slippage: depositSlip.slippagePct,
         });
         const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
         const { chunkBinRange } = await import("@meteora-ag/dlmm");
@@ -1303,6 +1358,7 @@ export async function deployPosition({
             log("deploy_warn", `Could not close empty position ${posAddr.slice(0, 8)} (rent stays locked until closed): ${closeErr.message}`);
           }
           recordClose(posAddr, "deploy failed (liquidity add error, verified empty on-chain)");
+          markAttempt(attemptId, "failed", { error: liqErr.message, txs: txHashes.length });
           return {
             success: false,
             error: `Position created on-chain but liquidity add failed: ${liqErr.message}. Position ${posAddr.slice(0, 8)} verified empty on-chain and marked closed.`,
@@ -1345,6 +1401,7 @@ export async function deployPosition({
         }, note);
         _positionsCacheAt = 0;
         log("deploy_warn", `Position ${posAddr.slice(0, 8)} is ${status} — kept open for management/close. ${note}`);
+        markAttempt(attemptId, "failed", { error: liqErr.message, txs: txHashes.length, partial_tracked: true });
         emit("deploy_partial", { pair: pool_name || pool_address.slice(0, 8), position: posAddr, status, amountX: partialX, amountY: partialY, error: liqErr.message });
         return {
           success: false,
@@ -1364,13 +1421,14 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { maxBinId, minBinId, strategyType },
-        slippage: 10, // 10% (SDK liquidity slippage is a percentage, NOT bps)
+        slippage: depositSlip.slippagePct, // percentage (NOT bps); the SDK derives the max active-bin drift from it
       });
       const txHash = await sendManagedTransaction(tx, [wallet, newPosition], "deploy standard");
       txHashes.push(txHash);
     }
 
     log("deploy", `SUCCESS — ${txHashes.length} tx(s): ${txHashes[0]}`);
+    markAttempt(attemptId, "entered", { txs: txHashes.length });
 
     _positionsCacheAt = 0;
     const signal_snapshot = getAndClearStagedSignals(pool_address);
@@ -1411,7 +1469,22 @@ export async function deployPosition({
     };
   } catch (error) {
     log("deploy_error", error.message);
+    await settleFailedAttempt(error.message);
     return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Does this position account exist on-chain? true / false, or null when the RPC
+ * read fails (unknown). Used by the boot-time deploy-checkpoint reconcile.
+ */
+export async function positionAccountExists(positionPubkey) {
+  try {
+    const info = await getConnection().getAccountInfo(new PublicKey(positionPubkey), "confirmed");
+    return info != null;
+  } catch (e) {
+    log("deploy_warn", `positionAccountExists(${String(positionPubkey).slice(0, 8)}) read failed: ${e.message}`);
+    return null;
   }
 }
 

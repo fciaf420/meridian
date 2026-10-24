@@ -30,6 +30,8 @@ import { execSync, spawn } from "child_process";
 import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } from "../runtime-helpers.js";
 
 import { log, logAction } from "../logger.js";
+import { checkVolatilityKnown, evaluatePoolThresholds, fetchPoolForRecheck } from "../deploy-guards.js";
+import { findBlockingAttempt } from "../deploy-checkpoint.js";
 import { getPositionBins, withTimeout } from "./bin-visual.js";
 import { emit } from "../notifier.js";
 import { kbRead, kbWrite, kbSearch, kbList, kbDelete, kbMigrate, kbGetStats, kbRebuildIndexes } from "./knowledge-base-tools.js";
@@ -538,13 +540,56 @@ async function executeToolInner(name, args, { manual = false } = {}) {
   }
 }
 
+// Injectable for tests: (poolAddress, timeframe) -> raw Pool Discovery record | null.
+let _fetchPoolForRecheck = fetchPoolForRecheck;
+export function __setDeployRecheckFetch(fn) { _fetchPoolForRecheck = fn || fetchPoolForRecheck; }
+
+/**
+ * Deploy-time guards from upstream yunus-0x/meridian:
+ *  - 3427771: screening thresholds re-enforced against fresh pool data, so a stale
+ *    or model-chosen candidate cannot slip past the filters between screening and deploy
+ *  - exit-rules.js computeBinsBelow: never deploy when volatility is unknown
+ */
+export async function checkDeploySafetyGuards(args) {
+  const sf = config.safety || {};
+  if (args._manual) return { pass: true };
+  const wantRecheck = sf.recheckScreeningAtDeploy !== false;
+  const wantVol = sf.requireKnownVolatility !== false;
+  if (!wantRecheck && !wantVol) return { pass: true };
+
+  let pool = null;
+  let fetchError = null;
+  try {
+    pool = await _fetchPoolForRecheck(args.pool_address, config.screening.timeframe || "5m");
+  } catch (e) {
+    fetchError = e;
+  }
+
+  // The thresholds come from Meteora's screener. With screening.source "gmgn" those
+  // pool filters were never applied, so there is nothing to "re-check" against.
+  if (wantRecheck && config.screening.source !== "gmgn") {
+    if (fetchError) {
+      return { pass: false, reason: `Could not verify pool screening thresholds before deploy: ${fetchError.message}` };
+    }
+    const r = evaluatePoolThresholds(pool, config.screening);
+    if (!r.pass) return { pass: false, reason: `Deploy-time screening re-check failed: ${r.reason}` };
+    for (const n of r.notes || []) log("deploy", `Screening re-check: ${n}`);
+  }
+
+  if (wantVol) {
+    const v = checkVolatilityKnown(args.volatility ?? pool?.volatility);
+    if (!v.pass) return { pass: false, reason: v.reason };
+  }
+  return { pass: true };
+}
+
 /**
  * Amount-independent deploy eligibility checks (bin step, position count,
  * duplicate pool/token). Shared between the USDC-mode entry preflight and the
  * standard safety checks so USDC mode never swaps before confirming the deploy
  * is even allowed.
  */
-async function checkDeployEligibility(args) {
+export async function checkDeployEligibility(args) {
   // Resolve bin_step — fall back to the pool detail API if the caller didn't pass it.
   let effectiveBinStep = args.bin_step;
   if (effectiveBinStep == null && args.pool_address) {
@@ -574,6 +619,21 @@ async function checkDeployEligibility(args) {
       reason: `bin_step ${effectiveBinStep} is outside the allowed range of [${minStep}-${maxStep}].`,
     };
   }
+
+  // An interrupted deploy (crash checkpoint still `submitting`/`uncertain`) must
+  // be reconciled against the chain before this pool/token is entered again.
+  const blocking = findBlockingAttempt({ pool: args.pool_address, mint: args.base_mint });
+  if (blocking) {
+    return {
+      pass: false,
+      reason: `A previous deploy into this pool/token (attempt ${blocking.id}, status ${blocking.status}) was interrupted and not yet reconciled on-chain. Check the position, then retry after the next restart reconciles it.`,
+    };
+  }
+
+  // Deploy-time re-check of screening thresholds + known volatility. The owner's
+  // manual Telegram deploys (args._manual) are exempt, like the token-age window.
+  const safetyGate = await checkDeploySafetyGuards(args);
+  if (!safetyGate.pass) return safetyGate;
 
   // Check position count limit + duplicate pool guard
   const positions = await getMyPositions();
