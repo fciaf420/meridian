@@ -27,6 +27,7 @@ const cfgMod = await import("../config.js");
 const { config } = cfgMod;
 const es = await import("../tools/entry-safety.js");
 const as = await import("../all-settings.js");
+const schema = await import("../settings-schema.js");
 const ui = await import("../telegram-ui.js");
 const tg = await import("../telegram.js");
 const { CONFIG_KEY_MAP } = await import("../runtime-helpers.js");
@@ -82,18 +83,18 @@ test("key list comes from what config.js reads (CONFIG_KEY_MAP keys, gmgn keys, 
   const keys = new Set(svc.entries.map((e) => e.key));
   for (const k of Object.keys(CONFIG_KEY_MAP)) assert.ok(keys.has(k), `CONFIG_KEY_MAP key ${k} listed`);
   for (const k of ["dryRun", "llmProvider", "screeningSource", "priorityFeeLevel", "llmReasoningEffort", "evilPandaMinMcap", "darwinianWeights", "autoresearch", "webPort", "gmgnSignalsEnabled"]) assert.ok(keys.has(k), k);
-  assert.ok(svc.entries.some((e) => e.key === "requireKol" && e.file === "gmgn"));
+  assert.ok(svc.entries.some((e) => e.key === "maxSniperCount" && e.file === "gmgn"));
   const labels = svc.groups().map((g) => g.label);
   for (const l of ["Capital & sizing", "Exits", "Strategy", "Screening (Meteora)", "Screening (GMGN)", "Schedule", "LLM", "Learning", "USDC mode"]) assert.ok(labels.includes(l), l);
   assert.equal(svc.find("maxPositions").group, "cap");
   assert.equal(svc.find("stopLossPct").group, "exit");
   assert.equal(svc.find("gmgnSignalsEnabled").group, "scrm");
 
-  // A key added to config.js shows up without touching the editor.
-  const src = fs.readFileSync(new URL("../config.js", import.meta.url), "utf8")
-    .replace("    maxPositions:    u.maxPositions    ?? 3,", "    maxPositions:    u.maxPositions    ?? 3,\n    brandNewKnob:    u.brandNewKnob    ?? 7,");
-  const withNew = as.parseConfigKeys(src);
-  assert.deepEqual(withNew.find((e) => e.key === "brandNewKnob"), { key: "brandNewKnob", file: "user", path: ["risk", "brandNewKnob"] });
+  // The registry is generated from the schema: every non-hidden schema row (bar the profile switch) is listed.
+  const hiddenOrSpecial = new Set(["profile", ...schema.SCHEMA.filter((r) => r.hidden).map((r) => r.key), ...cfgMod.LOCKED_KEYS]);
+  for (const r of schema.SCHEMA) if (!hiddenOrSpecial.has(r.key)) assert.ok(keys.has(r.key), `schema row ${r.key} is listed`);
+  // Removed (dead) keys are gone from the editor.
+  for (const k of ["minClaimAmount", "outOfRangeBinsToClose", "minVolumeToRebalance", "healthCheckIntervalMin", "minKolCount", "minSmartDegenCount", "requireKol"]) assert.ok(!keys.has(k), k);
 });
 
 test("secrets and LOCKED_KEYS are never listed, shown or editable", async () => {

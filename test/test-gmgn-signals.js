@@ -25,7 +25,7 @@ const { config } = await import("../config.js");
 const screening = await import("../tools/screening.js");
 const weights = await import("../signal-weights.js");
 const tracker = await import("../signal-tracker.js");
-const { parseConfigKeys } = await import("../all-settings.js");
+const { registryKeys } = await import("../all-settings.js");
 
 const NOW_MS = 1_790_000_000_000;
 const NOW_S = NOW_MS / 1000;
@@ -330,9 +330,8 @@ test("recalculateWeights learns gmgn_buy_pressure / gmgn_spike from closed posit
 // ─── Config toggle ──────────────────────────────────────────────
 test("gmgnSignalsEnabled defaults on and is listed for Telegram All settings", () => {
   assert.equal(config.screening.gmgnSignalsEnabled, true);
-  const src = fs.readFileSync(path.join(REPO, "config.js"), "utf8");
-  const entry = parseConfigKeys(src).find((e) => e.key === "gmgnSignalsEnabled");
-  assert.deepEqual(entry, { key: "gmgnSignalsEnabled", file: "user", path: ["screening", "gmgnSignalsEnabled"] });
+  const entry = registryKeys(config).find((e) => e.key === "gmgnSignalsEnabled");
+  assert.deepEqual({ key: entry.key, file: entry.file, path: entry.path }, { key: "gmgnSignalsEnabled", file: "user", path: ["screening", "gmgnSignalsEnabled"] });
 });
 
 test("gmgn_spike starts as absent=better (spikes precede upside OOR for bid_ask)", async () => {
