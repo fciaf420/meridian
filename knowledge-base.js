@@ -13,13 +13,15 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { dataDirOverride, rootDataPath } from "./config-paths.js";
 import { config } from "./config.js";
 import { classifyOutcome, classifyRecord } from "./learning-data.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function getKbDir() {
-  return path.resolve(__dirname, config.knowledgeBase?.dir || "./knowledge");
+  // Relative dirs resolve under MERIDIAN_DATA_DIR when set (absolute dirs are honoured as configured).
+  return path.resolve(dataDirOverride() || __dirname, config.knowledgeBase?.dir || "./knowledge");
 }
 
 // ─── Caching Layer ────────────────────────────────────────────
@@ -436,7 +438,7 @@ export async function migrateFromJson() {
 
   // 1. Migrate lessons.json → knowledge/lessons/
   try {
-    const lessonsPath = path.join(__dirname, "lessons.json");
+    const lessonsPath = rootDataPath("lessons.json");
     if (fs.existsSync(lessonsPath)) {
       const data = JSON.parse(fs.readFileSync(lessonsPath, "utf8"));
       const lessons = data.lessons || [];
@@ -511,7 +513,7 @@ export async function migrateFromJson() {
 
   // 2. Migrate pool-memory.json → knowledge/pools/
   try {
-    const poolMemPath = path.join(__dirname, "pool-memory.json");
+    const poolMemPath = rootDataPath("pool-memory.json");
     if (fs.existsSync(poolMemPath)) {
       const pools = JSON.parse(fs.readFileSync(poolMemPath, "utf8"));
 

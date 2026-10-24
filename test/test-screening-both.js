@@ -2,6 +2,7 @@
  * screeningSource "both": combined Meteora + GMGN discovery. Both discovery
  * functions and the pool lookup are injected, so there is no network access.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 

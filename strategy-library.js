@@ -2,10 +2,11 @@
  * Strategy Library — persistent store of LP strategies.
  */
 
+import { dataPath } from "./config-paths.js";
 import fs from "fs";
 import { log } from "./logger.js";
 
-const STRATEGY_FILE = "./strategy-library.json";
+const STRATEGY_FILE = dataPath("strategy-library.json");
 
 function load() {
   if (!fs.existsSync(STRATEGY_FILE)) return { active: null, strategies: {} };

@@ -3,6 +3,7 @@
  * Run: node test/test-screening.js
  */
 
+import "./_bootstrap.js";
 import assert from "node:assert/strict";
 import { discoverPools, getPoolDetail } from "../tools/screening.js";
 

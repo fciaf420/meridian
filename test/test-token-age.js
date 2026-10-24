@@ -2,6 +2,7 @@
 // every screening source and every deploy strategy, plus the Telegram confirm
 // card. Age data is mocked: no Meteora API, no gmgn-cli, no RPC, no transaction
 // (DRY_RUN is forced; the refusals under test happen before any pool load).
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -20,6 +21,7 @@ process.env.DRY_RUN = "true";
 delete process.env.HELIUS_API_KEY;
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 

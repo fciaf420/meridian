@@ -1,5 +1,6 @@
 // Close-reason labels: hard-rule closes record the rule, judgment closes the model's reason.
 process.env.DRY_RUN = "true";
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 

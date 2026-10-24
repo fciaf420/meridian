@@ -2,10 +2,11 @@
  * Token blacklist — mints the agent should never deploy into.
  */
 
+import { dataPath } from "./config-paths.js";
 import fs from "fs";
 import { log } from "./logger.js";
 
-const BLACKLIST_FILE = "./token-blacklist.json";
+const BLACKLIST_FILE = dataPath("token-blacklist.json");
 
 function load() {
   if (!fs.existsSync(BLACKLIST_FILE)) return {};

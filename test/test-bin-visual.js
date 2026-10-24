@@ -1,6 +1,7 @@
 // Bin charts (tools/bin-visual.js) and their Telegram wiring. Fixture:
 // test/fixtures/bins.json, two live positions fetched read-only (NPC-SOL,
 // BRAIN-SOL). Everything is mocked: no RPC, no Telegram API, no transaction.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -14,6 +15,7 @@ delete process.env.TELEGRAM_CHAT_ID;
 const FIXTURE = JSON.parse(fs.readFileSync(new URL("./fixtures/bins.json", import.meta.url), "utf8"));
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-bins-"));
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 

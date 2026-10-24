@@ -1,3 +1,4 @@
+import { rootDataPath } from "../config-paths.js";
 /**
  * Candle-based range depth (rangeDepthMode "ohlcv").
  *
@@ -53,13 +54,10 @@
  */
 
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { log as defaultLog } from "../logger.js";
 import { MIN_RANGE_PCT } from "../runtime-helpers.js";
 import { config } from "../config.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const TIMEFRAME_MINUTES = { "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240 };
 
@@ -345,7 +343,7 @@ export function createOhlcv(deps = {}) {
   const log = deps.log ?? defaultLog;
   const getConfig = deps.getConfig ?? (() => ({}));
   const offline = !!deps.offline;
-  const usagePath = deps.usagePath ?? process.env.MERIDIAN_ST_USAGE_PATH ?? path.join(__dirname, "..", "solanatracker-usage.json");
+  const usagePath = deps.usagePath ?? process.env.MERIDIAN_ST_USAGE_PATH ?? rootDataPath("solanatracker-usage.json");
   const spawnGmgn = deps.spawnGmgn ?? (async (args) => (await import("./gmgn.js")).spawnGmgn(args));
   const getTokenAgeHours = deps.getTokenAgeHours ?? (async (mint) => {
     const { fetchGmgnPriceInfo } = await import("./gmgn.js");

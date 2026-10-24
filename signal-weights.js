@@ -9,13 +9,14 @@
  * LLM prompt so the agent can prioritize the right screening criteria.
  */
 
+import { dataPath } from "./config-paths.js";
 import fs from "fs";
 import { log } from "./logger.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 import { classifyRecord, learnableRecords } from "./learning-data.js";
 
-const WEIGHTS_FILE = "./signal-weights.json";
-const LESSONS_FILE = "./lessons.json";
+const WEIGHTS_FILE = dataPath("signal-weights.json");
+const LESSONS_FILE = dataPath("lessons.json");
 const CALIBRATION_WINDOW_DAYS = 90;
 const MIN_CALIBRATION_SAMPLES = 20;
 let _signalCalibrationCache = { mtimeMs: null, calibration: null };

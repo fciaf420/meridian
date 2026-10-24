@@ -3,6 +3,7 @@
 // (autoresearch.json via MERIDIAN_AUTORESEARCH_FILE; lessons/logs/KB via cwd).
 process.env.DRY_RUN = "true";
 
+import "./_bootstrap.js";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -15,6 +16,7 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-autoresearch-test-")
 const AR_FILE = path.join(TMP, "autoresearch.json");
 process.env.MERIDIAN_AUTORESEARCH_FILE = AR_FILE;
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 
 // recordPerformance also writes the tracked nuggets files and could create the

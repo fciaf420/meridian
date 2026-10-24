@@ -1,5 +1,6 @@
 // ohlcvBufferMult evolution + depth-use tracking + update_config bounds.
 process.env.DRY_RUN = "true";
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 

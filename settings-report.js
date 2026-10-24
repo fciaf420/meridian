@@ -11,13 +11,15 @@ import { isDryRun, isTruthyDryRun } from "./env-flags.js";
 import path from "path";
 import { fileURLToPath } from "url";
 import { config, CONFIG_WARNINGS } from "./config.js";
+import { userConfigPath, gmgnConfigPath, dataPath, rootDataPath } from "./config-paths.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const resolveFile = (f) => (f === "user-config.json" ? userConfigPath() : f === "gmgn-config.json" ? gmgnConfigPath() : f === "lessons.json" ? dataPath(f) : f === "autoresearch.json" ? rootDataPath(f) : path.join(__dirname, f));
 const read = (f) => {
-  try { return JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8")); }
+  try { return JSON.parse(fs.readFileSync(resolveFile(f), "utf8")); }
   catch { return {}; }
 };
-const exists = (f) => fs.existsSync(path.join(__dirname, f));
+const exists = (f) => fs.existsSync(resolveFile(f));
 
 /**
  * Build the settings report.

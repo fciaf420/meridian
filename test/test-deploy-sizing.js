@@ -1,6 +1,7 @@
 // Deploy sizing: positionSizePct × (portfolio total − gasReserve), clamped to
 // maxDeployAmount, capped by free SOL − gasReserve, skipped below the floor.
 // Pure math + injected wallet/positions: no RPC, no LLM, no transaction.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -14,6 +15,7 @@ process.env.MERIDIAN_USER_CONFIG_PATH = USER_CFG;
 process.env.MERIDIAN_GMGN_CONFIG_PATH = path.join(TMP, "gmgn-config.json");
 process.env.DRY_RUN = "true";
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 

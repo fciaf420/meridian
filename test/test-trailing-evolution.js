@@ -14,6 +14,7 @@
  */
 process.env.DRY_RUN = "true";
 
+import "./_bootstrap.js";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -22,6 +23,7 @@ import path from "path";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-trailing-evo-"));
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 // Evolution writes user-config.json: point config.js (and lessons.js) at a scratch copy.
 const USER_CONFIG = path.join(TMP, "user-config.json");

@@ -1,5 +1,6 @@
 // Telegram "🧾 All settings" editor. Everything is mocked or temp-file backed:
 // no Telegram API, no RPC, no LLM, no transaction, no repo config file touched.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -20,6 +21,7 @@ process.env.RPC_URL = "http://127.0.0.1:9";
 process.env.DRY_RUN = "true";
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => { process.env.DRY_RUN = "true"; fs.rmSync(TMP, { recursive: true, force: true }); });
 

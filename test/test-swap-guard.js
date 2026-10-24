@@ -9,6 +9,7 @@
  * Everything is local: stand-in CLI scripts, mocked balance reads, a temp cwd
  * for state.json. No network, no RPC, no transactions.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -27,6 +28,7 @@ process.env.RPC_URL = "http://127.0.0.1:9"; // never reached: balance reads are 
 process.env.DRY_RUN = "true";
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => { process.chdir(REPO); fs.rmSync(TMP, { recursive: true, force: true }); });
 

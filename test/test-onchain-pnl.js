@@ -7,6 +7,7 @@
  * into a temp dir BEFORE importing anything — it never touches live files.
  * Every chain / API read is mocked.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -15,6 +16,7 @@ import path from "path";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-onchain-pnl-"));
 process.chdir(tmp);
+process.env.MERIDIAN_DATA_DIR = tmp; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 process.env.DRY_RUN = "true";
 

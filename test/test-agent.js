@@ -3,6 +3,7 @@
  * Run: DRY_RUN=true node test/test-agent.js
  */
 
+import "./_bootstrap.js";
 import "dotenv/config";
 import { agentLoop } from "../agent.js";
 

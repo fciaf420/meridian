@@ -7,6 +7,7 @@
  * state.js reads/writes ./state.json relative to the cwd, so this test chdirs
  * into a temp dir BEFORE importing anything. Every chain / API read is mocked.
  */
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -15,6 +16,7 @@ import path from "path";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-exit-safety-"));
 process.chdir(tmp);
+process.env.MERIDIAN_DATA_DIR = tmp; // this file works in its own cwd
 process.env.DRY_RUN = "true";
 
 const state = await import(new URL("../state.js", import.meta.url));

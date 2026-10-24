@@ -8,12 +8,10 @@
 import "dotenv/config";
 import readline from "readline";
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import { userConfigPath } from "./config-paths.js";
 import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(__dirname, "user-config.json");
+const CONFIG_PATH = userConfigPath();
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 

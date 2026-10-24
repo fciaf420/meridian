@@ -1,5 +1,6 @@
 // Config schema / profiles / migration. Everything runs against temp files and child
 // processes; no network, no RPC, no live config is read or written.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";

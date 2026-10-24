@@ -2,6 +2,7 @@
 // deploy hard checks, Telegram toggles and the LLM can't-loosen rule.
 // Everything is mocked: no RPC, no Telegram API, no transaction. Runs in a temp
 // cwd with a temp user-config.json so nothing in the repo is touched.
+import "./_bootstrap.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
@@ -21,6 +22,7 @@ delete process.env.HELIUS_API_KEY;
 delete process.env.DRY_RUN;
 delete process.env.TELEGRAM_BOT_TOKEN;
 process.chdir(TMP);
+process.env.MERIDIAN_DATA_DIR = TMP; // this file works in its own cwd
 delete process.env.MERIDIAN_LOG_DIR; // this file checks its own ./logs in the temp cwd
 test.after(() => fs.rmSync(TMP, { recursive: true, force: true }));
 

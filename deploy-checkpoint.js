@@ -27,6 +27,7 @@
  * EISDIR...) still fails closed. See setCorruptionHandler().
  */
 
+import { dataPath } from "./config-paths.js";
 import fs from "fs";
 import path from "path";
 import { writeJsonAtomicSync } from "./atomic-write.js";
@@ -36,7 +37,7 @@ const UNRESOLVED = new Set(["submitting", "uncertain"]);
 const KEEP_RESOLVED = 50;
 
 function filePath() {
-  return process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE || path.resolve("deploy-attempts.json");
+  return process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE || path.resolve(dataPath("deploy-attempts.json"));
 }
 
 let onCorrupt = null;

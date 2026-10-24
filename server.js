@@ -37,6 +37,7 @@ import { buildUnifiedMemoryBrief } from "./unified-memory.js";
 import { loadWeights } from "./signal-weights.js";
 import { getActiveExperiment, loadAutoresearch, describeOverrides } from "./autoresearch.js";
 import { buildKnowledgeGraph } from "./tools/knowledge-graph.js";
+import { rootDataPath } from "./config-paths.js";
 import { log } from "./logger.js";
 import { userConfigPath } from "./config-paths.js";
 import { getScreeningThresholdSummary, normalizeCandidatesPayload } from "./runtime-helpers.js";
@@ -664,7 +665,7 @@ export function startServer(timersFn) {
             wsSend(ws, { type: "chat:response", text: `Need at least 5 closed positions to evolve. ${needed} more needed.`, ts: new Date().toISOString() });
             break;
           }
-          const lessonsData = JSON.parse(fs.readFileSync(path.join(__dirname, "lessons.json"), "utf8"));
+          const lessonsData = JSON.parse(fs.readFileSync(rootDataPath("lessons.json"), "utf8"));
           const result = evolveThresholds(lessonsData.performance, config);
           if (!result || Object.keys(result.changes).length === 0) {
             wsSend(ws, { type: "chat:response", text: "No threshold changes needed — current settings already match performance data.", ts: new Date().toISOString() });

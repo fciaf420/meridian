@@ -8,6 +8,7 @@
  */
 process.env.DRY_RUN = "true";
 
+import "./_bootstrap.js";
 import assert from "node:assert";
 import { config } from "../config.js";
 import { usdToSol, usdcModeEnabled } from "../tools/usdc-mode.js";

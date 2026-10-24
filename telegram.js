@@ -14,13 +14,10 @@
 //   - With no owner configured, the first PRIVATE chat to message the bot is
 //     registered once, with a loud warning in the log. Callbacks never register.
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 import { userConfigPath } from "./config-paths.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = userConfigPath();
 
 export const TELEGRAM_MAX_TEXT = 4096;

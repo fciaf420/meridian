@@ -1,15 +1,11 @@
 // tools/knowledge-graph.js — Aggregates agent data into a knowledge graph for visualization
 
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { getMyPositions } from "./dlmm.js";
 import { getWalletBalances } from "./wallet.js";
 import { log } from "../logger.js";
+import { dataPath, userConfigPath } from "../config-paths.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const BASE = path.join(__dirname, "..");
 
 // ─── Color helpers ─────────────────────────────────────────────
 
@@ -45,10 +41,10 @@ export async function buildKnowledgeGraph() {
 
   // ── 1. Read static data files ────────────────────────────────
 
-  const stateData = readJSON(path.join(BASE, "state.json"));
-  const poolMemory = readJSON(path.join(BASE, "pool-memory.json"));
-  const lessonsData = readJSON(path.join(BASE, "lessons.json"));
-  const userConfig = readJSON(path.join(BASE, "user-config.json"));
+  const stateData = readJSON(dataPath("state.json"));
+  const poolMemory = readJSON(dataPath("pool-memory.json"));
+  const lessonsData = readJSON(dataPath("lessons.json"));
+  const userConfig = readJSON(userConfigPath());
 
   // ── 2. Fetch live data in parallel ───────────────────────────
 

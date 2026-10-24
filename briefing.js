@@ -19,6 +19,7 @@
 // Each briefing sent is logged (tag BRIEFING) and appended to
 // logs/briefings.jsonl as { ts, text }; /briefing re-sends the latest one.
 
+import { dataPath, logDir } from "./config-paths.js";
 import fs from "fs";
 import path from "path";
 import { log } from "./logger.js";
@@ -27,9 +28,9 @@ import { claimedFeesSol } from "./tools/onchain-pnl.js";
 import { computePortfolioSol, resolveSolPrice, valueDlmmPositions } from "./portfolio-value.js";
 import { getRpcStats, formatRpcStatsLine } from "./tools/rpc-stats.js";
 
-const STATE_FILE = "./state.json";
-const LESSONS_FILE = "./lessons.json";
-export const BRIEFINGS_FILE = "./logs/briefings.jsonl";
+const STATE_FILE = dataPath("state.json");
+const LESSONS_FILE = dataPath("lessons.json");
+export const BRIEFINGS_FILE = path.join(logDir(), "briefings.jsonl");
 
 /** Close records from here on store the on-chain PnL % (tools/dlmm.js closePosition). */
 export const ONCHAIN_PNL_SINCE = "2026-09-26T00:50:00.000Z";

@@ -8,12 +8,13 @@
  * - Actions taken (claims, rebalances)
  */
 
+import { dataPath } from "./config-paths.js";
 import fs from "fs";
 import { log } from "./logger.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 import { config as liveConfig } from "./config.js";
 
-const STATE_FILE = "./state.json";
+const STATE_FILE = dataPath("state.json");
 
 // Points of API vs on-chain PnL disagreement above which the API reading is
 // treated as wrong (same value as PNL_MISMATCH_PTS in pnl-confirm.js).
