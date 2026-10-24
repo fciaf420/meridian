@@ -75,25 +75,37 @@ export function noteScreenedPrice(pool, price, now = Date.now()) {
   screened.set(String(pool), { price: p, at: now });
   if (screened.size > 500) for (const [k, v] of screened) if (now - v.at > SCREEN_SNAPSHOT_TTL_MS) screened.delete(k);
 }
+/** The candidate was shown with a price NOT comparable to pool_price (e.g. GMGN USD): never compare, and ignore any model-supplied screen_price. */
+export function noteUncomparableScreenPrice(pool, now = Date.now()) {
+  if (pool) screened.set(String(pool), { price: null, at: now, uncomparable: true });
+}
+export function isScreenPriceUncomparable(pool, now = Date.now(), ttlMs = SCREEN_SNAPSHOT_TTL_MS) {
+  const v = screened.get(String(pool));
+  return !!(v && v.uncomparable && now - v.at <= ttlMs);
+}
 export function getScreenedPrice(pool, now = Date.now(), ttlMs = SCREEN_SNAPSHOT_TTL_MS) {
   const v = screened.get(String(pool));
-  return v && now - v.at <= ttlMs ? v.price : null;
+  return v && v.price != null && now - v.at <= ttlMs ? v.price : null;
 }
 export function clearScreenedPrices() { screened.clear(); }
 
 /**
  * Compare the price seen at screening with the fresh pool price. Both numbers
- * come from the same Pool Discovery `pool_price` field. Returns pass with
- * checked:false when either side is missing (callers log + fall back).
+ * must be Pool Discovery `pool_price` (SOL per token); never mix in a GMGN USD
+ * price. DROP-ONLY: refuses only when the price fell more than `maxDropPct`.
+ * For a single-sided SOL deposit below the active bin a rise is harmless (the
+ * range is anchored on the active bin at deploy time), so rises pass; callers
+ * log them (`rose: true`). maxDropPct <= 0 disables the check.
+ * Returns pass with checked:false when either side is missing.
  */
-export function checkScreenPriceDrift({ screenPrice, freshPrice, maxMovePct }) {
-  const a = num(screenPrice), b = num(freshPrice), max = num(maxMovePct);
+export function checkScreenPriceDrift({ screenPrice, freshPrice, maxDropPct }) {
+  const a = num(screenPrice), b = num(freshPrice), max = num(maxDropPct);
   if (a == null || a <= 0 || b == null || b <= 0) return { pass: true, checked: false };
   const movePct = ((b - a) / a) * 100;
-  if (max != null && max > 0 && Math.abs(movePct) > max) {
-    return { pass: false, checked: true, movePct, reason: `price moved ${movePct.toFixed(1)}% between screening (${a}) and deploy (${b}); limit is ${max}%` };
+  if (max != null && max > 0 && movePct < -max) {
+    return { pass: false, checked: true, movePct, reason: `price dropped ${Math.abs(movePct).toFixed(1)}% between screening (${a}) and deploy (${b}); limit is ${max}%` };
   }
-  return { pass: true, checked: true, movePct };
+  return { pass: true, checked: true, movePct, rose: movePct > 0 };
 }
 
 // ─── Screening thresholds, re-checked at deploy ───────────────────
@@ -204,11 +216,13 @@ export function priceMovePctBetweenBins(binStep, fromBinId, toBinId) {
 /**
  * @returns {{pass:boolean, movePct:number|null, reason?:string}}
  */
-export function checkEntryPriceMove({ binStep, fromBinId, toBinId, maxMovePct }) {
+export function checkEntryPriceMove({ binStep, fromBinId, toBinId, maxMovePct, dropOnly = false }) {
   const movePct = priceMovePctBetweenBins(binStep, fromBinId, toBinId);
   if (movePct == null) return { pass: false, movePct: null, reason: "price unavailable for move check (bin step or active bin unknown)" };
   const max = num(maxMovePct);
-  if (max != null && max > 0 && Math.abs(movePct) > max) {
+  // dropOnly: a rise is harmless when no token X leg is deposited (SOL-only
+  // bins sit below the active bin); only a fall past the limit refuses.
+  if (max != null && max > 0 && (dropOnly ? movePct < -max : Math.abs(movePct) > max)) {
     return { pass: false, movePct, reason: `price moved ${movePct.toFixed(1)}% (active bin ${fromBinId} → ${toBinId}) since the deploy started; limit is ${max}%` };
   }
   return { pass: true, movePct };
@@ -262,7 +276,7 @@ export async function preSubmitGate({
   refetch, getActiveId, readFreeSol,
   binStep, loadBinId, anchorBinId, maxMovePct,
   reserve, amount, totalBins,
-  allowShrink = false, minAmount = 0.1,
+  allowShrink = false, minAmount = 0.1, dropOnly = false,
 }) {
   try { await refetch(); } catch (e) { return { pass: false, reason: `fresh pool read failed (${e.message})` }; }
   const nowBin = getActiveId();
@@ -270,7 +284,7 @@ export async function preSubmitGate({
   let worst = 0;
   for (const from of [loadBinId, anchorBinId]) {
     if (from == null) continue;
-    const m = checkEntryPriceMove({ binStep, fromBinId: from, toBinId: nowBin, maxMovePct });
+    const m = checkEntryPriceMove({ binStep, fromBinId: from, toBinId: nowBin, maxMovePct, dropOnly });
     if (!m.pass) return { pass: false, reason: m.reason };
     if (Math.abs(m.movePct) > Math.abs(worst)) worst = m.movePct;
   }
@@ -300,10 +314,17 @@ export async function preSubmitGate({
  * Never throws. `swapFn` is swapToken-compatible.
  * @returns {Promise<{ok:boolean, note:string}>}
  */
-export async function swapBackAfterRefusal({ swapFn, baseMint, amount, solMint, log = () => {} }) {
+export async function swapBackAfterRefusal({ swapFn, baseMint, amount, solMint, log = () => {}, onFail = null }) {
+  const res = await swapBackInner({ swapFn, baseMint, amount, solMint, log });
+  if (!res.ok) { try { onFail?.(res); } catch { /* alert is best-effort */ } }
+  return res;
+}
+
+async function swapBackInner({ swapFn, baseMint, amount, solMint, log }) {
   if (!(Number(amount) > 0)) return { ok: false, note: "no swapped token amount recorded; nothing to swap back" };
   try {
-    const r = await swapFn({ input_mint: baseMint, output_mint: solMint, amount });
+    // "close" impact cap (same setting as post-close swap-backs, default 25%): leaving the bag is worse than slippage.
+    const r = await swapFn({ input_mint: baseMint, output_mint: solMint, amount }, { impactCap: "close" });
     if (r?.success || r?.dry_run) {
       log(`Swapped ${amount} ${String(baseMint).slice(0, 8)}... back to SOL after refusal`);
       return { ok: true, note: "swapped back to SOL" };

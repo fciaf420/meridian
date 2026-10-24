@@ -92,6 +92,14 @@ export function beginAttempt({ pool, mint = null, position, amountSol = null, no
   return id;
 }
 
+// Attempts being driven by THIS process right now. Periodic/manual reconcile and
+// /reconcile clear must never touch them: the deploy that owns the attempt is
+// about to write its own terminal status (review finding A/G).
+const inFlight = new Set();
+export function trackInFlightAttempt(id) { if (id) inFlight.add(id); }
+export function releaseInFlightAttempt(id) { inFlight.delete(id); }
+export function isAttemptInFlight(id) { return inFlight.has(id); }
+
 export function markAttempt(id, status, extra = {}) {
   try {
     const db = load();
@@ -105,10 +113,32 @@ export function markAttempt(id, status, extra = {}) {
 }
 
 /**
+ * Compare-and-set: change the status only if it still equals `expected` (i.e.
+ * unchanged since the caller read it). Load -> check -> save is synchronous, so
+ * a deploy's own write can never be overwritten by a stale reconcile read.
+ * Returns true when the transition happened.
+ */
+export function markAttemptIf(id, expected, status, extra = {}) {
+  try {
+    const db = load();
+    const a = db.attempts[id];
+    if (!a || a.status !== expected) return false;
+    Object.assign(a, extra, { status, updatedAt: new Date().toISOString() });
+    save(db);
+    return true;
+  } catch (e) {
+    defaultLog("deploy_warn", `Could not update deploy attempt ${id}: ${e.message}`);
+    return false;
+  }
+}
+
+/**
  * Operator override: mark an unresolved attempt resolved after checking the chain
- * themselves. Returns the attempt or null when the id is not an unresolved one.
+ * themselves. Returns the attempt or null when the id is not an unresolved one,
+ * or when the attempt is in flight in this process (even with force).
  */
 export function clearAttempt(id, note = "cleared by operator") {
+  if (inFlight.has(id)) return null;
   const db = load();
   const a = db.attempts[id];
   if (!a || !UNRESOLVED.has(a.status)) return null;
@@ -135,17 +165,22 @@ export function findBlockingAttempt({ pool, mint }) {
  * Boot reconciliation. `positionExists(pubkey)` -> true | false | null (unknown).
  * Returns [{ attempt, outcome }] for every previously unresolved attempt.
  */
-export async function reconcileAttempts({ positionExists, log = defaultLog, notify = null } = {}) {
+export async function reconcileAttempts({ positionExists, log = defaultLog, notify = null, minAgeMs = 0, now = Date.now() } = {}) {
   const results = [];
   for (const a of getUnresolvedAttempts()) {
+    // Never reconcile a deploy that is running in this process, nor (periodic
+    // callers pass minAgeMs) one too young to have been abandoned.
+    if (inFlight.has(a.id)) continue;
+    if (minAgeMs > 0 && now - Date.parse(a.startedAt) < minAgeMs) continue;
+    const readStatus = a.status;
     let exists = null;
     try { exists = await positionExists(a.position); } catch (e) { log("deploy_warn", `Reconcile read failed for ${String(a.position).slice(0, 8)}: ${e.message}`); }
     if (exists === true) {
-      markAttempt(a.id, "reconciled_landed");
+      if (!markAttemptIf(a.id, readStatus, "reconciled_landed")) { log("deploy", `Deploy attempt ${a.id} changed while reconciling; left as is.`); continue; }
       log("deploy_warn", `Deploy attempt ${a.id} (pool ${String(a.pool).slice(0, 8)}) was interrupted but position ${String(a.position).slice(0, 8)} EXISTS on-chain; it will be managed/adopted. Check it.`);
       results.push({ attempt: a, outcome: "landed" });
     } else if (exists === false) {
-      markAttempt(a.id, "reconciled_absent");
+      if (!markAttemptIf(a.id, readStatus, "reconciled_absent")) { log("deploy", `Deploy attempt ${a.id} changed while reconciling; left as is.`); continue; }
       log("deploy", `Deploy attempt ${a.id} (pool ${String(a.pool).slice(0, 8)}) was interrupted; no position account on-chain. Nothing created.`);
       results.push({ attempt: a, outcome: "absent" });
     } else {

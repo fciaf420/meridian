@@ -30,7 +30,7 @@ import { execSync, spawn } from "child_process";
 import { CONFIG_KEY_MAP, getRequiredSolBalance, calculateBinsForPriceRange } from "../runtime-helpers.js";
 
 import { log, logAction } from "../logger.js";
-import { checkVolatilityKnown, pickVolatility, evaluatePoolThresholds, fetchPoolForRecheck, checkScreenPriceDrift, getScreenedPrice, recordRefusal } from "../deploy-guards.js";
+import { checkVolatilityKnown, pickVolatility, evaluatePoolThresholds, fetchPoolForRecheck, checkScreenPriceDrift, getScreenedPrice, isScreenPriceUncomparable, recordRefusal } from "../deploy-guards.js";
 import { findBlockingAttempt } from "../deploy-checkpoint.js";
 import { getPositionBins, withTimeout } from "./bin-visual.js";
 import { emit } from "../notifier.js";
@@ -556,8 +556,8 @@ export async function checkDeploySafetyGuards(args) {
   if (args._manual) return { pass: true };
   const wantRecheck = sf.recheckScreeningAtDeploy !== false;
   const wantVol = sf.requireKnownVolatility !== false;
-  const maxDrift = Number(sf.maxScreenToDeployMovePct ?? 5);
-  const wantDrift = maxDrift > 0 && config.screening.source !== "gmgn";
+  const maxDrop = Number(sf.maxScreenToDeployDropPct ?? 12);
+  const wantDrift = maxDrop > 0 && config.screening.source !== "gmgn";
   if (!wantRecheck && !wantVol && !wantDrift) return { pass: true };
 
   let pool = null;
@@ -591,9 +591,14 @@ export async function checkDeploySafetyGuards(args) {
   // dodge it by omitting the arg), then the model-supplied screen_price. When
   // neither exists, or the fresh read failed, this check is skipped with a log.
   if (wantDrift) {
+    if (isScreenPriceUncomparable(args.pool_address)) {
+      log("deploy", "Screening->deploy price drift not checked (candidate came from GMGN with a USD price; units differ from pool_price)");
+      return { pass: true };
+    }
     const screenPrice = getScreenedPrice(args.pool_address) ?? args.screen_price;
-    const d = checkScreenPriceDrift({ screenPrice, freshPrice: pool?.pool_price, maxMovePct: maxDrift });
+    const d = checkScreenPriceDrift({ screenPrice, freshPrice: pool?.pool_price, maxDropPct: maxDrop });
     if (!d.checked) log("deploy", "Screening->deploy price drift not checked (no screening price or no fresh price available)");
+    else if (d.pass && d.rose) log("deploy", `Price rose ${d.movePct.toFixed(1)}% since screening (not refused: rises are harmless for SOL-only deposits)`);
     else if (!d.pass) { recordRefusal("screen_drift", d.reason); return { pass: false, reason: `Screening→deploy price drift: ${d.reason}` }; }
   }
   return { pass: true };

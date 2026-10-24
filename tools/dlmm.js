@@ -9,8 +9,8 @@ import BN from "bn.js";
 import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
-import { preSubmitGate, depositSlippage, checkEntryPriceMove, swapBackAfterRefusal, recordRefusal } from "../deploy-guards.js";
-import { beginAttempt, markAttempt } from "../deploy-checkpoint.js";
+import { preSubmitGate, depositSlippage, swapBackAfterRefusal, recordRefusal } from "../deploy-guards.js";
+import { beginAttempt, markAttempt, trackInFlightAttempt, releaseInFlightAttempt } from "../deploy-checkpoint.js";
 import { emit } from "../notifier.js";
 import {
   trackPosition,
@@ -527,7 +527,6 @@ export async function deployPosition({
   bin_step,
   volatility,
   screen_price, // eslint-disable-line no-unused-vars -- consumed by the executor's drift guard
-  screen_active_bin,
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
@@ -938,19 +937,8 @@ export async function deployPosition({
   const pool = _poolOverridesForTest.get(String(pool_address))
     ?? await DLMM.create(getConnection(), new PublicKey(pool_address));
   const activeIdAtLoad = pool.lbPair.activeId;
-  // Screening -> deploy gap, bin form: runs BEFORE any swap, so a refusal here
-  // strands nothing. (The price form lives in the executor's safety checks.)
-  if (screen_active_bin != null && Number.isFinite(Number(screen_active_bin))) {
-    const m = checkEntryPriceMove({
-      binStep: bin_step ?? pool.lbPair?.binStep, fromBinId: Number(screen_active_bin), toBinId: activeIdAtLoad,
-      maxMovePct: config.safety?.maxScreenToDeployMovePct ?? 5,
-    });
-    if (!m.pass && m.movePct != null) {
-      recordRefusal("screen_drift", m.reason);
-      log("deploy", `Refusing deploy into ${pool_address}: ${m.reason} (screening bin)`);
-      return { success: false, blocked_by: "screen_drift", error: `Screening→deploy drift: ${m.reason}` };
-    }
-  }
+  // (Screening -> deploy price drift lives in the executor's safety checks, using
+  // the code-recorded Pool Discovery price; there is no screening active-bin source.)
   // Set once the two-sided auto-swap has bought the token; any refusal after that
   // point sells it back (see unwindAutoSwap) so a refusal never strands a bag.
   let autoSwapped = null;
@@ -961,6 +949,7 @@ export async function deployPosition({
     const r = await swapBackAfterRefusal({
       swapFn: swapToken, baseMint, amount, solMint: WSOL_MINT,
       log: (m) => log("deploy", m),
+      onFail: (res) => emit("swap_unwind_failed", { pair: pool_name || String(pool_address).slice(0, 8), pool: pool_address, mint: baseMint, amount, note: res.note }),
     });
     if (!r.ok) log("deploy_warn", `Auto-swap unwind: ${r.note}`);
     return ` Auto-swap unwind: ${r.note}.`;
@@ -1135,7 +1124,7 @@ export async function deployPosition({
 
   const strategyType = strategyMap[activeStrategy];
   if (strategyType === undefined) {
-    throw new Error(`Invalid strategy: ${activeStrategy}. Use spot, curve, or bid_ask.`);
+    return { success: false, error: `Invalid strategy: ${activeStrategy}. Use spot, curve, or bid_ask.${await unwindAutoSwap()}` };
   }
 
   // Calculate amounts
@@ -1182,7 +1171,7 @@ export async function deployPosition({
   if (finalAmountY > 0) {
     const yDecimals = await getMintDecimals(pool.lbPair.tokenYMint);
     if (yDecimals == null) {
-      throw new Error(`Could not resolve token Y decimals for ${pool.lbPair.tokenYMint.toBase58()}; refusing to size deposit.`);
+      return { success: false, error: `Could not resolve token Y decimals for ${pool.lbPair.tokenYMint.toBase58()}; refusing to size deposit.${await unwindAutoSwap()}` };
     }
     totalYLamports = uiToRawBN(finalAmountY, yDecimals);
   }
@@ -1190,7 +1179,7 @@ export async function deployPosition({
   if (finalAmountX > 0) {
     const xDecimals = await getMintDecimals(pool.lbPair.tokenXMint);
     if (xDecimals == null) {
-      throw new Error(`Could not resolve token X decimals for ${pool.lbPair.tokenXMint.toBase58()}; refusing to size deposit.`);
+      return { success: false, error: `Could not resolve token X decimals for ${pool.lbPair.tokenXMint.toBase58()}; refusing to size deposit.${await unwindAutoSwap()}` };
     }
     totalXLamports = uiToRawBN(finalAmountX, xDecimals);
   }
@@ -1232,6 +1221,7 @@ export async function deployPosition({
         position: newPosition.publicKey.toString(),
         amountSol: finalAmountY,
       });
+      trackInFlightAttempt(attemptId); // reconcile / clear must leave it alone until this deploy ends
     } catch (e) {
       log("deploy_error", `Could not write deploy checkpoint: ${e.message}`);
       return { success: false, error: `Deploy refused: could not persist the crash checkpoint (${e.message}).${await unwindAutoSwap()}` };
@@ -1252,6 +1242,8 @@ export async function deployPosition({
         totalBins,
         // With a swapped token in hand, fit the SOL leg to the balance instead of refusing.
         allowShrink: !!autoSwapped,
+        // SOL-only deposit sits below the active bin: a price RISE is harmless, only a drop refuses.
+        dropOnly: !(finalAmountX > 0),
       });
       if (!gate.pass) {
         markAttempt(attemptId, "aborted", { error: gate.reason });
@@ -1510,7 +1502,12 @@ export async function deployPosition({
   } catch (error) {
     log("deploy_error", error.message);
     await settleFailedAttempt(error.message);
-    return { success: false, error: error.message };
+    // Thrown before any tx could have been sent (e.g. SDK tx-build error): do not
+    // leave the auto-swapped token stranded.
+    const unwound = txMaybeSent ? "" : await unwindAutoSwap();
+    return { success: false, error: `${error.message}${unwound}` };
+  } finally {
+    releaseInFlightAttempt(attemptId);
   }
 }
 

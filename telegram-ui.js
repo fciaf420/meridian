@@ -2333,7 +2333,7 @@ export function createTelegramUI(deps) {
   }
 
   // ── alerts ──
-  const FUND_EVENTS = new Set(["deploy", "close", "pnl_watcher_close", "deploy_partial"]);
+  const FUND_EVENTS = new Set(["deploy", "close", "pnl_watcher_close", "deploy_partial", "swap_unwind_failed"]);
   function alert(kind, key, cooldownMs, text, keyboard = []) {
     if (!FUND_EVENTS.has(kind) && !limiter.allow(`${kind}:${key}`, cooldownMs)) {
       logf("telegram", `Alert suppressed (rate limit): ${kind} ${key}`);
@@ -2410,6 +2410,11 @@ export function createTelegramUI(deps) {
       d.resetText ? `Resets ${escapeHtml(d.resetText)}` : null,
       "Screening and deploys are paused until it answers. Out-of-range positions past the wait are closed in code; stop-loss / take-profit still run in the PnL watcher.",
     ].filter(Boolean).join("\n"), [[positionsBtn(), btn("🧯 Recent errors", "er!")]]),
+    swap_unwind_failed: (d) => alert("swap_unwind_failed", d.mint, 0, [
+      `🚨 <b>Auto-swap unwind FAILED</b> ${escapeHtml(d.pair)}`,
+      `Deploy was refused after the SOL→token swap and the swap back to SOL failed. The token is still in the wallet: <code>${escapeHtml(shortAddr(d.mint))}</code> (~${escapeHtml(d.amount)}).`,
+      escapeHtml(String(d.note ?? "").slice(0, 300)),
+    ].join("\n"), [[btn("💰 Wallet", "wa!")]]),
     cycle_error: (d) => alert("cycle_error", `${d.cycle}:${String(d.error).slice(0, 60)}`, 15 * 60_000,
       `❌ <b>${escapeHtml(d.cycle)} cycle failed</b>\n${escapeHtml(String(d.error ?? "").slice(0, 500))}`,
       [[btn("🧯 Recent errors", "er!")]]),

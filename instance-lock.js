@@ -58,6 +58,22 @@ export function readCwd(pid) {
   }
 }
 
+/** Canonical form for comparing two paths: realpath (symlinks, canonical on-disk casing); null when it cannot be resolved. */
+function canon(p) {
+  try { return fs.realpathSync.native(p); } catch { return null; }
+}
+/**
+ * Same file? realpath both sides (symlinks, canonical on-disk casing); on darwin
+ * (case-insensitive volumes) also fold case. If either side cannot be resolved
+ * (file missing) fall back to a resolved-string compare, case-folded on darwin.
+ */
+export function samePath(a, b, platform = process.platform) {
+  const fold = (p) => (platform === "darwin" ? p.toLowerCase() : p);
+  const ca = canon(a), cb = canon(b);
+  if (ca != null && cb != null) return fold(ca) === fold(cb);
+  return fold(path.resolve(a)) === fold(path.resolve(b));
+}
+
 /**
  * Does `cmd` (a `ps` command line) run THIS app's entry script (`entry`, an
  * absolute path, normally process.argv[1])? `ps` shows the argv as typed, so
@@ -71,10 +87,10 @@ export function entryMatches(cmd, pid, { entry = process.argv[1], cwdOf = readCw
   const base = path.basename(abs);
   const tokens = cmd.split(/\s+/).filter((t) => t.endsWith(base));
   for (const t of tokens) {
-    if (path.isAbsolute(t)) { if (path.resolve(t) === abs) return true; continue; }
+    if (path.isAbsolute(t)) { if (samePath(t, abs)) return true; continue; }
     const cwd = cwdOf(pid);
     if (cwd == null) return true; // cannot verify the relative path: assume it is us
-    if (path.resolve(cwd, t) === abs) return true;
+    if (samePath(path.resolve(cwd, t), abs)) return true;
   }
   return false;
 }

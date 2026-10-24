@@ -7,7 +7,7 @@ import { agentLoop, lightChat, getScreenerModelLabel, screenerLoop } from "./age
 import { log, enableLogPathFile } from "./logger.js";
 import { getMyPositions, isCloseInflight, getInflightCloses, positionAccountExists } from "./tools/dlmm.js";
 import { acquireInstanceLock, releaseInstanceLock } from "./instance-lock.js";
-import { reconcileAttempts, getUnresolvedAttempts, clearAttempt, setCorruptionHandler } from "./deploy-checkpoint.js";
+import { reconcileAttempts, getUnresolvedAttempts, clearAttempt, isAttemptInFlight, setCorruptionHandler } from "./deploy-checkpoint.js";
 import { getRefusalStats } from "./deploy-guards.js";
 import { activeRpcHosts, formatRpcHosts } from "./rpc-hosts.js";
 import { llmHealth, isLlmUnavailableError } from "./llm-health.js";
@@ -108,12 +108,15 @@ setCorruptionHandler(({ backup, error }) => {
 // re-entry into its pool/token stays blocked (findBlockingAttempt).
 const reconcileNotified = new Set(); // unverified attempts already announced (no per-tick spam)
 let reconcileInFlight = false;
+// Periodic ticks leave attempts younger than this alone (a deploy may still be running).
+const PERIODIC_RECONCILE_MIN_AGE_MS = 10 * 60_000;
 async function reconcileDeployAttemptsNow({ source = "periodic", announceAll = false } = {}) {
   if (reconcileInFlight) return [];
   reconcileInFlight = true;
   try {
     return await reconcileAttempts({
       positionExists: positionAccountExists,
+      minAgeMs: source === "periodic" ? PERIODIC_RECONCILE_MIN_AGE_MS : 0,
       notify: async (results) => {
         const fresh = results.filter(({ attempt, outcome }) => announceAll || outcome !== "unverified" || !reconcileNotified.has(attempt.id));
         for (const { attempt, outcome } of results) if (outcome === "unverified") reconcileNotified.add(attempt.id);
@@ -147,8 +150,10 @@ async function handleReconcileCommand(rawArgs = "") {
       return `This marks the attempt resolved WITHOUT trusting the bot's own chain read. First confirm on an explorer that the position account does not exist (or is already managed), then repeat:\n/reconcile clear ${target} force`;
     }
     const ids = target === "all" ? open.map((a) => a.id) : [target];
-    const cleared = ids.filter((id) => clearAttempt(id, "cleared by operator via /reconcile"));
-    return cleared.length ? `Cleared ${cleared.length} attempt(s): ${cleared.join(", ")}` : "No matching unresolved attempt.";
+    const busy = ids.filter((id) => isAttemptInFlight(id));
+    const cleared = ids.filter((id) => !isAttemptInFlight(id) && clearAttempt(id, "cleared by operator via /reconcile"));
+    const busyNote = busy.length ? `\nRefused (deploy in flight in this process, even with force): ${busy.join(", ")}` : "";
+    return (cleared.length ? `Cleared ${cleared.length} attempt(s): ${cleared.join(", ")}` : "No matching unresolved attempt.") + busyNote;
   }
   const results = await reconcileDeployAttemptsNow({ source: "manual", announceAll: false });
   const remaining = getUnresolvedAttempts();

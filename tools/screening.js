@@ -141,9 +141,20 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   );
 
   // Remember what price each candidate was shown at (deploy-time drift guard).
+  // ONLY Pool Discovery `pool_price` (SOL per token) is recorded: that is the unit
+  // the deploy-time check compares against. GMGN rows carry a USD token price, so
+  // they are skipped (logged), including GMGN-only rows in "both" mode.
   if (config.screening.source !== "gmgn") {
-    const { noteScreenedPrice } = await import("../deploy-guards.js");
-    for (const p of eligible) noteScreenedPrice(p.pool, p.price);
+    const { noteScreenedPrice, noteUncomparableScreenPrice } = await import("../deploy-guards.js");
+    for (const p of eligible) {
+      const fromPoolDiscovery = !Array.isArray(p.sources) || p.sources.includes("meteora");
+      if (!fromPoolDiscovery) {
+        noteUncomparableScreenPrice(p.pool);
+        log("screening", `Screen price not recorded for ${p.pool}: GMGN-only candidate (USD price, not comparable to pool_price)`);
+        continue;
+      }
+      noteScreenedPrice(p.pool, p.price);
+    }
   }
 
   return {

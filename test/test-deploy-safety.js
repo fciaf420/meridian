@@ -10,7 +10,8 @@ import path from "node:path";
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-deploy-safety-"));
 process.env.MERIDIAN_DEPLOY_ATTEMPTS_FILE = path.join(tmp, "deploy-attempts.json");
 
-const { acquireInstanceLock, releaseInstanceLock, isLiveInstance, pidExists } = await import("../instance-lock.js");
+const lockMod = await import("../instance-lock.js");
+const { acquireInstanceLock, releaseInstanceLock, isLiveInstance, pidExists } = lockMod;
 const { maskRpcUrl, activeRpcHosts, formatRpcHosts } = await import("../rpc-hosts.js");
 const g = await import("../deploy-guards.js");
 const cp = await import("../deploy-checkpoint.js");
@@ -406,11 +407,11 @@ test("checkpoint: resolved history is pruned to a bounded size", () => {
 
 // ─── screening -> deploy drift (finding 5) ────────────────────────
 test("screen drift: pure check; skipped when a side is missing", () => {
-  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 1.04, maxMovePct: 5 }).pass, true);
-  const bad = g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 0.9, maxMovePct: 5 });
-  assert.equal(bad.pass, false); assert.match(bad.reason, /-10\.0%/);
-  assert.deepEqual(g.checkScreenPriceDrift({ screenPrice: null, freshPrice: 1, maxMovePct: 5 }), { pass: true, checked: false });
-  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 50, maxMovePct: 0 }).pass, true, "0 disables");
+  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 1.04, maxDropPct: 5 }).pass, true);
+  const bad = g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 0.9, maxDropPct: 5 });
+  assert.equal(bad.pass, false); assert.match(bad.reason, /dropped 10\.0%/);
+  assert.deepEqual(g.checkScreenPriceDrift({ screenPrice: null, freshPrice: 1, maxDropPct: 5 }), { pass: true, checked: false });
+  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 0.5, maxDropPct: 0 }).pass, true, "0 disables");
 });
 
 test("executor guard: screening price (LLM arg or code snapshot) vs fresh pool price", async () => {
@@ -418,15 +419,24 @@ test("executor guard: screening price (LLM arg or code snapshot) vs fresh pool p
   await withConfig({}, async () => {
     ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), pool_price: 1.5 }));
     assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.5 })).pass, true);
+    // B: a RISE (+50%) is harmless for SOL-only below-active deposits: passes.
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.0 })).pass, true, "rise is not refused");
+    // a drop beyond the 12% default refuses; a 10% drop does not
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), pool_price: 0.8 }));
     const r = await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.0 });
-    assert.equal(r.pass, false); assert.match(r.reason, /price drift/);
+    assert.equal(r.pass, false); assert.match(r.reason, /price dropped 20\.0%/);
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), pool_price: 0.9 }));
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.0 })).pass, true, "10% drop < 12% limit");
     // The code-recorded snapshot wins over a (possibly dodging) model-supplied value.
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), pool_price: 0.5 }));
     g.noteScreenedPrice("PD", 1.0);
-    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.5 })).pass, false);
+    assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 0.5 })).pass, false);
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), pool_price: 1.5 }));
     g.clearScreenedPrices();
     assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD" })).pass, true, "no screening price -> documented fallback: not checked");
-    await withConfig({ safety: { maxScreenToDeployMovePct: 0 } }, async () => {
-      assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.0 })).pass, true);
+    await withConfig({ safety: { maxScreenToDeployDropPct: 0 } }, async () => {
+      ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), pool_price: 0.1 }));
+      assert.equal((await ex.checkDeploySafetyGuards({ pool_address: "PD", screen_price: 1.0 })).pass, true, "0 = disabled");
     });
   });
   assert.equal(g.getRefusalStats().screen_drift, 2);
@@ -458,9 +468,10 @@ test("pre-submit gate after an auto-swap: own swap impact excluded; balance leg 
 
 test("swapBackAfterRefusal: sells the swapped token to SOL; reports failures without throwing", async () => {
   const calls = [];
-  const ok = await g.swapBackAfterRefusal({ swapFn: async (a) => { calls.push(a); return { success: true }; }, baseMint: "MINTX", amount: 12.5, solMint: "SOL" });
+  const ok = await g.swapBackAfterRefusal({ swapFn: async (a, d) => { calls.push(a, d); return { success: true }; }, baseMint: "MINTX", amount: 12.5, solMint: "SOL" });
   assert.equal(ok.ok, true);
   assert.deepEqual(calls[0], { input_mint: "MINTX", output_mint: "SOL", amount: 12.5 });
+  assert.deepEqual(calls[1], { impactCap: "close" }, "swap-back uses the close-path price-impact cap (D1)");
   assert.equal((await g.swapBackAfterRefusal({ swapFn: async () => ({ success: false, error: "no route" }), baseMint: "MINTX", amount: 1, solMint: "SOL" })).ok, false);
   assert.equal((await g.swapBackAfterRefusal({ swapFn: async () => { throw new Error("boom"); }, baseMint: "MINTX", amount: 1, solMint: "SOL" })).ok, false);
   assert.equal((await g.swapBackAfterRefusal({ swapFn: async () => { throw new Error("unused"); }, baseMint: "MINTX", amount: 0, solMint: "SOL" })).ok, false);
@@ -476,4 +487,130 @@ test("deploy source: every refusal after the auto-swap unwinds it; gate skips th
   const refusals = afterSwap.match(/return \{ success: false,[^\n]*\n?/g).filter((l) => /bin arrays|Pre-submit recheck failed|crash checkpoint/.test(l));
   assert.ok(refusals.length >= 4);
   for (const l of refusals) assert.ok(/unwindAutoSwap\(\)/.test(l), l.slice(0, 80));
+});
+
+// ─── Opus 5.5 review fixes ────────────────────────────────────────
+test("A: reconcile skips in-flight and young attempts; compare-and-set; clear refuses in-flight", async () => {
+  const id = cp.beginAttempt({ pool: "PIF", mint: "MIF", position: "POS_INFLIGHT_1" });
+  cp.trackInFlightAttempt(id);
+  // periodic reconcile with positionExists -> false must NOT touch the in-flight attempt
+  const res = await cp.reconcileAttempts({ positionExists: async () => false, log: () => {}, minAgeMs: 10 * 60_000 });
+  assert.ok(!res.some((x) => x.attempt.id === id));
+  assert.equal(cp.getUnresolvedAttempts().find((a) => a.id === id).status, "submitting");
+  // even without the age filter (manual), in-flight is skipped
+  const res2 = await cp.reconcileAttempts({ positionExists: async () => false, log: () => {} });
+  assert.ok(!res2.some((x) => x.attempt.id === id));
+  // clear force refuses in-flight
+  assert.equal(cp.clearAttempt(id), null);
+  assert.equal(cp.isAttemptInFlight(id), true);
+  // young attempt not in flight (e.g. another writer): skipped by age filter, reconciled at boot (minAge 0)
+  const young = cp.beginAttempt({ pool: "PYG", position: "POS_YOUNG_1" });
+  const rp = await cp.reconcileAttempts({ positionExists: async () => false, log: () => {}, minAgeMs: 10 * 60_000 });
+  assert.ok(!rp.some((x) => x.attempt.id === young));
+  const old = cp.beginAttempt({ pool: "POLD", position: "POS_OLD_1", now: Date.now() - 20 * 60_000 });
+  const ro = await cp.reconcileAttempts({ positionExists: async () => false, log: () => {}, minAgeMs: 10 * 60_000 });
+  assert.ok(ro.some((x) => x.attempt.id === old && x.outcome === "absent"), "old unresolved attempt is reconciled");
+  // release -> now reconcilable/clearable
+  cp.releaseInFlightAttempt(id);
+  assert.ok(cp.clearAttempt(id));
+  cp.clearAttempt(young);
+});
+
+test("A: reconcile is compare-and-set (a deploy write during the RPC await is not overwritten)", async () => {
+  const id = cp.beginAttempt({ pool: "PCAS", position: "POS_CAS_1", now: Date.now() - 30 * 60_000 });
+  const res = await cp.reconcileAttempts({
+    positionExists: async () => { cp.markAttempt(id, "uncertain", { error: "deploy wrote this during the await" }); return false; },
+    log: () => {},
+  });
+  assert.ok(!res.some((x) => x.attempt.id === id), "no outcome reported for a changed attempt");
+  const a = cp.getUnresolvedAttempts().find((x) => x.id === id);
+  assert.equal(a.status, "uncertain", "stale reconcile did not overwrite uncertain with reconciled_absent");
+  assert.equal(cp.markAttemptIf(id, "submitting", "failed"), false);
+  assert.equal(cp.markAttemptIf(id, "uncertain", "failed"), true);
+});
+
+test("A: source wires in-flight tracking and the periodic min age", () => {
+  const dl = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  assert.ok(/trackInFlightAttempt\(attemptId\)/.test(dl) && /finally \{\s*releaseInFlightAttempt\(attemptId\)/.test(dl));
+  const ix = fs.readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  assert.ok(/minAgeMs: source === "periodic"/.test(ix) && /isAttemptInFlight/.test(ix));
+});
+
+test("B: screen drift is drop-only; entry-move gate drop-only for SOL-only, symmetric otherwise", async () => {
+  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 2, maxDropPct: 12 }).pass, true);
+  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 2, maxDropPct: 12 }).rose, true);
+  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 0.87, maxDropPct: 12 }).pass, false);
+  assert.equal(g.checkScreenPriceDrift({ screenPrice: 1, freshPrice: 0.5, maxDropPct: 0 }).pass, true);
+  // bin step 100 (1%/bin): +10 bins = +10.5%, -10 bins = -9.5%
+  const up = { binStep: 100, fromBinId: 100, toBinId: 110, maxMovePct: 5 };
+  assert.equal(g.checkEntryPriceMove(up).pass, false, "symmetric by default (two-sided)");
+  assert.equal(g.checkEntryPriceMove({ ...up, dropOnly: true }).pass, true, "rise ok when SOL-only");
+  assert.equal(g.checkEntryPriceMove({ ...up, toBinId: 90, dropOnly: true }).pass, false, "drop still refused");
+  const gate = (extra) => g.preSubmitGate({ refetch: async () => {}, getActiveId: () => 110, readFreeSol: async () => 5, binStep: 100, loadBinId: 100, anchorBinId: 100, maxMovePct: 5, reserve: 0.2, amount: 1, totalBins: 60, ...extra });
+  assert.equal((await gate({ dropOnly: true })).pass, true);
+  assert.equal((await gate({})).pass, false);
+  assert.equal(config.safety.maxScreenToDeployDropPct, 12);
+});
+
+test("C: GMGN-only candidate in both mode never records a comparable screen price", async () => {
+  g.clearScreenedPrices();
+  const screening = await import("../tools/screening.js");
+  const src = fs.readFileSync(new URL("../tools/screening.js", import.meta.url), "utf8");
+  assert.ok(screening && /noteUncomparableScreenPrice\(p\.pool\)/.test(src));
+  // behaviour: an uncomparable marker blocks both the code price and any model-supplied screen_price
+  g.noteUncomparableScreenPrice("GMGN_ONLY_POOL");
+  assert.equal(g.getScreenedPrice("GMGN_ONLY_POOL"), null);
+  assert.equal(g.isScreenPriceUncomparable("GMGN_ONLY_POOL"), true);
+  await withConfig({ source: "both" }, async () => {
+    // fresh pool_price is SOL-per-token (5e-6); the model echoes the USD price 4.6e-4 (88x) -> must not refuse
+    ex.__setDeployRecheckFetch(async () => ({ ...goodPool(), pool_price: 0.00000523 }));
+    const r = await ex.checkDeploySafetyGuards({ pool_address: "GMGN_ONLY_POOL", screen_price: 0.000462 });
+    assert.equal(r.pass, true);
+    // a Pool Discovery candidate in both mode is still compared
+    g.noteScreenedPrice("MET_POOL", 0.00001);
+    const r2 = await ex.checkDeploySafetyGuards({ pool_address: "MET_POOL" });
+    assert.equal(r2.pass, false, "drop of ~48% from a recorded Pool Discovery price refuses");
+  });
+  g.clearScreenedPrices();
+});
+
+test("D: unwind failure fires onFail; unthrown-after-swap paths unwind (source)", async () => {
+  let failed = null;
+  await g.swapBackAfterRefusal({ swapFn: async () => ({ success: false, error: "no route" }), baseMint: "M", amount: 1, solMint: "S", onFail: (r) => { failed = r; } });
+  assert.match(failed.note, /remains in the wallet/);
+  let okCalled = false;
+  await g.swapBackAfterRefusal({ swapFn: async () => ({ success: true }), baseMint: "M", amount: 1, solMint: "S", onFail: () => { okCalled = true; } });
+  assert.equal(okCalled, false);
+  const dl = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  assert.ok(/Invalid strategy[^\n]*unwindAutoSwap\(\)/.test(dl));
+  assert.ok(/token Y decimals[^\n]*unwindAutoSwap\(\)/.test(dl) && /token X decimals[^\n]*unwindAutoSwap\(\)/.test(dl));
+  assert.ok(/txMaybeSent \? "" : await unwindAutoSwap\(\)/.test(dl), "outer catch unwinds when no tx could have been sent");
+  assert.ok(/emit\("swap_unwind_failed"/.test(dl));
+  const ui = fs.readFileSync(new URL("../telegram-ui.js", import.meta.url), "utf8");
+  assert.ok(/swap_unwind_failed: \(d\) =>/.test(ui));
+});
+
+test("E: screen_active_bin is gone from the model-facing tool and the deploy path", () => {
+  const defs = fs.readFileSync(new URL("../tools/definitions.js", import.meta.url), "utf8");
+  const dl = fs.readFileSync(new URL("../tools/dlmm.js", import.meta.url), "utf8");
+  assert.equal(defs.includes("screen_active_bin"), false);
+  assert.equal(dl.includes("screen_active_bin"), false);
+});
+
+test("F: instance lock path comparison uses realpath and folds case on darwin", () => {
+  const { samePath } = lockMod;
+  const real = fs.mkdtempSync(path.join(tmp, "Real-"));
+  fs.writeFileSync(path.join(real, "index.js"), "");
+  const link = path.join(tmp, "link-dir");
+  fs.symlinkSync(real, link);
+  const file = path.join(real, "index.js");
+  assert.equal(samePath(path.join(link, "index.js"), file), true, "symlinked dir resolves to the same file");
+  if (process.platform === "darwin") assert.equal(samePath(file.replace("Real-", "REAL-"), file, "darwin"), true, "canonical casing on case-insensitive disk");
+  // case-fold: fake non-existent paths differ only by case
+  assert.equal(samePath("/Users/x/Projects/meridian/index.js", "/Users/x/projects/meridian/index.js", "darwin"), true);
+  assert.equal(samePath("/Users/x/Projects/meridian/index.js", "/Users/x/projects/meridian/index.js", "linux"), false);
+  assert.equal(samePath("/Users/x/a/index.js", "/Users/x/b/index.js", "darwin"), false);
+  // through isLiveInstance: absolute token differing only by case / via symlink is "us"
+  const m = (cmd, entry) => isLiveInstance(10, { exists: () => true, entry, command: () => cmd, cwdOf: () => null });
+  assert.equal(m(`node ${path.join(link, "index.js")}`, file), true);
 });

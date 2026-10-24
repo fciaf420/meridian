@@ -81,12 +81,14 @@ export const config = {
     // (every trade stayed inside one bin).
     requireKnownVolatility: u.requireKnownVolatility ?? true,
     // Max price move (%) between the start of a deploy and the first tx send.
+    // DROP-ONLY for SOL-only deposits (a rise leaves the bins below the active
+    // bin, harmless); symmetric when a token X leg is deposited (two-sided).
     maxEntryPriceMovePct: u.maxEntryPriceMovePct ?? 5,
-    // Max price move (%) between the price shown at screening and the fresh pool
+    // Max price DROP (%) between the price shown at screening and the fresh pool
     // price at deploy time (the minutes-long screening -> LLM -> deploy gap).
-    // 0 disables. Skipped when screening.source is "gmgn" (different price source)
-    // or no screening price is available.
-    maxScreenToDeployMovePct: u.maxScreenToDeployMovePct ?? 5,
+    // Rises are logged, never refused. 0 disables. Skipped when screening.source
+    // is "gmgn" (different price source) or no Pool Discovery screening price exists.
+    maxScreenToDeployDropPct: u.maxScreenToDeployDropPct ?? 12,
     // Deposit slippage (%) handed to the DLMM SDK. The SDK converts it to an
     // allowed active-bin drift: ceil(pct / (binStep/100)) bins. Was a hard-coded
     // 10%. See deploy-guards.js depositSlippage().
