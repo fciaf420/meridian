@@ -534,7 +534,7 @@ test("M3: closeForExit runs the postClose parity hook (actions log / USDC settle
   const res = { reason: "STOP_LOSS: x", onchainPct: null, onchain: null };
   const calls = [];
   const base = { closePosition: async (args) => { state.recordClose(args.position_address, args._close_reason); return { success: true }; }, getTracked: state.getTrackedPosition, isCloseInflight: () => false, recordAutoClose: state.recordAutoClose, emit: () => {}, log: quiet };
-  const r = await engine.closeForExit(apiPos(p, -20), res, { ...base, postClose: async (args, result) => { calls.push(args.position_address); } });
+  const r = await engine.closeForExit(apiPos(p, -20), res, { ...base, postClose: async (args) => { calls.push(args.position_address); } });
   assert.equal(r.closed, true);
   assert.deepEqual(calls, [p]);
   const q = open();
