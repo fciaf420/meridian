@@ -10,6 +10,7 @@ import fs from "fs";
 import { log } from "./logger.js";
 import { writeJsonAtomicSync } from "./atomic-write.js";
 import { config, reloadScreeningThresholds, USER_CONFIG_PATH } from "./config.js";
+import { readConfigState, updateConfigState } from "./config-state.js";
 import { recordPoolDeploy } from "./pool-memory.js";
 import { recalculateWeights } from "./signal-weights.js";
 import { filePositionClose } from "./knowledge-base.js";
@@ -213,18 +214,21 @@ export async function recordPerformance(perf) {
 
   // Evolve thresholds every 5 closed positions (compare against stored counter, not modulo)
   {
-    const lastEvolvedAt = readUserConfig()._positionsAtEvolution || 0;
+    const lastEvolvedAt = readConfigState().positionsAtEvolution || 0;
+    // Silent auto-evolution is opt-in (config.learning.autoTune, default off). When off, the
+    // same analysis runs but only LOGS what it would change; nothing in user-config.json moves.
+    const apply = config.learning?.autoTune === true;
     if (data.performance.length - lastEvolvedAt >= MIN_EVOLVE_POSITIONS) {
       // Single read of user-config.json shared by both evolution passes
       let userConfig = readUserConfig();
 
-      const result = evolveThresholds(data.performance, config, { userConfig, lessonsData: data });
+      const result = evolveThresholds(data.performance, config, { userConfig, lessonsData: data, apply });
       if (result?.changes && Object.keys(result.changes).length > 0) {
         userConfig = result.userConfig; // carry forward mutations
         log("evolve", `Auto-evolved thresholds: ${JSON.stringify(result.changes)}`);
       }
       // Also evolve from lessons (reuses same userConfig + data)
-      const lessonResult = evolveFromLessons(data.lessons || [], config, { userConfig, lessonsData: data });
+      const lessonResult = evolveFromLessons(data.lessons || [], config, { userConfig, lessonsData: data, apply });
       if (lessonResult?.changes && Object.keys(lessonResult.changes).length > 0) {
         userConfig = lessonResult.userConfig;
         log("evolve", `Lesson-based evolution: ${JSON.stringify(lessonResult.changes)}`);
@@ -515,11 +519,17 @@ export function evolveTrailing(perfData, config) {
   return { changes, rationale };
 }
 
-export function evolveThresholds(perfData, config, { userConfig, lessonsData } = {}) {
+/**
+ * @param {boolean} [opts.apply=true] false = propose only: log the changes and record them in
+ *   config-state.json (lastProposal) without touching user-config.json or the live config.
+ *   Explicit owner commands (/evolve, dashboard) call this with the default; the automatic
+ *   post-close path passes config.learning.autoTune.
+ */
+export function evolveThresholds(perfData, config, { userConfig, lessonsData, apply = true } = {}) {
   const computed = computeThresholdChanges(perfData, config);
   if (!computed) return null;
   const { changes, rationale } = computed;
-  return persistThresholdChanges(perfData, config, changes, rationale, { userConfig, lessonsData });
+  return persistThresholdChanges(perfData, config, changes, rationale, { userConfig, lessonsData, apply });
 }
 
 /**
@@ -754,19 +764,28 @@ export function computeThresholdChanges(perfData, config) {
   return { changes, rationale };
 }
 
-function persistThresholdChanges(perfData, config, changes, rationale, { userConfig, lessonsData } = {}) {
+/** Log what auto-tuning WOULD have changed, and remember the latest proposal in config-state.json. */
+function recordProposal(source, changes, rationale, positions) {
+  for (const [k, v] of Object.entries(changes)) log("evolve_proposed", `[${source}] would set ${k} → ${v} (not applied: autoTune is off): ${rationale[k] ?? ""}`);
+  try { updateConfigState({ lastProposal: { at: new Date().toISOString(), source, positions, changes, rationale } }); } catch { /* best effort */ }
+}
+
+function persistThresholdChanges(perfData, config, changes, rationale, { userConfig, lessonsData, apply = true } = {}) {
   // ── Persist changes to user-config.json ───────────────────────
   // Use shared userConfig if provided by caller (avoids redundant read/write
   // when evolveThresholds + evolveFromLessons run back-to-back).
   if (!userConfig) userConfig = readUserConfig();
 
   // Always update the counter so we don't re-check the same data every close
-  userConfig._lastEvolved = new Date().toISOString();
-  userConfig._positionsAtEvolution = perfData.length;
+  // (bookkeeping lives in config-state.json, not user-config.json).
+  updateConfigState({ lastEvolved: new Date().toISOString(), positionsAtEvolution: perfData.length });
 
   if (Object.keys(changes).length === 0) {
-    writeUserConfig(userConfig);
     return { changes: {}, rationale: {}, userConfig };
+  }
+  if (!apply) {
+    recordProposal("thresholds", changes, rationale, perfData.length);
+    return { changes: {}, proposed: changes, rationale, userConfig };
   }
 
   Object.assign(userConfig, changes);
@@ -870,7 +889,7 @@ function findDuplicate(lessons, candidate) {
  * @param {Object} [opts.userConfig] - Pre-read user-config.json (will be mutated + written)
  * @param {Object} [opts.lessonsData] - Pre-loaded lessons.json data (avoids extra load/save)
  */
-export function evolveFromLessons(lessons, config, { userConfig, lessonsData } = {}) {
+export function evolveFromLessons(lessons, config, { userConfig, lessonsData, apply = true } = {}) {
   lessons = (lessons || []).filter((l) => !isExcludedLesson(l));
   if (lessons.length < 5) return null;
 
@@ -918,10 +937,16 @@ export function evolveFromLessons(lessons, config, { userConfig, lessonsData } =
 
   if (Object.keys(changes).length === 0) return { changes: {}, rationale: {} };
 
+  if (!apply) {
+    updateConfigState({ lastEvolved: new Date().toISOString() });
+    recordProposal("lessons", changes, rationale, lessons.length);
+    return { changes: {}, proposed: changes, rationale, userConfig };
+  }
+
   // Persist to user-config.json (use shared userConfig if provided)
   if (!userConfig) userConfig = readUserConfig();
   Object.assign(userConfig, changes);
-  userConfig._lastEvolved = new Date().toISOString();
+  updateConfigState({ lastEvolved: new Date().toISOString() });
   writeUserConfig(userConfig);
 
   // Apply to live config

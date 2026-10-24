@@ -18,6 +18,7 @@ import { checkAgentSwap } from "./swap-guard.js";
 import { isManagementBusy, getManagementCloseReason, isDraining, trackInflightOp } from "../session.js";
 import { managementPnlCloseGate } from "../pnl-confirm.js";
 import { getOnchainPnl } from "./onchain-pnl.js";
+import { updateConfigState } from "../config-state.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
@@ -204,7 +205,8 @@ const toolMap = {
     }
 
     // Persist to user-config.json
-    persistUserConfig(applied, { _lastAgentTune: new Date().toISOString() });
+    persistUserConfig(applied);
+    try { updateConfigState({ lastAgentTune: new Date().toISOString() }); } catch { /* best effort */ }
 
     // Restart cron jobs if intervals changed
     const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null || applied.pnlWatcherIntervalSec != null;
