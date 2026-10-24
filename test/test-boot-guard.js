@@ -113,11 +113,11 @@ test("evaluateBootConfig: override + user-config present -> ok but overrides lis
   assert.deepEqual(activeOverrides({ MERIDIAN_CONFIG_DIR: "" }), []);
 });
 
-function runGuard(env) {
+function runGuard(env, { live = false } = {}) {
   const log = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-guard-log-"));
   const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("MERIDIAN_")));
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", 'await import("./boot-guard.js"); console.log("BOOTED");'], {
-    cwd: ROOT, encoding: "utf8", env: { ...clean, DRY_RUN: "true", MERIDIAN_LOG_DIR: log, ...env },
+    cwd: ROOT, encoding: "utf8", env: { ...clean, ...(live ? {} : { DRY_RUN: "true" }), MERIDIAN_LOG_DIR: log, ...env },
   });
   const logs = fs.readdirSync(log).filter((f) => f.startsWith("agent-")).map((f) => fs.readFileSync(path.join(log, f), "utf8")).join("\n");
   fs.rmSync(log, { recursive: true, force: true });
@@ -126,7 +126,7 @@ function runGuard(env) {
 
 test("boot-guard process: override + missing user-config exits non-zero before booting", () => {
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-guard-cfg-"));
-  const r = runGuard({ MERIDIAN_CONFIG_DIR: empty });
+  const r = runGuard({ MERIDIAN_CONFIG_DIR: empty }, { live: true });
   assert.notEqual(r.status, 0);
   assert.doesNotMatch(r.stdout, /BOOTED/);
   assert.match(r.stderr, /Refusing to start/);
