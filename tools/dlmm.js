@@ -54,6 +54,7 @@ const WSOL_MINT = "So11111111111111111111111111111111111111112";
 const CLOSE_VERIFY_READS = 4;
 const CLOSE_VERIFY_DELAY_MS = 1500;
 import { fetchTopLpersStats, evaluateTopLpersGate } from "./study.js";
+import { flipCloseTags } from "./bidask-flip.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -2595,6 +2596,7 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         close_reason: closeReason,
         ...depthUseAtClose(tracked, closeReason),
         ...trailingAtClose(tracked, closeReason, config.management),
+        ...flipCloseTags(tracked),
         deployed_at: tracked.deployed_at,
         signal_snapshot: tracked.signal_snapshot || null,
         ...(tracked.experiment_id && { experiment_id: tracked.experiment_id, experiment_arm: tracked.experiment_arm }),
@@ -2779,6 +2781,8 @@ export { sendManagedTransaction as _sendManagedTransactionForTest };
 export { initializedBinArrayWindow as _initializedBinArrayWindowForTest };
 // Read-only access for the re-center shadow log (tools/recenter-shadow.js).
 export { getPool as getPoolForRead, initializedBinArrayWindow };
+// Bid-Ask flip live mode (tools/bidask-flip.js) signs its rebalance with the bot wallet.
+export { getWallet as _getWalletForFlip };
 
 /** Test hook: seed the pool cache with a mock DLMM instance. */
 const _poolOverridesForTest = new Map(); // test seam only; production never populates it

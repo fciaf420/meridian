@@ -613,6 +613,7 @@ function startCronJobs() {
       try {
         const pos = await getMyPositions();
         const exits = [];
+        const exitPositions = new Set(); // positions with an exit alert this tick (the bid-ask flip yields to them)
         const holdTimeHints = [];
         for (const p of pos.positions || []) {
           // Store mid-position snapshot in pool-memory (keyed by pool address)
@@ -627,6 +628,7 @@ function startCronJobs() {
           if (p.pnl_pct != null) {
             const exitAction = updatePnlAndCheckExits(p.position, p.pnl_pct, config);
             if (exitAction) {
+              exitPositions.add(p.position);
               exits.push(`⚠ ${p.pair}: ${exitAction}`);
               log("exit_check", `${p.pair}: ${exitAction}`);
             }
@@ -652,6 +654,13 @@ function startCronJobs() {
               }
             } catch { /* GMGN exit context is best-effort */ }
           }
+        }
+        // Bid-Ask flip (tools/bidask-flip.js): runs under the management lock; any
+        // exit rule on the same tick wins. "shadow" only simulates and logs.
+        if (config.bidAskFlip?.mode && config.bidAskFlip.mode !== "off") {
+          await import("./tools/bidask-flip.js")
+            .then((m) => m.runBidAskFlips(pos.positions || [], { config, exitAlerts: exitPositions, isBusy, isCloseInflight }))
+            .catch((e) => log("bidask_flip", `flip pass failed: ${e.message}`));
         }
         if (exits.length > 0) {
           exitAlerts = `\n\nEXIT ALERTS (CLOSE THESE IMMEDIATELY):\n${exits.join("\n")}\n`;
