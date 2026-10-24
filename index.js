@@ -1315,6 +1315,7 @@ const tgUI = createTelegramUI({
   getStatusInfo: () => ({
     activeStrategy: config.strategy.activeStrategy,
     strategy: config.strategy.strategy,
+    hybridBidAskPct: config.strategy.strategy === "hybrid" ? config.strategy.hybridBidAskPct : null,
     managementModel: config.llm.managementModel,
     screeningModel: getScreenerModelLabel(),
     screeningSource: config.screening.source,

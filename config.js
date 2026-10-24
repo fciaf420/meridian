@@ -313,7 +313,9 @@ export const config = {
     ohlcvTiers: S("ohlcvTiers"), // token-age → candle timeframe tiers; null = DEFAULT_OHLCV_TIERS in tools/ohlcv.js
     strategy:   S("strategy"),
     hybridBidAskPct: S("hybridBidAskPct"), // "hybrid" shape: Bid-Ask layer share (%)
-    hybridSpotPct: S("hybridSpotPct"),     // derived = 100 - hybridBidAskPct (never set directly)
+    // Derived live = 100 - hybridBidAskPct, so a Telegram / applyConfigChanges edit never leaves it stale. Writes are ignored.
+    get hybridSpotPct() { const b = Number(this.hybridBidAskPct); return Number.isFinite(b) ? Math.max(0, Math.round((100 - b) * 100) / 100) : null; },
+    set hybridSpotPct(_v) { /* derived; ignored */ },
     binsBelow:  S("binsBelow"),  // activeBin - 69 to activeBin = 70 bins total (program max)
     evilPanda: {
       minTokenVolume24h: S("evilPandaMinTokenVolume24h"),
@@ -682,6 +684,11 @@ export function applyConfigChanges({ changes = {}, source = "manual", reason = "
     // Block atlas-disallowed keys when source is atlas_autotune
     if (source === "atlas_autotune" && ATLAS_DISALLOWED.has(key)) {
       rejected.atlas_disallowed[key] = value;
+      continue;
+    }
+
+    if (key === "hybridSpotPct") { // derived (100 - hybridBidAskPct): never writable
+      rejected.locked[key] = value;
       continue;
     }
 

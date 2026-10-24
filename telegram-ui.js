@@ -514,7 +514,7 @@ export function renderStatus(info, now = Date.now()) {
   const lines = [
     `📈 <b>Status</b>`,
     `Mode: <b>${info.dryRun ? "DRY RUN" : "LIVE"}</b>${info.usdcMode ? " · 💵 USDC mode" : ""}`,
-    `Strategy: ${escapeHtml(info.activeStrategy ?? "?")}${info.strategy ? ` (${escapeHtml(info.strategy)})` : ""}`,
+    `Strategy: ${escapeHtml(info.activeStrategy ?? "?")}${info.strategy ? ` (${escapeHtml(info.strategy)}${info.strategy === "hybrid" && info.hybridBidAskPct != null ? ` ${escapeHtml(String(info.hybridBidAskPct))}% Bid-Ask / ${escapeHtml(String(100 - info.hybridBidAskPct))}% Spot` : ""})` : ""}`,
     `Models: manage <code>${escapeHtml(info.managementModel ?? "?")}</code> · screen <code>${escapeHtml(info.screeningModel ?? "?")}</code>`,
     `Screening source: ${escapeHtml(info.screeningSource ?? "meteora")}`,
     "",

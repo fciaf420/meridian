@@ -441,6 +441,7 @@ async function executeToolInner(name, args, { manual = false, codeExit = false }
     // Respect the active strategy: Evil Panda is ALWAYS single-sided SOL SPOT,
     // never bid_ask — even in USDC mode. Other strategies stay bid_ask single-sided.
     args.strategy = config.strategy.activeStrategy === "evil_panda" ? "spot" : "bid_ask";
+    if (config.strategy.strategy === "hybrid" && args.strategy === "bid_ask") log("usdc", "USDC mode: hybrid shape is not supported here; falling back to pure bid_ask for this entry");
     args.bins_above = 0;
     if (args.initial_value_usd == null) args.initial_value_usd = entry.usd_spent;
     log("usdc", `Entry funded: deploying ${entry.amount_y} SOL (~$${entry.usd_spent}) as ${args.strategy}${entry.dry_run ? " [DRY RUN]" : ""}`);

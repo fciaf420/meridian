@@ -10,7 +10,6 @@ import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import bs58 from "bs58";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "meridian-hybrid-"));
 const USER_CFG = path.join(tmp, "user-config.json");
@@ -183,18 +182,66 @@ test("standard path: a merged tx that cannot fit returns null + reason (caller f
   assert.match(big.reason, /merged hybrid tx is \d+ bytes/);
 });
 
-test("wide path: per-chunk reconcile for the SECOND layer compares against what the chunk held BEFORE it", async () => {
-  const ranges = [{ lowerBinId: -140, upperBinId: -71 }, { lowerBinId: -70, upperBinId: -1 }];
-  const bin = (binId, y) => ({ binId, positionXAmount: "0", positionYAmount: String(y) });
-  const mkPool = (bins) => ({ getPosition: async () => ({ positionData: { positionBinData: bins } }) });
-  // after the Bid-Ask layer: both chunks funded
-  const afterBA = [bin(-100, 500), bin(-30, 700)];
-  assert.deepEqual(await dlmm._readChunkFundingForTest(mkPool(afterBA), "p", ranges), [true, true], "plain read (first layer / non-hybrid): any liquidity = funded");
+// A tiny constant-product-ish model of a position inside a bin: shares are fixed by deposits;
+// the amounts a position "holds" are its pro-rata share of the bin's CURRENT reserves, so a swap
+// moves X and Y with NO deposit/withdraw. Raw X and Y units are in different mints (never comparable).
+function mkBin(binId, shares, reserves) { // reserves: { x, y }, totalShares: 1000 (position owns shares/1000)
+  return { binId, positionLiquidity: String(shares), positionXAmount: String(Math.floor(reserves.x * shares / 1000)), positionYAmount: String(Math.floor(reserves.y * shares / 1000)) };
+}
+const swapPool = (bins) => ({ getPosition: async () => ({ positionData: { positionBinData: bins } }) });
+const RANGES = [{ lowerBinId: -140, upperBinId: -71 }, { lowerBinId: -70, upperBinId: -1 }];
+
+test("wide path: per-chunk reconcile uses liquidity SHARES, never X/Y amounts (swaps through the range can't fake or hide a deposit)", async () => {
+  const noRes = { x: 0, y: 0 };
+  const afterBA = [mkBin(-100, 500, { x: 0, y: 2000 }), mkBin(-30, 700, { x: 0, y: 2000 })];
+  assert.deepEqual(await dlmm._readChunkFundingForTest(swapPool(afterBA), "p", RANGES), [true, true], "plain read (non-hybrid / first layer): any liquidity = funded");
   const before = [500n, 700n];
-  assert.deepEqual(await dlmm._readChunkFundingForTest(mkPool(afterBA), "p", ranges, before), [false, false], "Spot layer sent nothing yet: still the Bid-Ask amounts => NOT landed");
-  const afterSpotChunk0 = [bin(-100, 500 + 300), bin(-30, 700)];
-  assert.deepEqual(await dlmm._readChunkFundingForTest(mkPool(afterSpotChunk0), "p", ranges, before), [true, false], "only chunk 0 got its Spot layer");
-  assert.equal(await dlmm._readChunkFundingForTest({ getPosition: async () => { throw new Error("rpc"); } }, "p", ranges, before), null, "unreadable => unknown (fail closed)");
+  assert.deepEqual(await dlmm._readChunkFundingForTest(swapPool(afterBA), "p", RANGES, before), [false, false], "nothing sent yet: shares unchanged => NOT landed");
+  assert.deepEqual(await dlmm._readChunkFundingForTest(swapPool([mkBin(-100, 800, { x: 0, y: 2000 }), mkBin(-30, 700, { x: 0, y: 2000 })]), "p", RANGES, before), [true, false], "only chunk 0 got its Spot layer");
+  assert.equal(await dlmm._readChunkFundingForTest({ getPosition: async () => { throw new Error("rpc"); } }, "p", RANGES, before), null, "unreadable => unknown (fail closed)");
+  assert.equal(await dlmm._readChunkShareStateForTest({ getPosition: async () => { throw new Error("rpc"); } }, "p", RANGES, before), null);
+  void noRes;
+});
+
+test("SWAP Y->X (price dips into the top chunk), Spot chunk FAILED: reads NOT landed and is safe to resend", async () => {
+  const before = [500n, 700n];
+  // shares unchanged; the dip converted the chunk's Y into lots of X (1 lamport ~ 100 raw X units): raw X+Y sum EXPLODES
+  const afterDip = [mkBin(-100, 500, { x: 0, y: 2000 }), mkBin(-30, 700, { x: 900_000, y: 100 })];
+  assert.ok(Number(afterDip[1].positionXAmount) + Number(afterDip[1].positionYAmount) > 600_000, "sanity: amounts moved a lot with no deposit");
+  const f = await dlmm._readChunkFundingForTest(swapPool(afterDip), "p", RANGES, before);
+  assert.deepEqual(f, [false, false], "a failed chunk must not look landed because a swap changed the amounts");
+  const st = await dlmm._readChunkShareStateForTest(swapPool(afterDip), "p", RANGES, before);
+  assert.deepEqual(st.map((x) => x.unchanged), [true, true], "unchanged shares => resend allowed");
+});
+
+test("SWAP X->Y (price recovers / high-priced token), Spot chunk LANDED: reads landed and is NEVER resent", async () => {
+  const before = [500n, 700n];
+  // deposit landed (shares 700 -> 1000) but the swap moved X into Y so the raw X+Y sum SHRANK
+  const afterRecover = [mkBin(-100, 500, { x: 0, y: 2000 }), mkBin(-30, 1000, { x: 1, y: 3 })];
+  const sumBefore = 700 * 2 + 0, sumAfter = Number(afterRecover[1].positionXAmount) + Number(afterRecover[1].positionYAmount);
+  assert.ok(sumAfter < sumBefore, "sanity: raw amounts went DOWN although a deposit landed");
+  const f = await dlmm._readChunkFundingForTest(swapPool(afterRecover), "p", RANGES, before);
+  assert.deepEqual(f, [false, true], "landed chunk is detected from shares despite the amount drop");
+  const st = await dlmm._readChunkShareStateForTest(swapPool(afterRecover), "p", RANGES, before);
+  assert.deepEqual(st.map((x) => x.unchanged), [true, false], "landed chunk: not resendable");
+});
+
+test("final verification + reconcile: landed-on-chain chunks count even if their send promise rejected; failed ones throw", async () => {
+  const before = [0n, 0n];
+  const funded = await dlmm._readChunkFundingForTest(swapPool([mkBin(-100, 400, { x: 5, y: 0 }), mkBin(-30, 0, { x: 5, y: 0 })]), "p", RANGES, before);
+  assert.deepEqual(funded, [true, false]);
+  const rec = dlmm.reconcileChunkResults([{ status: "rejected", reason: new Error("timeout") }, { status: "rejected", reason: new Error("timeout") }], funded);
+  assert.deepEqual(rec, { landed: [0], failed: [1], unknown: [] });
+});
+
+test("100/0 mix: no Spot instruction is built (plain Bid-Ask tx, no zero-amount add)", async () => {
+  const pool = fakePool();
+  const r = await build.buildHybridStandardTx({ pool, ...common, legs: mix.splitHybridLamports(new BN("1000000000"), 100) });
+  assert.ok(r.tx);
+  assert.equal(pool.calls.length, 1, "only the init+Bid-Ask call; Spot add never requested");
+  assert.equal(pool.calls[0][0], "initAdd");
+  assert.ok(!r.tx.instructions.some((i) => i.programId.equals(ComputeBudgetProgram.programId)), "SDK compute-budget ix stripped (applyPriorityFee sizes it)");
+  assert.equal(r.tx.instructions.filter((i) => i.programId.equals(DLMM_ID) && i.data[0] === 20).length, 1, "one Bid-Ask deposit");
 });
 
 test("mergeLegInstructions refuses foreign programs in leg B (never silently drops a deposit-relevant ix)", () => {
@@ -214,6 +261,9 @@ test("deploy source: hybrid is built AFTER the checkpoint + pre-submit gate and 
   assert.ok(at("buildHybridStandardTx({") < at('sendManagedTransaction(hybridStandard.tx, [wallet, newPosition], "deploy hybrid standard")'));
   assert.ok(at("const addLayers = isHybrid") > at("await pool.refetchStates();"), "chunk txs priced off a fresh active bin");
   assert.ok(at('name: "bid-ask"') < at('name: "spot"'), "Bid-Ask layer first, Spot layer second");
+  assert.ok(at("layersLanded.length > 0) await pool.refetchStates()") < at("await pool.addLiquidityByStrategyChunkable("), "Spot layer re-reads the active bin before it is built");
+  assert.match(deployBody, /readChunkShares\(pool/, "per-chunk baseline is liquidity shares");
+  assert.ok(!/chunkTotals|positionXAmount/.test(deployBody), "deploy path never compares token amounts");
   assert.match(deployBody, /layersLanded\.push\(layer\.name\)/, "a layer is only counted after its chunks reconcile on-chain");
   assert.match(deployBody, /layers_landed: layersLanded/, "partial hybrid deploys record which layer landed");
   assert.match(deployBody, /slippage: depositSlip\.slippagePct/);
@@ -229,6 +279,12 @@ test("deploy (dry run): hybrid reports the mix; bid_ask is untouched; bad mix / 
   const POOL = "HybPool1111111111111111111111111111111111111";
   const d = (args = {}) => dlmm.deployPosition({ pool_address: POOL, amount_y: 1, bin_step: 100, price_range_pct: 50, ...args });
   config.strategy.hybridBidAskPct = 70;
+  config.strategy.strategy = "bid_ask";
+  const refused = await d({ strategy: "hybrid" });
+  assert.equal(refused.success, false);
+  assert.match(refused.error, /Hybrid deploy refused: the configured shape is 'bid_ask'/, "LLM path: hybrid refused unless the owner configured it");
+  assert.equal((await d({ strategy: "hybrid", _manual: true })).would_deploy.strategy, "hybrid", "owner-initiated (Telegram picker) deploys may pick hybrid");
+  config.strategy.strategy = "hybrid";
   const h = await d({ strategy: "hybrid" });
   assert.equal(h.dry_run, true);
   assert.equal(h.would_deploy.strategy, "hybrid");
@@ -242,6 +298,7 @@ test("deploy (dry run): hybrid reports the mix; bid_ask is untouched; bad mix / 
   assert.equal((await d()).would_deploy.strategy, "hybrid");
   config.strategy.strategy = "bid_ask";
   assert.equal((await d()).would_deploy.strategy, "bid_ask", "existing configs keep deploying pure bid_ask");
+  config.strategy.strategy = "hybrid";
   assert.match((await d({ strategy: "hybrid", amount_x: 5 })).error, /single-sided SOL only/);
   assert.match((await d({ strategy: "hybrid", sol_split_pct: 80 })).error, /single-sided SOL only/);
   config.strategy.hybridBidAskPct = 0;
@@ -249,6 +306,7 @@ test("deploy (dry run): hybrid reports the mix; bid_ask is untouched; bad mix / 
   config.strategy.hybridBidAskPct = 140;
   assert.match((await d({ strategy: "hybrid" })).error, /Hybrid deploy refused/);
   config.strategy.hybridBidAskPct = 70;
+  config.strategy.strategy = "bid_ask";
   await assert.rejects(d({ strategy: "curve" }), /Only 'bid_ask', 'spot' or 'hybrid'/);
 });
 
@@ -373,4 +431,29 @@ test("flip planner: fill% comes from the hybrid's ACTUAL bin amounts (not a pure
   for (const c of plan.chunks) assert.ok(c.deposit.minBinId > deep.active && c.deposit.maxBinId <= deep.U);
   assert.match(flip.planBidAskFlip(flipInput(deep, { strategy: "curve" })).reason, /not a bid_ask\/hybrid/);
   assert.match(flip.planBidAskFlip(flipInput(deep, { binsAbove: 2 })).reason, /not single-sided/);
+});
+
+test("hybridSpotPct is derived LIVE from hybridBidAskPct and cannot be written", async () => {
+  const { applyConfigChanges } = await import("../config.js");
+  const r1 = applyConfigChanges({ changes: { hybridBidAskPct: 70 }, source: "manual" });
+  assert.equal(r1.applied.hybridBidAskPct, 70);
+  assert.equal(config.strategy.hybridSpotPct, 30, "recomputed after applyConfigChanges, not stale");
+  config.strategy.hybridBidAskPct = 45; // Telegram edit path (setPath on the schema row)
+  assert.equal(config.strategy.hybridSpotPct, 55, "recomputed after a direct edit too");
+  const r2 = applyConfigChanges({ changes: { hybridSpotPct: 10 }, source: "manual" });
+  assert.equal(r2.success, false);
+  assert.ok("hybridSpotPct" in r2.rejected.locked, "write to the derived key is rejected");
+  assert.equal(config.strategy.hybridSpotPct, 55);
+  config.strategy.hybridSpotPct = 1; // direct assignment is ignored too
+  assert.equal(config.strategy.hybridSpotPct, 55);
+  const persisted = JSON.parse(fs.readFileSync(USER_CFG, "utf8"));
+  assert.notEqual(persisted.hybridSpotPct, 10, "the rejected write was never persisted");
+  config.strategy.hybridBidAskPct = 70;
+});
+
+test("tool definition no longer promotes hybrid; deployPosition (LLM path) is the gate", async () => {
+  const defs = (await import("../tools/definitions.js")).tools;
+  const dp = defs.find((t) => t.function.name === "deploy_position");
+  assert.match(dp.function.parameters.properties.strategy.description, /ONLY when the configured strategy is hybrid/);
+  assert.ok(!/flatter, fee-earning base/.test(JSON.stringify(defs)));
 });

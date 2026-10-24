@@ -467,6 +467,7 @@ const closeInflight = new Map();
 
 async function getPool(poolAddress) {
   const key = poolAddress.toString();
+  if (_poolOverridesForTest.has(key)) return _poolOverridesForTest.get(key); // test seam; empty in production
   if (!poolCache.has(key)) {
     const { DLMM } = await getDLMM();
     const pool = await DLMM.create(getConnection(), new PublicKey(poolAddress));
@@ -582,6 +583,11 @@ export async function deployPosition({
   // Validate the mix and the shape BEFORE anything is spent or built.
   let hybridMix = null;
   if (activeStrategy === HYBRID) {
+    // Hybrid is an owner-defined shape: the LLM may use it only when the owner configured it
+    // (strategy: "hybrid"); owner-initiated Telegram deploys (_manual) may always pick it.
+    if (!_manual && config.strategy.strategy !== HYBRID) {
+      return { success: false, error: "Hybrid deploy refused: the configured shape is '" + config.strategy.strategy + "', and hybrid is an owner-defined shape. Deploy with strategy='" + config.strategy.strategy + "' (or omit strategy)." };
+    }
     try { hybridMix = normalizeHybridMix(config.strategy.hybridBidAskPct); } catch (e) {
       return { success: false, error: `Hybrid deploy refused: ${e.message}` };
     }
@@ -1321,7 +1327,7 @@ export async function deployPosition({
 
     // Hybrid ≤69 bins: ONE atomic tx (initialize + Bid-Ask add + Spot add). Built
     // here, before anything is sent. If it can't fit, fall back to the chunked path
-    // (create empty position, then per-chunk txs that each carry both legs).
+    // (create the empty position, then send the Bid-Ask and Spot layers as separate chunk sets).
     let hybridStandard = null;
     let useChunkedPath = isWideRange;
     if (isHybrid && !isWideRange) {
@@ -1404,6 +1410,9 @@ export async function deployPosition({
           : [{ name: null, y: totalYLamports, type: strategyType }];
         for (const layer of addLayers) {
         const layerTag = layer.name ? ` [${layer.name} layer]` : "";
+        // Re-read the active bin before EACH layer is built (the Spot layer must not reuse the
+        // pre-Bid-Ask activeId snapshot: slippage guards are priced off pool.lbPair.activeId).
+        if (layer.name && layersLanded.length > 0) await pool.refetchStates();
         const addTxs = await pool.addLiquidityByStrategyChunkable({
           positionPubKey: newPosition.publicKey,
           user: wallet.publicKey,
@@ -1417,7 +1426,7 @@ export async function deployPosition({
         const chunkRanges = chunkBinRange(minBinId, maxBinId);
         // Per-chunk holdings BEFORE this layer: the Spot layer lands on bins the Bid-Ask layer
         // already funded, so "landed" means "holds more than before", not "holds anything".
-        const before = layer.name ? await readChunkTotals(pool, newPosition.publicKey, chunkRanges) : null;
+        const before = layer.name ? await readChunkShares(pool, newPosition.publicKey, chunkRanges) : null;
         if (chunkRanges.length !== addTxArray.length) {
           // Unexpected SDK chunking: can't map txs to bins for reconcile, so
           // keep the old one-at-a-time behaviour.
@@ -1437,10 +1446,14 @@ export async function deployPosition({
           // confirmation window instead of N, and every chunk is priced off
           // the same activeId.
           const readFunded = () => readChunkFunding(pool, newPosition.publicKey, chunkRanges, before);
+          // Resend only if this chunk is verified still untouched: hybrid compares liquidity
+          // shares for EXACT equality (swaps cannot fake or hide a deposit); plain = bins empty.
+          const resendSafe = async (i) => before
+            ? (await readChunkShareState(pool, newPosition.publicKey, chunkRanges, before))?.[i]?.unchanged === true
+            : (await readFunded())?.[i] === false;
           const results = await Promise.allSettled(addTxArray.map((tx, i) =>
             sendManagedTransaction(tx, [wallet], `deploy add-liquidity${layerTag} ${i + 1}/${addTxArray.length}`, {
-              // Resend only if this chunk's bins are verified still empty.
-              beforeResend: async () => (await readFunded())?.[i] === false,
+              beforeResend: () => resendSafe(i),
             })));
           // Reconcile against the position on-chain, never against send
           // results alone: a "failed" chunk may have landed.
@@ -2819,6 +2832,8 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
         pool_name: tracked.pool_name || poolAddress.slice(0, 8),
         strategy: tracked.strategy,
         strategy_type: tracked.strategy_type || null,
+        ...(tracked.strategy_mix && { strategy_mix: tracked.strategy_mix }),
+        ...(tracked.legs && { legs: tracked.legs }),
         sol_split_pct: tracked.sol_split_pct ?? null,
         bin_range: tracked.bin_range,
         bin_step: tracked.bin_step || null,
@@ -2906,19 +2921,41 @@ export async function closePosition({ position_address, _pnlOverride = null, _cl
 }
 
 // ─── Helpers ──────────────────────────────────────────────────
-/** Per-chunk total (X + Y raw units, BigInt) of a position's bins. */
-function chunkTotals(bins, ranges) {
+/**
+ * Per-chunk liquidity SHARES (BigInt, sum of positionLiquidity) of a position's bins.
+ * Shares change only on deposit / withdraw. Token amounts (positionX/YAmount) are the
+ * position's pro-rata share of each bin's CURRENT reserves, so a swap through the range
+ * changes them with no deposit, and X and Y raw units are not comparable. Never use
+ * amounts to decide whether a chunk landed.
+ */
+function chunkShares(bins, ranges) {
   const big = (v) => { try { return BigInt(String(v ?? "0").split(".")[0] || "0"); } catch { return 0n; } };
   return ranges.map(({ lowerBinId, upperBinId }) =>
     bins.filter((b) => b.binId >= lowerBinId && b.binId <= upperBinId)
-      .reduce((sum, b) => sum + big(b.positionXAmount) + big(b.positionYAmount), 0n));
+      .reduce((sum, b) => sum + big(b.positionLiquidity), 0n));
 }
 
-/** Per-chunk totals read on-chain; throws when unreadable (the layer then fails closed, before anything is sent). */
-async function readChunkTotals(pool, positionPubKey, ranges) {
+/** Per-chunk liquidity shares read on-chain; throws when unreadable (the layer then fails closed, before anything is sent). */
+async function readChunkShares(pool, positionPubKey, ranges) {
   const pd = (await pool.getPosition(positionPubKey))?.positionData;
   if (!pd) throw new Error("could not read the position's bins before the next hybrid layer");
-  return chunkTotals(pd.positionBinData || [], ranges);
+  return chunkShares(pd.positionBinData || [], ranges);
+}
+
+/**
+ * Hybrid per-chunk state vs the shares held BEFORE the layer, read on-chain.
+ * funded: shares grew (a deposit landed). unchanged: shares identical (safe to resend).
+ * Returns null when the read fails (unknown: neither funded nor resendable).
+ */
+async function readChunkShareState(pool, positionPubKey, ranges, before) {
+  try {
+    const pd = (await pool.getPosition(positionPubKey))?.positionData;
+    if (!pd) return null;
+    return chunkShares(pd.positionBinData || [], ranges).map((v, i) => ({ funded: v > before[i], unchanged: v === before[i] }));
+  } catch (e) {
+    log("deploy_warn", `Could not read chunk shares for ${positionPubKey.toString().slice(0, 8)}: ${e.message}`);
+    return null;
+  }
 }
 
 /**
@@ -2932,10 +2969,9 @@ async function readChunkFunding(pool, positionPubKey, ranges, before = null) {
     if (!pd) return null;
     const bins = pd.positionBinData || [];
     const has = (b) => Number(b.positionXAmount || 0) > 0 || Number(b.positionYAmount || 0) > 0;
-    // `before` (hybrid second layer): a chunk counts as funded only if it holds MORE than it did before this layer.
+    // `before` (hybrid layers): a chunk counts as funded only if its liquidity SHARES grew since before this layer.
     if (before) {
-      const now = chunkTotals(bins, ranges);
-      return now.map((v, i) => v > before[i]);
+      return chunkShares(bins, ranges).map((v, i) => v > before[i]);
     }
     return ranges.map(({ lowerBinId, upperBinId }) =>
       bins.some((b) => b.binId >= lowerBinId && b.binId <= upperBinId && has(b)));
@@ -3056,7 +3092,7 @@ export function _setPoolForTest(poolAddress, pool) {
   else { poolCache.set(String(poolAddress), pool); _poolOverridesForTest.set(String(poolAddress), pool); }
 }
 
-export { readChunkFunding as _readChunkFundingForTest };
+export { readChunkFunding as _readChunkFundingForTest, readChunkShareState as _readChunkShareStateForTest };
 
 /**
  * Test seam only: swap in a mock connection / wallet (pass null to restore the

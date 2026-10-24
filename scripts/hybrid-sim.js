@@ -94,7 +94,7 @@ async function binDeltas(sdk, pool, lo, hi, simAccounts, pre) {
   const dec = (data) => pool.program.coder.accounts.decode("binArray", data);
   const mapOf = (infos) => {
     const m = new Map();
-    infos.forEach((info, i) => {
+    infos.forEach((info) => {
       if (!info) return;
       const ba = dec(info.data);
       const base = ba.index.toNumber() * 70;

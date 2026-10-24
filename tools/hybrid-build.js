@@ -19,7 +19,7 @@
 // close to the 1.4M CU / 1232 B ceilings, so tools/dlmm.js sends the Bid-Ask
 // layer's chunk txs, reconciles them on-chain, then the Spot layer's.
 
-import { Transaction } from "@solana/web3.js";
+import { Transaction, ComputeBudgetProgram } from "@solana/web3.js";
 import { mergeLegInstructions } from "../hybrid-mix.js";
 import { legacyTxSize, MAX_TX_BYTES } from "./tx-send.js";
 
@@ -65,6 +65,13 @@ export async function buildHybridStandardTx({ pool, StrategyType, BN, positionPu
     positionPubKey, user, totalXAmount: zero(BN), totalYAmount: legs.bidAsk,
     strategy: { minBinId, maxBinId, strategyType: StrategyType.BidAsk }, slippage,
   });
+  if (legs.spot.isZero()) {
+    // 100/0 mix: no Spot instruction (a zero-amount add burns ~116k CU for nothing). Plain Bid-Ask tx;
+    // the SDK compute-budget ix is dropped like in the merged path (applyPriorityFee sizes the tx).
+    const ixs = txA.instructions.filter((ix) => !ix.programId.equals(ComputeBudgetProgram.programId));
+    const only = new Transaction({ blockhash: txA.recentBlockhash, lastValidBlockHeight: txA.lastValidBlockHeight, feePayer: user }).add(...ixs);
+    return { tx: only, size: legacyTxSize(only), txA, txB: null };
+  }
   const txB = await quietSdkEstimator(() => pool.addLiquidityByStrategy({
     positionPubKey, user, totalXAmount: zero(BN), totalYAmount: legs.spot,
     strategy: { minBinId, maxBinId, strategyType: StrategyType.Spot }, slippage,

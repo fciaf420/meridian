@@ -1,0 +1,21 @@
+width 80: 163 extended accounts of that size
+candidates: 163
+usable (SOL-quoted, >=71 bins below active): 3
+
+position 7Mqp…iKYH pool 3ued…x5Ja owner BLXV…KotR (owner balance 0.003 SOL) bins 260..339 active 332 -> deposit range 260..331 (72 bins)
+  bid-ask chunk 1/2 bins 260..329: {"InstructionError":[4,{"Custom":1}]} CU 521122  [Transfer: insufficient lamports 1007256, need 9988125 | Program 11111111111111111111111111111111 failed: custom program error: 0x1]
+  bid-ask chunk 2/2 bins 330..331: OK CU 303420
+  spot chunk 1/2 bins 260..329: {"InstructionError":[4,{"Custom":1}]} CU 521122  [Transfer: insufficient lamports 1007256, need 9722160 | Program 11111111111111111111111111111111 failed: custom program error: 0x1]
+  spot chunk 2/2 bins 330..331: OK CU 303418
+
+position 55xg…BFaY pool b7eB…vRxy owner GzdP…hGUY (owner balance 10.965 SOL) bins -213..-134 active -137 -> deposit range -213..-138 (76 bins)
+  bid-ask chunk 1/2 bins -213..-144: OK CU 657192
+  bid-ask chunk 2/2 bins -143..-138: OK CU 471573
+  spot chunk 1/2 bins -213..-144: OK CU 657238
+  spot chunk 2/2 bins -143..-138: OK CU 471578
+
+position DwwM…qXrX pool HbjY…1sVh owner DdGV…aRkf (owner balance 0.685 SOL) bins -2000..-1921 active -1583 -> deposit range -2000..-1921 (80 bins)
+  bid-ask chunk 1/2 bins -2000..-1931: OK CU 685710
+  bid-ask chunk 2/2 bins -1930..-1921: OK CU 294829
+  spot chunk 1/2 bins -2000..-1931: OK CU 685784
+  spot chunk 2/2 bins -1930..-1921: OK CU 294851
